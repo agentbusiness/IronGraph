@@ -1,0 +1,920 @@
+/*
+ * The console shell and the streams screen, in the design's own language.
+ *
+ * Everything here composes the idioms reference.css establishes — the band, the apparatus label,
+ * detents, hairline rules, square marks — so the header, the query screen and the streams screen
+ * read as one instrument. No colour is written literally: every surface takes the ground/ink/rule
+ * tokens, which is what lets the plate/page switch reach the whole console at once.
+ */
+
+/* ── The register cross, sized where it appears ─────────────────────────────
+ * The glyph itself lives in design/parts.tsx; these are the design's sizes for it. Without them
+ * the SVG has no intrinsic size and fills its container — an 11px mark rendered a hundred wide. */
+.cross,
+.mark .cross {
+  width: 9px;
+  height: 9px;
+  color: var(--rubric);
+  flex: 0 0 auto;
+  align-self: center;
+}
+
+.marg-h .cross {
+  width: 8px;
+  height: 8px;
+  color: var(--rubric);
+}
+
+/* ── The band: what the shell adds to the design's header ─────────────────── */
+
+/* A pick states a current value and opens to change it — the trigger design/Menu.tsx renders.
+ * Assembled dynamically, so no stylesheet-reachability pass can infer it from a JSX literal. */
+#ig .pick {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--rule-2);
+  background: transparent;
+  color: var(--ink-2);
+  cursor: pointer;
+  font-family: Archivo, sans-serif;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+#ig .pick:hover {
+  color: var(--ink);
+  border-color: var(--ink-3);
+}
+
+#ig .pick:disabled {
+  color: var(--ink-3);
+  border-color: var(--rule);
+  cursor: default;
+}
+
+#ig .pick .v {
+  color: var(--ink);
+}
+
+#ig .pick svg {
+  width: 8px;
+  height: 8px;
+  color: var(--ink-3);
+  flex: 0 0 auto;
+}
+
+.band .state {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.pip {
+  width: 5px;
+  height: 5px;
+  background: var(--rubric);
+  flex: 0 0 auto;
+}
+
+.pip.hollow {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--ink-3);
+}
+
+/* The two destinations, as the design's segmented set. The band centres them vertically. */
+.band .seg-set {
+  align-self: center;
+}
+
+/* ── The console frame ──────────────────────────────────────────────────────
+ * reference.css gives #ig the plate: full height, 14px margin, a flex column. The leaf is
+ * whatever screen is open below the band, on the manuscript's five tracks — index, rail,
+ * reading column, margin rule, margin. Both screens speak this grid; a screen's own wrapper
+ * is display:contents so its columns land on these tracks directly. */
+.console-leaf {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  /* The margin holds the index's width: it reads and operates on a selection, which is as much
+   * of the work as the index is, and a symmetric page is the manuscript's own proportion. */
+  grid-template-columns: minmax(220px, 300px) 46px minmax(0, 1fr) 1px minmax(220px, 300px);
+  grid-template-rows: minmax(0, 1fr);
+}
+
+/* The caret, restated on every writing surface. The frame already sets it once and inheritance
+ * carries it, but embedded editors ship carets of their own; this keeps any that slip through in
+ * the console's ink and shape. */
+#ig input,
+#ig textarea,
+#ig select,
+#ig [contenteditable] {
+  caret-color: var(--rubric);
+  caret-shape: var(--caret, block);
+}
+
+.console-leaf > .screen > .col-i,
+.console-leaf > .screen > .rail,
+.console-leaf > .screen > .col-ii,
+.console-leaf > .screen > .marg-rule,
+.console-leaf > .screen > .marg {
+  min-height: 0;
+}
+
+/* The notice a broken project catalog raises, above whichever screen is open. */
+#ig > .notice {
+  margin: 10px 0 0;
+}
+
+/* ── The sheet: the one place this console interrupts ───────────────────────
+ * Creating a project stops the reader either way; the sheet at least says so plainly and
+ * hands focus straight to the one field it is about. */
+.sheet-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 88;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding: 14vh 16px 0;
+  background: color-mix(in srgb, var(--ground) 72%, transparent);
+}
+
+.sheet {
+  width: min(100%, 470px);
+  border: 1px solid var(--rule-2);
+  background: var(--ground);
+}
+
+.sheet-h {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--rule-2);
+}
+
+.sheet-h .grow,
+.sheet-f .grow {
+  flex: 1;
+}
+
+.sheet-b {
+  padding: 14px;
+}
+
+.fld {
+  display: block;
+  margin-bottom: 14px;
+}
+
+.fld > span {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.fld input[type='text'],
+.fld input[type='number'] {
+  width: 100%;
+  height: 34px;
+  padding: 0 11px;
+  border: 1px solid var(--rule-2);
+  background: transparent;
+  color: var(--ink);
+  outline: 0;
+  font: 400 16px/1.4 'Source Serif 4', 'Iowan Old Style', Georgia, serif;
+}
+
+.fld input:focus {
+  border-color: var(--rubric);
+}
+
+.fld select {
+  width: 100%;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--rule-2);
+  background: var(--ground);
+  color: var(--ink);
+  outline: 0;
+  font-family: Archivo, sans-serif;
+  font-size: 11.5px;
+  letter-spacing: 0.02em;
+}
+
+.fld select:focus {
+  border-color: var(--rubric);
+}
+
+.fld .fld-note {
+  display: block;
+  margin-top: 6px;
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--ink-3);
+  font-style: italic;
+}
+
+/* ── Documents, Training and Docs ──────────────────────────────────────────
+ * These pages use the same manuscript tracks and apparatus as Query and Streams. They add no
+ * palette or control vocabulary: prose is Source Serif, apparatus is Archivo, code is counter ink,
+ * with mutations presented at the level appropriate to each surface. */
+
+.bar.bare {
+  padding-left: 0;
+  padding-right: 0;
+  background: transparent;
+}
+
+.screen[data-screen='training'] .stmt,
+.screen[data-screen='docs'] .stmt {
+  margin: 8px 0 12px;
+  padding: 16px 18px;
+  overflow: auto;
+  border: 1px solid var(--rule-2);
+  background: color-mix(in srgb, var(--ink) 4%, var(--ground));
+  color: var(--counter);
+  font: 500 15px/1.7 Archivo, ui-monospace, SFMono-Regular, monospace;
+  white-space: pre;
+  tab-size: 2;
+}
+
+.screen[data-screen='training'] .stmt.terminal { color: var(--ink); }
+
+.import-gate {
+  margin: 0 0 22px;
+  padding: 15px 16px 17px;
+  border-top: 3px double var(--rubric-deep);
+  border-bottom: 1px solid var(--rubric-deep);
+}
+
+.import-gate p {
+  margin: 8px 0;
+  color: var(--ink-2);
+}
+
+.document-list li.on,
+.lesson-list li.on,
+.docs-list li.on {
+  border-left: 1px solid var(--rubric);
+  background: var(--rubric-wash);
+}
+
+.document-list .origin,
+.lesson-list .origin { color: var(--counter); }
+
+.document-work,
+.training-work,
+.docs-work { scroll-behavior: smooth; }
+
+.document-empty {
+  padding-top: clamp(34px, 10vh, 110px);
+  max-width: 58ch;
+}
+
+.document-empty .prose { margin-top: 18px; }
+
+.document-head {
+  border-bottom: 1px solid var(--rule);
+  margin-bottom: 18px;
+}
+
+.document-head label > span,
+.document-body > span { display: block; margin-bottom: 8px; }
+
+.document-head input {
+  width: 100%;
+  padding: 0 0 12px;
+  border: 0;
+  border-bottom: 1px solid transparent;
+  outline: 0;
+  background: transparent;
+  color: var(--ink);
+  font: 400 clamp(28px, 4vw, 46px)/1.12 'Source Serif 4', Georgia, serif;
+  letter-spacing: -.018em;
+}
+
+.document-head input:focus { border-bottom-color: var(--rubric); }
+
+.document-body { display: block; }
+
+.markdown-editor { border: 1px solid var(--rule-2); margin: 8px 0 28px; }
+.markdown-tools {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+  padding: 7px 9px;
+  border-bottom: 1px solid var(--rule);
+}
+.markdown-tools button {
+  height: 24px;
+  padding: 0 7px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--ink-3);
+  cursor: pointer;
+  font: 650 10px Archivo, sans-serif;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.markdown-tools button:hover { color: var(--ink); border-color: var(--rule-2); }
+.markdown-tool-divider { width: 1px; height: 15px; margin: 0 3px; background: var(--rule-2); }
+.markdown-live { min-height: min(54vh, 620px); }
+.markdown-editor .cm-editor { min-height: inherit; background: transparent; color: var(--ink); }
+.markdown-editor .cm-editor.cm-focused { outline: 0; }
+.markdown-editor .cm-scroller { min-height: inherit; font: 400 18px/1.68 'Source Serif 4', Georgia, serif; padding: 17px 0 28px; }
+.markdown-editor .cm-content { caret-color: var(--rubric); }
+.markdown-editor .cm-line { padding: 0 18px; }
+.markdown-editor .cm-gutters { display: none; }
+.markdown-editor .cm-activeLine { background: transparent; }
+.markdown-editor .cm-placeholder { color: var(--unwritten); font-style: italic; }
+.markdown-editor .lm-heading { color: var(--ink); font-weight: 600; line-height: 1.28; padding-top: .45em; }
+.markdown-editor .lm-h1 { font-size: 2em; }
+.markdown-editor .lm-h2 { font-size: 1.55em; }
+.markdown-editor .lm-h3 { font-size: 1.3em; }
+.markdown-editor .lm-h4,
+.markdown-editor .lm-h5,
+.markdown-editor .lm-h6 { font-size: 1.1em; }
+.markdown-editor .lm-strong { font-weight: 700; color: var(--ink); }
+.markdown-editor .lm-em { font-style: italic; }
+.markdown-editor .lm-strike { text-decoration: line-through; color: var(--ink-3); }
+.markdown-editor .lm-codespan { color: var(--counter); font: 500 .86em Archivo, ui-monospace, monospace; }
+.markdown-editor .lm-syntax { color: var(--unwritten); }
+
+.lesson-list .t { display: block; margin-top: 5px; }
+
+.lesson-question {
+  max-width: 58ch;
+  margin: 18px 0 24px;
+  color: var(--ink-2);
+  font-size: 19px;
+  line-height: 1.55;
+}
+
+.import-state,
+.dataset-ready {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.import-gate h2 {
+  margin: 11px 0 5px;
+  font-size: 25px;
+  font-weight: 400;
+}
+
+.dataset-ready {
+  margin: 20px 0;
+  padding: 9px 0;
+  border-top: 1px solid var(--rule);
+  border-bottom: 1px solid var(--rule);
+  color: var(--ink-2);
+  font-size: 14px;
+}
+
+.dataset-ready b { color: var(--ink); font-family: Archivo, sans-serif; }
+
+.lesson-query,
+.lesson-answer { margin: 20px 0 28px; }
+
+.lesson-query > .stmt { margin-top: 0; }
+
+.lesson-explanation {
+  max-width: 68ch;
+  padding: 20px 0 36px;
+  border-top: 1px solid var(--rule-2);
+}
+
+.lesson-explanation ol { margin: 15px 0 0; padding-left: 24px; }
+.lesson-explanation li { margin-bottom: 12px; font-size: 17px; line-height: 1.55; color: var(--ink-2); }
+.lesson-explanation li::marker { color: var(--rubric); font-family: Archivo, sans-serif; font-size: 11px; }
+
+.lesson-result,
+.doc-table {
+  max-width: 100%;
+  overflow: auto;
+  border: 1px solid var(--rule);
+}
+
+.lesson-result .bt td,
+.doc-table .bt td { white-space: normal; min-width: 130px; }
+
+.doc-count { padding: 10px 18px; border-bottom: 1px solid var(--rule); }
+.docs-groups { margin: 0; padding: 0; list-style: none; }
+.docs-group { border-bottom: 1px solid var(--rule-2); }
+.docs-section {
+  width: 100%;
+  min-height: 38px;
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 16px 10px 18px;
+  border: 0;
+  background: transparent;
+  color: var(--counter);
+  font: 600 9.5px/1.2 Archivo, sans-serif;
+  letter-spacing: .15em;
+  text-align: left;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.docs-section:hover { color: var(--ink); background: var(--rubric-wash); }
+.docs-section svg { width: 8px; height: 8px; }
+.docs-section-count { color: var(--ink-3); font-variant-numeric: tabular-nums; letter-spacing: .05em; }
+.docs-list { border-top: 1px solid var(--rule); }
+.docs-list .t { font-size: 14px; }
+.docs-list .r { margin-top: 4px; }
+.docs-list .ap { text-transform: none; letter-spacing: .04em; }
+
+.docs-prose {
+  max-width: 78ch;
+  padding-bottom: 60px;
+  font-size: 17px;
+  line-height: 1.65;
+  color: var(--ink-2);
+}
+
+.docs-prose > .ap { margin-bottom: 12px; }
+.docs-prose h1 { margin-bottom: 24px; }
+.docs-prose h2 { margin: 38px 0 13px; color: var(--ink); font-size: 26px; line-height: 1.2; font-weight: 400; }
+.docs-prose h3 { margin: 25px 0 10px; color: var(--ink); font: 600 13px/1.3 Archivo, sans-serif; letter-spacing: .08em; text-transform: uppercase; }
+.docs-prose p { margin: 0 0 1em; }
+.docs-prose ul,
+.docs-prose ol { margin: 0 0 1.2em; padding-left: 25px; }
+.docs-prose li { margin: 5px 0; }
+.docs-prose :not(.stmt) > code { color: var(--counter); font: 500 .83em/1.5 Archivo, ui-monospace, monospace; }
+.docs-prose a,
+.doc-link { color: var(--counter); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; }
+.doc-link { padding: 0; border: 0; background: transparent; font: inherit; cursor: pointer; }
+.docs-prose hr { height: 1px; margin: 30px 0; border: 0; background: var(--rule); }
+.doc-code { margin: 18px 0 24px; }
+.doc-code > .bar { border: 0; }
+.doc-code > .stmt { margin-top: 0; }
+.doc-result-table { margin: 0 0 24px; }
+.doc-result-table .bt-frame { background: color-mix(in srgb, var(--ink) 3%, var(--ground)); }
+.doc-result-table .bt th { padding: 10px 13px; font-size: 10.5px; }
+.doc-result-table .bt td { padding: 11px 13px; font-size: 15px; line-height: 1.45; white-space: normal; }
+.doc-result-table > .ap { margin: 9px 0 0; }
+.docs-dataset-imports { margin: 0 0 26px; border-top: 3px double var(--rule-2); border-bottom: 1px solid var(--rule); }
+.dataset-import-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.dataset-import-row { display: flex; align-items: center; gap: 9px; min-height: 42px; padding: 8px 10px; border-top: 1px solid var(--rule); border-right: 1px solid var(--rule); }
+.dataset-import-row:nth-child(3n) { border-right: 0; }
+.dataset-import-row b { font: 500 13px Archivo, ui-monospace, monospace; color: var(--ink); }
+.dataset-import-row .grow { flex: 1; }
+
+/* ── Settings: local host integration register ─────────────────────────── */
+.settings-index-head { padding: 22px 18px 18px; border-bottom: 3px double var(--rule-2); }
+.settings-index-head h2 { margin: 6px 0 0; font: 400 23px/1.15 'Source Serif 4', serif; color: var(--ink); }
+.settings-index-item { width: 100%; display: grid; grid-template-columns: 28px 1fr; gap: 10px; padding: 14px 18px; border: 0; border-bottom: 1px solid var(--rule); background: var(--rubric-wash); color: var(--ink); text-align: left; }
+.settings-index-item > span:last-child { display: grid; gap: 3px; }
+.settings-index-item b { font: 500 14px/1.3 Archivo, sans-serif; }
+.settings-index-item small { color: var(--ink-3); font: 400 11px/1.3 Archivo, sans-serif; }
+.settings-index-facts { display: grid; grid-template-columns: repeat(2, 1fr); border-bottom: 1px solid var(--rule); }
+.settings-index-facts > span { display: grid; padding: 14px 18px; border-right: 1px solid var(--rule); }
+.settings-index-facts > span:last-child { border-right: 0; }
+.settings-index-facts b { color: var(--counter); font: 500 22px/1 Archivo, sans-serif; }
+.settings-index-facts small { margin-top: 5px; color: var(--ink-3); font: 400 9px/1.3 Archivo, sans-serif; letter-spacing: .08em; text-transform: uppercase; }
+.settings-work { overflow: auto; }
+.settings-heading { max-width: 78ch; padding-bottom: 22px; border-bottom: 3px double var(--rule-2); }
+.settings-heading h1 { margin: 10px 0 16px; }
+.settings-heading p:not(.ap) { max-width: 66ch; color: var(--ink-2); font-size: 17px; line-height: 1.55; }
+.settings-heading .bar { margin-top: 22px; }
+.settings-work > .notice { margin: 18px 0; }
+.settings-integrations { margin-top: 22px; border-top: 1px solid var(--rule-2); }
+.settings-integration { min-height: 66px; display: grid; grid-template-columns: 8px minmax(170px, 1fr) minmax(170px, .8fr) auto; align-items: center; gap: 13px; padding: 10px 12px; border-bottom: 1px solid var(--rule); color: var(--ink-3); }
+.settings-integration.detected { color: var(--ink); }
+.settings-integration-name,
+.settings-integration-version { display: grid; gap: 3px; min-width: 0; }
+.settings-integration-name strong { overflow: hidden; text-overflow: ellipsis; font: 500 14px/1.3 Archivo, sans-serif; }
+.settings-integration-name small,
+.settings-integration-version small { color: var(--ink-3); font: 400 11px/1.3 Archivo, sans-serif; }
+.settings-integration-version .ap { color: inherit; }
+.settings-integration .detent { min-width: 80px; }
+.screen[data-screen='training'] .lesson-answer .bt th { padding: 9px 12px; font-size: 10.5px; }
+.screen[data-screen='training'] .lesson-answer .bt td { padding: 10px 12px; font-size: 15px; line-height: 1.45; }
+
+/* The new pages keep the manuscript's margin after the reading column on narrow screens. */
+@media (max-width: 1180px) {
+  .console-leaf:has(.screen[data-screen='documents']),
+  .console-leaf:has(.screen[data-screen='training']),
+  .console-leaf:has(.screen[data-screen='docs']) {
+    grid-template-columns: minmax(210px, 270px) 42px minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
+  }
+
+  .console-leaf:has(.screen[data-screen='settings']) {
+    grid-template-columns: minmax(210px, 270px) 42px minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
+  }
+
+  .screen[data-screen='settings'] .marg { display: grid; grid-column: 3; grid-row: 2; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; padding: 18px 0 28px; border-top: 1px solid var(--rule); }
+  .screen[data-screen='settings'] .marg-h { grid-column: 1 / -1; margin-bottom: 0; }
+  .screen[data-screen='settings'] .nota { margin: 0; }
+
+  .screen[data-screen='documents'] .marg,
+  .screen[data-screen='training'] .marg,
+  .screen[data-screen='docs'] .marg {
+    display: grid;
+    grid-column: 3;
+    grid-row: 2;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 14px;
+    padding: 18px 0 28px;
+    border-top: 1px solid var(--rule);
+  }
+
+  .screen[data-screen='documents'] .marg-h,
+  .screen[data-screen='training'] .marg-h,
+  .screen[data-screen='docs'] .marg-h { grid-column: 1 / -1; margin-bottom: 0; }
+  .screen[data-screen='documents'] .nota,
+  .screen[data-screen='training'] .nota,
+  .screen[data-screen='docs'] .nota { margin: 0; }
+}
+
+@media (max-width: 880px) {
+  .band .seg-set { order: 3; width: 100%; overflow-x: auto; }
+  .band .seg-set button { flex: 1 0 auto; }
+  .console-leaf:has(.screen[data-screen='documents']),
+  .console-leaf:has(.screen[data-screen='training']),
+  .console-leaf:has(.screen[data-screen='docs']) {
+    display: block;
+  }
+  .screen[data-screen='documents'],
+  .screen[data-screen='training'],
+  .screen[data-screen='docs'] { display: flex; flex-direction: column; }
+  .screen[data-screen='documents'] .col-i,
+  .screen[data-screen='training'] .col-i,
+  .screen[data-screen='docs'] .col-i { max-height: 31vh; order: 1; }
+  .screen[data-screen='documents'] .col-ii,
+  .screen[data-screen='training'] .col-ii,
+  .screen[data-screen='docs'] .col-ii { order: 2; padding-right: 0; }
+  .screen[data-screen='documents'] .marg,
+  .screen[data-screen='training'] .marg,
+  .screen[data-screen='docs'] .marg { order: 3; display: block; padding-right: 0; }
+  .markdown-live { min-height: 46vh; }
+  .docs-prose { font-size: 16px; }
+  .dataset-import-grid { grid-template-columns: 1fr; }
+  .dataset-import-row { border-right: 0; }
+  .screen[data-screen='settings'] .settings-index { max-height: none; }
+  .settings-integration { grid-template-columns: 8px minmax(0, 1fr) auto; }
+  .settings-integration-version { grid-column: 2; }
+  .settings-integration .detent { grid-column: 3; grid-row: 1 / span 2; }
+}
+
+.sheet-f {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 14px;
+  border-top: 1px solid var(--rule-2);
+}
+
+/* ── The streams screen ─────────────────────────────────────────────────────
+ * The same manuscript the query screen is written on. The index lists the four broker
+ * registers, the reading column holds the open one, and the margin annotates whatever
+ * row the reader selected — including every operation that can be run against it. */
+
+/* One broker register in the index. The left rule is the design's nota idiom: hot when open. */
+.lst.regs button {
+  border-left: 1px solid transparent;
+  padding-left: 17px;
+}
+
+.lst.regs li.on button {
+  border-left-color: var(--rubric);
+  background: var(--rubric-wash);
+}
+
+.lst.regs .t {
+  font-size: 15.5px;
+}
+
+/* The broker table: the design's table idiom, sized for dozens of rows rather than millions. */
+.bt-frame {
+  border: 1px solid var(--rule);
+  overflow: auto;
+  min-height: 0;
+}
+
+.bt {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.bt th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 6px 11px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--ground);
+  text-align: left;
+  font-family: Archivo, sans-serif;
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+
+.bt td {
+  padding: 7px 11px 8px;
+  border-bottom: 1px solid var(--rule);
+  font-size: 13.5px;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.bt td.name {
+  color: var(--ink);
+  font-size: 14.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 30ch;
+}
+
+.bt th.n,
+.bt td.n {
+  text-align: right;
+  width: 1%;
+}
+
+.bt td .kindword {
+  font: 500 11.5px Archivo, ui-monospace, monospace;
+  color: var(--counter);
+  letter-spacing: 0.01em;
+}
+
+.bt tbody tr {
+  cursor: pointer;
+}
+
+.bt tbody tr:hover {
+  background: var(--rubric-wash);
+}
+
+.bt tbody tr[aria-selected='true'] {
+  background: var(--rubric-wash);
+  box-shadow: inset 1px 0 var(--rubric);
+}
+
+/* A count that is a problem — consumer lag above zero — is written in the warm ink. */
+.bt td.hot {
+  color: var(--rubric-lift);
+}
+
+/* ── The streams margin: reading and operating on one row ─────────────────── */
+
+/* The statement a control will run, stated before it runs. The console never hides that
+ * every operation here is one Cypher statement on the same channel the query screen uses. */
+.stmt {
+  display: block;
+  margin: 10px 0 0;
+  padding: 7px 9px;
+  border-left: 1px solid var(--rule-2);
+  font: 500 11px Archivo, ui-monospace, monospace;
+  color: var(--ink-3);
+  letter-spacing: 0.01em;
+  overflow-wrap: anywhere;
+}
+
+.stmt b {
+  color: var(--counter);
+  font-weight: 500;
+}
+
+/* Margin forms reuse the sheet's field idiom at margin scale. */
+.marg .fld input[type='text'],
+.marg .fld input[type='number'] {
+  height: 30px;
+  font-size: 14.5px;
+}
+
+.marg .fld,
+.marg .seg-set {
+  margin-bottom: 12px;
+}
+
+.marg form .insp-acts {
+  margin-top: 4px;
+}
+
+/* The inline confirmation for an operation that erases something. It replaces the action that
+ * asked for it, names the consequence, and offers the two detents — no dialog, no second screen.
+ * Stacked, not on the notice's two-column grid: the margin is 228px wide, and a gutter column
+ * spent on a 6px mark is prose squeezed into a ribbon. */
+.marg .notice {
+  display: block;
+  margin: 12px 0 16px;
+  padding: 10px 11px 12px;
+}
+
+.marg .notice .kindmark {
+  display: none;
+}
+
+.marg .notice p {
+  font-size: 13.5px;
+}
+
+.marg .notice .lbl {
+  margin-bottom: 7px;
+}
+
+.marg .notice .stmt {
+  margin-top: 9px;
+}
+
+.notice .acts .detent {
+  white-space: nowrap;
+}
+
+/* ── The result table, repaired and made legible ────────────────────────────
+ * Virtualized rows and cells are positioned absolutely against the scroll box. They used to sit
+ * in normal flow *and* carry their virtual offset as a transform, so every offset applied twice:
+ * rows drifted to double their height apart, columns to double their width. The stylesheet is
+ * where the flow is removed, so the transforms the virtualizer writes are the whole position. */
+#ig .virtual-table-body {
+  position: relative;
+}
+
+#ig .virtual-row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: block;
+  border-bottom: 1px solid var(--rule);
+  background: transparent;
+}
+
+#ig .virtual-row.striped {
+  background: transparent;
+}
+
+#ig .virtual-row:hover {
+  background: var(--rubric-wash);
+}
+
+#ig .virtual-cell {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  padding: 0 11px;
+  font-size: 13px;
+  color: var(--ink-2);
+  border-right: 1px solid var(--rule);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+#ig .virtual-cell.num {
+  justify-content: flex-end;
+  text-align: right;
+}
+
+#ig .virtual-table-header {
+  position: relative;
+  display: block;
+  height: 30px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--ground);
+}
+
+#ig .header-cell {
+  gap: 7px;
+}
+
+#ig .header-cell .hdr-name {
+  font-family: Archivo, sans-serif;
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#ig .header-cell .hdr-type {
+  font-family: Archivo, sans-serif;
+  font-size: 8.5px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  color: var(--ink-3);
+}
+
+#ig .header-cell.num {
+  flex-direction: row-reverse;
+}
+
+#ig .cell-null {
+  color: var(--unwritten);
+  font-style: italic;
+  font-size: 12.5px;
+}
+
+/* An entity in a cell is a control: it opens in the margin, the same as a click on the plot. */
+#ig .cell-ent {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 7px;
+  max-width: 100%;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+  overflow: hidden;
+}
+
+#ig .cell-ent-kind {
+  font: 500 11.5px Archivo, ui-monospace, monospace;
+  color: var(--counter);
+  letter-spacing: 0.01em;
+  flex: 0 0 auto;
+}
+
+#ig .cell-ent-name {
+  font-size: 13.5px;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#ig .cell-ent-id {
+  font-family: Archivo, sans-serif;
+  font-size: 9.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-3);
+  flex: 0 0 auto;
+}
+
+#ig .cell-ent:hover .cell-ent-name,
+#ig .cell-ent:hover .cell-ent-kind {
+  color: var(--rubric);
+}
+
+#ig .cell-ent[aria-pressed='true'] {
+  box-shadow: inset 0 -1px var(--rubric);
+}
+
+#ig .cell-ent[aria-pressed='true'] .cell-ent-kind {
+  color: var(--rubric);
+}
+
+/* ── Small screens ────────────────────────────────────────────────────────── */
+
+@media (max-width: 880px) {
+  .console-leaf {
+    display: flex;
+    flex-direction: column;
+    overflow: auto;
+  }
+
+  .console-leaf > .screen {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .console-leaf > .screen > .col-i {
+    flex: 0 0 auto;
+  }
+
+  .console-leaf > .screen > .col-ii {
+    flex: 1 1 auto;
+  }
+
+  /* The margin returns on small screens as a block after the reading column. On the streams
+   * screen it is the only place an operation can be run from; on the query screen it is where a
+   * selection is read and expanded. Hiding it, as the wide layout's stylesheet otherwise does,
+   * hides the controls. */
+  .console-leaf > .screen > .marg {
+    display: block;
+    border-top: 1px solid var(--rule);
+    padding: 16px 0 32px;
+    max-height: none;
+  }
+
+  .band .seg-set {
+    order: 2;
+  }
+
+  .band .state {
+    display: none;
+  }
+}

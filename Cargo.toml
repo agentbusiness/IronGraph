@@ -1,0 +1,174 @@
+[package]
+name = "irongraph"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+default-run = "irongraph"
+autotests = false
+
+[[bin]]
+name = "irongraph"
+path = "src/main.rs"
+bench = false
+test = false
+
+[[bin]]
+name = "performance-matrix"
+path = "src/bin/performance_matrix.rs"
+bench = false
+test = false
+required-features = ["perf-harness"]
+
+[workspace]
+members = ["bindings/node", "bindings/python", "crates/artifact-loader", "crates/client", "crates/cypher", "crates/embedded", "crates/embedding", "crates/execution", "crates/ffi", "crates/gpu", "crates/graph", "crates/mcp", "crates/server", "crates/storage", "crates/types"]
+exclude = ["bindings/rust"]
+
+# Versions shared between the root crate and the member crates live here, so the two cannot drift.
+# They already had: `artifact-loader` pinned safetensors 0.7 while candle — the only reason either
+# crate parses safetensors at all — had moved to 0.8, which put two copies of the same format
+# parser in one build.
+[workspace.dependencies]
+blake3 = "1.8.2"
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+libc = "0.2.180"
+memmap2 = "0.9.9"
+safetensors = "0.8.0"
+sha2 = "0.10.9"
+thiserror = "2.0.17"
+
+[features]
+default = ["accelerator"]
+accelerator = ["irongraph-server/accelerator", "irongraph-embedded/accelerator"]
+metal = ["accelerator"]
+cuda = ["accelerator", "irongraph-server/cuda", "irongraph-embedded/cuda"]
+perf-harness = ["dep:async-trait", "dep:futures", "dep:serde", "dep:serde_json", "dep:tempfile", "dep:tokio-util", "dep:uuid"]
+
+[dependencies]
+irongraph-types = { path = "crates/types" }
+irongraph-server = { path = "crates/server", default-features = false }
+irongraph-client = { path = "crates/client" }
+irongraph-embedded = { path = "crates/embedded", default-features = false }
+irongraph-mcp = { path = "crates/mcp" }
+anyhow = "1.0.100"
+async-trait = { version = "0.1.89", optional = true }
+clap = { version = "4.5.54", features = ["derive", "env"] }
+futures = { version = "0.3.31", optional = true }
+tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "registry"] }
+serde = { version = "1.0.228", features = ["derive"], optional = true }
+serde_json = { version = "1.0.149", optional = true }
+tempfile = { version = "3.24.0", optional = true }
+tokio-util = { version = "0.7.18", features = ["rt"], optional = true }
+uuid = { version = "1.19.0", features = ["serde", "v4", "v7"], optional = true }
+
+[dev-dependencies]
+async-trait = "0.1.89"
+chrono = { version = "0.4.42", features = ["serde"] }
+chrono-tz = "0.10.4"
+ciborium = "0.2.2"
+criterion = { version = "0.7.0", features = ["async_tokio", "html_reports"] }
+futures = "0.3.31"
+hex = "0.4.3"
+libc = { workspace = true }
+# Real clients for the Stream and Queue wire surfaces. `rdkafka` vendors and builds the actual
+# librdkafka, which is what backs the Python, Go, Node, and .NET Kafka clients, and `lapin` is a
+# pure-Rust AMQP 0-9-1 client. Both build from cargo with no external services, so the interop
+# gates run in CI rather than being manual steps nobody performs.
+lapin = "3.7.0"
+ordered-float = { version = "5.1.0", features = ["serde"] }
+parking_lot = "0.12.5"
+postcard = { version = "1.1.3", features = ["alloc", "use-std"] }
+proptest = "1.9.0"
+rdkafka = { version = "0.38.0", features = ["cmake-build"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = { workspace = true }
+tempfile = "3.24.0"
+tokio-util = { version = "0.7.18", features = ["rt"] }
+tokio-test = "0.4.4"
+uuid = { version = "1.19.0", features = ["serde", "v4", "v7"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+# Unwind rather than abort so the panic guards this code already installs actually run.
+#
+# The crate itself denies `unwrap`, `expect`, and `panic`, but its dependencies do not: candle and
+# the Metal kernel bindings panic on several device paths, which is exactly why `catch_unwind`
+# appears around device enumeration, model forward passes, and device synchronisation. Under
+# `panic = "abort"` none of those guards can ever run — the process dies at the panic site. For a
+# node that holds every project, serves every connection, converting one
+# bad query into a terminated database process is far worse than the small size and speed cost of unwinding.
+panic = "unwind"
+strip = "symbols"
+
+# Incremental compilation remains enabled for local iteration across the focused workspace crates.
+# Debug info stays off to keep the five consolidated integration binaries quick to link.
+[profile.dev]
+debug = 0
+incremental = true
+
+# Dependencies are optimized even in debug builds.
+#
+# They are not what anyone debugs here, and a few of them dominate wall-clock time when they are
+# not: startup streams a 2.8 GB model artifact through a SHA-256 verifier, and the unoptimized
+# software implementation of that hash turns a download into a multi-minute stall that looks
+# exactly like a hang. Compression, encryption, and the tensor library have the same character.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.test]
+debug = 0
+incremental = true
+
+[profile.bench]
+debug = true
+
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "allow"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[[bench]]
+name = "core"
+harness = false
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[[bench]]
+name = "performance_matrix"
+harness = false
+
+[[bench]]
+name = "broker_throughput"
+harness = false
+
+[[test]]
+name = "cypher"
+path = "test_suites/cypher.rs"
+
+[[test]]
+name = "gpu"
+path = "test_suites/gpu.rs"
+
+[[test]]
+name = "graph_storage"
+path = "test_suites/graph_storage.rs"
+
+[[test]]
+name = "protocol_interop"
+path = "test_suites/protocol_interop.rs"

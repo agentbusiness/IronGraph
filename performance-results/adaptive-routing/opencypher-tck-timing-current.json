@@ -1,0 +1,16 @@
+{
+  "suite": "full_opencypher_tck_gpu_conformance",
+  "upstream_commit": "677cbafabb8c3c5eed458fd3b1ec0daec8d67d23",
+  "scenario_count": 3897,
+  "cpu_passed": 3897,
+  "metal_passed": 3897,
+  "matched": 3897,
+  "fully_conformant": 3897,
+  "test_seconds": 79.28,
+  "elapsed_seconds": 405.44,
+  "status": 0,
+  "build_profile": "release",
+  "fixture": "/tmp/irongraph-opencypher.wjoqIr/openCypher/tck/features",
+  "completed_unix_millis": 1787662285000,
+  "report": "performance-results/adaptive-routing/opencypher-tck-report-current.json"
+}

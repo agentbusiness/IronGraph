@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "irongraph": {
+      "type": "stdio",
+      "command": "irongraph-mcp",
+      "args": []
+    }
+  }
+}

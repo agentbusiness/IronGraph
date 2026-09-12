@@ -1,0 +1,24 @@
+{
+  "name": "irongraph",
+  "version": "0.1.0",
+  "description": "Use IronGraph as durable graph memory through Cypher, documents, and semantic search.",
+  "license": "Apache-2.0",
+  "author": {
+    "name": "IronGraph"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "IronGraph",
+    "shortDescription": "Durable graph memory for your agent.",
+    "longDescription": "Give the agent an explicit second brain for durable facts, source documents, connected knowledge, exact Cypher queries, and semantic recall across indexed graph entities.",
+    "developerName": "IronGraph",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write", "Search"],
+    "defaultPrompt": [
+      "Recall what IronGraph knows about this topic.",
+      "Save this context to IronGraph for later.",
+      "Explore the connected evidence in IronGraph."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

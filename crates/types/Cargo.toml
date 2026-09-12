@@ -1,0 +1,22 @@
+[package]
+name = "irongraph-types"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+
+[dependencies]
+ordered-float = { version = "5.1.0", features = ["serde"] }
+serde = { version = "1.0.228", features = ["derive", "rc"] }
+thiserror = { workspace = true }
+uuid = { version = "1.19.0", features = ["serde", "v4", "v7"] }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"

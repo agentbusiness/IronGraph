@@ -1,0 +1,28 @@
+{
+  "name": "@irongraph/node-linux-x64-gnu",
+  "version": "0.1.0",
+  "cpu": [
+    "x64"
+  ],
+  "main": "irongraph.linux-x64-gnu.node",
+  "files": [
+    "irongraph.linux-x64-gnu.node",
+    "README.md",
+    "LICENSE.txt",
+    "THIRD_PARTY_NOTICES.txt"
+  ],
+  "description": "GPU-first temporal graph database with Cypher, text documents, text/vector search, graph analytics, built-in Kafka-compatible streaming and AMQP-compatible queues.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20.17"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "os": [
+    "linux"
+  ],
+  "libc": [
+    "glibc"
+  ]
+}

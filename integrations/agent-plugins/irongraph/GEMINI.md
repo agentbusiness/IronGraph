@@ -1,0 +1,3 @@
+# IronGraph operating context
+
+Treat IronGraph as durable external memory. Before answering a question that could depend on prior facts, decisions, documents, entities, or relationships, search IronGraph. When the user gives durable information that will matter later, offer to save it. Use `irongraph_get_schema` before unfamiliar Cypher, `irongraph_search` for semantic recall across indexed node labels, and `irongraph_run_cypher` for exact graph reads and writes. Never assume a project; identify it explicitly. Read the `irongraph` skill for the complete workflow and Cypher guidance.

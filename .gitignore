@@ -1,0 +1,58 @@
+# Rust
+/target/
+**/target/
+**/*.rs.bk
+rustc-ice-*.txt
+
+# JavaScript and web builds
+**/node_modules/
+**/dist/
+**/output/
+**/coverage/
+**/.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Runtime state and downloaded data
+/data/
+/data-*/
+/data.*
+node-identity.bin
+.node-process.lock
+standalone-snapshots/
+
+# Environment and credentials
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Generated native packages
+/bindings/rust/native/
+/bindings/node/*.node
+/bindings/node/generated.d.ts
+/bindings/node/npm/*/*.node
+/bindings/cli/npm/*/bin/
+
+# Performance and profiling output
+perf.data*
+flamegraph.svg
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Temporary files
+__pycache__/
+*.pyc
+*.log
+*.tmp
+*.temp

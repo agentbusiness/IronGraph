@@ -1,0 +1,26 @@
+[package]
+name = "irongraph-node"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = ["accelerator"]
+accelerator = ["irongraph-embedded/accelerator"]
+cuda = ["accelerator", "irongraph-embedded/cuda"]
+
+[dependencies]
+irongraph-client = { path = "../../crates/client" }
+irongraph-embedded = { path = "../../crates/embedded", default-features = false }
+irongraph-types = { path = "../../crates/types" }
+napi = { version = "3.12.2", features = ["async", "napi8", "serde-json", "tokio_rt"] }
+napi-derive = "3.6.3"
+serde_json = "1.0.150"
+uuid = "1.24.0"
+
+[build-dependencies]
+napi-build = "2.3.1"

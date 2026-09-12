@@ -1,0 +1,237 @@
+"""Entry pages: how to read the reference, and the datasets every example runs against.
+
+These are written directly rather than generated from `Page`, because an index is prose and a
+navigation table, not a documented surface item with two examples.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[3]
+MANIFEST = ROOT / "datasets" / "manifest.json"
+
+
+def datasets() -> dict[str, dict]:
+    return json.loads(MANIFEST.read_text()) if MANIFEST.exists() else {}
+
+
+ORDER = [
+    "flights",
+    "trust",
+    "epinions",
+    "dblp",
+    "citations",
+    "library",
+    "social",
+    "email",
+    "overflow",
+]
+
+MODELS: dict[str, str] = {
+    "flights": (
+        "`(:Airport {airport_id, iata, icao, name, city, country, latitude, longitude, "
+        "altitude_ft, timezone})`\n"
+        "`(:Airline {airline_id, name, iata, icao, country, active})`\n"
+        "`(:Airport)-[:ROUTE {airline, stops, equipment, km}]->(:Airport)`\n\n"
+        "`km` is the great-circle distance between the two airports, computed at load time so "
+        "there is a genuine numeric weight to route on."
+    ),
+    "trust": (
+        "`(:Account {account_id, reputation})`\n"
+        "`(:Account)-[:RATED {rating, at, at_epoch}]->(:Account)`\n\n"
+        "`rating` is an integer from -10 to +10. `at` is a datetime and `at_epoch` the same instant "
+        "in seconds. `Account.reputation` is a **declared temporal property**: each rating wrote one "
+        "history sample stamped with that rating's own event time, so `HISTORY` and `AT TIME` read "
+        "the real 2010-2016 timeline rather than the time the data was loaded."
+    ),
+    "epinions": "`(:User {user_id})`\n`(:User)-[:TRUSTS]->(:User)`",
+    "dblp": (
+        "`(:Author {author_id})`\n"
+        "`(:Community {community_id, size})`\n"
+        "`(:Author)-[:COAUTHORED]->(:Author)`\n"
+        "`(:Author)-[:MEMBER_OF]->(:Community)`\n\n"
+        "The communities are the published ground truth, so an algorithm's output can be checked "
+        "against groups it never saw."
+    ),
+    "citations": (
+        "`(:Paper {paper_id, arxiv_id, title, authors, journal_ref, submitted, abstract})`\n"
+        "`(:Paper)-[:CITES]->(:Paper)`\n\n"
+        "29,555 papers carry a real title, author list and abstract, which is what the text "
+        "functions and text indexes work on."
+    ),
+    "library": (
+        "`(:Paper {paper_id, arxiv_id, title, authors, submitted, abstract, embedding})`\n\n"
+        "A subset of `citations` chosen for subject spread rather than size. It is eight papers "
+        "because the vector index validates its own approximation against exact search and refuses "
+        "to publish below 90% agreement, which on real embeddings is not reached above that "
+        "size — so eight is the largest corpus on which semantic search can be demonstrated "
+        "working. `embedding` holds the placeholder written before the index was declared; the "
+        "vectors themselves live in the index."
+    ),
+    "social": "`(:Person {person_id})`\n`(:Person)-[:FRIEND]->(:Person)`",
+    "email": (
+        "`(:Member {member_id, department})`\n"
+        "`(:Member)-[:EMAILED]->(:Member)`\n\n"
+        "Every member's real department is recorded, giving 42 known groups to measure a community "
+        "algorithm against."
+    ),
+    "overflow": (
+        "`(:User {user_id})`\n"
+        "`(:User)-[:INTERACTED {at, at_epoch}]->(:User)`\n\n"
+        "Half a million interactions carrying real timestamps from 2009 to 2016."
+    ),
+}
+
+
+def readme() -> str:
+    known = datasets()
+    rows = []
+    for name in ORDER:
+        entry = known.get(name)
+        if not entry:
+            continue
+        rows.append(
+            f"| [`{name}`](./datasets.md#{name}) | {entry['nodes']:,} | "
+            f"{entry['relationships']:,} | {entry['role']} |"
+        )
+    table = "\n".join(rows)
+    return f"""# Cypher reference
+
+This is the reference for Cypher as IronGraph implements it: the clauses, functions and procedures
+you can run, what each one does, and where each one differs from Cypher as you may know it from
+elsewhere.
+
+Every page follows the same shape, and every page answers the same three questions in its header
+table: what kind of thing this is, whether it is standard Cypher or an IronGraph addition, and which
+dataset its examples run against.
+
+## Every example runs, and the result is the real one
+
+The examples on these pages are not illustrative. Each page carries a simple example and an advanced
+one, both executed against a running IronGraph node loaded with the datasets below, and the result
+printed beneath each example is the output that execution actually produced. Load the same dataset,
+run the same statement, and you will see the same rows.
+
+That is enforced rather than promised: the pages are generated by a tool that executes every example
+and refuses to publish a page whose example does not run.
+
+## The datasets
+
+Nine open datasets, chosen so that every capability has somewhere real to be demonstrated. Load
+them once and every example on every page becomes runnable.
+
+| Dataset | Nodes | Relationships | What it is here for |
+| --- | ---: | ---: | --- |
+{table}
+
+Full descriptions, sources, licences and graph models are on the [datasets page](./datasets.md),
+including how to load them.
+
+## How to read this reference
+
+- **[Clauses](./clauses/README.md)** — the pieces a query pipeline is built from: time, layers and
+  similarity search.
+- **[Statements](./statements/README.md)** — projects, indexes, constraints and temporal schema.
+  Administration is Cypher; there is no second language for it.
+- **[Functions](./functions/README.md)** — aggregates, and the vector functions.
+- **[Procedures](./procedures/README.md)** — the twelve built-in graph algorithms: traversal,
+  routing, centrality, community detection and local structure.
+
+## Reading the header table
+
+Each page states its relationship to standard Cypher in one of three ways.
+
+- **Standard Cypher** — behaves as you would expect from any Cypher implementation.
+- **Standard Cypher, extended by IronGraph** — the name is familiar, but the behaviour or the
+  available forms go further than the standard describes. Read the page before assuming.
+- **IronGraph extension** — no equivalent in standard Cypher. Everything under Procedures is an
+  extension, as is everything to do with time, layers, projects and vectors.
+"""
+
+
+def datasets_page() -> str:
+    known = datasets()
+    sections = []
+    for name in ORDER:
+        entry = known.get(name)
+        if not entry:
+            continue
+        extra = ""
+        if "event_time_from" in entry:
+            extra = (
+                f"\n**Event time span** — `{entry['event_time_from']}` to "
+                f"`{entry['event_time_to']}`.\n"
+            )
+        if "temporal_samples" in entry:
+            extra += (
+                f"\n**Temporal history** — {entry['temporal_samples']:,} samples on a declared "
+                "temporal property, each stamped with its own event time.\n"
+            )
+        if "papers_with_abstract" in entry:
+            extra += f"\n**Text** — {entry['papers_with_abstract']:,} papers carry a full abstract.\n"
+        sections.append(
+            f"""## {name}
+
+{entry['title']}
+
+| | |
+| --- | --- |
+| Project | `{name}` |
+| Nodes | {entry['nodes']:,} |
+| Relationships | {entry['relationships']:,} |
+| Source | {entry['source']} |
+| Licence | {entry['licence']} |
+
+{entry['role']}
+{extra}
+**Graph model**
+
+{MODELS.get(name, '')}
+"""
+        )
+    body = "\n".join(sections)
+    return f"""# Reference datasets
+
+Every example in this reference runs against one of nine open datasets. Each is loaded into its own
+IronGraph project named after it, so an example that begins `USE trust` runs against the Bitcoin OTC
+rating network and nothing else.
+
+The datasets were chosen so that each capability has somewhere real to be demonstrated: a weighted
+network to route across, a timestamped one to window, a labelled one to check a community algorithm
+against, a text-bearing one to search. None of them is synthetic.
+
+## Loading them
+
+Fetch the sources, then load them. Each dataset is imported into a project named after its slug.
+The loader checks `SHOW PROJECTS` first and skips a dataset whose project already exists, so a
+repeat run never duplicates rows or replaces an existing graph.
+
+```bash
+./datasets/download.sh
+```
+
+```bash
+python3 datasets/load.py
+```
+
+Load one at a time with `--only`:
+
+```bash
+python3 datasets/load.py --only trust
+```
+
+To replace a dataset deliberately, drop its project yourself, then run the loader again. `DROP
+PROJECT ... CASCADE` is destructive and is never an implicit part of sample-data import.
+
+The loader writes `datasets/manifest.json` recording what each project ended up holding. The figures
+on this page come from that file.
+
+{body}
+## Licences and attribution
+
+Each dataset keeps the licence and citation of its source, listed above. They are downloaded from
+their original publishers rather than redistributed here, and the download step records exactly
+where each file came from.
+"""

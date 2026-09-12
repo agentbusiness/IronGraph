@@ -1,0 +1,43 @@
+{
+  "name": "@irongraph/node",
+  "version": "0.1.0",
+  "description": "GPU-first temporal graph database with Cypher, text documents, text/vector search, graph analytics, built-in Kafka-compatible streaming and AMQP-compatible queues.",
+  "license": "Apache-2.0",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "README.md",
+    "LICENSE.txt",
+    "THIRD_PARTY_NOTICES.txt"
+  ],
+  "engines": {
+    "node": ">=20.17"
+  },
+  "scripts": {
+    "build": "napi build --platform --release --dts generated.d.ts",
+    "build:debug": "napi build --platform --dts generated.d.ts",
+    "test": "node test.cjs",
+    "pack:check": "npm pack --dry-run"
+  },
+  "napi": {
+    "binaryName": "irongraph",
+    "targets": [
+      "aarch64-apple-darwin",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-unknown-linux-gnu"
+    ]
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "3.6.0"
+  },
+  "optionalDependencies": {
+    "@irongraph/node-darwin-arm64": "0.1.0",
+    "@irongraph/node-linux-arm64-gnu": "0.1.0",
+    "@irongraph/node-linux-x64-gnu": "0.1.0"
+  }
+}

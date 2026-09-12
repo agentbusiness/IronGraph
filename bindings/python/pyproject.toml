@@ -1,0 +1,28 @@
+[build-system]
+requires = ["maturin>=1.15,<2"]
+build-backend = "maturin"
+
+[project]
+name = "irongraph"
+version = "0.1.0"
+description = "GPU-first temporal graph database with Cypher, text documents, text/vector search, graph analytics, built-in Kafka-compatible streaming and AMQP-compatible queues."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+license-files = ["LICENSE.txt", "THIRD_PARTY_NOTICES.txt"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "Typing :: Typed",
+]
+
+[tool.maturin]
+module-name = "irongraph._native"
+python-source = "python"
+features = ["pyo3/extension-module", "pyo3/abi3-py39"]
+strip = true
+
+[tool.maturin.sbom]
+# Native dependency notices are bundled separately.
+rust = false

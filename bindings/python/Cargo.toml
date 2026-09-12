@@ -1,0 +1,24 @@
+[package]
+name = "irongraph-python"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[features]
+default = ["accelerator"]
+accelerator = ["irongraph-embedded/accelerator"]
+cuda = ["accelerator", "irongraph-embedded/cuda"]
+
+[dependencies]
+irongraph-client = { path = "../../crates/client" }
+irongraph-embedded = { path = "../../crates/embedded", default-features = false }
+irongraph-types = { path = "../../crates/types" }
+pyo3 = { version = "0.29.2", features = ["extension-module"] }
+pythonize = "0.29.0"
+serde_json = "1.0.150"
+uuid = "1.24.0"

@@ -1,0 +1,37 @@
+[package]
+name = "irongraph-execution"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+
+[features]
+default = []
+accelerator = []
+cuda = []
+
+[dependencies]
+blake3 = { workspace = true }
+chrono = { version = "0.4.42", features = ["serde"] }
+chrono-tz = { version = "0.10.4", features = ["serde"] }
+irongraph-types = { path = "../types" }
+irongraph-graph = { path = "../graph" }
+half = { version = "2.7.1", features = ["serde"] }
+ordered-float = { version = "5.1.0", features = ["serde"] }
+parking_lot = { version = "0.12.5", features = ["serde"] }
+serde = { version = "1.0.228", features = ["derive", "rc"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
+uuid = { version = "1.19.0", features = ["serde", "v4", "v7"] }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[dev-dependencies]
+proptest = "1.9.0"

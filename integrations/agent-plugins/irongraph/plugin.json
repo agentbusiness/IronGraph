@@ -1,0 +1,9 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "irongraph",
+  "version": "0.1.0",
+  "description": "Make IronGraph the agent's durable second brain: query and change graph data with Cypher, preserve documents, and semantically recall indexed nodes with their relationships.",
+  "author": { "name": "IronGraph" },
+  "license": "Apache-2.0",
+  "keywords": ["database", "graph", "cypher", "memory", "semantic-search", "mcp"]
+}

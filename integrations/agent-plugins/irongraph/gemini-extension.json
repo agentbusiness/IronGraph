@@ -1,0 +1,12 @@
+{
+  "name": "irongraph",
+  "version": "0.1.0",
+  "description": "Durable graph memory, Cypher, documents, and semantic recall for Gemini CLI.",
+  "contextFileName": "GEMINI.md",
+  "mcpServers": {
+    "irongraph": {
+      "command": "irongraph-mcp",
+      "args": []
+    }
+  }
+}

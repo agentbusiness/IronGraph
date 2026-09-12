@@ -1,0 +1,99 @@
+{
+  "citations": {
+    "licence": "Public research dataset (SNAP), cite Leskovec et al. 2005",
+    "load_seconds": 29.2,
+    "nodes": 58572,
+    "papers_with_abstract": 29555,
+    "project": "citations",
+    "relationships": 352807,
+    "role": "Text and document work: text indexes, string functions, dates, documents.",
+    "source": "https://snap.stanford.edu/data/cit-HepTh.html",
+    "title": "arXiv hep-th citation network with abstracts"
+  },
+  "dblp": {
+    "licence": "Public research dataset (SNAP), cite Yang and Leskovec 2012",
+    "load_seconds": 40.2,
+    "nodes": 322080,
+    "project": "dblp",
+    "relationships": 1162094,
+    "role": "Community detection at scale, compared against published communities.",
+    "source": "https://snap.stanford.edu/data/com-DBLP.html",
+    "title": "DBLP co-authorship network with ground-truth communities"
+  },
+  "email": {
+    "licence": "Public research dataset (SNAP), cite Yin et al. 2017",
+    "load_seconds": 0.4,
+    "nodes": 1005,
+    "project": "email",
+    "relationships": 24929,
+    "role": "Small labelled graph with 42 known departments for checking community output.",
+    "source": "https://snap.stanford.edu/data/email-Eu-core.html",
+    "title": "European research institution email network"
+  },
+  "epinions": {
+    "licence": "Public research dataset (SNAP), cite Richardson et al. 2003",
+    "load_seconds": 10.3,
+    "nodes": 75879,
+    "project": "epinions",
+    "relationships": 508837,
+    "role": "Centrality and component structure: PageRank, WCC, SCC, k-core, degree.",
+    "source": "https://snap.stanford.edu/data/soc-Epinions1.html",
+    "title": "Epinions directed trust network"
+  },
+  "flights": {
+    "licence": "Open Database License (ODbL) 1.0",
+    "load_seconds": 2.4,
+    "nodes": 13859,
+    "project": "flights",
+    "relationships": 66770,
+    "role": "Weighted routing: shortest paths, Dijkstra, traversal, numeric and string functions.",
+    "source": "https://github.com/jpatokal/openflights",
+    "title": "OpenFlights airports, airlines and routes"
+  },
+  "library": {
+    "licence": "Public research dataset (SNAP), cite Leskovec et al. 2005",
+    "load_seconds": 0.3,
+    "nodes": 8,
+    "project": "library",
+    "relationships": 0,
+    "role": "Vector and text search: the largest corpus for which the vector index publishes.",
+    "source": "https://snap.stanford.edu/data/cit-HepTh.html",
+    "title": "Eight arXiv papers with embedded abstracts",
+    "vector_index_state": "ONLINE"
+  },
+  "overflow": {
+    "event_time_from": "2009-09-29T02:56:28Z",
+    "event_time_to": "2016-03-06T11:05:55Z",
+    "licence": "Public research dataset (SNAP), cite Paranjape et al. 2017",
+    "load_seconds": 15.7,
+    "nodes": 24818,
+    "project": "overflow",
+    "relationships": 506550,
+    "role": "Large timestamped interaction stream for windowed time analysis.",
+    "source": "https://snap.stanford.edu/data/sx-mathoverflow.html",
+    "title": "MathOverflow temporal interaction network"
+  },
+  "social": {
+    "licence": "Public research dataset (SNAP), cite Leskovec and Mcauley 2012",
+    "load_seconds": 1.3,
+    "nodes": 4039,
+    "project": "social",
+    "relationships": 88234,
+    "role": "Dense undirected neighbourhoods: triangle counting and clustering coefficient.",
+    "source": "https://snap.stanford.edu/data/ego-Facebook.html",
+    "title": "Facebook combined ego networks"
+  },
+  "trust": {
+    "event_time_from": "2010-11-08T18:45:11Z",
+    "event_time_to": "2016-01-25T01:12:03Z",
+    "licence": "Public research dataset (SNAP), cite Kumar et al. 2016",
+    "load_seconds": 1.4,
+    "nodes": 5881,
+    "project": "trust",
+    "relationships": 35592,
+    "role": "The temporal reference dataset: real 2010-2016 event times, declared temporal properties, HISTORY, AT TIME, WINDOW, rollups and every aggregate.",
+    "source": "https://snap.stanford.edu/data/soc-sign-bitcoin-otc.html",
+    "temporal_samples": 35592,
+    "title": "Bitcoin OTC signed trust ratings"
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "suite": "full_opencypher_tck_gpu_conformance",
+  "scenario_count": 3897,
+  "cpu_passed": 3897,
+  "metal_passed": 3897,
+  "matched": 3897,
+  "fully_conformant": 3897,
+  "test_seconds": 48.09,
+  "elapsed_seconds": 53.88,
+  "user_seconds": 20.48,
+  "system_seconds": 5.46,
+  "started_unix_millis": 1787614652000,
+  "completed_unix_millis": 1787614706000,
+  "status": 0,
+  "cache_state": "warm build and operating-system caches",
+  "prior_warm_confirmation": {
+    "test_seconds": 29.17,
+    "elapsed_seconds": 32.73,
+    "user_seconds": 8.41,
+    "system_seconds": 3.79,
+    "started_unix_millis": 1787614494000,
+    "completed_unix_millis": 1787614526000,
+    "status": 0
+  },
+  "earlier_cold_confirmation": {
+    "test_seconds": 143.94,
+    "elapsed_seconds": 206.43,
+    "user_seconds": 67.89,
+    "system_seconds": 13.50,
+    "started_unix_millis": 1787612272000,
+    "completed_unix_millis": 1787612478000,
+    "status": 0
+  }
+}

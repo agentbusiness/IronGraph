@@ -1,0 +1,274 @@
+{
+  "schema": "irongraph-real-route-v1",
+  "generated_unix_ms": 1787666088826,
+  "project_id": "ba4aca18-e725-8974-afcd-2f54a22d54d7",
+  "project_name": "route_probe_99ad4bee1a56",
+  "http_url": "http://127.0.0.1:28484",
+  "bolt_uri": "bolt://127.0.0.1:27687",
+  "neo4j_driver_version": "6.2.0",
+  "operations": [
+    {
+      "transport": "http_query",
+      "operation": "write_nodes_100",
+      "wall_us": 1880.0,
+      "server_us": 1555,
+      "rows": []
+    },
+    {
+      "transport": "http_query",
+      "operation": "write_nodes_1000",
+      "wall_us": 10738.125,
+      "server_us": 10191,
+      "rows": []
+    },
+    {
+      "transport": "http_query",
+      "operation": "write_nodes_5000",
+      "wall_us": 53524.416,
+      "server_us": 51408,
+      "rows": []
+    },
+    {
+      "transport": "http_query",
+      "operation": "write_nodes_3900",
+      "wall_us": 43934.584,
+      "server_us": 42549,
+      "rows": []
+    },
+    {
+      "transport": "http_query",
+      "operation": "create_index",
+      "wall_us": 26106.333,
+      "server_us": 25618,
+      "rows": []
+    },
+    {
+      "transport": "http_query",
+      "operation": "write_edges_100",
+      "wall_us": 11241.209,
+      "server_us": 10346,
+      "rows": []
+    },
+    {
+      "transport": "http_query",
+      "operation": "write_edges_1000",
+      "wall_us": 24432.333,
+      "server_us": 23576,
+      "rows": []
+    },
+    {
+      "transport": "http_query",
+      "operation": "write_edges_5000",
+      "wall_us": 94993.417,
+      "server_us": 92569,
+      "rows": []
+    },
+    {
+      "transport": "http_query",
+      "operation": "write_edges_3899",
+      "wall_us": 79210.541,
+      "server_us": 76669,
+      "rows": []
+    },
+    {
+      "transport": "http_query",
+      "operation": "point_read",
+      "wall_us": 13229.583,
+      "server_us": 12796,
+      "rows": [
+        {
+          "value": 17
+        }
+      ]
+    },
+    {
+      "transport": "http_query",
+      "operation": "traversal",
+      "wall_us": 11845.209,
+      "server_us": 11479,
+      "rows": [
+        {
+          "reached": 3
+        }
+      ]
+    },
+    {
+      "transport": "http_query",
+      "operation": "aggregate",
+      "wall_us": 33857.75,
+      "server_us": 33500,
+      "rows": [
+        {
+          "nodes": 10000,
+          "value_sum": 479604
+        }
+      ]
+    },
+    {
+      "transport": "http_query",
+      "operation": "louvain",
+      "wall_us": 22720.083,
+      "server_us": 22235,
+      "rows": [
+        {
+          "assignments": 10000,
+          "communities": 79
+        }
+      ]
+    },
+    {
+      "transport": "neo4j_driver_bolt",
+      "operation": "write_nodes_100",
+      "wall_us": 13796.042,
+      "server_available_after_us": 0,
+      "server_consumed_after_us": 13,
+      "rows": []
+    },
+    {
+      "transport": "neo4j_driver_bolt",
+      "operation": "write_nodes_1000",
+      "wall_us": 24825.708,
+      "server_available_after_us": 0,
+      "server_consumed_after_us": 21,
+      "rows": []
+    },
+    {
+      "transport": "neo4j_driver_bolt",
+      "operation": "write_nodes_5000",
+      "wall_us": 84977.542,
+      "server_available_after_us": 0,
+      "server_consumed_after_us": 69,
+      "rows": []
+    },
+    {
+      "transport": "neo4j_driver_bolt",
+      "operation": "write_nodes_3900",
+      "wall_us": 73867.292,
+      "server_available_after_us": 0,
+      "server_consumed_after_us": 60,
+      "rows": []
+    },
+    {
+      "transport": "neo4j_driver_bolt",
+      "operation": "write_edges_100",
+      "wall_us": 24352.167,
+      "server_available_after_us": 0,
+      "server_consumed_after_us": 23,
+      "rows": []
+    },
+    {
+      "transport": "neo4j_driver_bolt",
+      "operation": "write_edges_1000",
+      "wall_us": 41456.417,
+      "server_available_after_us": 0,
+      "server_consumed_after_us": 36,
+      "rows": []
+    },
+    {
+      "transport": "neo4j_driver_bolt",
+      "operation": "write_edges_5000",
+      "wall_us": 131855.708,
+      "server_available_after_us": 0,
+      "server_consumed_after_us": 108,
+      "rows": []
+    },
+    {
+      "transport": "neo4j_driver_bolt",
+      "operation": "write_edges_3899",
+      "wall_us": 113355.5,
+      "server_available_after_us": 0,
+      "server_consumed_after_us": 94,
+      "rows": []
+    },
+    {
+      "transport": "neo4j_driver_bolt",
+      "operation": "point_read",
+      "wall_us": 25604.167,
+      "server_available_after_us": 0,
+      "server_consumed_after_us": 25,
+      "rows": [
+        {
+          "value": 26
+        }
+      ]
+    },
+    {
+      "transport": "neo4j_driver_bolt",
+      "operation": "traversal",
+      "wall_us": 27601.084,
+      "server_available_after_us": 0,
+      "server_consumed_after_us": 27,
+      "rows": [
+        {
+          "reached": 3
+        }
+      ]
+    },
+    {
+      "transport": "neo4j_driver_bolt",
+      "operation": "aggregate",
+      "wall_us": 75765.125,
+      "server_available_after_us": 0,
+      "server_consumed_after_us": 75,
+      "rows": [
+        {
+          "nodes": 20000,
+          "value_sum": 959289
+        }
+      ]
+    },
+    {
+      "transport": "neo4j_driver_bolt",
+      "operation": "louvain",
+      "wall_us": 49351.292,
+      "server_available_after_us": 0,
+      "server_consumed_after_us": 48,
+      "rows": [
+        {
+          "assignments": 20000,
+          "communities": 156
+        }
+      ]
+    },
+    {
+      "transport": "neo4j_driver_bolt",
+      "operation": "validation",
+      "wall_us": 130364.709,
+      "server_available_after_us": 0,
+      "server_consumed_after_us": 129,
+      "rows": [
+        {
+          "node_count": 20000,
+          "edge_count": 19998
+        }
+      ]
+    }
+  ],
+  "validation": {
+    "node_count": 20000,
+    "edge_count": 19998
+  },
+  "icij_louvain": {
+    "project_id": "a6c1dd5b-a162-8867-8848-0594ec59bfc0",
+    "nodes": 2017662,
+    "edges": 1006150,
+    "assignments": 2017662,
+    "communities": 1281802,
+    "samples": [
+      3562362,
+      2940913,
+      3011858
+    ],
+    "p50_us": 3011858
+  },
+  "metal_capable_dynamic_icij": {
+    "configured_backend": "metal",
+    "selected_executor": "cpu",
+    "wall_us": 3288207,
+    "server_us": 3263544,
+    "assignments": 2017662,
+    "communities": 1281802
+  },
+  "median_http_wall_us": 24432.333,
+  "median_bolt_wall_us": 49351.292
+}

@@ -1,0 +1,186 @@
+{
+  "format": 1,
+  "dataset": "openalex",
+  "project_name": "real-openalex-shard-20260825",
+  "server": "http://127.0.0.1:18484/",
+  "started_at": "2026-08-25T04:48:28.020Z",
+  "configuration": {
+    "batch_size": 1000,
+    "max_nodes": 0,
+    "max_edges": 500000
+  },
+  "sources": [
+    {
+      "path": "datasets/openalex/works-2025-11-06-part-0804.jsonl.gz",
+      "bytes": 159018853,
+      "sha256": "5c0dca3bcff1bdacd3f4cdf71de6819c0d77269358a2bcdc0795ac80c1a05d94"
+    }
+  ],
+  "ingestion": [
+    {
+      "stage": "openalex-works",
+      "rows": 145664,
+      "requests": 146,
+      "elapsed_ms": 18140.459125,
+      "rows_per_second": 8029.785740056345
+    },
+    {
+      "stage": "openalex-authors",
+      "rows": 166412,
+      "requests": 167,
+      "elapsed_ms": 31937.980500000005,
+      "rows_per_second": 5210.473467475502
+    },
+    {
+      "stage": "openalex-topics",
+      "rows": 4450,
+      "requests": 5,
+      "elapsed_ms": 1096.7606670000023,
+      "rows_per_second": 4057.402981246765
+    },
+    {
+      "stage": "openalex-reference-nodes",
+      "rows": 469615,
+      "requests": 470,
+      "elapsed_ms": 121790.403708,
+      "rows_per_second": 3855.9277718294693
+    },
+    {
+      "stage": "openalex-authorships",
+      "rows": 174881,
+      "requests": 175,
+      "elapsed_ms": 165580.837958,
+      "rows_per_second": 1056.1668980341735
+    },
+    {
+      "stage": "openalex-topics-edges",
+      "rows": 115500,
+      "requests": 116,
+      "elapsed_ms": 78102.07366599998,
+      "rows_per_second": 1478.8339742928026
+    },
+    {
+      "stage": "openalex-known-work-citations",
+      "rows": 303,
+      "requests": 1,
+      "elapsed_ms": 660.1149590000277,
+      "rows_per_second": 459.01095842305745
+    },
+    {
+      "stage": "openalex-external-citations",
+      "rows": 499697,
+      "requests": 500,
+      "elapsed_ms": 394797.49687499995,
+      "rows_per_second": 1265.704580083022
+    }
+  ],
+  "queries": [
+    {
+      "name": "node-cardinality",
+      "cypher": "MATCH (n) RETURN count(n) AS nodes",
+      "elapsed_ms": 335.0213340000482,
+      "server_elapsed_us": 333011,
+      "rows": [
+        {
+          "nodes": 786141
+        }
+      ]
+    },
+    {
+      "name": "edge-cardinality",
+      "cypher": "MATCH ()-[r]->() RETURN count(r) AS edges",
+      "elapsed_ms": 335.18383300001733,
+      "server_elapsed_us": 333411,
+      "rows": [
+        {
+          "edges": 790381
+        }
+      ]
+    },
+    {
+      "name": "exact-retrieval",
+      "cypher": "MATCH (n:`OpenAlexWork` {`openalex_id`: $id}) RETURN n.`openalex_id` AS id",
+      "elapsed_ms": 662.956165999989,
+      "server_elapsed_us": 661181,
+      "rows": [
+        {
+          "id": "W284231549"
+        }
+      ]
+    },
+    {
+      "name": "shortest-path",
+      "cypher": "MATCH (a:`OpenAlexAuthor` {`openalex_id`: $start}), (b:`OpenAlexWork` {`openalex_id`: $end}) CALL graph.shortestpath(a, b) YIELD cost RETURN cost",
+      "elapsed_ms": 484.48104199999943,
+      "server_elapsed_us": 482673,
+      "rows": [
+        {
+          "cost": 1
+        }
+      ]
+    },
+    {
+      "name": "degree",
+      "cypher": "CALL graph.degree() YIELD degree RETURN count(*) AS nodes, max(degree) AS maximum_degree",
+      "elapsed_ms": 841.8688329999568,
+      "server_elapsed_us": 840103,
+      "rows": [
+        {
+          "nodes": 786141,
+          "maximum_degree": 2419
+        }
+      ]
+    },
+    {
+      "name": "weak-components",
+      "cypher": "CALL graph.wcc() YIELD component RETURN count(*) AS assignments, count(DISTINCT component) AS components",
+      "elapsed_ms": 1021.7311669999035,
+      "server_elapsed_us": 1019992,
+      "rows": [
+        {
+          "assignments": 786141,
+          "components": 29174
+        }
+      ]
+    },
+    {
+      "name": "strong-components",
+      "cypher": "CALL graph.scc() YIELD component RETURN count(*) AS assignments, count(DISTINCT component) AS components",
+      "elapsed_ms": 1081.2717920000432,
+      "server_elapsed_us": 1079526,
+      "rows": [
+        {
+          "assignments": 786141,
+          "components": 786141
+        }
+      ]
+    },
+    {
+      "name": "pagerank",
+      "cypher": "CALL graph.pagerank(0.85, 0.000001, 20) YIELD score RETURN count(*) AS ranked, sum(score) AS score_sum",
+      "elapsed_ms": 996.7227079999866,
+      "server_elapsed_us": 994993,
+      "rows": [
+        {
+          "ranked": 786141,
+          "score_sum": 0.9999999999998709
+        }
+      ]
+    },
+    {
+      "name": "louvain",
+      "cypher": "CALL graph.louvain() YIELD community RETURN count(*) AS assignments, count(DISTINCT community) AS communities",
+      "elapsed_ms": 62492.935332999914,
+      "server_elapsed_us": 62491176,
+      "rows": [
+        {
+          "assignments": 786141,
+          "communities": 29743
+        }
+      ]
+    }
+  ],
+  "project_id": "9c25e593-8d09-8877-99ec-306e39fab72f",
+  "finished_at": "2026-08-25T05:03:28.136Z",
+  "status": "passed"
+}

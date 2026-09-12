@@ -1,0 +1,11 @@
+# The crate denies `unwrap`, `expect`, and `panic` because a panic in production is a node abort:
+# the release profile sets `panic = "abort"`, so there is no unwinding and no per-connection
+# recovery — one bad row takes down the process holding every project.
+#
+# Tests are the opposite case. A failed assertion there is the intended outcome, and forcing every
+# fixture to thread `Result` through obscures what is being asserted. Allowing the panicking forms
+# in tests is what makes the production gate enforceable rather than something that has to be
+# switched off wholesale.
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true
+allow-panic-in-tests = true

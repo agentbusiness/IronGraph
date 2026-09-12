@@ -1,0 +1,27 @@
+[package]
+name = "irongraph-sdk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "GPU-first temporal graph database with Cypher, text documents, text/vector search, graph analytics, built-in Kafka-compatible streaming and AMQP-compatible queues."
+license = "Apache-2.0"
+readme = "README.md"
+links = "irongraph_ffi"
+include = ["src/**", "build.rs", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE.txt", "THIRD_PARTY_NOTICES.txt", "native-manifest.json"]
+categories = ["database"]
+keywords = ["graph", "database", "cypher", "vector", "embedded"]
+
+[workspace]
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+
+[build-dependencies]
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.10.9"
+
+[dev-dependencies]
+tempfile = "3.27.0"

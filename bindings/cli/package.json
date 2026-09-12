@@ -1,0 +1,16 @@
+{
+  "name": "irongraph",
+  "version": "0.1.0",
+  "description": "Run the IronGraph temporal graph database and web console locally. Built-in text/vector search, streaming and queues.",
+  "license": "Apache-2.0",
+  "bin": { "irongraph": "cli.cjs" },
+  "files": ["cli.cjs", "README.md", "LICENSE.txt", "THIRD_PARTY_NOTICES.txt"],
+  "engines": { "node": ">=20.17" },
+  "publishConfig": { "access": "public" },
+  "scripts": { "test": "node --test test/*.test.cjs" },
+  "optionalDependencies": {
+    "@irongraph/cli-darwin-arm64": "0.1.0",
+    "@irongraph/cli-linux-arm64-gnu": "0.1.0",
+    "@irongraph/cli-linux-x64-gnu": "0.1.0"
+  }
+}

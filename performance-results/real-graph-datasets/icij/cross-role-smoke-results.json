@@ -1,0 +1,197 @@
+{
+  "format": 1,
+  "dataset": "icij",
+  "project_name": "icij-cross-role-final",
+  "server": "http://127.0.0.1:18484/",
+  "started_at": "2026-08-25T07:31:35.959Z",
+  "configuration": {
+    "batch_size": 10,
+    "max_nodes": 0,
+    "max_edges": 0
+  },
+  "sources": [
+    {
+      "path": "scripts/perf/fixtures/icij-cross-role/nodes-entities.csv",
+      "bytes": 465,
+      "sha256": "ccd8bbeedf5361ebd4f958b8d7b2a5e18ac373c5d8805acd978e54ae68b0cfe9"
+    },
+    {
+      "path": "scripts/perf/fixtures/icij-cross-role/nodes-officers.csv",
+      "bytes": 163,
+      "sha256": "fb903c8dbba7fd7d2c8cf550a18d7729aa9f96a907d39e3583437ad922a27258"
+    },
+    {
+      "path": "scripts/perf/fixtures/icij-cross-role/nodes-addresses.csv",
+      "bytes": 71,
+      "sha256": "b5086e3c5fcad2159852da397e62fdf290f5807d671bf911a1963fb49488bef4"
+    },
+    {
+      "path": "scripts/perf/fixtures/icij-cross-role/nodes-intermediaries.csv",
+      "bytes": 193,
+      "sha256": "b95f239e818afd4ceea697f89727e2706d81f260ebd81071903ed35bb62c0f08"
+    },
+    {
+      "path": "scripts/perf/fixtures/icij-cross-role/nodes-others.csv",
+      "bytes": 153,
+      "sha256": "ece47aaafe6865d0ecfae94ce3adf9e17ce01e30eb8255f78d99c7df5738cbe0"
+    },
+    {
+      "path": "scripts/perf/fixtures/icij-cross-role/relationships.csv",
+      "bytes": 143,
+      "sha256": "cb94ce9bf550e5df03c418e550c38e64c02ca9c9899a4249cf21f8123be0e52a"
+    }
+  ],
+  "ingestion": [
+    {
+      "stage": "icij-nodes-entity",
+      "rows": 1,
+      "requests": 1,
+      "elapsed_ms": 9.118583000000001,
+      "rows_per_second": 109.66616194643399
+    },
+    {
+      "stage": "icij-nodes-officer",
+      "rows": 1,
+      "requests": 1,
+      "elapsed_ms": 6.651666999999989,
+      "rows_per_second": 150.33825355358314
+    },
+    {
+      "stage": "icij-nodes-address",
+      "rows": 0,
+      "requests": 0,
+      "elapsed_ms": 0.18283299999998803,
+      "rows_per_second": 0
+    },
+    {
+      "stage": "icij-nodes-intermediary",
+      "rows": 1,
+      "requests": 1,
+      "elapsed_ms": 3.2265000000000015,
+      "rows_per_second": 309.9333643266696
+    },
+    {
+      "stage": "icij-nodes-other",
+      "rows": 0,
+      "requests": 0,
+      "elapsed_ms": 0.19591699999999435,
+      "rows_per_second": 0
+    },
+    {
+      "stage": "icij-relationships",
+      "rows": 1,
+      "requests": 1,
+      "elapsed_ms": 7.904208000000011,
+      "rows_per_second": 126.51488928428991
+    }
+  ],
+  "queries": [
+    {
+      "name": "node-cardinality",
+      "cypher": "MATCH (n) RETURN count(n) AS nodes",
+      "elapsed_ms": 10.45258400000057,
+      "server_elapsed_us": 296,
+      "rows": [
+        {
+          "nodes": 2
+        }
+      ]
+    },
+    {
+      "name": "edge-cardinality",
+      "cypher": "MATCH ()-[r]->() RETURN count(r) AS edges",
+      "elapsed_ms": 19.055583000000297,
+      "server_elapsed_us": 93,
+      "rows": [
+        {
+          "edges": 1
+        }
+      ]
+    },
+    {
+      "name": "exact-retrieval",
+      "cypher": "MATCH (n:`IcijNode` {`dataset_id`: $id}) RETURN n.`dataset_id` AS id",
+      "elapsed_ms": 4.533374999999978,
+      "server_elapsed_us": 136,
+      "rows": [
+        {
+          "id": "165428"
+        }
+      ]
+    },
+    {
+      "name": "shortest-path",
+      "cypher": "MATCH (a:`IcijNode` {`dataset_id`: $start}), (b:`IcijNode` {`dataset_id`: $end}) CALL graph.shortestpath(a, b) YIELD cost RETURN cost",
+      "elapsed_ms": 10.449999999999818,
+      "server_elapsed_us": 553,
+      "rows": [
+        {
+          "cost": 1
+        }
+      ]
+    },
+    {
+      "name": "degree",
+      "cypher": "CALL graph.degree() YIELD degree RETURN count(*) AS nodes, max(degree) AS maximum_degree",
+      "elapsed_ms": 2.3840409999993426,
+      "server_elapsed_us": 200,
+      "rows": [
+        {
+          "nodes": 2,
+          "maximum_degree": 1
+        }
+      ]
+    },
+    {
+      "name": "weak-components",
+      "cypher": "CALL graph.wcc() YIELD component RETURN count(*) AS assignments, count(DISTINCT component) AS components",
+      "elapsed_ms": 2.1322500000005675,
+      "server_elapsed_us": 175,
+      "rows": [
+        {
+          "assignments": 2,
+          "components": 1
+        }
+      ]
+    },
+    {
+      "name": "strong-components",
+      "cypher": "CALL graph.scc() YIELD component RETURN count(*) AS assignments, count(DISTINCT component) AS components",
+      "elapsed_ms": 2.2552499999992506,
+      "server_elapsed_us": 137,
+      "rows": [
+        {
+          "assignments": 2,
+          "components": 2
+        }
+      ]
+    },
+    {
+      "name": "pagerank",
+      "cypher": "CALL graph.pagerank(0.85, 0.000001, 20) YIELD score RETURN count(*) AS ranked, sum(score) AS score_sum",
+      "elapsed_ms": 2.074916999999914,
+      "server_elapsed_us": 194,
+      "rows": [
+        {
+          "ranked": 2,
+          "score_sum": 0.9999999999999998
+        }
+      ]
+    },
+    {
+      "name": "louvain",
+      "cypher": "CALL graph.louvain() YIELD community RETURN count(*) AS assignments, count(DISTINCT community) AS communities",
+      "elapsed_ms": 1.8309580000004644,
+      "server_elapsed_us": 130,
+      "rows": [
+        {
+          "assignments": 2,
+          "communities": 1
+        }
+      ]
+    }
+  ],
+  "project_id": "b71c380b-79b6-8d76-ae21-ef54234fd78d",
+  "finished_at": "2026-08-25T07:31:44.118Z",
+  "status": "passed"
+}

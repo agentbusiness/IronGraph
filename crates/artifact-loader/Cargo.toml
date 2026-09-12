@@ -1,0 +1,31 @@
+[package]
+name = "irongraph-artifact-loader"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+
+[dependencies]
+blake3 = { workspace = true }
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+libc = { workspace = true }
+memmap2 = { workspace = true }
+safetensors = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.24.0"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"

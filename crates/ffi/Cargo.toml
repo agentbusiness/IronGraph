@@ -1,0 +1,23 @@
+[package]
+name = "irongraph-ffi"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[features]
+default = ["accelerator"]
+accelerator = ["irongraph-embedded/accelerator"]
+cuda = ["accelerator", "irongraph-embedded/cuda"]
+
+[dependencies]
+irongraph-client = { path = "../client" }
+irongraph-embedded = { path = "../embedded", default-features = false }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+
+[dev-dependencies]
+tempfile = "3.27.0"

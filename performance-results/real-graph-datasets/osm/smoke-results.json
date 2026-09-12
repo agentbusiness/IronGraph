@@ -1,0 +1,144 @@
+{
+  "format": 1,
+  "dataset": "osm",
+  "project_name": "real-osm-smoke2-20260825",
+  "server": "http://127.0.0.1:18484/",
+  "started_at": "2026-08-25T04:42:34.156Z",
+  "configuration": {
+    "batch_size": 1000,
+    "max_nodes": 0,
+    "max_edges": 5000
+  },
+  "sources": [
+    {
+      "path": "datasets/osm-canary/extracted/canary-islands.gpkg",
+      "bytes": 222760960,
+      "sha256": "06cd263323cc3875cc50196d44cfb3d79684fd03a2cc675a39b44ddb4189250b"
+    }
+  ],
+  "ingestion": [
+    {
+      "stage": "osm-road-junctions",
+      "rows": 8566,
+      "requests": 9,
+      "elapsed_ms": 150.00137499999997,
+      "rows_per_second": 57106.14319368741
+    },
+    {
+      "stage": "osm-roads",
+      "rows": 5000,
+      "requests": 5,
+      "elapsed_ms": 197.088709,
+      "rows_per_second": 25369.28688289292
+    }
+  ],
+  "queries": [
+    {
+      "name": "node-cardinality",
+      "cypher": "MATCH (n) RETURN count(n) AS nodes",
+      "elapsed_ms": 14.404999999998836,
+      "server_elapsed_us": 13265,
+      "rows": [
+        {
+          "nodes": 8566
+        }
+      ]
+    },
+    {
+      "name": "edge-cardinality",
+      "cypher": "MATCH ()-[r]->() RETURN count(r) AS edges",
+      "elapsed_ms": 3.707791000000725,
+      "server_elapsed_us": 2072,
+      "rows": [
+        {
+          "edges": 5000
+        }
+      ]
+    },
+    {
+      "name": "exact-retrieval",
+      "cypher": "MATCH (n:`RoadJunction` {`junction_id`: $id}) RETURN n.`junction_id` AS id",
+      "elapsed_ms": 5.924916999998459,
+      "server_elapsed_us": 4247,
+      "rows": [
+        {
+          "id": "-14.2363394,28.1489331"
+        }
+      ]
+    },
+    {
+      "name": "shortest-path",
+      "cypher": "MATCH (a:`RoadJunction` {`junction_id`: $start}), (b:`RoadJunction` {`junction_id`: $end}) CALL graph.shortestpath(a, b) YIELD cost RETURN cost",
+      "elapsed_ms": 4.334082999999737,
+      "server_elapsed_us": 2647,
+      "rows": [
+        {
+          "cost": 0
+        }
+      ]
+    },
+    {
+      "name": "degree",
+      "cypher": "CALL graph.degree() YIELD degree RETURN count(*) AS nodes, max(degree) AS maximum_degree",
+      "elapsed_ms": 8.662374999999884,
+      "server_elapsed_us": 7072,
+      "rows": [
+        {
+          "nodes": 8566,
+          "maximum_degree": 8
+        }
+      ]
+    },
+    {
+      "name": "weak-components",
+      "cypher": "CALL graph.wcc() YIELD component RETURN count(*) AS assignments, count(DISTINCT component) AS components",
+      "elapsed_ms": 10.721625000000131,
+      "server_elapsed_us": 9027,
+      "rows": [
+        {
+          "assignments": 8566,
+          "components": 5432
+        }
+      ]
+    },
+    {
+      "name": "strong-components",
+      "cypher": "CALL graph.scc() YIELD component RETURN count(*) AS assignments, count(DISTINCT component) AS components",
+      "elapsed_ms": 10.158792000000176,
+      "server_elapsed_us": 8516,
+      "rows": [
+        {
+          "assignments": 8566,
+          "components": 6887
+        }
+      ]
+    },
+    {
+      "name": "pagerank",
+      "cypher": "CALL graph.pagerank(0.85, 0.000001, 20) YIELD score RETURN count(*) AS ranked, sum(score) AS score_sum",
+      "elapsed_ms": 10.123833000001468,
+      "server_elapsed_us": 8330,
+      "rows": [
+        {
+          "ranked": 8566,
+          "score_sum": 1.0000000000000309
+        }
+      ]
+    },
+    {
+      "name": "louvain",
+      "cypher": "CALL graph.louvain() YIELD community RETURN count(*) AS assignments, count(DISTINCT community) AS communities",
+      "elapsed_ms": 14.399833999999828,
+      "server_elapsed_us": 12724,
+      "rows": [
+        {
+          "assignments": 8566,
+          "communities": 5432
+        }
+      ]
+    }
+  ],
+  "project_id": "56c74f3b-5923-841d-b3af-e30afde5d1b5",
+  "finished_at": "2026-08-25T04:42:42.781Z",
+  "status": "passed"
+}

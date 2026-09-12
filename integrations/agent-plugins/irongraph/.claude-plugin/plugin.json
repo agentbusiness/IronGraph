@@ -1,0 +1,8 @@
+{
+  "name": "irongraph",
+  "version": "0.1.0",
+  "description": "Durable graph memory, Cypher, documents, and semantic recall for Claude.",
+  "license": "Apache-2.0",
+  "author": { "name": "IronGraph" },
+  "keywords": ["database", "graph", "cypher", "memory", "search"]
+}

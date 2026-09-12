@@ -1,0 +1,28 @@
+{
+  "name": "@irongraph/cli-linux-x64-gnu",
+  "version": "0.1.0",
+  "description": "IronGraph standalone temporal graph database with text documents, search, built-in streaming and queues.",
+  "license": "Apache-2.0",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "engines": {
+    "node": ">=20.17"
+  },
+  "files": [
+    "bin/irongraph",
+    "bin/irongraph-mcp",
+    "README.md",
+    "LICENSE.txt",
+    "THIRD_PARTY_NOTICES.txt"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -1,0 +1,186 @@
+{
+  "format": 1,
+  "dataset": "icij",
+  "project_name": "real-icij-offshore-20260825",
+  "server": "http://127.0.0.1:18484/",
+  "started_at": "2026-08-25T05:21:32.344Z",
+  "configuration": {
+    "batch_size": 1000,
+    "max_nodes": 0,
+    "max_edges": 1000000
+  },
+  "sources": [
+    {
+      "path": "datasets/icij/extracted/nodes-entities.csv",
+      "bytes": 198928989,
+      "sha256": "b1baca3676d045e82e3e7bd701d472210f5cc99a39d6949fa2e203cb2f19cae7"
+    },
+    {
+      "path": "datasets/icij/extracted/nodes-officers.csv",
+      "bytes": 91022305,
+      "sha256": "c89898b1cf7d4d8b14d9e109a49286d5a53642b1dc21f6a945e7e63a6717f2fa"
+    },
+    {
+      "path": "datasets/icij/extracted/nodes-addresses.csv",
+      "bytes": 72466849,
+      "sha256": "d0ef10a2dacf11b62bb4290b0e2521405f965f36f11534ad50d42bf6e8ecdb2b"
+    },
+    {
+      "path": "datasets/icij/extracted/nodes-intermediaries.csv",
+      "bytes": 4064192,
+      "sha256": "287a655fca5a607be1929c52f081c848370769d3f7a681900fde7710b9e9fcfe"
+    },
+    {
+      "path": "datasets/icij/extracted/nodes-others.csv",
+      "bytes": 398436,
+      "sha256": "32f6532c8bb290233d67423de5d778cb5a55478e721d0a07e9c8a2991a1b82c0"
+    },
+    {
+      "path": "datasets/icij/extracted/relationships.csv",
+      "bytes": 259198321,
+      "sha256": "bf0d0b4e36e243b8de2a0aeef160ef5faf3b07a14754d9e7235a758196d85323"
+    }
+  ],
+  "ingestion": [
+    {
+      "stage": "icij-nodes-entity",
+      "rows": 814344,
+      "requests": 815,
+      "elapsed_ms": 341982.49799999996,
+      "rows_per_second": 2381.244668257848
+    },
+    {
+      "stage": "icij-nodes-officer",
+      "rows": 771315,
+      "requests": 772,
+      "elapsed_ms": 944190.344666,
+      "rows_per_second": 816.9062566222775
+    },
+    {
+      "stage": "icij-nodes-address",
+      "rows": 402246,
+      "requests": 403,
+      "elapsed_ms": 730040.4497080001,
+      "rows_per_second": 550.9913870675103
+    },
+    {
+      "stage": "icij-nodes-intermediary",
+      "rows": 26768,
+      "requests": 27,
+      "elapsed_ms": 42946.390791999875,
+      "rows_per_second": 623.2886979873147
+    },
+    {
+      "stage": "icij-nodes-other",
+      "rows": 2989,
+      "requests": 3,
+      "elapsed_ms": 4795.023833999876,
+      "rows_per_second": 623.354565790898
+    },
+    {
+      "stage": "icij-relationships",
+      "rows": 1000000,
+      "requests": 1000,
+      "elapsed_ms": 2730853.371166,
+      "rows_per_second": 366.18590018732027
+    }
+  ],
+  "queries": [
+    {
+      "name": "node-cardinality",
+      "cypher": "MATCH (n) RETURN count(n) AS nodes",
+      "elapsed_ms": 2217.2186249997467,
+      "server_elapsed_us": 2216351,
+      "rows": [
+        {
+          "nodes": 2017662
+        }
+      ]
+    },
+    {
+      "name": "edge-cardinality",
+      "cypher": "MATCH ()-[r]->() RETURN count(r) AS edges",
+      "elapsed_ms": 891.6135410005227,
+      "server_elapsed_us": 889843,
+      "rows": [
+        {
+          "edges": 1006150
+        }
+      ]
+    },
+    {
+      "name": "exact-retrieval",
+      "cypher": "MATCH (n:`IcijNode` {`dataset_id`: $id}) RETURN n.`dataset_id` AS id",
+      "elapsed_ms": 1757.2209170004353,
+      "server_elapsed_us": 1755464,
+      "rows": [
+        {
+          "id": "14095990"
+        }
+      ]
+    },
+    {
+      "name": "shortest-path",
+      "cypher": "MATCH (a:`IcijNode` {`dataset_id`: $start}), (b:`IcijNode` {`dataset_id`: $end}) CALL graph.shortestpath(a, b) YIELD cost RETURN cost",
+      "elapsed_ms": 1114.1948330001906,
+      "server_elapsed_us": 1112401,
+      "rows": [
+        {
+          "cost": 1
+        }
+      ]
+    },
+    {
+      "name": "degree",
+      "cypher": "CALL graph.degree() YIELD degree RETURN count(*) AS nodes, max(degree) AS maximum_degree",
+      "elapsed_ms": 2275.8638340001926,
+      "server_elapsed_us": 2274088,
+      "rows": [
+        {
+          "nodes": 2017662,
+          "maximum_degree": 36953
+        }
+      ]
+    },
+    {
+      "name": "weak-components",
+      "cypher": "CALL graph.wcc() YIELD component RETURN count(*) AS assignments, count(DISTINCT component) AS components",
+      "elapsed_ms": 2629.277499999851,
+      "server_elapsed_us": 2627429,
+      "rows": [
+        {
+          "assignments": 2017662,
+          "components": 1280312
+        }
+      ]
+    },
+    {
+      "name": "strong-components",
+      "cypher": "CALL graph.scc() YIELD component RETURN count(*) AS assignments, count(DISTINCT component) AS components",
+      "elapsed_ms": 2856.413792000152,
+      "server_elapsed_us": 2854512,
+      "rows": [
+        {
+          "assignments": 2017662,
+          "components": 2017388
+        }
+      ]
+    },
+    {
+      "name": "pagerank",
+      "cypher": "CALL graph.pagerank(0.85, 0.000001, 20) YIELD score RETURN count(*) AS ranked, sum(score) AS score_sum",
+      "elapsed_ms": 2476.2862910004333,
+      "server_elapsed_us": 2474336,
+      "rows": [
+        {
+          "ranked": 2017662,
+          "score_sum": 1.0000000000038725
+        }
+      ]
+    }
+  ],
+  "project_id": "a6c1dd5b-a162-8867-8848-0594ec59bfc0",
+  "finished_at": "2026-08-25T06:44:08.629Z",
+  "status": "failed",
+  "error": "Error: DEADLINE_EXCEEDED: query execution deadline exceeded"
+}

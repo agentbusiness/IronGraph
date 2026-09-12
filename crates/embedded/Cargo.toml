@@ -1,0 +1,23 @@
+[package]
+name = "irongraph-embedded"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+
+[features]
+default = ["accelerator"]
+accelerator = ["irongraph-server/accelerator"]
+cuda = ["accelerator", "irongraph-server/cuda"]
+
+[dependencies]
+irongraph-client = { path = "../client" }
+irongraph-server = { path = "../server", default-features = false }
+irongraph-types = { path = "../types" }
+tokio = { version = "1.52.0", features = ["rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
+thiserror = { workspace = true }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tempfile = "3.27.0"
