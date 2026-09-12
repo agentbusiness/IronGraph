@@ -949,8 +949,14 @@ def publish(stage, config, state):
         })
     if release is None:
         raise ReleaseError("Could not create binary release.")
-    # No source checkout, git refs, or automatically generated source archive is uploaded.
-    for name in sorted(state["checksums"]):
+    # Registry packages are published to their registries, not duplicated on GitHub.
+    # The SDK downloads one matching native library at build time.
+    github_assets = {f"libirongraph_ffi-{target}.a" for target in TARGETS}
+    if not github_assets.issubset(state["checksums"]):
+        raise ReleaseError("Missing required GitHub binary assets.")
+    if {asset["name"] for asset in release.get("assets", [])} - github_assets:
+        raise ReleaseError("GitHub release contains assets outside the three required native libraries.")
+    for name in sorted(github_assets):
         upload_asset(config, release, publication / name)
     if release.get("draft"):
         github(config, base + f"/releases/{release['id']}", "PATCH", {"draft": False})
