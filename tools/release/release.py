@@ -759,15 +759,10 @@ def package_all(stage, config):
     package_legal(source, notices)
     publication = stage / "publish"
     publication.mkdir(exist_ok=True)
-    expected_files = set(PUBLIC_FILES) | {"native-manifest.json", "qualification.json", "SHA256SUMS"}
-    qualification = {"version": version, "targets": {}}
+    expected_files = {"README.md", "LICENSE.txt"}
     manifest = {"version": version, "targets": {}}
     for target, suffix in TARGETS.items():
         directory = output / target
-        report = read_json(directory / "qualification.json")
-        qualification["targets"][target] = {key: report[key] for key in
-            ("os_version", "backends", "embedding_search", "native_sha256", "rustc")}
-        qualification["targets"][target]["standalone"] = read_json(directory / "standalone-qualification.json")
         archive = directory / f"libirongraph_ffi-{target}.a"
         manifest["targets"][target] = {
             "url": f"https://github.com/{config['IRONGRAPH_BINARY_REPO']}/releases/download/v{version}/{archive.name}",
@@ -819,15 +814,9 @@ def package_all(stage, config):
     expected_files.add(crate.name)
     shutil.copy2(source / "README.md", publication / "README.md")
     shutil.copy2(source / "LICENSE.txt", publication / "LICENSE.txt")
-    shutil.copy2(source / "bindings/node/THIRD_PARTY_NOTICES.txt", publication / "THIRD_PARTY_NOTICES.txt")
-    write_json(publication / "native-manifest.json", manifest)
-    write_json(publication / "qualification.json", qualification)
-    if {p.name for p in publication.iterdir()} - expected_files:
-        raise ReleaseError("Unexpected material in publication directory; no files will be uploaded.")
-    checksums = {p.name: sha256(p) for p in publication.iterdir() if p.is_file() and p.name != "SHA256SUMS"}
-    (publication / "SHA256SUMS").write_text("".join(f"{digest}  {name}\n" for name, digest in sorted(checksums.items())))
-    checksums["SHA256SUMS"] = sha256(publication / "SHA256SUMS")
-    return checksums
+    if {p.name for p in publication.iterdir()} != expected_files:
+        raise ReleaseError("Publication directory has unexpected or missing files; no files will be uploaded.")
+    return {p.name: sha256(p) for p in publication.iterdir() if p.is_file()}
 
 
 def github(config, route, method="GET", value=None):
