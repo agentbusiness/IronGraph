@@ -51,6 +51,7 @@ Thumbs.db
 *~
 
 # Temporary files
+/GATES.md
 __pycache__/
 *.pyc
 *.log
