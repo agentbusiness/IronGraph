@@ -8871,13 +8871,11 @@ impl ResidentRowColumn {
                 values,
                 element_validity,
                 validity,
-            } => {
-                if !canonical_list_ranges(offsets, values, element_validity, validity, rows) {
-                    return Err(Error::new(
-                        ErrorCode::CorruptStorage,
-                        "resident row list column has an invalid canonical shape",
-                    ));
-                }
+            } if !canonical_list_ranges(offsets, values, element_validity, validity, rows) => {
+                return Err(Error::new(
+                    ErrorCode::CorruptStorage,
+                    "resident row list column has an invalid canonical shape",
+                ));
             }
             _ => {}
         }

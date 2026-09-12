@@ -97,12 +97,8 @@ pub struct Config {
     #[arg(long, env = "IRONGRAPH_EXECUTION_DEVICE", default_value_t = 0)]
     pub execution_device: u32,
 
-    /// Upper bound on device/unified memory the governor may admit. This is a ceiling, not a
-    /// promise: on Metal the governor additionally caps it at the hardware recommended working-set
-    /// size, so a value at or above the machine's real capacity simply lets the hardware limit
-    /// govern instead of an arbitrary sub-hardware constant. Kept generous so the resident graph,
-    /// indexes, and local text embedding have room to breathe; the safety reserve below still protects the
-    /// host.
+    /// Upper bound on device or unified memory that IronGraph may admit. Hardware limits may lower
+    /// the effective capacity.
     #[arg(
         long,
         env = "IRONGRAPH_DEVICE_MEMORY_LIMIT_BYTES",
@@ -110,19 +106,8 @@ pub struct Config {
     )]
     pub device_memory_limit_bytes: usize,
 
-    /// Bytes held back from the admitted limit as slack for the OS and for allocator overhead on
-    /// unified-memory devices.
-    ///
-    /// **It does not account for other processes**, despite what this comment used to claim. It is a
-    /// compile-time constant and cannot know what else is running. Co-tenant pressure is handled
-    /// instead by the host free-memory probe the backend installs on the governor, which bounds each
-    /// admission's increase against memory actually free at that moment
-    /// (`crates/gpu/src/metal.rs`, `DeviceMemoryGovernor::set_host_available_probe`).
-    ///
-    /// Raising this is still the immediate mitigation on a loaded machine when that probe is
-    /// unavailable: measured on a 48 GB host with 19.3 GB free, an admitted budget of 37.4 GB needed
-    /// a reserve near 21 GB to match reality. Lowering it frees headroom for the resident graph at
-    /// the cost of a thinner margin; override with `IRONGRAPH_DEVICE_RESERVED_BYTES`.
+    /// Bytes reserved for the operating system and allocator overhead. Increase this value when the
+    /// host needs more memory headroom.
     #[arg(
         long,
         env = "IRONGRAPH_DEVICE_RESERVED_BYTES",

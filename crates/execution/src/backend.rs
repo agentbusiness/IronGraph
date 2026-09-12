@@ -6601,11 +6601,10 @@ impl ResidentPatternPairPredicateRequest {
                     "resident paired pattern traversal bytes per pair overflow",
                 )
             })?;
-        let rows_for_target = if bytes_per_pair == 0 {
-            logical_rows
-        } else {
-            (RESIDENT_PATTERN_PAIR_TRAVERSAL_CHUNK_TARGET_BYTES / bytes_per_pair).max(1)
-        };
+        let rows_for_target = RESIDENT_PATTERN_PAIR_TRAVERSAL_CHUNK_TARGET_BYTES
+            .checked_div(bytes_per_pair)
+            .unwrap_or(logical_rows)
+            .max(1);
         Ok(logical_rows.min(rows_for_target))
     }
 
@@ -34018,7 +34017,7 @@ impl ResidentTemporalValueProgramRequest {
                             function: left_function,
                             ..
                         },
-                        ResidentTemporalRegisterKind::Temporal { function: _, .. },
+                        ResidentTemporalRegisterKind::Temporal { .. },
                     ) = (left, right)
                     else {
                         return Err(Error::new(

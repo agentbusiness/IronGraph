@@ -1758,11 +1758,10 @@ impl IvfPqIndex {
                     .count() as u64,
             );
         }
-        let recall = if expected == 0 {
-            10_000_u64
-        } else {
-            matched.saturating_mul(10_000) / expected
-        };
+        let recall = matched
+            .saturating_mul(10_000)
+            .checked_div(expected)
+            .unwrap_or(10_000_u64);
         self.recall_basis_points = u16::try_from(recall.min(10_000)).map_err(|_| {
             Error::internal("IVF-PQ recall basis points exceed their bounded representation")
         })?;

@@ -6164,10 +6164,7 @@ fn prune_request_results(state: &mut DatabaseState) -> Result<()> {
         .applied
         .index
         .saturating_sub(REQUEST_RESULT_INDEX_WINDOW);
-    loop {
-        let Some((&index, &request_id)) = state.request_result_order.first_key_value() else {
-            break;
-        };
+    while let Some((&index, &request_id)) = state.request_result_order.first_key_value() {
         if index >= minimum_index
             && state.request_results.len() <= MAX_REQUEST_RESULTS
             && state.request_result_bytes <= MAX_REQUEST_RESULT_BYTES

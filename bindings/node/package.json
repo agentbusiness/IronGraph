@@ -1,8 +1,11 @@
 {
   "name": "@irongraph/node",
   "version": "0.1.0",
-  "description": "GPU-first temporal graph database with Cypher, text documents, text/vector search, graph analytics, built-in Kafka-compatible streaming and AMQP-compatible queues.",
+  "description": "Embed a GPU-first graph database in Node.js with automatic local embeddings, Cypher, vector search, streaming, and queues.",
   "license": "Apache-2.0",
+  "repository": { "type": "git", "url": "git+https://github.com/agentbusiness/IronGraph.git", "directory": "bindings/node" },
+  "homepage": "https://github.com/agentbusiness/IronGraph#readme",
+  "bugs": { "url": "https://github.com/agentbusiness/IronGraph/issues" },
   "main": "index.js",
   "types": "index.d.ts",
   "publishConfig": {

@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "irongraph"
 version = "0.1.0"
-description = "GPU-first temporal graph database with Cypher, text documents, text/vector search, graph analytics, built-in Kafka-compatible streaming and AMQP-compatible queues."
+description = "Embed a GPU-first graph database in Python with automatic local embeddings, Cypher, vector search, streaming, and queues."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "Apache-2.0"
@@ -16,6 +16,11 @@ classifiers = [
   "Programming Language :: Rust",
   "Typing :: Typed",
 ]
+
+[project.urls]
+Homepage = "https://github.com/agentbusiness/IronGraph"
+Repository = "https://github.com/agentbusiness/IronGraph"
+Issues = "https://github.com/agentbusiness/IronGraph/issues"
 
 [tool.maturin]
 module-name = "irongraph._native"

@@ -249,6 +249,11 @@ test('explicit MCP configuration is preserved and relative paths are made stable
   const c = await setup(t, { IRONGRAPH_MCP_BINARY: custom, IRONGRAPH_MCP_URL: 'http://127.0.0.1:24567' });
   assert.equal((await c.run('start', '--background')).code, 0);
   assert.equal(c.state().mcpBinary, custom);
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (/ready/.test((await c.run('status')).stdout)) break;
+    await delay(25);
+  }
+  assert.match((await c.run('status')).stdout, /ready/);
   assert.match((await c.run('logs')).stdout, /http:\/\/127\.0\.0\.1:24567/);
   assert.equal((await c.run('stop')).code, 0);
   assert.equal(fs.existsSync(custom), true);

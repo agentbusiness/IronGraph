@@ -1,6 +1,7 @@
 {
   "name": "@irongraph/node-darwin-x64",
   "version": "0.1.0",
+  "private": true,
   "cpu": [
     "x64"
   ],
@@ -15,9 +16,6 @@
   "license": "Apache-2.0",
   "engines": {
     "node": ">=20.17"
-  },
-  "publishConfig": {
-    "access": "public"
   },
   "os": [
     "darwin"

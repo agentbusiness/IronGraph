@@ -11,8 +11,9 @@
     "LICENSE.txt",
     "THIRD_PARTY_NOTICES.txt"
   ],
-  "description": "GPU-first temporal graph database with Cypher, text documents, text/vector search, graph analytics, built-in Kafka-compatible streaming and AMQP-compatible queues.",
+  "description": "Native Linux AMD64 runtime for the embeddable IronGraph graph database and automatic local embeddings.",
   "license": "Apache-2.0",
+  "repository": { "type": "git", "url": "git+https://github.com/agentbusiness/IronGraph.git", "directory": "bindings/node" },
   "engines": {
     "node": ">=20.17"
   },
