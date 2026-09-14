@@ -13,6 +13,19 @@ administer the database. Built-in Kafka-compatible Streams and AMQP-compatible Q
 and message workloads. The browser package provides a typed client and React hooks. IronGraph is
 open-source software released under the Apache License 2.0.
 
+## Measured performance
+
+In an in-process benchmark on an Apple M5 Pro with 2 million nodes and 8 million relationships,
+`MATCH (n:Node) RETURN count(n)` took **0.834 µs at p50 on Metal** (1.083 µs on CPU).
+The count uses maintained cardinality data rather than scanning the graph. On the same graph,
+an indexed range count took 1.61 ms on Metal versus 19.38 ms on CPU; k-core took 326 ms on Metal
+versus 2,430 ms on CPU.
+
+These are medians of five timed runs after two warm-ups. They measure in-process execution,
+not startup, embedding-model installation, SDK overhead, or network latency. The sub-microsecond
+result applies to this cardinality query, not to arbitrary Cypher queries. See the
+[performance overview](https://irongraph.tech/) for other measured workloads.
+
 ## Start the database and open the web console
 
 Use this path to run IronGraph as a standalone database with its built-in web console.
