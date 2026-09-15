@@ -62,6 +62,8 @@ class ReleaseTests(unittest.TestCase):
         linux = release.tool_environment(self.root, "aarch64-unknown-linux-gnu")
         self.assertIn("strip=none", macos["CARGO_ENCODED_RUSTFLAGS"].split("\x1f"))
         self.assertNotIn("strip=none", linux["CARGO_ENCODED_RUSTFLAGS"].split("\x1f"))
+        self.assertEqual(macos["CARGO_PROFILE_RELEASE_STRIP"], "none")
+        self.assertNotIn("CARGO_PROFILE_RELEASE_STRIP", linux)
 
     def fixture_source(self):
         for folder in ("bindings/python", "bindings/node", "bindings/javascript", "bindings/rust", "bindings/cli", "web", "crates/ffi"):

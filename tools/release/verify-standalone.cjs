@@ -72,7 +72,8 @@ async function main() {
       Array.from({ length: event.row_count }, (_, index) => event.columns.map(column => column.values[index])))
   }
   const ready = async () => {
-    const deadline = Date.now() + 300000
+    // The pinned 2.47 GB embedding model can need longer than five minutes on a cold install.
+    const deadline = Date.now() + 600000
     let lastError
     while (Date.now() < deadline) {
       try {

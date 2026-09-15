@@ -1,6 +1,6 @@
 {
   "name": "@irongraph/node-linux-x64-gnu",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "cpu": [
     "x64"
   ],
@@ -13,7 +13,11 @@
   ],
   "description": "Native Linux AMD64 runtime for the embeddable IronGraph graph database and automatic local embeddings.",
   "license": "Apache-2.0",
-  "repository": { "type": "git", "url": "git+https://github.com/agentbusiness/IronGraph.git", "directory": "bindings/node" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agentbusiness/IronGraph.git",
+    "directory": "bindings/node"
+  },
   "engines": {
     "node": ">=20.17"
   },

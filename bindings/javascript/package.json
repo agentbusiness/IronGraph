@@ -1,11 +1,17 @@
 {
   "name": "@irongraph/client",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "JavaScript and React client for an embeddable graph database with automatic local embeddings and vector search.",
   "license": "Apache-2.0",
-  "repository": { "type": "git", "url": "git+https://github.com/agentbusiness/IronGraph.git", "directory": "bindings/javascript" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agentbusiness/IronGraph.git",
+    "directory": "bindings/javascript"
+  },
   "homepage": "https://github.com/agentbusiness/IronGraph#readme",
-  "bugs": { "url": "https://github.com/agentbusiness/IronGraph/issues" },
+  "bugs": {
+    "url": "https://github.com/agentbusiness/IronGraph/issues"
+  },
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -48,6 +54,6 @@
     "react": "19.2.7",
     "react-dom": "19.2.7",
     "typescript": "6.0.3",
-    "vitest": "4.1.10"
+    "vitest": "4.1.11"
   }
 }

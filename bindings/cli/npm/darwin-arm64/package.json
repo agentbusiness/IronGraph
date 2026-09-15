@@ -1,9 +1,13 @@
 {
   "name": "@irongraph/cli-darwin-arm64",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Native macOS ARM64 CLI for the embeddable IronGraph graph database and automatic local embeddings.",
   "license": "Apache-2.0",
-  "repository": { "type": "git", "url": "git+https://github.com/agentbusiness/IronGraph.git", "directory": "bindings/cli" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agentbusiness/IronGraph.git",
+    "directory": "bindings/cli"
+  },
   "os": [
     "darwin"
   ],

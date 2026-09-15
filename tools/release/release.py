@@ -294,9 +294,12 @@ def tool_environment(source, target):
     # on macOS even in the isolated release build.
     if target == "aarch64-apple-darwin":
         flags.extend(["-C", "strip=none"])
-    return {"CARGO_TARGET_DIR": str(source.parent / "build" / target),
-            "CARGO_ENCODED_RUSTFLAGS": "\x1f".join(flags),
-            "RUSTFLAGS": "", "PYO3_PYTHON": sys.executable}
+    env = {"CARGO_TARGET_DIR": str(source.parent / "build" / target),
+           "CARGO_ENCODED_RUSTFLAGS": "\x1f".join(flags),
+           "RUSTFLAGS": "", "PYO3_PYTHON": sys.executable}
+    if target == "aarch64-apple-darwin":
+        env["CARGO_PROFILE_RELEASE_STRIP"] = "none"
+    return env
 
 
 def llvm_objcopy(source):

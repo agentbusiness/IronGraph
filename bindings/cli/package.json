@@ -1,19 +1,38 @@
 {
   "name": "irongraph",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Run an embeddable graph database with automatic local embeddings, Cypher, streaming, queues, and a web console.",
   "license": "Apache-2.0",
-  "repository": { "type": "git", "url": "git+https://github.com/agentbusiness/IronGraph.git", "directory": "bindings/cli" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agentbusiness/IronGraph.git",
+    "directory": "bindings/cli"
+  },
   "homepage": "https://github.com/agentbusiness/IronGraph#readme",
-  "bugs": { "url": "https://github.com/agentbusiness/IronGraph/issues" },
-  "bin": { "irongraph": "cli.cjs" },
-  "files": ["cli.cjs", "README.md", "LICENSE.txt", "THIRD_PARTY_NOTICES.txt"],
-  "engines": { "node": ">=20.17" },
-  "publishConfig": { "access": "public" },
-  "scripts": { "test": "node --test test/*.test.cjs" },
+  "bugs": {
+    "url": "https://github.com/agentbusiness/IronGraph/issues"
+  },
+  "bin": {
+    "irongraph": "cli.cjs"
+  },
+  "files": [
+    "cli.cjs",
+    "README.md",
+    "LICENSE.txt",
+    "THIRD_PARTY_NOTICES.txt"
+  ],
+  "engines": {
+    "node": ">=20.17"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.cjs"
+  },
   "optionalDependencies": {
-    "@irongraph/cli-darwin-arm64": "0.1.0",
-    "@irongraph/cli-linux-arm64-gnu": "0.1.0",
-    "@irongraph/cli-linux-x64-gnu": "0.1.0"
+    "@irongraph/cli-darwin-arm64": "0.1.1",
+    "@irongraph/cli-linux-arm64-gnu": "0.1.1",
+    "@irongraph/cli-linux-x64-gnu": "0.1.1"
   }
 }
