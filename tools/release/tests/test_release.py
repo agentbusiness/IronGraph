@@ -57,6 +57,12 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(release.clean_env(), {})
             self.assertEqual(release.clean_env({"NPM_TOKEN": "publish-only"}), {"NPM_TOKEN": "publish-only"})
 
+    def test_isolated_macos_flags_preserve_proc_macro_symbols(self):
+        macos = release.tool_environment(self.root, "aarch64-apple-darwin")
+        linux = release.tool_environment(self.root, "aarch64-unknown-linux-gnu")
+        self.assertIn("strip=none", macos["CARGO_ENCODED_RUSTFLAGS"].split("\x1f"))
+        self.assertNotIn("strip=none", linux["CARGO_ENCODED_RUSTFLAGS"].split("\x1f"))
+
     def fixture_source(self):
         for folder in ("bindings/python", "bindings/node", "bindings/javascript", "bindings/rust", "bindings/cli", "web", "crates/ffi"):
             (self.root / folder).mkdir(parents=True)

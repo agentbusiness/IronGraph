@@ -290,6 +290,10 @@ def finalize_versions(stage, state, root=ROOT):
 def tool_environment(source, target):
     flags = [f"--remap-path-prefix={source}=/irongraph",
              f"--remap-path-prefix={Path.home()}=/build-home", "-C", "debuginfo=0"]
+    # Encoded flags override .cargo/config.toml. Preserve procedural-macro symbol tables
+    # on macOS even in the isolated release build.
+    if target == "aarch64-apple-darwin":
+        flags.extend(["-C", "strip=none"])
     return {"CARGO_TARGET_DIR": str(source.parent / "build" / target),
             "CARGO_ENCODED_RUSTFLAGS": "\x1f".join(flags),
             "RUSTFLAGS": "", "PYO3_PYTHON": sys.executable}
@@ -1078,7 +1082,7 @@ def release(args, config):
     if args.dry_run:
         print(f"Plan: {current_version()} -> v{version}; local macOS ARM64 + Docker Linux ARM64/AMD64; "
               "wheels -> PyPI; embedded/React/standalone launcher and native executables -> npm; "
-              "wrapper -> crates.io; native libraries and standalone tar.gz bundles -> GitHub release.\n"
+              "wrapper -> crates.io; only the three native SDK libraries -> GitHub release.\n"
               "No files changed, builds started, credentials inspected remotely, or uploads performed.")
         return
     if args.check:
