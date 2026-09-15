@@ -1,8 +1,9 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use irongraph_client::{MutualTls, Query, RemoteClient as RustRemoteClient};
 use irongraph_embedded::{
     EmbeddedDatabase as RustEmbeddedDatabase, EmbeddedOptions, EmbeddingPolicy, ExecutionDevice,
+    OperationOptions, StreamAppend, StreamFetch,
 };
 use irongraph_types::ProjectId;
 use napi::{Error, Result, Status};
@@ -30,7 +31,7 @@ fn query_request(
 
 #[napi]
 pub struct EmbeddedDatabase {
-    database: Arc<Mutex<Option<RustEmbeddedDatabase>>>,
+    database: Arc<RwLock<Option<RustEmbeddedDatabase>>>,
 }
 
 #[napi]
@@ -41,6 +42,7 @@ impl EmbeddedDatabase {
         device: Option<String>,
         device_ordinal: Option<u32>,
         load_embeddings: Option<bool>,
+        budgets: Option<serde_json::Value>,
     ) -> Result<Self> {
         let ordinal = device_ordinal.unwrap_or(0);
         let execution_device = match device.as_deref().unwrap_or("auto") {
@@ -55,20 +57,23 @@ impl EmbeddedDatabase {
                 ));
             }
         };
-        let options = EmbeddedOptions::new(data_dir)
+        let mut options = EmbeddedOptions::new(data_dir)
             .with_execution_device(execution_device)
             .with_embedding_policy(if load_embeddings.unwrap_or(true) {
                 EmbeddingPolicy::Automatic
             } else {
                 EmbeddingPolicy::Disabled
             });
+        if let Some(budgets) = budgets {
+            irongraph_embedded::configure_budgets(&mut options, budgets).map_err(node_error)?;
+        }
         let database = napi::tokio::task::spawn_blocking(move || {
             RustEmbeddedDatabase::open(options).map_err(node_error)
         })
         .await
         .map_err(node_error)??;
         Ok(Self {
-            database: Arc::new(Mutex::new(Some(database))),
+            database: Arc::new(RwLock::new(Some(database))),
         })
     }
 
@@ -78,17 +83,27 @@ impl EmbeddedDatabase {
         cypher: String,
         project_id: Option<String>,
         parameters: Option<serde_json::Value>,
+        query_options: Option<serde_json::Value>,
+        operation_options: Option<serde_json::Value>,
     ) -> Result<serde_json::Value> {
-        let query = query_request(cypher, project_id, parameters)?;
+        let mut query = query_request(cypher, project_id, parameters)?;
+        if let Some(options) = query_options {
+            irongraph_client::configure_query(&mut query, options).map_err(node_error)?;
+        }
+        let options: OperationOptions = operation_options
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(node_error)?
+            .unwrap_or_default();
         let database = Arc::clone(&self.database);
         napi::tokio::task::spawn_blocking(move || {
             let guard = database
-                .lock()
+                .read()
                 .map_err(|_| Error::new(Status::GenericFailure, "database lock is poisoned"))?;
             let result = guard
                 .as_ref()
                 .ok_or_else(|| Error::new(Status::GenericFailure, "database is closed"))?
-                .query(query)
+                .query_with_options(query, options)
                 .map_err(node_error)?;
             serde_json::to_value(result).map_err(node_error)
         })
@@ -101,7 +116,7 @@ impl EmbeddedDatabase {
         let database = Arc::clone(&self.database);
         napi::tokio::task::spawn_blocking(move || {
             let guard = database
-                .lock()
+                .read()
                 .map_err(|_| Error::new(Status::GenericFailure, "database lock is poisoned"))?;
             let bookmark = guard
                 .as_ref()
@@ -119,13 +134,106 @@ impl EmbeddedDatabase {
         let database = Arc::clone(&self.database);
         napi::tokio::task::spawn_blocking(move || {
             let database = database
-                .lock()
+                .write()
                 .map_err(|_| Error::new(Status::GenericFailure, "database lock is poisoned"))?
                 .take();
             if let Some(database) = database {
                 database.close().map_err(node_error)?;
             }
             Ok(())
+        })
+        .await
+        .map_err(node_error)?
+    }
+
+    #[napi]
+    pub async fn flush(&self) -> Result<()> {
+        let database = Arc::clone(&self.database);
+        napi::tokio::task::spawn_blocking(move || {
+            let guard = database.read().map_err(node_error)?;
+            guard
+                .as_ref()
+                .ok_or_else(|| node_error("database is closed"))?
+                .flush()
+                .map_err(node_error)
+        })
+        .await
+        .map_err(node_error)?
+    }
+
+    #[napi]
+    pub fn cancel(&self, operation_id: String) -> Result<bool> {
+        let guard = self.database.read().map_err(node_error)?;
+        Ok(guard
+            .as_ref()
+            .ok_or_else(|| node_error("database is closed"))?
+            .cancel(&operation_id))
+    }
+
+    #[napi]
+    pub fn status(&self) -> Result<serde_json::Value> {
+        let guard = self.database.read().map_err(node_error)?;
+        serde_json::to_value(
+            guard
+                .as_ref()
+                .ok_or_else(|| node_error("database is closed"))?
+                .status()
+                .map_err(node_error)?,
+        )
+        .map_err(node_error)
+    }
+
+    #[napi]
+    pub async fn stream_append(
+        &self,
+        request: serde_json::Value,
+        options: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let request: StreamAppend = serde_json::from_value(request).map_err(node_error)?;
+        let options: OperationOptions = options
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(node_error)?
+            .unwrap_or_default();
+        let database = Arc::clone(&self.database);
+        napi::tokio::task::spawn_blocking(move || {
+            let guard = database.read().map_err(node_error)?;
+            serde_json::to_value(
+                guard
+                    .as_ref()
+                    .ok_or_else(|| node_error("database is closed"))?
+                    .stream_append(request, options)
+                    .map_err(node_error)?,
+            )
+            .map_err(node_error)
+        })
+        .await
+        .map_err(node_error)?
+    }
+
+    #[napi]
+    pub async fn stream_fetch(
+        &self,
+        request: serde_json::Value,
+        options: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let request: StreamFetch = serde_json::from_value(request).map_err(node_error)?;
+        let options: OperationOptions = options
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(node_error)?
+            .unwrap_or_default();
+        let database = Arc::clone(&self.database);
+        napi::tokio::task::spawn_blocking(move || {
+            let guard = database.read().map_err(node_error)?;
+            serde_json::to_value(
+                guard
+                    .as_ref()
+                    .ok_or_else(|| node_error("database is closed"))?
+                    .stream_fetch(request, options)
+                    .map_err(node_error)?,
+            )
+            .map_err(node_error)
         })
         .await
         .map_err(node_error)?
@@ -193,8 +301,12 @@ impl Client {
         cypher: String,
         project_id: Option<String>,
         parameters: Option<serde_json::Value>,
+        query_options: Option<serde_json::Value>,
     ) -> Result<serde_json::Value> {
-        let query = query_request(cypher, project_id, parameters)?;
+        let mut query = query_request(cypher, project_id, parameters)?;
+        if let Some(options) = query_options {
+            irongraph_client::configure_query(&mut query, options).map_err(node_error)?;
+        }
         let client = Arc::clone(&self.client);
         napi::tokio::task::spawn_blocking(move || {
             let result = client

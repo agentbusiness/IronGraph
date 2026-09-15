@@ -6,6 +6,11 @@ owns the database lifecycle and benefits from local calls without a network serv
 The embedded database has the same project, layer, Cypher, transaction, WAL, snapshot, index, text
 embedding, and execution-device semantics as the standalone instance.
 
+Native queries and stream append/fetch execute inside your process. Opening an embedded database
+does not launch a database executable or open an HTTP, Bolt, Kafka, or AMQP listener. Automatic
+text-model installation requires network access when the verified model is not already installed.
+For graph and stream applications that do not use text embeddings, explicitly disable model loading.
+
 ## Decide whether embedding fits
 
 Embed IronGraph when:
@@ -15,11 +20,73 @@ Embed IronGraph when:
 - in-process startup and shutdown fit the application's lifecycle; and
 - other processes do not need to open the same database directory.
 
-Run a standalone node when multiple processes need concurrent access, a browser application is the
+Run a standalone instance when multiple processes need concurrent access, a browser application is the
 primary client, or protocol-level integration is required.
 
 Only one embedded IronGraph instance can be active in a process. The selected data directory must be
 exclusive to that process.
+
+## Native streams and query controls
+
+Create projects and topics with Cypher, then select the immutable project UUID for native stream
+calls. Native streams use the same topics, records, offsets, and persistence as Kafka clients.
+The following Python example requires an installed native package and no standalone application:
+
+```python
+from irongraph import EmbeddedDatabase
+
+with EmbeddedDatabase("./data/streams", device="cpu", load_embeddings=False,
+                      budgets={"worker_threads": 2, "max_concurrent_operations": 8}) as db:
+    db.query("CREATE PROJECT IF NOT EXISTS streams")
+    project = db.query("USE streams RETURN 1")["catalog"]["project_id"]
+    db.query("CREATE TOPIC IF NOT EXISTS events PARTITIONS 1", project_id=project)
+    ack = db.stream_append({
+        "project_id": project, "topic": "events", "partition": 0,
+        "records": [{"key": None, "headers": {}, "value": list(b"hello"),
+                     "create_time_ms": None}],
+    })
+    page = db.stream_fetch({
+        "project_id": project, "topic": "events", "partition": 0,
+        "offset": ack["first_offset"], "max_records": 1, "max_bytes": 4096,
+    })
+    assert bytes(page["records"][0][1]["payload"]) == b"hello"
+```
+
+The expected payload is `hello`. Closing and reopening the same directory preserves it. Next,
+use `next_offset` for the next page and check `high_watermark` and `truncated` to determine the
+prefix covered by the read. A high watermark is an exclusive end offset captured for that page;
+it does not promise that no later records will arrive. A first record that exceeds `max_bytes`
+returns an explicit budget error. Retained or unreadable records return errors rather than EOF.
+
+Rust exposes `stream_append`, `stream_fetch`, `flush`, `status`, and `cancel` on `EmbeddedDatabase`.
+Node.js exposes `streamAppend`, `streamFetch`, `flush`, `status`, and `cancel`. Binary values use byte
+arrays; null and empty values are distinct. Returned records include their persisted message
+identity and ingress metadata. Topic administration continues to use Cypher.
+
+Python's `query_options` and Node.js's fourth query argument accept `bookmark`, `consistency`,
+and `limits`. Rust carries these fields on `Query`. `CHECK READ ONLY` accepts candidate text
+as the `$statement` parameter through the same query method.
+
+Use `operation_options` in Python, the fifth query argument in Node.js, or
+`query_with_options` in Rust to supply `operation_id` and `timeout_ms`. Stream calls accept the
+same operation options. Cancellation IDs identify active calls, not durable idempotency keys;
+`cancel` returns false when the call has not started or has already completed. Query cancellation
+is cooperative. A stream append cancelled before dispatch is rejected; after dispatch, it waits
+for the authoritative result or deadline. A dispatched write that times out has an uncertain
+outcome and must not be retried automatically.
+
+Acknowledgements mean the mutation has been published in memory. WAL persistence is asynchronous;
+an abrupt process or host failure can lose recently acknowledged mutations that have not reached
+durable storage. Call `flush` to make earlier acknowledged writes durable while keeping the handle
+open. Explicit `close` drains and joins the WAL workers, establishes the final durable
+boundary, and releases directory ownership. Independent query and stream calls are not one atomic
+transaction. Always observe errors from explicit close.
+
+Resource options include `max_write_bytes`, `max_concurrent_operations`, `worker_threads`,
+`request_timeout_ms`, `startup_timeout_ms`, `snapshot_interval_ms`, and the device memory limits.
+These are separate request, worker, and device budgets; they are not a total host-process RSS limit.
+`status` reports readiness, the resolved data directory, and active operations. One handle can
+serve concurrent projects up to its configured operation budget.
 
 ## Install an SDK
 

@@ -146,6 +146,26 @@ impl Query {
 }
 
 /// Terminal query metadata shared by embedded, API, and Bolt callers.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueryOptions {
+    bookmark: Option<Bookmark>,
+    #[serde(default)]
+    consistency: CommitAcknowledgement,
+    #[serde(default)]
+    limits: QueryLimits,
+}
+
+/// Apply transport-neutral query controls supplied by a language binding.
+pub fn configure_query(query: &mut Query, options: serde_json::Value) -> Result<()> {
+    let options: QueryOptions = serde_json::from_value(options)?;
+    query.bookmark = options.bookmark;
+    query.consistency = options.consistency;
+    query.limits = options.limits;
+    query.validate()
+}
+
+/// Terminal query metadata shared by embedded, API, and Bolt callers.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct QuerySummary {
     pub bookmark: Option<Bookmark>,
@@ -195,7 +215,12 @@ impl QueryResult {
                     ..
                 } => {
                     return Err(ClientError::Database {
-                        code: format!("{code:?}"),
+                        code: serde_json::to_value(code)?
+                            .as_str()
+                            .ok_or_else(|| {
+                                ClientError::MalformedResult("error code is not a string".into())
+                            })?
+                            .to_owned(),
                         message,
                         retryable,
                         retry_after_ms,

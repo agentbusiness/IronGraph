@@ -9,6 +9,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
+#[cfg(irongraph_web_bundle)]
 use rust_embed::RustEmbed;
 use tokio::{net::TcpListener, task::JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -39,9 +40,16 @@ use crate::{
     },
 };
 
-#[derive(RustEmbed)]
-#[folder = "../../web/dist"]
+#[cfg_attr(irongraph_web_bundle, derive(RustEmbed))]
+#[cfg_attr(irongraph_web_bundle, folder = "../../web/dist")]
 struct WebAssets;
+
+#[cfg(not(irongraph_web_bundle))]
+impl WebAssets {
+    fn get(_path: &str) -> Option<rust_embed::EmbeddedFile> {
+        None
+    }
+}
 
 #[derive(Clone)]
 struct AppState {

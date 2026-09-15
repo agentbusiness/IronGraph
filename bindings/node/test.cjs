@@ -59,10 +59,25 @@ async function main() {
     for (const statement of ['SHOW TOPICS', 'SHOW QUEUES', 'SHOW EXCHANGES', 'SHOW INDEXES']) {
       assert.ok((await database.query(`USE app ${statement}`)).rows.length > 0, statement)
     }
+    const projectId = (await database.query('USE app RETURN 1')).catalog.project_id
+    assert.equal(database.status().ready, true)
+    const append = await database.streamAppend({ project_id: projectId, topic: 'activity', partition: 0,
+      records: [{ key: [0, 255], headers: { source: [78] }, value: [1, 2, 3], create_time_ms: 1234 }] })
+    assert.equal(append.first_offset, 0)
+    const fetch = { project_id: projectId, topic: 'activity', partition: 0, offset: 0, max_records: 1, max_bytes: 4096 }
+    const page = await database.streamFetch(fetch)
+    assert.equal(page.high_watermark, 1)
+    assert.deepEqual(page.records[0][1].payload, [1, 2, 3])
+    await assert.rejects(database.query('UNWIND [1,2,3] AS n RETURN n', projectId, null, { bookmark: append.bookmark, limits: { rows: 1 } }), /ResultBudgetExceeded/)
+    const bounded = await database.query('UNWIND [1,2,3] AS n RETURN n', projectId, null, { bookmark: append.bookmark, limits: { rows: 3 } })
+    assert.equal(bounded.rows.length, 3)
+    await assert.rejects(database.query('CREATE (:Rejected)', projectId, null, null, { timeout_ms: 0 }))
     await database.snapshot()
+    await database.flush()
     await database.close()
 
     const reopened = await EmbeddedDatabase.open(directory, 'cpu', 0, false)
+    assert.deepEqual((await reopened.streamFetch(fetch)).records, page.records)
     const result = await reopened.query('USE app MATCH (n:Item) RETURN n.value AS value')
     assert.equal(result.rows[0][0].type, 'integer')
     assert.equal(result.rows[0][0].value, '42')

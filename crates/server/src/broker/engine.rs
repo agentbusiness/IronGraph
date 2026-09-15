@@ -98,6 +98,16 @@ pub struct PayloadRecord {
     pub checksum: [u8; 32],
 }
 
+/// Strict finite-read bounds for an in-process stream caller.
+pub struct PartitionRead<'a> {
+    pub project: ProjectId,
+    pub topic: &'a str,
+    pub partition: i32,
+    pub offset: u64,
+    pub maximum_bytes: usize,
+    pub maximum_records: usize,
+}
+
 /// Canonical payload metadata. The opaque bytes live only in the referenced immutable segment;
 /// protocol reads materialize one bounded payload batch into transient `PayloadRecord` values.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3109,6 +3119,43 @@ impl BrokerStateMachine {
         self.fetch_stream(stream, offset, maximum_bytes, false, segments)
     }
 
+    pub(crate) fn fetch_partition_bounded(
+        &self,
+        read: &PartitionRead<'_>,
+        segments: &SegmentStore,
+    ) -> Result<(u64, Vec<(u64, Arc<PayloadRecord>)>)> {
+        let stream = self.partition_stream(read.project, read.topic, read.partition)?;
+        let high_watermark = self
+            .streams
+            .get(&stream)
+            .ok_or_else(|| Error::internal("partition stream is absent"))?
+            .next_offset;
+        let pending = self.fetch_stream_records_with_bounds(
+            stream,
+            read.offset,
+            read.maximum_bytes,
+            false,
+            Some(read.maximum_records),
+        )?;
+        let loaded = load_payloads(
+            &self.payload_segments,
+            pending.iter().map(|(_, stored)| stored.clone()),
+            segments,
+        )?;
+        let records = pending
+            .into_iter()
+            .map(|(offset, stored)| {
+                Ok((
+                    offset,
+                    loaded.get(&stored.id).cloned().ok_or_else(|| {
+                        Error::internal("broker payload batch omitted a requested ID")
+                    })?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        Ok((high_watermark, records))
+    }
+
     pub(crate) fn partition_fetch_segment_descriptors(
         &self,
         project: ProjectId,
@@ -4698,6 +4745,17 @@ impl BrokerStateMachine {
         maximum_bytes: usize,
         include_settled: bool,
     ) -> Result<Vec<(u64, StoredPayloadRecord)>> {
+        self.fetch_stream_records_with_bounds(stream, offset, maximum_bytes, include_settled, None)
+    }
+
+    fn fetch_stream_records_with_bounds(
+        &self,
+        stream: StreamId,
+        offset: u64,
+        maximum_bytes: usize,
+        include_settled: bool,
+        maximum_records: Option<usize>,
+    ) -> Result<Vec<(u64, StoredPayloadRecord)>> {
         let state = self
             .streams
             .get(&stream)
@@ -4715,6 +4773,9 @@ impl BrokerStateMachine {
             .iter()
             .filter(|record| record.offset >= offset)
         {
+            if maximum_records.is_some_and(|maximum| pending.len() >= maximum) {
+                break;
+            }
             if !include_settled
                 && matches!(
                     reference.delivery,
@@ -4729,7 +4790,15 @@ impl BrokerStateMachine {
                 .ok_or_else(|| Error::internal("broker payload is missing"))?;
             let visible_bytes = usize::try_from(self.accounted_payload_bytes(stored)?)
                 .map_err(|_| Error::internal("broker record length exceeds this platform"))?;
-            if !pending.is_empty() && bytes.saturating_add(visible_bytes) > maximum_bytes {
+            if bytes.saturating_add(visible_bytes) > maximum_bytes
+                && (!pending.is_empty() || maximum_records.is_some())
+            {
+                if pending.is_empty() {
+                    return Err(Error::new(
+                        crate::ErrorCode::ResultBudgetExceeded,
+                        "first stream record exceeds the explicit byte bound",
+                    ));
+                }
                 break;
             }
             bytes = bytes.saturating_add(visible_bytes);

@@ -20,6 +20,7 @@ const MAX_CONNECTIONS: usize = 512;
 const MAX_FETCH_WAIT_MILLIS: u32 = 30_000;
 const MAX_FETCH_WAKEUPS: usize = 64;
 const NONE: i16 = 0;
+const UNKNOWN_SERVER_ERROR: i16 = -1;
 const OFFSET_OUT_OF_RANGE: i16 = 1;
 const UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
 const REQUEST_TIMED_OUT: i16 = 7;
@@ -135,7 +136,9 @@ impl StreamServer {
                     };
                     connections.spawn(async move {
                         let _permit = permit;
-                        let _ = serve(stream, project, coordinator, endpoint).await;
+                        if let Err(error) = serve(stream, project, coordinator, endpoint).await {
+                            tracing::warn!(stage = "connection", category = ?error.code, "Kafka connection failed");
+                        }
                     });
                 }
                 _ = connections.join_next(), if !connections.is_empty() => {}
@@ -249,6 +252,7 @@ where
                 &memory,
                 api_key,
                 api_version,
+                correlation,
                 project,
                 request_coordinator,
                 request_endpoint,
@@ -329,6 +333,7 @@ async fn execute_request_blocking(
     memory: &super::memory::BrokerMemoryReservation,
     api_key: i16,
     api_version: i16,
+    correlation: i32,
     project: ProjectId,
     coordinator: Arc<dyn BrokerCoordinator>,
     endpoint: KafkaEndpoint,
@@ -336,14 +341,17 @@ async fn execute_request_blocking(
 ) -> Result<HandledRequest> {
     memory
         .spawn_blocking(move || {
-            handle_request(
+            let span = tracing::warn_span!("kafka_request", api_key, api_version, correlation);
+            span.in_scope(|| handle_request(
                 api_key,
                 api_version,
                 project,
                 &coordinator,
                 &endpoint,
                 &body,
-            )
+            ).inspect_err(|error| {
+                tracing::warn!(stage = "request", category = ?error.code, kafka_code = produce_error_code(error), "Kafka request failed before response");
+            }))
         })
         .await
         .map_err(|error| Error::internal(format!("Kafka request task failed: {error}")))?
@@ -789,14 +797,35 @@ fn produce(
                                 BrokerReply::KafkaBatchPublished { first_offset, .. } => {
                                     (NONE, i64::try_from(first_offset).unwrap_or(-1))
                                 }
-                                _ => (INVALID_REQUEST, -1),
+                                _ => {
+                                    let error = Error::internal(
+                                        "broker returned an unexpected publish reply",
+                                    );
+                                    log_produce_failure(
+                                        "acknowledgement",
+                                        version,
+                                        partition,
+                                        &error,
+                                    );
+                                    (UNKNOWN_SERVER_ERROR, -1)
+                                }
                             },
                         },
-                        Err(error) => (produce_error_code(&error), -1),
+                        Err(error) => {
+                            log_produce_failure("submission", version, partition, &error);
+                            (produce_error_code(&error), -1)
+                        }
                     }
                 }
-                Ok(_) => (INVALID_REQUEST, -1),
-                Err(error) => (produce_error_code(&error), -1),
+                Ok(_) => {
+                    let error = kafka_protocol_error("produce batch contains no records");
+                    log_produce_failure("validation", version, partition, &error);
+                    (INVALID_REQUEST, -1)
+                }
+                Err(error) => {
+                    log_produce_failure("decoding", version, partition, &error);
+                    (produce_error_code(&error), -1)
+                }
             };
             replies.push((topic.clone(), partition, error, first_offset));
         }
@@ -1879,8 +1908,16 @@ const fn produce_error_code(error: &Error) -> i16 {
         | ErrorCode::WriteAdmissionFull
         | ErrorCode::ResultBudgetExceeded => MESSAGE_TOO_LARGE,
         ErrorCode::ProjectNotFound | ErrorCode::ProjectFenced => UNKNOWN_TOPIC_OR_PARTITION,
-        _ => INVALID_REQUEST,
+        ErrorCode::InvalidData | ErrorCode::ProtocolViolation => INVALID_REQUEST,
+        _ => UNKNOWN_SERVER_ERROR,
     }
+}
+
+fn log_produce_failure(stage: &'static str, api_version: i16, partition: i32, error: &Error) {
+    // Do not record topic names or any key, header, value, credential, or request bytes.
+    tracing::warn!(stage, api_version, partition, category = ?error.code,
+        kafka_code = produce_error_code(error), reason = %error.message,
+        "Kafka produce rejected");
 }
 
 const fn admin_error_code(error: &Error) -> i16 {
@@ -2674,6 +2711,175 @@ mod compression_tests {
 
     use super::*;
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_database_produce_v0_v3_survives_restart() -> Result<()> {
+        use crate::{
+            engine::{
+                ExecutionClass, SingleNodeBootstrapConfig, WriteStorageLimits, open_standalone,
+            },
+            gpu::{
+                BackendKind, DeviceMemoryGovernor, ResolvedComputeDevice,
+                create_execution_backend_with_governor,
+            },
+            protocol::{QueryExecutor, QueryRequest, QueryStreamEvent},
+            server::Database,
+        };
+        let directory = tempfile::tempdir()?;
+        for round in 0..2 {
+            let boot = open_standalone(
+                directory.path(),
+                SingleNodeBootstrapConfig {
+                    execution_class: ExecutionClass::Cpu,
+                    startup_timeout: std::time::Duration::from_secs(30),
+                    storage_limits: WriteStorageLimits {
+                        max_log_record_bytes: 8 * 1024 * 1024,
+                        max_log_entries_per_read: 4096,
+                        max_snapshot_bytes: 64 * 1024 * 1024,
+                    },
+                },
+                |path, identity| {
+                    Ok(Arc::new(Database::open_backend(
+                        path,
+                        4 * 1024 * 1024,
+                        std::time::Duration::from_secs(10),
+                        identity,
+                    )?))
+                },
+            )
+            .await?;
+            let database = boot.backend().clone();
+            database.bind_runtime(Arc::downgrade(boot.runtime()))?;
+            let snapshot = directory.path().join("standalone-snapshots");
+            database.standalone_recover(&snapshot).await?;
+            database.bind_execution_backend(create_execution_backend_with_governor(
+                ResolvedComputeDevice {
+                    backend: BackendKind::Cpu,
+                    ordinal: 0,
+                },
+                DeviceMemoryGovernor::new(usize::MAX, 0),
+            )?)?;
+            boot.runtime().replay_standalone_wal().await?;
+            let query = |statement: &str| -> Result<Option<ProjectId>> {
+                let request: QueryRequest = serde_json::from_value(
+                    serde_json::json!({ "request_id":uuid::Uuid::new_v4(), "query":statement }),
+                )
+                .map_err(|error| Error::internal(error.to_string()))?;
+                let mut project = None;
+                database.execute(request, &mut |event| {
+                    match event {
+                        QueryStreamEvent::Catalog { catalog } => project = catalog.project_id,
+                        QueryStreamEvent::Error { code, message, .. } => {
+                            return Err(Error::new(code, message));
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                })?;
+                Ok(project)
+            };
+            if round == 0 {
+                query("CREATE PROJECT protocol_restart")?;
+                query("USE protocol_restart CREATE TOPIC before_restart PARTITIONS 1")?;
+            } else {
+                query("USE protocol_restart CREATE TOPIC after_restart PARTITIONS 1")?;
+            }
+            let project = query("USE protocol_restart RETURN 1")?
+                .ok_or_else(|| Error::internal("project identity absent"))?;
+            let (server_io, mut client_io) = tokio::io::duplex(2 * 1024 * 1024);
+            let server = tokio::spawn(serve(
+                server_io,
+                project,
+                database.clone(),
+                KafkaEndpoint {
+                    host: "127.0.0.1".into(),
+                    port: 18486,
+                },
+            ));
+            let topics = if round == 0 {
+                vec!["before_restart"]
+            } else {
+                vec!["before_restart", "after_restart"]
+            };
+            for topic in topics {
+                let mut expected = if round == 1 && topic == "before_restart" {
+                    2
+                } else {
+                    0
+                };
+                let prior = database.fetch_partition(project, topic, 0, 0, 4096)?;
+                assert_eq!(prior.len(), expected as usize);
+                for version in [0, 3] {
+                    let value = format!("distinct-{round}-{version}-{topic}");
+                    let encoded = if version == 0 {
+                        // Magic 0 record with independently constructed CRC and lengths.
+                        let mut body = Writer::new();
+                        body.i8(0);
+                        body.i8(0);
+                        body.bytes(None)?;
+                        body.bytes(Some(value.as_bytes()))?;
+                        let mut message = Writer::new();
+                        message.i64(0);
+                        message.i32((body.len() + 4) as i32);
+                        message.i32(crc32fast::hash(body.as_slice()) as i32);
+                        message.raw(body.as_slice());
+                        message.finish()
+                    } else {
+                        encoded_batch(&RecordView {
+                            create_time_ms: 1234,
+                            key: Some(b"key"),
+                            value: Some(value.as_bytes()),
+                            headers: vec![header("source", Some(b"protocol"))],
+                        })?
+                    };
+                    let mut produce = Writer::new();
+                    if version == 3 {
+                        produce.nullable_string(None)?;
+                    }
+                    produce.i16(-1);
+                    produce.i32(5000);
+                    produce.array_len(1);
+                    produce.string(topic)?;
+                    produce.array_len(1);
+                    produce.i32(0);
+                    produce.bytes(Some(&encoded))?;
+                    let response = request(
+                        &mut client_io,
+                        0,
+                        version,
+                        expected as i32 + 10,
+                        produce.as_slice(),
+                    )
+                    .await?;
+                    let mut response = Reader::new(&response);
+                    assert_eq!(response.array_count()?, 1);
+                    assert_eq!(response.string()?, topic);
+                    assert_eq!(response.array_count()?, 1);
+                    assert_eq!(response.i32()?, 0);
+                    assert_eq!(response.i16()?, NONE, "produce v{version}, round {round}");
+                    assert_eq!(response.i64()?, expected);
+                    let read =
+                        database.fetch_partition(project, topic, 0, expected as u64, 4096)?;
+                    assert_eq!(read.len(), 1);
+                    assert_eq!(&*read[0].1.payload, value.as_bytes());
+                    expected += 1;
+                }
+                assert_eq!(
+                    database
+                        .list_offset(project, topic, 0, -1)?
+                        .map(|value| value.0),
+                    Some(expected as u64)
+                );
+            }
+            drop(client_io);
+            server
+                .await
+                .map_err(|error| Error::internal(error.to_string()))??;
+            database.standalone_snapshot(&snapshot).await?;
+            boot.runtime().shutdown().await?;
+        }
+        Ok(())
+    }
+
     fn nullable_message_set(
         value: Option<&[u8]>,
         attributes: u8,
@@ -3370,6 +3576,7 @@ mod compression_tests {
                 &reservation,
                 1,
                 2,
+                1,
                 ProjectId::random(),
                 coordinator,
                 KafkaEndpoint {

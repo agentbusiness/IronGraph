@@ -90,8 +90,29 @@ def embedded_smoke() -> None:
                 database.query(f"USE app {statement}")
             for statement in ("SHOW TOPICS", "SHOW QUEUES", "SHOW EXCHANGES", "SHOW INDEXES"):
                 assert database.query(f"USE app {statement}")["rows"], statement
+            project_id = database.query("USE app RETURN 1")["catalog"]["project_id"]
+            assert database.status()["ready"]
+            ack = database.stream_append({"project_id": project_id, "topic": "activity", "partition": 0,
+                "records": [{"key": [0, 255], "headers": {"source": [80]}, "value": [1, 2, 3], "create_time_ms": 1234}]})
+            assert ack["first_offset"] == 0
+            fetch = {"project_id": project_id, "topic": "activity", "partition": 0, "offset": 0, "max_records": 1, "max_bytes": 4096}
+            page = database.stream_fetch(fetch)
+            assert page["high_watermark"] == 1
+            assert page["records"][0][1]["payload"] == [1, 2, 3]
+            bounded = database.query("UNWIND [1,2,3] AS n RETURN n", project_id=project_id,
+                                     query_options={"bookmark": ack["bookmark"], "limits": {"rows": 3}})
+            assert len(bounded["rows"]) == 3
+            try:
+                database.query("UNWIND [1,2,3] AS n RETURN n", project_id=project_id,
+                               query_options={"limits": {"rows": 1}})
+            except RuntimeError as error:
+                assert "ResultBudgetExceeded" in str(error)
+            else:
+                raise AssertionError("row limit was ignored")
             database.snapshot()
+            database.flush()
         with EmbeddedDatabase(data_dir, device="cpu", load_embeddings=False) as reopened:
+            assert reopened.stream_fetch(fetch)["records"] == page["records"]
             result = reopened.query(
                 "USE app MATCH (n:Item) RETURN n.value AS value"
             )

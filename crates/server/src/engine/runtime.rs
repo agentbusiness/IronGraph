@@ -37,7 +37,6 @@ struct QueuedWrite {
 
 enum WriterMessage {
     Write(QueuedWrite),
-    #[cfg(test)]
     Flush(tokio::sync::oneshot::Sender<Result<()>>),
     Shutdown(tokio::sync::oneshot::Sender<Result<()>>),
 }
@@ -81,7 +80,6 @@ fn standalone_writer_loop(
             };
             match received {
                 Ok(WriterMessage::Write(write)) => pending.push_back(write),
-                #[cfg(test)]
                 Ok(WriterMessage::Flush(reply)) => {
                     let (flush, completed) = mpsc::sync_channel(1);
                     let result = persistence
@@ -856,6 +854,7 @@ pub struct WriteRuntime {
     standalone_wal: Arc<parking_lot::Mutex<DurableLog>>,
     persistence_tx: SyncSender<PersistenceMessage>,
     writer_tx: SyncSender<WriterMessage>,
+    workers: parking_lot::Mutex<Option<(std::thread::JoinHandle<()>, std::thread::JoinHandle<()>)>>,
     #[cfg(test)]
     eventual_durability_test_hook: Arc<EventualDurabilityTestHook>,
 }
@@ -897,7 +896,7 @@ impl WriteRuntime {
         let eventual_durability_test_hook = Arc::new(EventualDurabilityTestHook::default());
         #[cfg(test)]
         let writer_test_hook = Arc::clone(&eventual_durability_test_hook);
-        std::thread::Builder::new()
+        let persistence_worker = std::thread::Builder::new()
             .name("irongraph-wal-persistence".to_owned())
             .spawn(move || {
                 standalone_persistence_loop(
@@ -911,7 +910,7 @@ impl WriteRuntime {
                 Error::internal(format!("failed to start WAL persistence: {error}"))
             })?;
         let writer_persistence = persistence_tx.clone();
-        std::thread::Builder::new()
+        let writer_worker = std::thread::Builder::new()
             .name("irongraph-wal-writer".to_owned())
             .spawn(move || {
                 standalone_writer_loop(
@@ -943,6 +942,7 @@ impl WriteRuntime {
             standalone_wal,
             persistence_tx,
             writer_tx,
+            workers: parking_lot::Mutex::new(Some((writer_worker, persistence_worker))),
             #[cfg(test)]
             eventual_durability_test_hook,
         })
@@ -987,10 +987,17 @@ impl WriteRuntime {
                 return Err(Error::internal("standalone writer is unavailable"));
             }
         }
-        tokio::time::timeout(deadline.remaining()?, response)
+        let remaining = deadline.remaining().map_err(|_| {
+            Error::new(
+                ErrorCode::DeadlineExceeded,
+                "write was dispatched; its outcome is uncertain; do not retry automatically",
+            )
+        })?;
+        tokio::time::timeout(remaining, response)
             .await
-            .map_err(|_| client_deadline_exceeded("standalone write completion timed out"))?
-            .map_err(|_| Error::internal("standalone writer stopped before replying"))?
+            .map_err(|_| Error::new(ErrorCode::DeadlineExceeded,
+                "write completion timed out after dispatch; its outcome is uncertain; do not retry automatically"))?
+            .map_err(|_| Error::internal("writer stopped after dispatch; write outcome is uncertain; do not retry automatically"))?
     }
 
     /// Replays every WAL mutation above the backend's restored snapshot bookmark.
@@ -1107,8 +1114,8 @@ impl WriteRuntime {
         )
     }
 
-    #[cfg(test)]
-    async fn flush_wal(&self) -> Result<()> {
+    /// Establish a durable WAL boundary for all earlier queued writes.
+    pub async fn flush_wal(&self) -> Result<()> {
         let (reply, response) = tokio::sync::oneshot::channel();
         self.writer_tx
             .try_send(WriterMessage::Flush(reply))
@@ -1121,15 +1128,50 @@ impl WriteRuntime {
     /// Drains every earlier write message and establishes a final WAL durability boundary before
     /// the dedicated persistence thread exits.
     pub async fn shutdown(&self) -> Result<()> {
+        let Some(workers) = self.workers.lock().take() else {
+            return Ok(());
+        };
         let (reply, response) = tokio::sync::oneshot::channel();
         let sender = self.writer_tx.clone();
-        tokio::task::spawn_blocking(move || sender.send(WriterMessage::Shutdown(reply)))
+        let sent = tokio::task::spawn_blocking(move || sender.send(WriterMessage::Shutdown(reply)))
             .await
             .map_err(|error| Error::internal(format!("WAL shutdown send task failed: {error}")))?
-            .map_err(|_| Error::internal("standalone writer is unavailable during shutdown"))?;
-        response
+            .map_err(|_| Error::internal("standalone writer is unavailable during shutdown"));
+        let completed = response
             .await
-            .map_err(|_| Error::internal("standalone writer stopped before shutdown completed"))?
+            .map_err(|_| Error::internal("standalone writer stopped before shutdown completed"));
+        let persistence = self.persistence_tx.clone();
+        let joined = tokio::task::spawn_blocking(move || join_workers(workers, &persistence))
+            .await
+            .map_err(|error| Error::internal(format!("WAL worker join task failed: {error}")))?;
+        sent?;
+        completed??;
+        joined
+    }
+}
+
+fn join_workers(
+    workers: (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>),
+    persistence: &SyncSender<PersistenceMessage>,
+) -> Result<()> {
+    let writer = workers.0.join();
+    // A panicked writer cannot send the normal shutdown message. Ensure its sibling is also
+    // stopped before joining; a persistence worker that has already exited rejects this send.
+    let (reply, _response) = mpsc::sync_channel(1);
+    let _ = persistence.send(PersistenceMessage::Shutdown(reply));
+    let persistence = workers.1.join();
+    writer.map_err(|_| Error::internal("WAL writer panicked"))?;
+    persistence.map_err(|_| Error::internal("WAL persistence panicked"))?;
+    Ok(())
+}
+
+impl Drop for WriteRuntime {
+    fn drop(&mut self) {
+        if let Some(workers) = self.workers.get_mut().take() {
+            let (reply, _response) = tokio::sync::oneshot::channel();
+            let _ = self.writer_tx.send(WriterMessage::Shutdown(reply));
+            let _ = join_workers(workers, &self.persistence_tx);
+        }
     }
 }
 

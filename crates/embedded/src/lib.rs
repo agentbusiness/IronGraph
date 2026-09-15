@@ -2,7 +2,9 @@
 //! semantics as the standalone server.
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
+    sync::Mutex,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
@@ -22,6 +24,68 @@ use irongraph_server::{
     server::Database,
 };
 use tokio_util::sync::CancellationToken;
+
+#[cfg(test)]
+mod acceptance;
+#[cfg(test)]
+mod standard_client;
+mod streams;
+pub use streams::{StreamAcknowledgement, StreamAppend, StreamFetch, StreamPage, StreamRecord};
+
+/// Controls shared by native query and stream calls. IDs identify active calls only.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationOptions {
+    pub operation_id: Option<String>,
+    pub timeout_ms: Option<u64>,
+}
+
+/// Readiness is returned only after recovery and configured model initialization finish.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RuntimeStatus {
+    pub data_dir: PathBuf,
+    pub ready: bool,
+    pub active_operations: usize,
+    pub max_concurrent_operations: usize,
+    pub worker_threads: usize,
+}
+
+struct Operation<'a> {
+    database: &'a EmbeddedDatabase,
+    id: String,
+    cancellation: CancellationToken,
+    deadline: std::time::Instant,
+}
+
+impl Operation<'_> {
+    fn check(&self) -> Result<()> {
+        if self.cancellation.is_cancelled() {
+            return Err(irongraph_types::Error::new(
+                irongraph_types::ErrorCode::Cancelled,
+                "operation cancelled before dispatch",
+            )
+            .into());
+        }
+        if std::time::Instant::now() >= self.deadline {
+            return Err(irongraph_types::Error::new(
+                irongraph_types::ErrorCode::DeadlineExceeded,
+                "operation deadline elapsed before dispatch",
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Operation<'_> {
+    fn drop(&mut self) {
+        self.database
+            .operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
+    }
+}
 
 const DEFAULT_MAXIMUM_WRITE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_RESERVED_DEVICE_BYTES: usize = 3 * 1024 * 1024 * 1024;
@@ -59,6 +123,8 @@ pub struct EmbeddedOptions {
     pub request_timeout: Duration,
     pub startup_timeout: Duration,
     pub snapshot_interval: Duration,
+    pub max_concurrent_operations: usize,
+    pub worker_threads: usize,
 }
 
 impl EmbeddedOptions {
@@ -74,6 +140,8 @@ impl EmbeddedOptions {
             request_timeout: Duration::from_secs(30),
             startup_timeout: Duration::from_secs(60),
             snapshot_interval: DEFAULT_SNAPSHOT_INTERVAL,
+            max_concurrent_operations: 32,
+            worker_threads: 2,
         }
     }
 
@@ -95,6 +163,11 @@ impl EmbeddedOptions {
     }
 
     fn validate(&self) -> Result<()> {
+        if self.max_concurrent_operations == 0 || self.worker_threads == 0 {
+            return Err(EmbeddedError::Configuration(
+                "operation and worker budgets must be positive".into(),
+            ));
+        }
         if self.data_dir.as_os_str().is_empty() {
             return Err(EmbeddedError::Configuration(
                 "embedded data directory is empty".to_owned(),
@@ -133,6 +206,50 @@ pub enum EmbeddedError {
 }
 
 pub type Result<T> = std::result::Result<T, EmbeddedError>;
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResourceBudgets {
+    device_memory_limit_bytes: Option<usize>,
+    device_reserved_bytes: Option<usize>,
+    max_write_bytes: Option<usize>,
+    max_concurrent_operations: Option<usize>,
+    worker_threads: Option<usize>,
+    request_timeout_ms: Option<u64>,
+    startup_timeout_ms: Option<u64>,
+    snapshot_interval_ms: Option<u64>,
+}
+
+/// Validate and apply explicit host resource budgets from a language binding.
+pub fn configure_budgets(options: &mut EmbeddedOptions, budgets: serde_json::Value) -> Result<()> {
+    let budgets: ResourceBudgets = serde_json::from_value(budgets)
+        .map_err(|error| EmbeddedError::Configuration(error.to_string()))?;
+    if let Some(value) = budgets.device_memory_limit_bytes {
+        options.device_memory_limit_bytes = value;
+    }
+    if let Some(value) = budgets.device_reserved_bytes {
+        options.device_reserved_bytes = value;
+    }
+    if let Some(value) = budgets.max_write_bytes {
+        options.max_write_bytes = value;
+    }
+    if let Some(value) = budgets.max_concurrent_operations {
+        options.max_concurrent_operations = value;
+    }
+    if let Some(value) = budgets.worker_threads {
+        options.worker_threads = value;
+    }
+    if let Some(value) = budgets.request_timeout_ms {
+        options.request_timeout = Duration::from_millis(value);
+    }
+    if let Some(value) = budgets.startup_timeout_ms {
+        options.startup_timeout = Duration::from_millis(value);
+    }
+    if let Some(value) = budgets.snapshot_interval_ms {
+        options.snapshot_interval = Duration::from_millis(value);
+    }
+    options.validate()
+}
 
 struct InstanceGuard;
 
@@ -251,10 +368,14 @@ impl EmbeddedCore {
         })
     }
 
-    fn query(&self, query: Query) -> Result<QueryResult> {
+    fn query(&self, query: Query, operation: &Operation<'_>) -> Result<QueryResult> {
         query.validate()?;
+        operation.check()?;
+        let mut request = query.into_protocol();
+        request.cancellation = operation.cancellation.clone();
+        request.deadline = Some(operation.deadline);
         let mut events = Vec::<QueryStreamEvent>::new();
-        self.database.execute(query.into_protocol(), &mut |event| {
+        self.database.execute(request, &mut |event| {
             events.push(event);
             Ok(())
         })?;
@@ -263,11 +384,18 @@ impl EmbeddedCore {
 
     async fn close(self) -> Result<()> {
         self.snapshot_shutdown.cancel();
-        let _ = self.snapshot_task.await;
-        self.database
+        let joined = self.snapshot_task.await;
+        let snapshot = self
+            .database
             .standalone_snapshot(&self.snapshot_directory)
-            .await?;
-        self.boot.runtime().shutdown().await?;
+            .await;
+        // Always stop the writer, including when the final snapshot fails.
+        let shutdown = self.boot.runtime().shutdown().await;
+        joined.map_err(|error| {
+            irongraph_types::Error::internal(format!("snapshot worker failed: {error}"))
+        })?;
+        snapshot?;
+        shutdown?;
         Ok(())
     }
 }
@@ -276,27 +404,118 @@ impl EmbeddedCore {
 pub struct EmbeddedDatabase {
     runtime: tokio::runtime::Runtime,
     core: Option<EmbeddedCore>,
+    options: EmbeddedOptions,
+    operations: Mutex<HashMap<String, CancellationToken>>,
+    next_operation: std::sync::atomic::AtomicU64,
 }
 
 impl EmbeddedDatabase {
-    pub fn open(options: EmbeddedOptions) -> Result<Self> {
+    pub fn open(mut options: EmbeddedOptions) -> Result<Self> {
+        options.validate()?;
+        options.data_dir = absolute_path(options.data_dir)?;
         let instance = InstanceGuard::acquire()?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(options.worker_threads)
+            .max_blocking_threads(options.max_concurrent_operations)
             .enable_all()
             .thread_name("irongraph-embedded")
             .build()?;
-        let core = runtime.block_on(EmbeddedCore::open(options, instance))?;
+        let core = runtime.block_on(EmbeddedCore::open(options.clone(), instance))?;
         Ok(Self {
             runtime,
             core: Some(core),
+            options,
+            operations: Mutex::new(HashMap::new()),
+            next_operation: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
     pub fn query(&self, query: Query) -> Result<QueryResult> {
+        self.query_with_options(query, OperationOptions::default())
+    }
+
+    pub fn query_with_options(
+        &self,
+        query: Query,
+        options: OperationOptions,
+    ) -> Result<QueryResult> {
+        let operation = self.begin_operation(options)?;
         self.core
             .as_ref()
             .ok_or_else(|| EmbeddedError::Configuration("database is closed".to_owned()))?
-            .query(query)
+            .query(query, &operation)
+    }
+
+    /// Returns false if the operation has not started or has already completed.
+    pub fn cancel(&self, operation_id: &str) -> bool {
+        let operations = self
+            .operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(token) = operations.get(operation_id) {
+            token.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn status(&self) -> Result<RuntimeStatus> {
+        Ok(RuntimeStatus {
+            data_dir: absolute_path(self.options.data_dir.clone())?,
+            ready: self.core.is_some(),
+            active_operations: self
+                .operations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            max_concurrent_operations: self.options.max_concurrent_operations,
+            worker_threads: self.options.worker_threads,
+        })
+    }
+
+    fn begin_operation(&self, options: OperationOptions) -> Result<Operation<'_>> {
+        let timeout = options
+            .timeout_ms
+            .map_or(self.options.request_timeout, Duration::from_millis);
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| EmbeddedError::Configuration("operation timeout is too large".into()))?;
+        let id = options.operation_id.unwrap_or_else(|| {
+            format!(
+                "internal:{}",
+                self.next_operation.fetch_add(1, Ordering::Relaxed)
+            )
+        });
+        if id.is_empty() || id.len() > 256 {
+            return Err(EmbeddedError::Configuration(
+                "operation ID must contain 1 to 256 bytes".into(),
+            ));
+        }
+        let mut operations = self
+            .operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if operations.contains_key(&id) {
+            return Err(EmbeddedError::Configuration(
+                "operation ID is already active".into(),
+            ));
+        }
+        if operations.len() >= self.options.max_concurrent_operations {
+            return Err(irongraph_types::Error::new(
+                irongraph_types::ErrorCode::Backpressure,
+                "embedded concurrency budget exhausted before dispatch",
+            )
+            .into());
+        }
+        let cancellation = CancellationToken::new();
+        operations.insert(id.clone(), cancellation.clone());
+        Ok(Operation {
+            database: self,
+            id,
+            cancellation,
+            deadline,
+        })
     }
 
     pub fn snapshot(&self) -> Result<irongraph_types::Bookmark> {
@@ -307,6 +526,14 @@ impl EmbeddedDatabase {
         Ok(self
             .runtime
             .block_on(core.database.standalone_snapshot(&core.snapshot_directory))?)
+    }
+
+    pub fn flush(&self) -> Result<()> {
+        let core = self
+            .core
+            .as_ref()
+            .ok_or_else(|| EmbeddedError::Configuration("database is closed".into()))?;
+        Ok(self.runtime.block_on(core.boot.runtime().flush_wal())?)
     }
 
     pub fn close(mut self) -> Result<()> {

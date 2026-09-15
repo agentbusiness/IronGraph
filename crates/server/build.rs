@@ -25,6 +25,10 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     let dist = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web/dist");
+    println!("cargo:rustc-check-cfg=cfg(irongraph_web_bundle)");
+    if dist.join("index.html").is_file() {
+        println!("cargo:rustc-cfg=irongraph_web_bundle");
+    }
 
     // Re-run whenever anything under the bundle changes. Cargo walks a directory given here, so
     // this covers a new asset, a deleted one, and an edit to any of them.

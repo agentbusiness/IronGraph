@@ -14,8 +14,8 @@ mod stream;
 pub use engine::{
     AmqpBatchRecord, AmqpExchangeKind, BrokerCommand, BrokerCommit, BrokerCoordinator, BrokerReply,
     BrokerStateMachine, ConsumerLagMetrics, Delivery, ExchangeMetrics, IngressMetadata,
-    KafkaBatchRecord, PayloadRecord, QueueInfo, QueueKind, QueueMetrics, RetentionPolicy,
-    StreamOffset, TopicMetrics,
+    KafkaBatchRecord, PartitionRead, PayloadRecord, QueueInfo, QueueKind, QueueMetrics,
+    RetentionPolicy, StreamOffset, TopicMetrics,
 };
 pub use queue::QueueServer;
 pub use stream::StreamServer;

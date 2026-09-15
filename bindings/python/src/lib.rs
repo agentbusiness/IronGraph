@@ -1,8 +1,12 @@
-use std::{path::PathBuf, sync::Mutex};
+use std::{
+    path::PathBuf,
+    sync::{Mutex, RwLock},
+};
 
 use irongraph_client::{MutualTls, Query, RemoteClient};
 use irongraph_embedded::{
     EmbeddedDatabase as RustEmbeddedDatabase, EmbeddedOptions, EmbeddingPolicy, ExecutionDevice,
+    OperationOptions, StreamAppend, StreamFetch,
 };
 use irongraph_types::ProjectId;
 use pyo3::{exceptions::PyRuntimeError, prelude::*, types::PyModule};
@@ -31,19 +35,20 @@ fn query_request(
 
 #[pyclass(name = "EmbeddedDatabase")]
 struct EmbeddedDatabase {
-    database: Mutex<Option<RustEmbeddedDatabase>>,
+    database: RwLock<Option<RustEmbeddedDatabase>>,
 }
 
 #[pymethods]
 impl EmbeddedDatabase {
     #[new]
-    #[pyo3(signature = (data_dir, *, device="auto", device_ordinal=0, load_embeddings=true))]
+    #[pyo3(signature = (data_dir, *, device="auto", device_ordinal=0, load_embeddings=true, budgets=None))]
     fn new(
         py: Python<'_>,
         data_dir: PathBuf,
         device: &str,
         device_ordinal: u32,
         load_embeddings: bool,
+        budgets: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let execution_device = match device {
             "auto" => ExecutionDevice::Auto,
@@ -56,39 +61,61 @@ impl EmbeddedDatabase {
                 ));
             }
         };
-        let options = EmbeddedOptions::new(data_dir)
+        let mut options = EmbeddedOptions::new(data_dir)
             .with_execution_device(execution_device)
             .with_embedding_policy(if load_embeddings {
                 EmbeddingPolicy::Automatic
             } else {
                 EmbeddingPolicy::Disabled
             });
+        if let Some(budgets) = budgets {
+            irongraph_embedded::configure_budgets(
+                &mut options,
+                pythonize::depythonize(&budgets).map_err(python_error)?,
+            )
+            .map_err(python_error)?;
+        }
         Ok(Self {
-            database: Mutex::new(Some(
+            database: RwLock::new(Some(
                 py.detach(move || RustEmbeddedDatabase::open(options))
                     .map_err(python_error)?,
             )),
         })
     }
 
-    #[pyo3(signature = (cypher, *, project_id=None, parameters=None))]
+    #[pyo3(signature = (cypher, *, project_id=None, parameters=None, query_options=None, operation_options=None))]
     fn query<'py>(
         &self,
         py: Python<'py>,
         cypher: String,
         project_id: Option<String>,
         parameters: Option<Bound<'py, PyAny>>,
+        query_options: Option<Bound<'py, PyAny>>,
+        operation_options: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let query = query_request(cypher, project_id, parameters)?;
+        let mut query = query_request(cypher, project_id, parameters)?;
+        if let Some(options) = query_options {
+            irongraph_client::configure_query(
+                &mut query,
+                pythonize::depythonize(&options).map_err(python_error)?,
+            )
+            .map_err(python_error)?;
+        }
+        let options: OperationOptions = operation_options
+            .as_ref()
+            .map(pythonize::depythonize)
+            .transpose()
+            .map_err(python_error)?
+            .unwrap_or_default();
         let result = py.detach(|| {
             let guard = self
                 .database
-                .lock()
+                .read()
                 .map_err(|_| PyRuntimeError::new_err("embedded database lock is poisoned"))?;
             guard
                 .as_ref()
                 .ok_or_else(|| PyRuntimeError::new_err("embedded database is closed"))?
-                .query(query)
+                .query_with_options(query, options)
                 .map_err(python_error)
         })?;
         pythonize::pythonize(py, &result).map_err(python_error)
@@ -98,7 +125,7 @@ impl EmbeddedDatabase {
         let bookmark = py.detach(|| {
             let guard = self
                 .database
-                .lock()
+                .read()
                 .map_err(|_| PyRuntimeError::new_err("embedded database lock is poisoned"))?;
             guard
                 .as_ref()
@@ -113,7 +140,7 @@ impl EmbeddedDatabase {
         py.detach(|| {
             let database = self
                 .database
-                .lock()
+                .write()
                 .map_err(|_| PyRuntimeError::new_err("embedded database lock is poisoned"))?
                 .take();
             if let Some(database) = database {
@@ -121,6 +148,85 @@ impl EmbeddedDatabase {
             }
             Ok(())
         })
+    }
+
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| {
+            let guard = self.database.read().map_err(python_error)?;
+            guard
+                .as_ref()
+                .ok_or_else(|| python_error("database is closed"))?
+                .flush()
+                .map_err(python_error)
+        })
+    }
+
+    fn status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let guard = self.database.read().map_err(python_error)?;
+        let status = guard
+            .as_ref()
+            .ok_or_else(|| python_error("database is closed"))?
+            .status()
+            .map_err(python_error)?;
+        pythonize::pythonize(py, &status).map_err(python_error)
+    }
+
+    fn cancel(&self, operation_id: &str) -> PyResult<bool> {
+        let guard = self.database.read().map_err(python_error)?;
+        Ok(guard
+            .as_ref()
+            .ok_or_else(|| python_error("database is closed"))?
+            .cancel(operation_id))
+    }
+
+    #[pyo3(signature = (request, *, options=None))]
+    fn stream_append<'py>(
+        &self,
+        py: Python<'py>,
+        request: Bound<'py, PyAny>,
+        options: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: StreamAppend = pythonize::depythonize(&request).map_err(python_error)?;
+        let options: OperationOptions = options
+            .as_ref()
+            .map(pythonize::depythonize)
+            .transpose()
+            .map_err(python_error)?
+            .unwrap_or_default();
+        let result = py.detach(|| {
+            let guard = self.database.read().map_err(python_error)?;
+            guard
+                .as_ref()
+                .ok_or_else(|| python_error("database is closed"))?
+                .stream_append(request, options)
+                .map_err(python_error)
+        })?;
+        pythonize::pythonize(py, &result).map_err(python_error)
+    }
+
+    #[pyo3(signature = (request, *, options=None))]
+    fn stream_fetch<'py>(
+        &self,
+        py: Python<'py>,
+        request: Bound<'py, PyAny>,
+        options: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request: StreamFetch = pythonize::depythonize(&request).map_err(python_error)?;
+        let options: OperationOptions = options
+            .as_ref()
+            .map(pythonize::depythonize)
+            .transpose()
+            .map_err(python_error)?
+            .unwrap_or_default();
+        let result = py.detach(|| {
+            let guard = self.database.read().map_err(python_error)?;
+            guard
+                .as_ref()
+                .ok_or_else(|| python_error("database is closed"))?
+                .stream_fetch(request, options)
+                .map_err(python_error)
+        })?;
+        pythonize::pythonize(py, &result).map_err(python_error)
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -186,15 +292,23 @@ impl Client {
         })
     }
 
-    #[pyo3(signature = (cypher, *, project_id=None, parameters=None))]
+    #[pyo3(signature = (cypher, *, project_id=None, parameters=None, query_options=None))]
     fn query<'py>(
         &self,
         py: Python<'py>,
         cypher: String,
         project_id: Option<String>,
         parameters: Option<Bound<'py, PyAny>>,
+        query_options: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let query = query_request(cypher, project_id, parameters)?;
+        let mut query = query_request(cypher, project_id, parameters)?;
+        if let Some(options) = query_options {
+            irongraph_client::configure_query(
+                &mut query,
+                pythonize::depythonize(&options).map_err(python_error)?,
+            )
+            .map_err(python_error)?;
+        }
         let result = py.detach(|| {
             self.client
                 .lock()

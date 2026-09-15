@@ -203,6 +203,8 @@ pub struct EmbeddedOptions {
     pub request_timeout_ms: Option<u64>,
     pub startup_timeout_ms: Option<u64>,
     pub snapshot_interval_ms: Option<u64>,
+    pub max_concurrent_operations: Option<usize>,
+    pub worker_threads: Option<usize>,
 }
 impl EmbeddedOptions {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
@@ -216,6 +218,8 @@ impl EmbeddedOptions {
             request_timeout_ms: None,
             startup_timeout_ms: None,
             snapshot_interval_ms: None,
+            max_concurrent_operations: None,
+            worker_threads: None,
         }
     }
     pub fn with_execution_device(mut self, device: ExecutionDevice) -> Self {
@@ -235,7 +239,8 @@ impl EmbeddedOptions {
         };
         json!({"data_dir":self.data_dir,"execution_device":device,"device_ordinal":ordinal,"embedding_policy":self.embedding_policy,
             "device_memory_limit_bytes":self.device_memory_limit_bytes,"device_reserved_bytes":self.device_reserved_bytes,"max_write_bytes":self.max_write_bytes,
-            "request_timeout_ms":self.request_timeout_ms,"startup_timeout_ms":self.startup_timeout_ms,"snapshot_interval_ms":self.snapshot_interval_ms})
+            "request_timeout_ms":self.request_timeout_ms,"startup_timeout_ms":self.startup_timeout_ms,"snapshot_interval_ms":self.snapshot_interval_ms,
+            "max_concurrent_operations":self.max_concurrent_operations,"worker_threads":self.worker_threads})
     }
 }
 
@@ -270,6 +275,72 @@ impl Drop for Handle {
 /// Synchronous database backed by the bundled native engine. Only one embedded instance can be
 /// active in a process. Close explicitly to observe snapshot or shutdown errors.
 pub struct EmbeddedDatabase(Handle);
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct OperationOptions {
+    pub operation_id: Option<String>,
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StreamRecord {
+    pub key: Option<Vec<u8>>,
+    pub headers: BTreeMap<String, Vec<u8>>,
+    pub value: Option<Vec<u8>>,
+    pub create_time_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StreamAppend {
+    pub project_id: String,
+    pub topic: String,
+    pub partition: i32,
+    pub records: Vec<StreamRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StreamAcknowledgement {
+    pub bookmark: Bookmark,
+    pub first_offset: u64,
+    pub record_count: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StreamFetch {
+    pub project_id: String,
+    pub topic: String,
+    pub partition: i32,
+    pub offset: u64,
+    pub max_records: usize,
+    pub max_bytes: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StreamPayload {
+    pub id: u64,
+    pub resolved_time_ms: i64,
+    pub ingress: Value,
+    pub payload: Vec<u8>,
+    pub checksum: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StreamPage {
+    pub records: Vec<(u64, StreamPayload)>,
+    pub high_watermark: u64,
+    pub next_offset: u64,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RuntimeStatus {
+    pub data_dir: PathBuf,
+    pub ready: bool,
+    pub active_operations: usize,
+    pub max_concurrent_operations: usize,
+    pub worker_threads: usize,
+}
+
 impl EmbeddedDatabase {
     pub fn open(options: EmbeddedOptions) -> Result<Self> {
         Handle::open(json!({"action":"open_embedded","options":options.json()})).map(Self)
@@ -277,9 +348,53 @@ impl EmbeddedDatabase {
     pub fn query(&self, query: Query) -> Result<QueryResult> {
         self.0.query(query)
     }
+    pub fn query_with_options(
+        &self,
+        query: Query,
+        options: OperationOptions,
+    ) -> Result<QueryResult> {
+        serde_json::from_value(call(
+            json!({"action":"query","handle":self.0.0,"query":query,"options":options}),
+        )?)
+        .map_err(|error| Error::sdk(error.to_string()))
+    }
+    pub fn stream_append(
+        &self,
+        request: StreamAppend,
+        options: OperationOptions,
+    ) -> Result<StreamAcknowledgement> {
+        serde_json::from_value(call(
+            json!({"action":"stream_append","handle":self.0.0,"request":request,"options":options}),
+        )?)
+        .map_err(|error| Error::sdk(error.to_string()))
+    }
+    pub fn stream_fetch(
+        &self,
+        request: StreamFetch,
+        options: OperationOptions,
+    ) -> Result<StreamPage> {
+        serde_json::from_value(call(
+            json!({"action":"stream_fetch","handle":self.0.0,"request":request,"options":options}),
+        )?)
+        .map_err(|error| Error::sdk(error.to_string()))
+    }
+    pub fn status(&self) -> Result<RuntimeStatus> {
+        serde_json::from_value(call(json!({"action":"status","handle":self.0.0}))?)
+            .map_err(|error| Error::sdk(error.to_string()))
+    }
+    pub fn cancel(&self, operation_id: &str) -> Result<bool> {
+        serde_json::from_value(call(
+            json!({"action":"cancel","handle":self.0.0,"operation_id":operation_id}),
+        )?)
+        .map_err(|error| Error::sdk(error.to_string()))
+    }
     pub fn snapshot(&self) -> Result<Bookmark> {
         serde_json::from_value(call(json!({"action":"snapshot","handle":self.0.0}))?)
             .map_err(|error| Error::sdk(error.to_string()))
+    }
+    pub fn flush(&self) -> Result<()> {
+        call(json!({"action":"flush","handle":self.0.0}))?;
+        Ok(())
     }
     pub fn close(mut self) -> Result<()> {
         self.0.close()

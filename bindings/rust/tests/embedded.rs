@@ -16,8 +16,46 @@ fn packaged_sdk_preserves_documents_and_integer_precision() -> Result<(), Box<dy
             .with_parameter("body", "Cargo binary persistence"),
     )?;
     database.snapshot()?;
+    let project_id = database
+        .query(Query::new("USE sdk RETURN 1"))?
+        .catalog
+        .and_then(|catalog| catalog["project_id"].as_str().map(str::to_owned))
+        .ok_or("missing project ID")?;
+    database.query(
+        Query::new("CREATE TOPIC native_stream PARTITIONS 1").with_project(project_id.clone()),
+    )?;
+    let ack = database.stream_append(
+        irongraph_sdk::StreamAppend {
+            project_id: project_id.clone(),
+            topic: "native_stream".into(),
+            partition: 0,
+            records: vec![irongraph_sdk::StreamRecord {
+                key: Some(vec![0, 255]),
+                headers: Default::default(),
+                value: Some(vec![1, 2, 3]),
+                create_time_ms: None,
+            }],
+        },
+        Default::default(),
+    )?;
+    assert_eq!((ack.first_offset, ack.record_count), (0, 1));
+    let fetch = irongraph_sdk::StreamFetch {
+        project_id,
+        topic: "native_stream".into(),
+        partition: 0,
+        offset: 0,
+        max_records: 1,
+        max_bytes: 4096,
+    };
+    let page = database.stream_fetch(fetch.clone(), Default::default())?;
+    assert_eq!(page.records[0].1.payload, vec![1, 2, 3]);
+    assert_eq!(database.status()?.data_dir, directory.path());
+    database.flush()?;
     database.close()?;
     let reopened = EmbeddedDatabase::open(options)?;
+    let persisted = reopened.stream_fetch(fetch, Default::default())?;
+    assert_eq!(persisted.high_watermark, 1);
+    assert_eq!(persisted.records[0].1.id, page.records[0].1.id);
     let result = reopened.query(Query::new(
         "USE sdk MATCH (d:Document) RETURN d.body, d.count",
     ))?;

@@ -4,13 +4,14 @@ use std::{
     collections::HashMap,
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
     time::Duration,
 };
 
 use irongraph_client::{ClientError, MutualTls, Query, RemoteClient};
 use irongraph_embedded::{
     EmbeddedDatabase, EmbeddedError, EmbeddedOptions, EmbeddingPolicy, ExecutionDevice,
+    OperationOptions, StreamAppend, StreamFetch,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -25,10 +26,10 @@ pub struct Buffer {
 }
 
 enum Connection {
-    Embedded(EmbeddedDatabase),
+    Embedded(Box<EmbeddedDatabase>),
     Remote(RemoteClient),
 }
-type SharedConnection = Arc<Mutex<Option<Connection>>>;
+type SharedConnection = Arc<RwLock<Option<Connection>>>;
 #[derive(Default)]
 struct Registry {
     next: u64,
@@ -114,11 +115,46 @@ type Result<T> = std::result::Result<T, Failure>;
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
-    OpenEmbedded { options: OpenOptions },
-    OpenRemote { options: RemoteOptions },
-    Query { handle: u64, query: Query },
-    Snapshot { handle: u64 },
-    Close { handle: u64 },
+    OpenEmbedded {
+        options: OpenOptions,
+    },
+    OpenRemote {
+        options: RemoteOptions,
+    },
+    Query {
+        handle: u64,
+        query: Query,
+        #[serde(default)]
+        options: OperationOptions,
+    },
+    StreamAppend {
+        handle: u64,
+        request: StreamAppend,
+        #[serde(default)]
+        options: OperationOptions,
+    },
+    StreamFetch {
+        handle: u64,
+        request: StreamFetch,
+        #[serde(default)]
+        options: OperationOptions,
+    },
+    Status {
+        handle: u64,
+    },
+    Cancel {
+        handle: u64,
+        operation_id: String,
+    },
+    Snapshot {
+        handle: u64,
+    },
+    Flush {
+        handle: u64,
+    },
+    Close {
+        handle: u64,
+    },
 }
 
 #[derive(Deserialize)]
@@ -137,6 +173,8 @@ struct OpenOptions {
     request_timeout_ms: Option<u64>,
     startup_timeout_ms: Option<u64>,
     snapshot_interval_ms: Option<u64>,
+    max_concurrent_operations: Option<usize>,
+    worker_threads: Option<usize>,
 }
 fn default_device() -> String {
     "auto".into()
@@ -190,6 +228,12 @@ impl OpenOptions {
         if let Some(value) = self.snapshot_interval_ms {
             options.snapshot_interval = Duration::from_millis(value);
         }
+        if let Some(value) = self.max_concurrent_operations {
+            options.max_concurrent_operations = value;
+        }
+        if let Some(value) = self.worker_threads {
+            options.worker_threads = value;
+        }
         Ok(options)
     }
 }
@@ -239,7 +283,7 @@ fn insert(connection: Connection) -> Result<Value> {
     let handle = registry.next;
     registry
         .connections
-        .insert(handle, Arc::new(Mutex::new(Some(connection))));
+        .insert(handle, Arc::new(RwLock::new(Some(connection))));
     Ok(json!({"handle": handle}))
 }
 
@@ -257,20 +301,26 @@ fn connection(handle: u64, remove: bool) -> Result<SharedConnection> {
 
 fn dispatch(bytes: &[u8]) -> Result<Value> {
     match serde_json::from_slice::<Request>(bytes)? {
-        Request::OpenEmbedded { options } => insert(Connection::Embedded(EmbeddedDatabase::open(
-            options.into_options()?,
-        )?)),
+        Request::OpenEmbedded { options } => insert(Connection::Embedded(Box::new(
+            EmbeddedDatabase::open(options.into_options()?)?,
+        ))),
         Request::OpenRemote { options } => insert(Connection::Remote(options.connect()?)),
-        Request::Query { handle, query } => {
+        Request::Query {
+            handle,
+            query,
+            options,
+        } => {
             let shared = connection(handle, false)?;
             let guard = shared
-                .lock()
+                .read()
                 .map_err(|_| Failure::new("INTERNAL", "connection is poisoned"))?;
             let connection = guard
                 .as_ref()
                 .ok_or_else(|| Failure::new("INVALID_HANDLE", "connection is closed"))?;
             let result = match connection {
-                Connection::Embedded(database) => database.query(query).map_err(Failure::from)?,
+                Connection::Embedded(database) => database
+                    .query_with_options(query, options)
+                    .map_err(Failure::from)?,
                 Connection::Remote(client) => client.query(query).map_err(Failure::from)?,
             };
             Ok(serde_json::to_value(result)?)
@@ -278,7 +328,7 @@ fn dispatch(bytes: &[u8]) -> Result<Value> {
         Request::Snapshot { handle } => {
             let shared = connection(handle, false)?;
             let guard = shared
-                .lock()
+                .read()
                 .map_err(|_| Failure::new("INTERNAL", "connection is poisoned"))?;
             match guard.as_ref() {
                 Some(Connection::Embedded(database)) => Ok(serde_json::to_value(
@@ -294,13 +344,60 @@ fn dispatch(bytes: &[u8]) -> Result<Value> {
         Request::Close { handle } => {
             let shared = connection(handle, true)?;
             let mut guard = shared
-                .lock()
+                .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(Connection::Embedded(database)) = guard.take() {
                 database.close().map_err(Failure::from)?;
             }
             Ok(Value::Null)
         }
+        Request::StreamAppend {
+            handle,
+            request,
+            options,
+        } => with_embedded(handle, |database| {
+            Ok(serde_json::to_value(
+                database.stream_append(request, options)?,
+            )?)
+        }),
+        Request::StreamFetch {
+            handle,
+            request,
+            options,
+        } => with_embedded(handle, |database| {
+            Ok(serde_json::to_value(
+                database.stream_fetch(request, options)?,
+            )?)
+        }),
+        Request::Flush { handle } => with_embedded(handle, |database| {
+            database.flush()?;
+            Ok(Value::Null)
+        }),
+        Request::Status { handle } => with_embedded(handle, |database| {
+            Ok(serde_json::to_value(database.status()?)?)
+        }),
+        Request::Cancel {
+            handle,
+            operation_id,
+        } => with_embedded(handle, |database| Ok(json!(database.cancel(&operation_id)))),
+    }
+}
+
+fn with_embedded(
+    handle: u64,
+    operation: impl FnOnce(&EmbeddedDatabase) -> Result<Value>,
+) -> Result<Value> {
+    let shared = connection(handle, false)?;
+    let guard = shared
+        .read()
+        .map_err(|_| Failure::new("INTERNAL", "connection is poisoned"))?;
+    match guard.as_ref() {
+        Some(Connection::Embedded(database)) => operation(database),
+        Some(Connection::Remote(_)) => Err(Failure::new(
+            "UNSUPPORTED_OPERATION",
+            "operation requires an embedded database",
+        )),
+        None => Err(Failure::new("INVALID_HANDLE", "connection is closed")),
     }
 }
 

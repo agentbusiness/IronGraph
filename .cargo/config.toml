@@ -1,0 +1,4 @@
+[target.'cfg(target_os = "macos")']
+# Rust stripping produces a misaligned LINKEDIT string pool in procedural-macro
+# dylibs with the installed Apple toolchain. Preserve their Mach-O symbol tables.
+rustflags = ["-C", "strip=none"]

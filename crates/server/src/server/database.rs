@@ -4379,6 +4379,25 @@ fn transaction_lifecycle_error(lifecycle: &TransactionLifecycle) -> Option<Error
     }
 }
 
+impl Database {
+    /// Read one finite partition prefix under the same publication view as its watermark.
+    pub fn fetch_partition_bounded(
+        &self,
+        read: &crate::broker::PartitionRead<'_>,
+    ) -> Result<(u64, Vec<(u64, Arc<crate::broker::PayloadRecord>)>)> {
+        let state = self.0.state.read();
+        if !state.projects.contains_key(&read.project) {
+            return Err(Error::new(
+                ErrorCode::ProjectNotFound,
+                "project does not exist",
+            ));
+        }
+        // Keeping the publication read lock also prevents payload reclamation until the bounded
+        // load completes. No data from another publication enters this page or watermark.
+        state.broker.fetch_partition_bounded(read, &self.0.segments)
+    }
+}
+
 impl BrokerCoordinator for Database {
     fn submit(&self, command: BrokerCommand, wait: CommitAcknowledgement) -> Result<BrokerCommit> {
         let timeout = u32::try_from(self.0.request_timeout.as_millis()).unwrap_or(u32::MAX);
