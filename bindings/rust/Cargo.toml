@@ -1,6 +1,6 @@
 [package]
 name = "irongraph-sdk"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.94"
 description = "Embed a GPU-first graph database in Rust with automatic local embeddings, Cypher, vector search, streaming, and queues."

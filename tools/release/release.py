@@ -634,6 +634,7 @@ def audit_archive(path, kind, version):
                         raise ReleaseError("Cargo package exposes an internal implementation dependency.")
         if parts.name == "package.json":
             manifest = json.loads(data)
+            audit_npm_metadata(manifest)
             package_manifest = manifest
             if manifest.get("version") != version or manifest.get("license") != "Apache-2.0":
                 raise ReleaseError("npm version/license mismatch.")
@@ -929,6 +930,7 @@ def existing_package(path, version):
         remote = public_json(f"https://registry.npmjs.org/{package}/{version}")
         if not remote:
             return False
+        audit_npm_metadata(remote)
         expected_integrity = "sha512-" + base64.b64encode(hashlib.sha512(path.read_bytes()).digest()).decode()
         if remote.get("dist", {}).get("integrity") != expected_integrity:
             raise ReleaseError(f"Published npm version differs from staged archive: {metadata['name']} {version}")
@@ -936,6 +938,69 @@ def existing_package(path, version):
     if expected and expected != sha256(path):
         raise ReleaseError(f"Published version differs from staged archive: {path.name}")
     return bool(expected)
+
+
+def audit_npm_metadata(metadata, secrets=()):
+    """Check the registry manifest as well as the manifest inside the archive."""
+    forbidden = {"_from", "_resolved", "_where", "_args", "_location", "_requested"}
+    local_path = re.compile(r"(?:(?:^|[\s\"'=(:])(?:file:\S|/(?:Users|home|Volumes|private|tmp|var/folders)/|[A-Za-z]:[\\/])|\\\\[^\\\s]+\\)", re.I)
+
+    def check(value):
+        if isinstance(value, dict):
+            if forbidden & value.keys():
+                raise ReleaseError("npm metadata contains local installation fields.")
+            for key, child in value.items():
+                check(key)
+                check(child)
+        elif isinstance(value, list):
+            for child in value:
+                check(child)
+        elif isinstance(value, str):
+            for _ in range(4):
+                if PRIVATE_BYTES.search(value.encode()) or local_path.search(value) or any(secret and secret in value for secret in secrets):
+                    raise ReleaseError("npm metadata contains private information or a local filesystem path.")
+                decoded = urllib.parse.unquote(value)
+                if decoded == value:
+                    break
+                value = decoded
+
+    check(metadata)
+
+
+def publish_npm(path, env, registry="https://registry.npmjs.org/"):
+    """Publish directory metadata, retaining exactly the reviewed archive bytes."""
+    path = Path(path).resolve()
+    with tarfile.open(path) as archive:
+        manifest = json.load(archive.extractfile("package/package.json"))
+    audit_archive(path, "npm", manifest["version"])
+    audit_npm_metadata(manifest, tuple(env.values()))
+    for name, contents in archive_files(path):
+        if PurePosixPath(name).name.lower().startswith("readme"):
+            audit_npm_metadata(contents.decode(), tuple(env.values()))
+    # A tarball spec makes npm inject its absolute pathname into public metadata.
+    # Directory specs avoid that path, while the CLI retains browser/OTP support.
+    with tempfile.TemporaryDirectory(prefix="irongraph-npm-", dir="/tmp") as temporary:
+        root = Path(temporary).resolve()
+        package = root / "package"
+        output = root / "packed"
+        output.mkdir()
+        with tarfile.open(path) as archive:
+            for member in archive:
+                if member.isdir():
+                    continue
+                destination = root / member.name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(archive.extractfile(member).read())
+                destination.chmod(member.mode & 0o777)
+        isolated_env = {**env, "NPM_CONFIG_CACHE": str(root / "cache")}
+        packed = json.loads(run(["npm", "pack", ".", "--json", "--ignore-scripts", "--registry", registry,
+                                 "--pack-destination", output], package, isolated_env, capture=True))
+        if len(packed) != 1 or Path(packed[0]["filename"]).name != packed[0]["filename"]:
+            raise ReleaseError("Unexpected npm repack output.")
+        if sha256(output / packed[0]["filename"]) != sha256(path):
+            raise ReleaseError("npm repack differs from reviewed archive; refusing publication.")
+        run(["npm", "publish", ".", "--access", "public", "--ignore-scripts", "--registry", registry],
+            package, isolated_env)
 
 
 def npm_publish_order(publication, version):
@@ -1003,8 +1068,7 @@ def publish(stage, config, state):
                 print(f"Already published, checksum verified: {path.name}", flush=True)
                 continue
             if path.suffix == ".tgz":
-                run(["npm", "publish", path, "--access", "public", "--ignore-scripts", "--registry", "https://registry.npmjs.org/"], stage,
-                    {"NPM_TOKEN": config["NPM_TOKEN"], "NPM_CONFIG_USERCONFIG": str(npmrc)})
+                publish_npm(path, {"NPM_TOKEN": config["NPM_TOKEN"], "NPM_CONFIG_USERCONFIG": str(npmrc)})
             elif path.suffix == ".whl":
                 run([python, "-m", "twine", "upload", "--non-interactive", "--disable-progress-bar", path], stage,
                     {"TWINE_USERNAME": "__token__", "TWINE_PASSWORD": config["MATURIN_PYPI_TOKEN"], "TWINE_REPOSITORY_URL": "https://upload.pypi.org/legacy/"})
