@@ -13198,27 +13198,7 @@ impl ExecutionBackend for CpuBackend {
             .resident
             .get(&project)
             .ok_or_else(|| project_not_resident(project))?;
-        let mut result = Vec::with_capacity(sources.len());
-        for (position, source) in sources.iter().enumerate() {
-            if position & 1023 == 0 {
-                ensure_not_cancelled(cancellation)?;
-            }
-            if let Some(row) = resident.outgoing.get(cpu_dense_key(*source)) {
-                result.extend(
-                    row.neighbors
-                        .iter()
-                        .copied()
-                        .zip(row.edges.iter().copied())
-                        .map(|(target, edge)| (*source, target, edge)),
-                );
-            } else {
-                let neighbors = resident.image.graph.outgoing.row(*source).ok_or_else(|| {
-                    Error::new(ErrorCode::QueryType, "expansion source is out of bounds")
-                })?;
-                result.extend(neighbors.map(|(target, edge)| (*source, target, edge)));
-            }
-        }
-        Ok(result)
+        expand_cpu_adjacency_bounded(resident, sources, false, usize::MAX, cancellation)
     }
 
     fn expand_project_in(
@@ -13231,27 +13211,7 @@ impl ExecutionBackend for CpuBackend {
             .resident
             .get(&project)
             .ok_or_else(|| project_not_resident(project))?;
-        let mut result = Vec::with_capacity(targets.len());
-        for (position, target) in targets.iter().enumerate() {
-            if position & 1023 == 0 {
-                ensure_not_cancelled(cancellation)?;
-            }
-            if let Some(row) = resident.incoming.get(cpu_dense_key(*target)) {
-                result.extend(
-                    row.neighbors
-                        .iter()
-                        .copied()
-                        .zip(row.edges.iter().copied())
-                        .map(|(source, edge)| (source, *target, edge)),
-                );
-            } else {
-                let neighbors = resident.image.graph.incoming.row(*target).ok_or_else(|| {
-                    Error::new(ErrorCode::QueryType, "expansion source is out of bounds")
-                })?;
-                result.extend(neighbors.map(|(source, edge)| (source, *target, edge)));
-            }
-        }
-        Ok(result)
+        expand_cpu_adjacency_bounded(resident, targets, true, usize::MAX, cancellation)
     }
 
     fn expand_project_out_bounded(
@@ -13372,6 +13332,13 @@ impl ExecutionBackend for CpuBackend {
         }
         validate_vector_queries(request, vector.dimension)?;
         let matrix = decode_vectors(vector);
+        let relationship_owned = request.property == crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY;
+        if relationship_owned && request.selection.is_some() {
+            return Err(Error::new(
+                ErrorCode::QueryType,
+                "relationship vector search cannot use a node selection",
+            ));
+        }
         let selected_rows = request
             .selection
             .as_ref()
@@ -13391,20 +13358,45 @@ impl ExecutionBackend for CpuBackend {
                     })
             })
             .transpose()?;
+        let allowed_entities = request.allowed_entities.as_ref().map(|ids| {
+            ids.iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+        });
         let layer_active = vector
             .entity_ids
             .iter()
             .map(|entity| {
-                u8::from(
+                if allowed_entities
+                    .as_ref()
+                    .is_some_and(|allowed| !allowed.contains(entity))
+                {
+                    return Ok(0);
+                }
+                if relationship_owned {
+                    let Some(row) = stable_id_row(&resident.edge_id_rows, *entity) else {
+                        return Ok(0);
+                    };
+                    return resident.active_delete_edge(*row).map(|edge| {
+                        u8::from(
+                            resident.edge_is_visible(*row, &[], request.layers)
+                                && edge.is_some_and(|(_, source, target)| {
+                                    resident.node_is_visible(source, &[], request.layers)
+                                        && resident.node_is_visible(target, &[], request.layers)
+                                }),
+                        )
+                    });
+                }
+                Ok(u8::from(
                     stable_id_row(&resident.node_id_rows, *entity).is_some_and(|row| {
                         resident.node_is_visible(*row, &[], request.layers)
                             && selected_rows
                                 .as_ref()
                                 .is_none_or(|selected| selected.contains(row))
                     }),
-                )
+                ))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let mut hits = Vec::with_capacity(request.query_count);
         for query_row in 0..request.query_count {
             ensure_not_cancelled(cancellation)?;
@@ -27829,6 +27821,83 @@ mod node_pipeline_cpu_tests {
     };
 
     const PROJECT: ProjectId = ProjectId(uuid::Uuid::nil());
+
+    #[test]
+    fn sparse_appended_nodes_expand_both_directions_without_base_adjacency() -> Result<()> {
+        let mut graph = GraphStore::default();
+        let mut cpu = CpuBackend::new(32 * 1024 * 1024, 0);
+        cpu.admit_project(ResidentProjectImage::graph_only(Arc::new(
+            graph.snapshot()?,
+        )))?;
+        let relationship_type = graph.catalog_mut().intern_relationship_type("LINK")?;
+        for id in 0..7 {
+            graph.insert_node(NodeInput {
+                id: NodeId(id),
+                layer: Layer::Observed,
+                revision: 1,
+                labels: Vec::new(),
+                properties: Vec::new(),
+            })?;
+        }
+        for (id, source, target) in [(10, 5, 0), (11, 2, 4), (12, 4, 6)] {
+            graph.insert_edge(EdgeInput {
+                id: EdgeId(id),
+                source: NodeId(source),
+                target: NodeId(target),
+                relationship_type,
+                layer: Layer::Observed,
+                revision: 1,
+                properties: Vec::new(),
+            })?;
+        }
+        cpu.apply_project_delta(ResidentProjectDelta {
+            project: PROJECT,
+            bookmark: Bookmark { term: 0, index: 1 },
+            graph: graph.device_delta(1)?,
+            temporal: Vec::new(),
+            vectors: Vec::new(),
+            invalidate_derived: true,
+        })?;
+        let cancellation = CancellationToken::new();
+        let rows = (0..7).collect::<Vec<_>>();
+        assert_eq!(
+            cpu.expand_project_out(PROJECT, &rows, &cancellation)?,
+            vec![(2, 4, 1), (4, 6, 2), (5, 0, 0)]
+        );
+        assert_eq!(
+            cpu.expand_project_in(PROJECT, &rows, &cancellation)?,
+            vec![(5, 0, 0), (2, 4, 1), (4, 6, 2)]
+        );
+        assert!(
+            cpu.expand_project_out(PROJECT, &[1, 3, 6], &cancellation)?
+                .is_empty()
+        );
+        assert!(
+            cpu.expand_project_in(PROJECT, &[1, 2, 3, 5], &cancellation)?
+                .is_empty()
+        );
+        assert_eq!(
+            cpu.expand_project_out_bounded(PROJECT, &rows, 2, &cancellation)?,
+            vec![(2, 4, 1), (4, 6, 2)]
+        );
+        assert_eq!(
+            cpu.expand_project_in_bounded(PROJECT, &rows, 2, &cancellation)?,
+            vec![(5, 0, 0), (2, 4, 1)]
+        );
+        assert_eq!(
+            cpu.expand_project_out(PROJECT, &[7], &cancellation)
+                .expect_err("outside resident capacity")
+                .code,
+            ErrorCode::QueryType
+        );
+        assert_eq!(
+            cpu.expand_project_in(PROJECT, &[7], &cancellation)
+                .expect_err("outside resident capacity")
+                .code,
+            ErrorCode::QueryType
+        );
+        Ok(())
+    }
 
     #[test]
     fn start_predicates_filter_before_cpu_resident_expansion() -> Result<()> {

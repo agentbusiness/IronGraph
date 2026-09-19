@@ -59,8 +59,10 @@ including `README.md` and files below `docs/`, is allowed when it describes the 
   embedding model installs, loads, binds to the selected device, and warms automatically at startup.
   IronGraph does not install, host, or invoke generative language models.
 - Documents are ordinary Cypher-native graph records, for example `(:Document {body: ...})`. They
-  persist through the normal WAL/snapshot path and participate in automatic embedding and vector
-  search through declared graph indexes. No document-specific REST protocol or second store exists.
+  persist through the normal WAL/snapshot path. Meaningful content from all nodes and relationships
+  participates in automatic embedding and ranked vector search when the local encoder is enabled;
+  declared embedding indexes additionally support explicit text-field selection. Operational metadata
+  is excluded from automatic encoder input. No document-specific REST protocol or second store exists.
 - Kafka-compatible topic operations and AMQP-compatible queue/exchange/binding operations remain.
   Administration, clearing/purging/deleting, and monitoring use Cypher statements such as `SHOW
   TOPICS`, `SHOW QUEUES`, `SHOW EXCHANGES`, and `SHOW CONSUMER LAG`.

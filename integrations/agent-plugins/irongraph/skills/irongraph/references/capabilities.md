@@ -2,7 +2,7 @@
 
 ## Semantic recall
 
-`irongraph_search` searches the vector index named by `index` over the node `label` you provide. Use it for `Document`, `Person`, `Organization`, `Decision`, `Concept`, or any other indexed label. Keep `include_connections` enabled unless the task needs isolated matches: connected relationships and neighboring nodes often explain why a result matters.
+`irongraph_search` needs `project` and `query`. It defaults to `graph_semantic`, which ranks meaningful content from nodes and relationships together, including documents, emails, people, tables, calendar entries, and tasks. Use `semantic_nodes` or `semantic_relationships` to restrict the entity kind. For a declared text-field index, provide both `index` and its node `label`. Keep `include_connections` enabled unless the task needs isolated matches: separate bounded context results explain connections without changing the search ranking.
 
 ## Exact graph work
 

@@ -21,6 +21,7 @@ mod columns;
 mod index;
 pub mod knowledge;
 mod persistent;
+mod semantic;
 mod shared;
 mod statistics;
 mod store;
@@ -42,15 +43,17 @@ pub use index::{
     AnnDeviceImage, DerivedIndexDeviceImage, DerivedIndexState, EmbeddingDType,
     EmbeddingIndexDefinition, EmbeddingProfile, EqualityIndex, GraphIndexDefinition,
     GraphIndexKind, IVF_PQ_ASSIGNMENT_TILE_BYTES, IVF_PQ_BUILD_BATCH_ROWS,
-    IVF_PQ_MIN_RECALL_BASIS_POINTS, IVF_PQ_SIZE_CLASS_VERSION, IndexCatalog, IndexDeviceImage,
-    IndexKey, IndexStatus, IvfPqBuildKernel, IvfPqBuildPlan, IvfPqConfig, IvfPqIndex,
-    OptimizerIndexStatistics, PostingDeviceImage, RangeIndex, ResolvedVectorMutation,
+    IVF_PQ_SIZE_CLASS_VERSION, IndexCatalog, IndexDeviceImage, IndexKey, IndexStatus,
+    IvfPqBuildKernel, IvfPqBuildPlan, IvfPqConfig, IvfPqIndex, OptimizerIndexStatistics,
+    PostingDeviceImage, RangeIndex, ResolvedVectorMutation, SEMANTIC_INDEX, SEMANTIC_NODE_INDEX,
+    SEMANTIC_NODE_PROPERTY, SEMANTIC_RELATIONSHIP_INDEX, SEMANTIC_RELATIONSHIP_PROPERTY,
     ScalarIndexCandidate, Similarity, TextDeviceImage, TextIndex, VectorDeviceImage, VectorHit,
     VectorIndex,
 };
 pub use persistent::PagedVec;
 pub use persistent::PersistentMap;
 pub use persistent::{stable_id_key, stable_id_row};
+pub use semantic::{SemanticText, SemanticTextBatch, semantic_text_delta, semantic_texts};
 #[allow(unused_imports)]
 pub use shared::{SharedAllocation, SharedFlat};
 pub use statistics::{FanoutStatistics, NumericHistogram, PropertyStatistics, StatisticsSnapshot};

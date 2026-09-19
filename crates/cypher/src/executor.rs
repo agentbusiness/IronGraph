@@ -12985,6 +12985,7 @@ fn execute_resident_vector_plan(
         &compiled.search,
         compiled.access,
         Some(&compiled.selection),
+        None,
         &mut state,
         context,
     )?;
@@ -18388,7 +18389,86 @@ fn vector_search(
     state: &mut ExecutionState<'_>,
     context: &ExecutionContext<'_>,
 ) -> Result<Vec<Row>> {
-    vector_search_with_selection(rows, search, access, None, state, context)
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let input = match &search.input {
+        SearchInput::Text(value) | SearchInput::Vector(value) => value,
+    };
+    if rows.iter().all(|row| {
+        matches!(
+            row.get(&search.variable),
+            Some(BindingValue::Node(_) | BindingValue::Relationship(_))
+        )
+    }) && super::optimizer::expression_variables(input).is_empty()
+        && super::optimizer::expression_variables(&search.limit).is_empty()
+    {
+        let names = if search.index == crate::graph::SEMANTIC_INDEX {
+            vec![
+                crate::graph::SEMANTIC_NODE_INDEX,
+                crate::graph::SEMANTIC_RELATIONSHIP_INDEX,
+            ]
+        } else {
+            vec![search.index.as_str()]
+        };
+        let mut hits = Vec::new();
+        for name in names {
+            let relationship = context.vector_indexes.get(name).is_some_and(|source| {
+                source.property == crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY
+            });
+            let mut allowed = rows
+                .iter()
+                .filter_map(|row| match row.get(&search.variable) {
+                    Some(BindingValue::Node(dense)) if !relationship => {
+                        state.graph.node_dense(*dense).map(|node| node.id().0)
+                    }
+                    Some(BindingValue::Relationship(dense)) if relationship => {
+                        state.graph.edge_dense(*dense).map(|edge| edge.id().0)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if allowed.is_empty() {
+                continue;
+            }
+            allowed.sort_unstable();
+            allowed.dedup();
+            let mut selected = search.clone();
+            selected.index = name.to_owned();
+            hits.extend(vector_search_with_selection(
+                vec![Row::new()],
+                &selected,
+                access,
+                None,
+                Some(&allowed),
+                state,
+                context,
+            )?);
+        }
+        if search.index == crate::graph::SEMANTIC_INDEX {
+            sort_semantic_rows(&mut hits, search, context);
+            hits.truncate(evaluate_non_negative_usize(
+                &search.limit,
+                rows.first(),
+                state,
+                context,
+            )?);
+        }
+        let mut output = Vec::new();
+        for hit in hits {
+            for row in &rows {
+                if row.get(&search.variable) == hit.get(&search.variable) {
+                    let mut next = row.clone();
+                    if let Some(score) = hit.get(&search.score_variable) {
+                        next.insert(search.score_variable.clone(), score.clone());
+                    }
+                    output.push(next);
+                }
+            }
+        }
+        return Ok(output);
+    }
+    vector_search_with_selection(rows, search, access, None, None, state, context)
 }
 
 fn vector_search_with_selection(
@@ -18396,24 +18476,97 @@ fn vector_search_with_selection(
     search: &SearchClause,
     access: VectorAccessPath,
     selection: Option<&crate::execution::ResidentNodePipelineRequest>,
+    allowed_entities: Option<&[u64]>,
     state: &mut ExecutionState<'_>,
     context: &ExecutionContext<'_>,
 ) -> Result<Vec<Row>> {
+    if search.index == crate::graph::SEMANTIC_INDEX {
+        let mut output = Vec::new();
+        for row in rows {
+            let limit = evaluate_non_negative_usize(&search.limit, Some(&row), state, context)?;
+            let mut merged = Vec::new();
+            for name in [
+                crate::graph::SEMANTIC_NODE_INDEX,
+                crate::graph::SEMANTIC_RELATIONSHIP_INDEX,
+            ] {
+                let mut selected = search.clone();
+                selected.index = name.to_owned();
+                merged.extend(vector_search_with_selection(
+                    vec![row.clone()],
+                    &selected,
+                    VectorAccessPath::Unspecified,
+                    None,
+                    allowed_entities,
+                    state,
+                    context,
+                )?);
+            }
+            sort_semantic_rows(&mut merged, search, context);
+            merged.truncate(limit);
+            output.extend(merged);
+        }
+        return Ok(output);
+    }
     let source = context
         .vector_indexes
         .get(&search.index)
         .ok_or_else(|| Error::new(ErrorCode::IndexUnavailable, "vector index is unavailable"))?;
     let limit = evaluate_non_negative_usize(&search.limit, rows.first(), state, context)?;
+    let automatic = matches!(
+        source.property,
+        crate::graph::SEMANTIC_NODE_PROPERTY | crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY
+    );
+    let access = if automatic {
+        let ann = source.approximate.filter(|ann| {
+            source.exact.row_count() > ann.config().candidate_budget.saturating_mul(4)
+                && limit <= ann.config().candidate_budget
+                && allowed_entities.is_none()
+                && current_backend(state, context)
+                    .is_some_and(|backend| backend.kind() != crate::execution::BackendKind::Cpu)
+        });
+        if let Some(ann) = ann {
+            VectorAccessPath::IvfPq {
+                filtered_rows: source.exact.row_count() as u64,
+                query_batch: 1,
+                candidate_budget: ann.config().candidate_budget as u32,
+                scratch_bytes: 0,
+            }
+        } else {
+            VectorAccessPath::Unspecified
+        }
+    } else {
+        access
+    };
     let requested_access = match access {
         VectorAccessPath::IvfPq { .. } => ResidentVectorAccess::IvfPq,
         VectorAccessPath::Exact { .. } => ResidentVectorAccess::Exact,
         // The unoptimized/reference plan is always exact. IVF-PQ is legal only after the
-        // optimizer records an explicit, recall- and memory-gated physical decision.
+        // optimizer records an explicit physical decision.
         VectorAccessPath::Unspecified => ResidentVectorAccess::Exact,
     };
     let mut output = Vec::new();
     for row in rows {
         check_execution(context)?;
+        let limit = evaluate_non_negative_usize(&search.limit, Some(&row), state, context)?;
+        let bound_owner = match row.get(&search.variable) {
+            Some(BindingValue::Node(dense))
+                if source.property != crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY =>
+            {
+                state.graph.node_dense(*dense).map(|node| node.id().0)
+            }
+            Some(BindingValue::Relationship(dense))
+                if source.property == crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY =>
+            {
+                state.graph.edge_dense(*dense).map(|edge| edge.id().0)
+            }
+            Some(_) => continue,
+            None => None,
+        };
+        let bound_ids = bound_owner.map(|id| [id]);
+        let allowed_entities = bound_ids
+            .as_ref()
+            .map(|ids| ids.as_slice())
+            .or(allowed_entities);
         let input = match &search.input {
             SearchInput::Vector(value) => evaluate_state(value, &row, state, context)?,
             SearchInput::Text(value) => {
@@ -18447,6 +18600,7 @@ fn vector_search_with_selection(
                         property: source.property,
                         layers: state.read_layers,
                         selection: selection.cloned(),
+                        allowed_entities: allowed_entities.map(<[u64]>::to_vec),
                         queries: vector,
                         query_count: 1,
                         limit,
@@ -18487,7 +18641,10 @@ fn vector_search_with_selection(
                 )
             } else {
                 (
-                    source.exact.exact_search(&vector, limit)?,
+                    source.exact.exact_search_where(&vector, limit, |id| {
+                        allowed_entities.is_none_or(|allowed| allowed.binary_search(&id).is_ok())
+                            && semantic_owner_visible(state, source.property, id)
+                    })?,
                     0,
                     [0_u8; 32],
                     context.bookmark,
@@ -18502,19 +18659,37 @@ fn vector_search_with_selection(
         let mut visible_hits = Vec::with_capacity(hits.len());
         for hit in hits {
             check_execution(context)?;
-            let Some(node) = state.graph.node(NodeId(hit.entity_id)) else {
+            if !semantic_owner_visible(state, source.property, hit.entity_id) {
                 continue;
+            }
+            let binding = if source.property == crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY {
+                let Some(edge) = state.graph.edge(crate::EdgeId(hit.entity_id)) else {
+                    continue;
+                };
+                state
+                    .dependencies
+                    .entities
+                    .insert(EntityDependency::Relationship(edge.id()), edge.revision());
+                BindingValue::Relationship(edge.dense())
+            } else {
+                let Some(node) = state.graph.node(NodeId(hit.entity_id)) else {
+                    continue;
+                };
+                state
+                    .dependencies
+                    .entities
+                    .insert(EntityDependency::Node(node.id()), node.revision());
+                BindingValue::Node(node.dense())
             };
-            if !state.read_layers.contains_layer(node.layer()) {
+            if row
+                .get(&search.variable)
+                .is_some_and(|bound| *bound != binding)
+            {
                 continue;
             }
             visible_hits.push(hit);
-            state
-                .dependencies
-                .entities
-                .insert(EntityDependency::Node(node.id()), node.revision());
             let mut next = row.clone();
-            next.insert(search.variable.clone(), BindingValue::Node(node.dense()));
+            next.insert(search.variable.clone(), binding);
             next.insert(
                 search.score_variable.clone(),
                 BindingValue::Value(ResultValue::Scalar(ScalarValue::Float(OrderedFloat(
@@ -18540,6 +18715,43 @@ fn vector_search_with_selection(
         });
     }
     Ok(output)
+}
+
+fn sort_semantic_rows(rows: &mut [Row], search: &SearchClause, context: &ExecutionContext<'_>) {
+    let ascending = context
+        .vector_indexes
+        .get(crate::graph::SEMANTIC_NODE_INDEX)
+        .is_some_and(|source| source.exact.similarity() == crate::graph::Similarity::Euclidean);
+    rows.sort_by(|left, right| {
+        let score = |row: &Row| match row.get(&search.score_variable) {
+            Some(BindingValue::Value(ResultValue::Scalar(ScalarValue::Float(score)))) => score.0,
+            _ => f64::NEG_INFINITY,
+        };
+        if ascending {
+            score(left).total_cmp(&score(right))
+        } else {
+            score(right).total_cmp(&score(left))
+        }
+    });
+}
+
+fn semantic_owner_visible(state: &ExecutionState<'_>, property: PropertyId, entity: u64) -> bool {
+    if property == crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY {
+        state.graph.edge(crate::EdgeId(entity)).is_some_and(|edge| {
+            state.read_layers.contains_layer(edge.layer())
+                && [edge.source(), edge.target()].iter().all(|id| {
+                    state
+                        .graph
+                        .node(*id)
+                        .is_some_and(|node| state.read_layers.contains_layer(node.layer()))
+                })
+        })
+    } else {
+        state
+            .graph
+            .node(NodeId(entity))
+            .is_some_and(|node| state.read_layers.contains_layer(node.layer()))
+    }
 }
 
 fn call_procedure(

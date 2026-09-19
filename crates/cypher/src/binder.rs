@@ -626,7 +626,14 @@ impl Binder<'_> {
                     self.static_lists.remove(&window.variable);
                 }
                 Clause::Search(search) => {
-                    self.require_variable(&search.variable)?;
+                    if !self.scope.contains_key(&search.variable) {
+                        let kind = match search.index.as_str() {
+                            crate::graph::SEMANTIC_INDEX => BindingKind::Dynamic,
+                            crate::graph::SEMANTIC_RELATIONSHIP_INDEX => BindingKind::Relationship,
+                            _ => BindingKind::Node,
+                        };
+                        self.scope.insert(search.variable.clone(), kind);
+                    }
                     match &search.input {
                         SearchInput::Text(value) | SearchInput::Vector(value) => {
                             self.bind_expression(value)?

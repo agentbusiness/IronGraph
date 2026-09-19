@@ -84,12 +84,8 @@ automation and operational access consistent with application queries.
 
 The only browser-facing data endpoint is `POST /api/query`. It returns a streamed query result. Bolt
 remains available for supported drivers; exact protocol and client versions are supplied with each
-IronGraph release. The web application is served below `/web/` and provides
-three surfaces:
-
-- **Query** for writing and running Cypher;
-- **Graph**, presented as the Plot result view within Query, for visual exploration; and
-- **Streams** for topics, queues, exchanges, bindings, and lag.
+IronGraph release. The web application is served below `/web/` and provides Query, Streams,
+Documents, Training, Docs, and Settings. Graph exploration is the Plot result view within Query.
 
 The browser interface and SDK clients use the database's supported query surface; they do not own a
 second copy of graph data.
@@ -128,8 +124,19 @@ document-specific store or REST endpoint.
 ## Derived indexes and text embedding
 
 Range, text, vector, and temporal indexes accelerate graph operations while remaining rebuildable
-from canonical graph data. Text embedding and vector search use declared graph indexes. When local
-embedding is enabled, the verified encoder loads on the selected device and warms during startup.
+from canonical graph data. When local embedding is enabled, the verified encoder loads on the
+selected device and warms during startup. Each project automatically maintains semantic indexes
+for its nodes and relationships, including existing data and later changes.
+
+Semantic content includes meaningful properties and labels or relationship types. Relationship
+descriptions also include identifying names from their endpoints. Recognized operational metadata,
+opaque identifiers, and source URLs are excluded. Complete source text remains on its canonical
+owner; generated vectors remain derived state. Applications can declare additional field-specific
+embedding indexes when they need explicit content selection.
+
+The `graph_semantic` search returns ranked nodes and relationships through the same Cypher surface
+used by the Query API, Bolt, and SDKs. GPU-backed instances execute vector retrieval on the selected
+GPU; CPU instances use the CPU backend.
 
 Encoder startup and index residency contribute to startup time and device-memory requirements. A
 production readiness check should therefore include encoder availability, warm-up completion, index

@@ -359,6 +359,8 @@ pub struct ResidentVectorQuery {
     pub layers: LayerMask,
     /// Optional device-resident MATCH/filter candidate stage fused ahead of vector scoring.
     pub selection: Option<ResidentNodePipelineRequest>,
+    /// Optional stable entity IDs from an already evaluated MATCH, intersected before top-k.
+    pub allowed_entities: Option<Vec<u64>>,
     /// Row-major F32 query matrix.
     pub queries: Vec<f32>,
     pub query_count: usize,
@@ -39011,6 +39013,23 @@ pub fn vector_query_scratch_bytes(
     output_rows: usize,
 ) -> Result<usize> {
     operator_scratch_bytes(input_rows, 256, output_rows, 32)?
+        .checked_add(
+            input_rows
+                .checked_mul(dimension)
+                .and_then(|coordinates| coordinates.checked_mul(2))
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorCode::ResultBudgetExceeded,
+                        "device native vector candidate shape overflow",
+                    )
+                })?,
+        )
+        .ok_or_else(|| {
+            Error::new(
+                ErrorCode::ResultBudgetExceeded,
+                "device native vector candidate scratch overflow",
+            )
+        })?
         .checked_add(
             dimension
                 .checked_mul(query_count)

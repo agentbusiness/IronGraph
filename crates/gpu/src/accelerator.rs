@@ -381,13 +381,15 @@ struct VectorColumn {
     dtype: EmbeddingDType,
     rows: usize,
     entity_ids: Option<Tensor>,
+    /// Dense owner rows: relationships for the semantic relationship column, nodes otherwise.
     node_rows: Option<Tensor>,
+    /// Whether the vector's stable owner ID resolves in the corresponding canonical domain.
     node_backed: Option<Tensor>,
     values: Option<Tensor>,
     squared_norms: Option<Tensor>,
     versions: Option<Tensor>,
     active: Option<Tensor>,
-    entity_rows: BTreeMap<u64, u32>,
+    entity_rows: PersistentMap<u32>,
 }
 
 #[derive(Clone)]
@@ -406,7 +408,6 @@ struct AnnIndex {
     codebook_vector_offsets: Vec<u32>,
     stale_row_ids: Option<Tensor>,
     stale_row_set: BTreeSet<u32>,
-    recall_basis_points: u16,
     build_generation: [u8; 32],
 }
 
@@ -519,6 +520,7 @@ pub struct CandleResident {
     edge_count: usize,
     active_edge_count: usize,
     node_id_rows: PersistentMap<u32>,
+    edge_id_rows: PersistentMap<u32>,
     /// Raw canonical stable IDs. These bit-preserving tensors are the only legal source for
     /// device-produced mutation targets; order-key transforms must never cross that boundary.
     node_entity_ids: Option<Tensor>,
@@ -1251,12 +1253,12 @@ impl CandleResident {
                     )
                 })?;
                 if matches!(mutation, ResolvedVectorMutation::Upsert { .. })
-                    && !property_rows.contains_key(&entity)
+                    && !property_rows.contains_key(stable_id_key(entity))
                 {
                     let row = u32::try_from(property_rows.len()).map_err(|_| {
                         Error::new(ErrorCode::ResultBudgetExceeded, "vector row exceeds u32")
                     })?;
-                    property_rows.insert(entity, row);
+                    property_rows.insert_cow(stable_id_key(entity), row);
                 }
                 affected.insert(property);
             }
@@ -1268,7 +1270,7 @@ impl CandleResident {
                     )
                 })?;
                 bytes = bytes.saturating_add(shared_vector_column_bytes(
-                    rows.get(&property).map_or(0, BTreeMap::len),
+                    rows.get(&property).map_or(0, PersistentMap::len),
                     column.dimension,
                 ));
             }
@@ -1493,6 +1495,21 @@ impl CandleResident {
             }
         }
 
+        let mut edge_id_rows = image.edge_id_rows.clone();
+        if edge_id_rows.len() != graph.edge_ids.len() {
+            edge_id_rows = PersistentMap::default();
+            for (row, id) in graph.edge_ids.iter().enumerate() {
+                edge_id_rows.insert(
+                    stable_id_key(id.0),
+                    u32::try_from(row).map_err(|_| {
+                        Error::new(
+                            ErrorCode::ResultBudgetExceeded,
+                            "relationship row exceeds u32",
+                        )
+                    })?,
+                );
+            }
+        }
         // Stable IDs retain their raw backend-neutral bytes in the shared canonical graph. The
         // signed order-key tensor is derived solely for unsigned device ordering.
         let node_device_capacity = if graph.node_ids.is_empty() {
@@ -1899,7 +1916,8 @@ impl CandleResident {
         };
 
         let (temporal_integer, shared_temporal) = upload_temporal(&mut upload, &image)?;
-        let (vectors, ann, shared_vectors) = upload_indexes(&mut upload, &image, &node_id_rows)?;
+        let (vectors, ann, shared_vectors) =
+            upload_indexes(&mut upload, &image, &node_id_rows, &edge_id_rows)?;
         let allocated_bytes = upload.allocated_bytes;
         let planned = Self::planned_bytes(&image);
         if allocated_bytes > planned {
@@ -1925,6 +1943,7 @@ impl CandleResident {
                 .filter(|active| **active != 0)
                 .count(),
             node_id_rows,
+            edge_id_rows,
             node_entity_ids,
             edge_entity_ids,
             node_id_order_keys,
@@ -2025,7 +2044,12 @@ impl CandleResident {
             staged.apply_shared_temporal_deltas(delta, device)?;
         }
         if shared_vectors {
-            staged.apply_shared_vector_deltas(delta, device)?;
+            staged.apply_shared_vector_deltas(
+                delta,
+                device,
+                &self.node_id_rows,
+                &self.edge_id_rows,
+            )?;
         }
         staged.apply_delta_in_place(delta, device, apply_graph, apply_temporal, apply_vectors)?;
         staged.active_node_count = active_node_count;
@@ -3054,6 +3078,21 @@ impl CandleResident {
         }
 
         if edge_changed {
+            for edge in &delta.graph.edges {
+                match stable_id_row(&self.edge_id_rows, edge.id.0) {
+                    Some(existing) if *existing != edge.dense => {
+                        return Err(Error::new(
+                            ErrorCode::CorruptStorage,
+                            "stable relationship ID moved to a different dense row",
+                        ));
+                    }
+                    None => {
+                        self.edge_id_rows
+                            .insert_cow(stable_id_key(edge.id.0), edge.dense);
+                    }
+                    Some(_) => {}
+                }
+            }
             if edge_append_only {
                 #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
                 {
@@ -3645,6 +3684,8 @@ impl CandleResident {
         &mut self,
         delta: &ResidentProjectDelta,
         device: &Device,
+        previous_node_rows: &PersistentMap<u32>,
+        previous_edge_rows: &PersistentMap<u32>,
     ) -> Result<()> {
         let mut backings = self.shared_vectors.clone();
         let mut entity_rows = self
@@ -3683,7 +3724,7 @@ impl CandleResident {
                 )
             })?;
             apply_shared_vector_mutation(backing, rows, mutation)?;
-            if let Some(row) = rows.get(&entity).copied() {
+            if let Some(row) = stable_id_row(rows, entity).copied() {
                 affected_rows.entry(property).or_default().insert(row);
             }
             affected.insert(property);
@@ -3697,7 +3738,26 @@ impl CandleResident {
                 )
             })?;
             Ok::<_, Error>(
-                total.saturating_add(shared_vector_column_bytes(column.rows, column.dimension)),
+                total.saturating_add(
+                    column
+                        .entity_ids
+                        .iter()
+                        .chain(&column.node_rows)
+                        .chain(&column.node_backed)
+                        .chain(&column.values)
+                        .chain(&column.squared_norms)
+                        .chain(&column.versions)
+                        .chain(&column.active)
+                        .map(|tensor| {
+                            tensor
+                                .elem_count()
+                                .saturating_mul(tensor.dtype().size_in_bytes())
+                        })
+                        .fold(
+                            column.rows.saturating_mul(size_of::<u64>()),
+                            usize::saturating_add,
+                        ),
+                ),
             )
         })?;
         let mut upload = TensorUpload::new(device);
@@ -3716,27 +3776,59 @@ impl CandleResident {
             let similarity = current.similarity;
             let dtype = current.dtype;
             let rows = backing.entity_ids.len();
-            let _raw_entity_ids =
+            if rows != current.rows {
                 metal_share_paged(&mut upload, &mut backing.entity_ids, DType::I64)?;
-            let resident_entity_ids = upload.u64_order_keys(backing.entity_ids.iter().copied())?;
-            let node_rows = upload.optional(
-                &backing
-                    .entity_ids
+            } else {
+                upload.allocated_bytes = upload
+                    .allocated_bytes
+                    .saturating_add(rows * size_of::<u64>());
+            }
+            let owner_rows = if property == crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY {
+                &self.edge_id_rows
+            } else {
+                &self.node_id_rows
+            };
+            let remapped_rows = if property == crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY {
+                delta
+                    .graph
+                    .edges
                     .iter()
-                    .map(|entity| {
-                        stable_id_row(&self.node_id_rows, *entity)
-                            .copied()
-                            .unwrap_or(0)
+                    .filter_map(|edge| {
+                        (stable_id_row(previous_edge_rows, edge.id.0) != Some(&edge.dense))
+                            .then(|| stable_id_row(&current.entity_rows, edge.id.0).copied())
+                            .flatten()
                     })
-                    .collect::<Vec<_>>(),
-            )?;
-            let node_backed = upload.optional(
-                &backing
-                    .entity_ids
+                    .collect::<BTreeSet<_>>()
+            } else {
+                delta
+                    .graph
+                    .nodes
                     .iter()
-                    .map(|entity| u8::from(stable_id_row(&self.node_id_rows, *entity).is_some()))
-                    .collect::<Vec<_>>(),
+                    .filter_map(|node| {
+                        (stable_id_row(previous_node_rows, node.id.0) != Some(&node.dense))
+                            .then(|| stable_id_row(&current.entity_rows, node.id.0).copied())
+                            .flatten()
+                    })
+                    .collect::<BTreeSet<_>>()
+            };
+            let (resident_entity_ids, node_rows, node_backed) = patch_shared_vector_owner_mapping(
+                current,
+                backing,
+                owner_rows,
+                &remapped_rows,
+                device,
             )?;
+            // These allocations remain owned by the replacement, including unchanged shared
+            // mappings. Account them without reading or uploading unrelated owner rows.
+            for tensor in resident_entity_ids
+                .iter()
+                .chain(&node_rows)
+                .chain(&node_backed)
+            {
+                upload.allocated_bytes = upload
+                    .allocated_bytes
+                    .saturating_add(tensor.elem_count() * tensor.dtype().size_in_bytes());
+            }
             let values = metal_share_paged(
                 &mut upload,
                 &mut backing.values,
@@ -3802,12 +3894,23 @@ impl CandleResident {
                         .ok_or_else(|| Error::internal("shared vector row map disappeared"))?,
                 },
             );
-            // The canonical matrix remains exact. The immutable ANN generation is rebuildable and
-            // cannot be used after any row version changes.
-            if let Some(index) = self.ann.remove(&property) {
-                self.allocated_bytes = self
-                    .allocated_bytes
-                    .saturating_sub(ann_index_tensor_bytes(&index));
+            // Keep the immutable postings live and rerank changed rows from the canonical
+            // device matrix. Version filtering excludes their old postings from ANN candidates.
+            if let Some(index) = self.ann.get_mut(&property) {
+                let old_stale_bytes = index
+                    .stale_row_ids
+                    .as_ref()
+                    .map_or(0, |tensor| tensor.elem_count() * size_of::<u32>());
+                for row in affected_rows.get(&property).into_iter().flatten() {
+                    if backing.active.get(*row as usize).copied().unwrap_or(false) {
+                        index.stale_row_set.insert(*row);
+                    } else {
+                        index.stale_row_set.remove(row);
+                    }
+                }
+                index.stale_row_ids =
+                    upload.optional(&index.stale_row_set.iter().copied().collect::<Vec<_>>())?;
+                self.allocated_bytes = self.allocated_bytes.saturating_sub(old_stale_bytes);
             }
         }
         self.shared_vectors = backings;
@@ -4600,6 +4703,10 @@ impl CandleResident {
                 .map(|row| row.dense)
                 .collect::<Vec<_>>();
             if !edge_rows.is_empty() {
+                for edge in &delta.graph.edges {
+                    self.edge_id_rows
+                        .insert_cow(stable_id_key(edge.id.0), edge.dense);
+                }
                 let ids = Tensor::from_slice(
                     &delta
                         .graph
@@ -4779,20 +4886,15 @@ impl CandleResident {
                     &mut self.vectors,
                     &mut self.ann,
                     &self.node_id_rows,
+                    &self.edge_id_rows,
                     mutation,
                     device,
                 )?;
             }
         }
-        if delta.invalidate_derived {
-            let released = self
-                .ann
-                .values()
-                .map(ann_index_tensor_bytes)
-                .fold(0_usize, usize::saturating_add);
-            self.ann.clear();
-            self.allocated_bytes = self.allocated_bytes.saturating_sub(released);
-        }
+        // Canonical vector mutations maintain a version-filtered ANN delta above. Ordinary
+        // graph invalidation must preserve that searchable generation; index administration
+        // replaces the complete resident image instead of using this sparse mutation path.
 
         self.drop_named_tensor_owners();
         self.node_count = delta.graph.node_capacity;
@@ -5124,8 +5226,75 @@ impl CandleResident {
                     .map_err(candle_error)
             })
             .transpose()?;
-        let layer_candidates = if vector.rows == 0 || self.node_count == 0 {
+        let relationship_owned = request.property == crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY;
+        if relationship_owned && request.selection.is_some() {
+            return Err(Error::new(
+                ErrorCode::QueryType,
+                "relationship vector search cannot use a node selection",
+            ));
+        }
+        let layer_candidates = if vector.rows == 0
+            || self.node_count == 0
+            || (relationship_owned && self.edge_count == 0)
+        {
             Tensor::zeros(vector.rows, DType::U8, device).map_err(candle_error)?
+        } else if relationship_owned {
+            let rows = vector
+                .node_rows
+                .as_ref()
+                .ok_or_else(|| Error::internal("relationship vector column has no owner rows"))?
+                .narrow(0, 0, vector.rows)
+                .map_err(candle_error)?;
+            let backed = vector
+                .node_backed
+                .as_ref()
+                .ok_or_else(|| Error::internal("relationship vector column has no owner mask"))?
+                .narrow(0, 0, vector.rows)
+                .map_err(candle_error)?;
+            let mut visible = self
+                .edge_active
+                .as_ref()
+                .ok_or_else(|| Error::internal("relationship vector graph has no activity tensor"))?
+                .index_select(&rows, 0)
+                .and_then(|active| active.broadcast_mul(&backed))
+                .map_err(candle_error)?;
+            if request.layers != LayerMask::ALL {
+                let layers = self
+                    .edge_layers
+                    .as_ref()
+                    .ok_or_else(|| {
+                        Error::internal("relationship vector graph has no layer tensor")
+                    })?
+                    .index_select(&rows, 0)
+                    .map_err(candle_error)?;
+                let mut allowed =
+                    Tensor::zeros(vector.rows, DType::U8, device).map_err(candle_error)?;
+                for layer in crate::Layer::ALL {
+                    if request.layers.contains_layer(layer) {
+                        allowed = allowed
+                            .broadcast_add(&layers.eq(layer as u8).map_err(candle_error)?)
+                            .map_err(candle_error)?;
+                    }
+                }
+                visible = visible.broadcast_mul(&allowed).map_err(candle_error)?;
+            }
+            for endpoints in [&self.edge_sources, &self.edge_targets] {
+                let endpoints = endpoints
+                    .as_ref()
+                    .ok_or_else(|| {
+                        Error::internal("relationship vector graph has no endpoint tensor")
+                    })?
+                    .index_select(&rows, 0)
+                    .map_err(candle_error)?;
+                visible = visible
+                    .broadcast_mul(&self.node_selection_mask_for_rows(
+                        &endpoints,
+                        &[],
+                        request.layers,
+                    )?)
+                    .map_err(candle_error)?;
+            }
+            visible
         } else {
             let visible_nodes = if let Some(selection) = &request.selection {
                 if selection.project != request.project || selection.layers != request.layers {
@@ -5162,6 +5331,26 @@ impl CandleResident {
                 .and_then(|visible| visible.broadcast_mul(&node_backed))
                 .map_err(candle_error)?
         };
+        let layer_candidates = if let Some(allowed) = &request.allowed_entities {
+            let rows = allowed
+                .iter()
+                .filter_map(|id| stable_id_row(&vector.entity_rows, *id).copied())
+                .collect::<BTreeSet<_>>();
+            let rows = rows.into_iter().collect::<Vec<_>>();
+            if rows.is_empty() {
+                Tensor::zeros(vector.rows, DType::U8, device).map_err(candle_error)?
+            } else {
+                let rows = Tensor::from_slice(&rows, rows.len(), device).map_err(candle_error)?;
+                let allowed = scatter_counts(&rows, vector.rows, device)?
+                    .gt(0_u32)
+                    .map_err(candle_error)?;
+                layer_candidates
+                    .broadcast_mul(&allowed)
+                    .map_err(candle_error)?
+            }
+        } else {
+            layer_candidates
+        };
         let selected_ann = match request.access {
             ResidentVectorAccess::Exact => None,
             ResidentVectorAccess::IvfPq => {
@@ -5171,12 +5360,10 @@ impl CandleResident {
                         "physical IVF-PQ access path is not resident",
                     )
                 })?;
-                if ann.recall_basis_points < crate::graph::IVF_PQ_MIN_RECALL_BASIS_POINTS
-                    || ann.build_generation == [0_u8; 32]
-                {
+                if ann.build_generation == [0_u8; 32] {
                     return Err(Error::new(
                         ErrorCode::IndexUnavailable,
-                        "physical IVF-PQ access path is not recall-validated",
+                        "physical IVF-PQ access path has no build generation",
                     ));
                 }
                 Some(ann)
@@ -5224,7 +5411,7 @@ impl CandleResident {
             approximate_candidates: selected_ann.is_some(),
             access: request.access,
             candidate_budget: selected_ann.map_or(0, |ann| {
-                u32::try_from(ann.config.candidate_budget).unwrap_or(u32::MAX)
+                u32::try_from(ann.config.candidate_budget.max(request.limit)).unwrap_or(u32::MAX)
             }),
             build_generation: selected_ann.map_or([0_u8; 32], |ann| ann.build_generation),
         })
@@ -74540,9 +74727,114 @@ fn reorder_integer_temporal_column(
     Ok(())
 }
 
+fn patch_shared_vector_owner_mapping(
+    current: &VectorColumn,
+    backing: &SharedVectorBacking,
+    owner_rows: &PersistentMap<u32>,
+    remapped_rows: &BTreeSet<u32>,
+    device: &Device,
+) -> Result<(Option<Tensor>, Option<Tensor>, Option<Tensor>)> {
+    let mut entity_ids = current.entity_ids.clone();
+    let mut dense_rows = current.node_rows.clone();
+    let mut backed = current.node_backed.clone();
+    let rows = backing.entity_ids.len();
+    if rows == current.rows && remapped_rows.is_empty() {
+        return Ok((entity_ids, dense_rows, backed));
+    }
+    if rows < current.rows {
+        return Err(Error::new(
+            ErrorCode::CorruptStorage,
+            "vector owner rows cannot shrink in a sparse delta",
+        ));
+    }
+    // Appending into unused capacity is invisible to the pinned generation's shorter view.
+    // Updating an already visible owner requires a private copy of just the mapping lanes.
+    if remapped_rows
+        .iter()
+        .any(|row| (*row as usize) < current.rows)
+    {
+        copy_optional_tensor(&mut dense_rows)?;
+        copy_optional_tensor(&mut backed)?;
+    }
+    let capacity = rows.checked_next_power_of_two().unwrap_or(rows).max(64);
+    ensure_tensor_capacity(&mut entity_ids, capacity, DType::I64, device)?;
+    ensure_tensor_capacity(&mut dense_rows, capacity, DType::U32, device)?;
+    ensure_tensor_capacity(&mut backed, capacity, DType::U8, device)?;
+    let appended = (current.rows..rows)
+        .map(|row| {
+            u32::try_from(row).map_err(|_| {
+                Error::new(
+                    ErrorCode::ResultBudgetExceeded,
+                    "vector owner row exceeds u32",
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !appended.is_empty() {
+        let ids = appended
+            .iter()
+            .map(|row| {
+                backing
+                    .entity_ids
+                    .get(*row as usize)
+                    .copied()
+                    .map(u64_order_key)
+                    .ok_or_else(|| Error::internal("appended vector owner is absent"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        scatter_rows(
+            entity_ids
+                .as_ref()
+                .ok_or_else(|| Error::internal("vector owner IDs are absent"))?,
+            &appended,
+            &Tensor::from_slice(&ids, ids.len(), device).map_err(candle_error)?,
+        )?;
+    }
+    let changed = appended
+        .into_iter()
+        .chain(remapped_rows.iter().copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let owners = changed
+        .iter()
+        .map(|row| {
+            let id = backing
+                .entity_ids
+                .get(*row as usize)
+                .copied()
+                .ok_or_else(|| Error::internal("changed vector owner is absent"))?;
+            Ok(stable_id_row(owner_rows, id).copied())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let dense = owners
+        .iter()
+        .map(|row| row.unwrap_or(0))
+        .collect::<Vec<_>>();
+    let live = owners
+        .iter()
+        .map(|row| u8::from(row.is_some()))
+        .collect::<Vec<_>>();
+    scatter_rows(
+        dense_rows
+            .as_ref()
+            .ok_or_else(|| Error::internal("vector owner rows are absent"))?,
+        &changed,
+        &Tensor::from_slice(&dense, dense.len(), device).map_err(candle_error)?,
+    )?;
+    scatter_rows(
+        backed
+            .as_ref()
+            .ok_or_else(|| Error::internal("vector owner mask is absent"))?,
+        &changed,
+        &Tensor::from_slice(&live, live.len(), device).map_err(candle_error)?,
+    )?;
+    Ok((entity_ids, dense_rows, backed))
+}
+
 fn apply_shared_vector_mutation(
     backing: &mut SharedVectorBacking,
-    rows: &mut BTreeMap<u64, u32>,
+    rows: &mut PersistentMap<u32>,
     mutation: &ResolvedVectorMutation,
 ) -> Result<()> {
     let (property, entity, revision) = match mutation {
@@ -74564,7 +74856,7 @@ fn apply_shared_vector_mutation(
             "shared vector mutation targets the wrong property",
         ));
     }
-    let existing = rows.get(&entity).copied();
+    let existing = stable_id_row(rows, entity).copied();
     let row = match (mutation, existing) {
         (ResolvedVectorMutation::Remove { .. }, None) => return Ok(()),
         (_, Some(row)) => row as usize,
@@ -74579,7 +74871,7 @@ fn apply_shared_vector_mutation(
             }
             backing.versions.push(revision);
             backing.active.push(false);
-            rows.insert(entity, encoded);
+            rows.insert_cow(stable_id_key(entity), encoded);
             row
         }
     };
@@ -74644,6 +74936,7 @@ fn apply_vector_delta(
     vectors: &mut BTreeMap<PropertyId, VectorColumn>,
     ann: &mut BTreeMap<PropertyId, AnnIndex>,
     node_id_rows: &PersistentMap<u32>,
+    edge_id_rows: &PersistentMap<u32>,
     mutation: &ResolvedVectorMutation,
     device: &Device,
 ) -> Result<()> {
@@ -74666,7 +74959,7 @@ fn apply_vector_delta(
             "vector delta targets a non-resident canonical column",
         )
     })?;
-    let existing = column.entity_rows.get(&entity).copied();
+    let existing = stable_id_row(&column.entity_rows, entity).copied();
     let row = match (mutation, existing) {
         (ResolvedVectorMutation::Remove { .. }, None) => return Ok(()),
         (_, Some(row)) => row,
@@ -74674,7 +74967,7 @@ fn apply_vector_delta(
             let row = u32::try_from(column.rows).map_err(|_| {
                 Error::new(ErrorCode::ResultBudgetExceeded, "vector row exceeds u32")
             })?;
-            column.entity_rows.insert(entity, row);
+            column.entity_rows.insert_cow(stable_id_key(entity), row);
             column.rows += 1;
             row
         }
@@ -74707,7 +75000,12 @@ fn apply_vector_delta(
         &[row],
         &Tensor::from_slice(&[u64_order_key(entity)], 1, device).map_err(candle_error)?,
     )?;
-    let (node_row, node_backed) = stable_id_row(node_id_rows, entity)
+    let owner_rows = if property == crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY {
+        edge_id_rows
+    } else {
+        node_id_rows
+    };
+    let (node_row, node_backed) = stable_id_row(owner_rows, entity)
         .copied()
         .map_or((0_u32, 0_u8), |row| (row, 1_u8));
     scatter_rows(
@@ -76323,6 +76621,7 @@ fn upload_indexes(
     upload: &mut TensorUpload<'_>,
     image: &ResidentProjectImage,
     node_id_rows: &PersistentMap<u32>,
+    edge_id_rows: &PersistentMap<u32>,
 ) -> Result<(
     BTreeMap<PropertyId, VectorColumn>,
     BTreeMap<PropertyId, AnnIndex>,
@@ -76372,17 +76671,13 @@ fn upload_indexes(
                 "canonical vector image is structurally inconsistent with its profile",
             ));
         }
-        let entity_rows = vector
-            .entity_ids
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(row, entity)| {
-                u32::try_from(row).map(|row| (entity, row)).map_err(|_| {
-                    Error::new(ErrorCode::ResultBudgetExceeded, "vector row exceeds u32")
-                })
-            })
-            .collect::<Result<BTreeMap<_, _>>>()?;
+        let mut entity_rows = PersistentMap::default();
+        for (row, entity) in vector.entity_ids.iter().copied().enumerate() {
+            let row = u32::try_from(row).map_err(|_| {
+                Error::new(ErrorCode::ResultBudgetExceeded, "vector row exceeds u32")
+            })?;
+            entity_rows.insert_cow(stable_id_key(entity), row);
+        }
         if entity_rows.len() != vector.entity_ids.len() {
             return Err(Error::new(
                 ErrorCode::CorruptStorage,
@@ -76396,18 +76691,23 @@ fn upload_indexes(
             metal_shared_paged_from_slice(upload, &vector.entity_ids, DType::I64)?
                 .map(|(_tensor, values)| values);
         let entity_ids = upload.u64_order_keys(vector.entity_ids.iter().copied())?;
+        let owner_rows = if vector.property == crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY {
+            edge_id_rows
+        } else {
+            node_id_rows
+        };
         let node_rows = upload.optional(
             &vector
                 .entity_ids
                 .iter()
-                .map(|entity| stable_id_row(node_id_rows, *entity).copied().unwrap_or(0))
+                .map(|entity| stable_id_row(owner_rows, *entity).copied().unwrap_or(0))
                 .collect::<Vec<_>>(),
         )?;
         let node_backed = upload.optional(
             &vector
                 .entity_ids
                 .iter()
-                .map(|entity| u8::from(stable_id_row(node_id_rows, *entity).is_some()))
+                .map(|entity| u8::from(stable_id_row(owner_rows, *entity).is_some()))
                 .collect::<Vec<_>>(),
         )?;
         let vector_dtype = match vector.dtype {
@@ -76703,7 +77003,6 @@ fn upload_ann(
         codebook_vector_offsets: ann.codebook_vector_offsets.clone(),
         stale_row_ids,
         stale_row_set,
-        recall_basis_points: ann.recall_basis_points,
         build_generation: ann.build_generation,
     })
 }
@@ -76953,25 +77252,6 @@ fn shared_vector_column_bytes(rows: usize, dimension: usize) -> usize {
     )
 }
 
-fn ann_index_tensor_bytes(index: &AnnIndex) -> usize {
-    index
-        .coarse
-        .iter()
-        .chain(&index.rows)
-        .chain(&index.built_versions)
-        .chain(&index.codes)
-        .chain(&index.codebook_values)
-        .chain(std::iter::once(&index.list_offsets))
-        .chain(&index.list_positions)
-        .chain(&index.stale_row_ids)
-        .map(|tensor| {
-            tensor
-                .elem_count()
-                .saturating_mul(tensor.dtype().size_in_bytes())
-        })
-        .fold(0_usize, usize::saturating_add)
-}
-
 fn shared_temporal_column_bytes(backing: &TemporalCanonicalColumn) -> usize {
     let integer = backing.value_type == TemporalType::Integer;
     let derived_order_bytes = usize::from(integer)
@@ -77042,13 +77322,6 @@ fn ann_candidate_rows(
             "resident IVF-PQ query shape is invalid",
         ));
     }
-    if limit > ann.config.candidate_budget || ann.stale_row_set.len() > ann.config.candidate_budget
-    {
-        return Err(Error::new(
-            ErrorCode::IndexUnavailable,
-            "resident IVF-PQ candidate or mutable-delta budget is exceeded",
-        ));
-    }
     let coarse = ann
         .coarse
         .as_ref()
@@ -77082,6 +77355,19 @@ fn ann_candidate_rows(
         .map_err(candle_error)?;
     let stale_rows = visible_ann_stale_rows(ann, &vector_active, visibility, device, cancellation)?;
     if ann_positions.elem_count() == 0 {
+        if stale_rows.elem_count() < limit && probe_count < ann.coarse_count {
+            let mut expanded = ann.clone();
+            expanded.config.probes = probe_count.saturating_mul(2).min(ann.coarse_count);
+            return ann_candidate_rows(
+                &expanded,
+                vector,
+                visibility,
+                limit,
+                device,
+                query,
+                cancellation,
+            );
+        }
         return Ok(stale_rows);
     }
     let all_rows = ann
@@ -77118,7 +77404,11 @@ fn ann_candidate_rows(
             &Tensor::full(f32::INFINITY, approximate.elem_count(), device).map_err(candle_error)?,
         )
         .map_err(candle_error)?;
-    let candidate_budget = ann.config.candidate_budget.min(masked.elem_count());
+    let candidate_budget = ann
+        .config
+        .candidate_budget
+        .max(limit)
+        .min(masked.elem_count());
     if candidate_budget == 0 {
         return Err(Error::new(
             ErrorCode::CorruptStorage,
@@ -77154,19 +77444,33 @@ fn ann_candidate_rows(
         device,
         cancellation,
     )?;
-    let candidate_rows = candidate_rows
-        .index_select(&valid_positions, 0)
-        .map_err(candle_error)?;
+    let candidate_rows = device_index_select(&candidate_rows, &valid_positions, 0)?;
     // Built-version filtering makes these fresh approximate rows disjoint from the compact exact
     // mutable delta.
     ensure_not_cancelled(cancellation)?;
-    if candidate_rows.elem_count() == 0 {
-        return Ok(stale_rows);
+    let candidates = if candidate_rows.elem_count() == 0 {
+        stale_rows
+    } else if stale_rows.elem_count() == 0 {
+        candidate_rows
+    } else {
+        Tensor::cat(&[&candidate_rows, &stale_rows], 0).map_err(candle_error)?
+    };
+    // Layer filtering and sparse lists must not turn a requested top-k into an arbitrary
+    // short page when more live vectors are available in other lists.
+    if candidates.elem_count() < limit && probe_count < ann.coarse_count {
+        let mut expanded = ann.clone();
+        expanded.config.probes = probe_count.saturating_mul(2).min(ann.coarse_count);
+        return ann_candidate_rows(
+            &expanded,
+            vector,
+            visibility,
+            limit,
+            device,
+            query,
+            cancellation,
+        );
     }
-    if stale_rows.elem_count() == 0 {
-        return Ok(candidate_rows);
-    }
-    Tensor::cat(&[&candidate_rows, &stale_rows], 0).map_err(candle_error)
+    Ok(candidates)
 }
 
 fn visible_ann_stale_rows(
@@ -77188,7 +77492,7 @@ fn visible_ann_stale_rows(
         .and_then(|visible| visible.gt(0_u8))
         .map_err(candle_error)?;
     let positions = selected_positions(&visible, stale_rows.elem_count(), device, cancellation)?;
-    stale_rows.index_select(&positions, 0).map_err(candle_error)
+    device_index_select(stale_rows, &positions, 0)
 }
 
 fn ann_probe_positions(
@@ -77424,9 +77728,7 @@ fn score_device_vectors(
         device,
         cancellation,
     )?;
-    let candidate_rows = candidate_rows
-        .index_select(&active_positions, 0)
-        .map_err(candle_error)?;
+    let candidate_rows = device_index_select(&candidate_rows, &active_positions, 0)?;
     let candidate_count = candidate_rows.elem_count();
     if candidate_count == 0 {
         return Ok(Vec::new());
@@ -78044,8 +78346,14 @@ mod tests {
             revision: 2,
             coordinates,
         };
-        let mut small_rows = (0..40).map(|row| (row, row as u32)).collect();
-        let mut large_rows = (0..40_000).map(|row| (row, row as u32)).collect();
+        let mut small_rows = crate::graph::PersistentMap::default();
+        let mut large_rows = crate::graph::PersistentMap::default();
+        for row in 0..40_000 {
+            large_rows.insert_cow(super::stable_id_key(row), row as u32);
+            if row < 40 {
+                small_rows.insert_cow(super::stable_id_key(row), row as u32);
+            }
+        }
         super::apply_shared_vector_mutation(&mut small, &mut small_rows, &mutation)?;
         super::apply_shared_vector_mutation(&mut large, &mut large_rows, &mutation)?;
         let range = 17 * dimension..18 * dimension;
@@ -81712,7 +82020,6 @@ mod tests {
             codebook_vector_offsets: vec![0, 1, 2, 3],
             stale_row_ids: None,
             stale_row_set: BTreeSet::new(),
-            recall_basis_points: 10_000,
             build_generation: [1_u8; 32],
         })
     }
@@ -81734,8 +82041,422 @@ mod tests {
             active: Some(
                 Tensor::from_slice(&[1_u8, 1, 1], 3, device).map_err(super::candle_error)?,
             ),
-            entity_rows: BTreeMap::new(),
+            entity_rows: crate::graph::PersistentMap::default(),
         })
+    }
+
+    fn semantic_relationship_fixture() -> crate::Result<(GraphStore, ResidentProjectImage)> {
+        use crate::graph::{
+            AnnDeviceImage, DerivedIndexDeviceImage, EmbeddingProfile, VectorDeviceImage,
+        };
+        let mut graph = GraphStore::default();
+        let relationship_type = graph.catalog_mut().intern_relationship_type("KNOWS")?;
+        for (id, layer) in [
+            (1, Layer::Observed),
+            (2, Layer::Observed),
+            (3, Layer::Knowledge),
+        ] {
+            graph.insert_node(NodeInput {
+                id: NodeId(id),
+                layer,
+                revision: 1,
+                labels: Vec::new(),
+                properties: Vec::new(),
+            })?;
+        }
+        for row in 0..16 {
+            graph.insert_edge(EdgeInput {
+                id: EdgeId(100 + row),
+                source: NodeId(1),
+                target: NodeId(if row == 14 { 3 } else { 2 }),
+                relationship_type,
+                layer: match row {
+                    12 | 13 => Layer::Knowledge,
+                    15 => Layer::Workspace,
+                    _ => Layer::Observed,
+                },
+                revision: 1,
+                properties: Vec::new(),
+            })?;
+        }
+        let mut image = ResidentProjectImage::graph_only(Arc::new(graph.snapshot()?));
+        let property = crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY;
+        image.indexes.profile = Some(EmbeddingProfile::new(
+            [1; 32],
+            [2; 32],
+            2,
+            EmbeddingDType::F16,
+            false,
+            Similarity::Euclidean,
+        )?);
+        image.indexes.vectors.push(VectorDeviceImage {
+            property,
+            dimension: 2,
+            similarity: Similarity::Euclidean,
+            dtype: EmbeddingDType::F16,
+            entity_ids: (100..116).collect(),
+            values: (0..16)
+                .flat_map(|row| [f16::from_f32(row as f32).to_bits(), 0])
+                .collect(),
+            versions: vec![1; 16],
+            active: vec![1; 16],
+        });
+        image.indexes.indexes.push(DerivedIndexDeviceImage::Vector {
+            name: "semantic_relationship_fixture".to_owned(),
+            property,
+            approximate: Some(AnnDeviceImage {
+                config: IvfPqConfig {
+                    coarse_centroids: 16,
+                    subquantizers: 1,
+                    bits_per_code: 8,
+                    probes: 2,
+                    candidate_budget: 2,
+                    iterations: 1,
+                    seed: 1,
+                    size_class_version: crate::graph::IVF_PQ_SIZE_CLASS_VERSION,
+                },
+                dimension: 2,
+                similarity: Similarity::Euclidean,
+                coarse_values: (0..16).flat_map(|row| [row as f32, 0.0]).collect(),
+                coarse_count: 16,
+                codebook_subspace_offsets: vec![0, 1],
+                codebook_vector_offsets: vec![0, 2],
+                codebook_values: vec![0.0, 0.0],
+                rows: (0..16).collect(),
+                codes: vec![0; 16],
+                list_offsets: (0..=16).collect(),
+                list_positions: (0..16).collect(),
+                built_versions: vec![1; 16],
+                build_generation: [1; 32],
+            }),
+        });
+        Ok((graph, image))
+    }
+
+    fn semantic_relationship_sparse_owner_mapping_shape(device: &Device) -> crate::Result<()> {
+        for count in [40_usize, 40_000] {
+            let base = 1_u64 << 50;
+            let mut owners = crate::graph::PersistentMap::default();
+            let mut rows = crate::graph::PersistentMap::default();
+            let mut backing = SharedVectorBacking {
+                property: crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY,
+                dimension: 2,
+                entity_ids: PagedVec::default(),
+                values: PagedVec::default(),
+                versions: PagedVec::default(),
+                active: PagedVec::default(),
+            };
+            for row in 0..count {
+                let id = base + row as u64;
+                owners.insert_cow(super::stable_id_key(id), row as u32);
+                rows.insert_cow(super::stable_id_key(id), row as u32);
+                backing.entity_ids.push(id);
+                backing.values.push(f16::from_f32(65_000.0).to_bits());
+                backing.values.push(f16::from_f32(-65_000.0).to_bits());
+                backing.versions.push(900 + row as u64);
+                backing.active.push(row % 5 != 0);
+            }
+            let current = VectorColumn {
+                dimension: 2,
+                similarity: Similarity::Euclidean,
+                dtype: EmbeddingDType::F16,
+                rows: count,
+                entity_ids: Some(
+                    Tensor::from_slice(
+                        &(0..count)
+                            .map(|row| u64_order_key(base + row as u64))
+                            .collect::<Vec<_>>(),
+                        count,
+                        device,
+                    )
+                    .map_err(super::candle_error)?,
+                ),
+                node_rows: Some(
+                    Tensor::from_slice(&(0..count as u32).collect::<Vec<_>>(), count, device)
+                        .map_err(super::candle_error)?,
+                ),
+                node_backed: Some(
+                    Tensor::ones(count, candle_core::DType::U8, device)
+                        .map_err(super::candle_error)?,
+                ),
+                values: None,
+                squared_norms: None,
+                versions: None,
+                active: None,
+                entity_rows: rows.clone(),
+            };
+            super::apply_shared_vector_mutation(
+                &mut backing,
+                &mut rows,
+                &ResolvedVectorMutation::Upsert {
+                    property: crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY,
+                    entity_id: base + 17,
+                    revision: 50_000,
+                    coordinates: vec![f16::from_f32(0.5).to_bits(), f16::from_f32(0.25).to_bits()],
+                },
+            )?;
+            assert!(
+                rows.shared_with(&current.entity_rows),
+                "editing coordinates must not clone all owner lookup entries"
+            );
+            let (ids, dense, mask) = super::patch_shared_vector_owner_mapping(
+                &current,
+                &backing,
+                &owners,
+                &BTreeSet::new(),
+                device,
+            )?;
+            assert_eq!(
+                ids.as_ref().map(Tensor::id),
+                current.entity_ids.as_ref().map(Tensor::id)
+            );
+            assert_eq!(
+                dense.as_ref().map(Tensor::id),
+                current.node_rows.as_ref().map(Tensor::id)
+            );
+            assert_eq!(
+                mask.as_ref().map(Tensor::id),
+                current.node_backed.as_ref().map(Tensor::id)
+            );
+            let appended_id = base + count as u64;
+            owners.insert_cow(super::stable_id_key(appended_id), count as u32);
+            super::apply_shared_vector_mutation(
+                &mut backing,
+                &mut rows,
+                &ResolvedVectorMutation::Upsert {
+                    property: crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY,
+                    entity_id: appended_id,
+                    revision: 50_001,
+                    coordinates: vec![f16::from_f32(0.75).to_bits(), 0],
+                },
+            )?;
+            assert!(super::stable_id_row(&current.entity_rows, appended_id).is_none());
+            let (ids, dense, mask) = super::patch_shared_vector_owner_mapping(
+                &current,
+                &backing,
+                &owners,
+                &BTreeSet::new(),
+                device,
+            )?;
+            assert_eq!(
+                ids.as_ref()
+                    .ok_or_else(|| Error::internal("missing owner IDs"))?
+                    .narrow(0, count, 1)
+                    .and_then(|tensor| tensor.to_vec1::<i64>())
+                    .map_err(super::candle_error)?,
+                vec![u64_order_key(appended_id)]
+            );
+            assert_eq!(
+                dense
+                    .as_ref()
+                    .ok_or_else(|| Error::internal("missing owner rows"))?
+                    .narrow(0, count, 1)
+                    .and_then(|tensor| tensor.to_vec1::<u32>())
+                    .map_err(super::candle_error)?,
+                vec![count as u32]
+            );
+            assert_eq!(
+                mask.as_ref()
+                    .ok_or_else(|| Error::internal("missing owner mask"))?
+                    .narrow(0, count, 1)
+                    .and_then(|tensor| tensor.to_vec1::<u8>())
+                    .map_err(super::candle_error)?,
+                vec![1]
+            );
+            assert_eq!(
+                current.entity_ids.as_ref().map(Tensor::elem_count),
+                Some(count)
+            );
+        }
+        Ok(())
+    }
+
+    fn semantic_relationship_search_on(device: &Device) -> crate::Result<()> {
+        use crate::{CpuBackend, ExecutionBackend, ResidentVectorAccess, ResidentVectorQuery};
+        let (mut graph, image) = semantic_relationship_fixture()?;
+        let mut cpu = CpuBackend::new(128 * 1024 * 1024, 0);
+        cpu.admit_project(image.clone())?;
+        let mut resident = CandleResident::upload(image, device)?;
+        let cancellation = CancellationToken::new();
+        let property = crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY;
+        let mut query = ResidentVectorQuery {
+            project: ProjectId(uuid::Uuid::nil()),
+            property,
+            layers: LayerMask::ALL,
+            selection: None,
+            allowed_entities: None,
+            queries: vec![0.0, 0.0],
+            query_count: 1,
+            limit: 16,
+            access: ResidentVectorAccess::Exact,
+        };
+        let compare = |resident: &CandleResident,
+                       cpu: &CpuBackend,
+                       query: &ResidentVectorQuery|
+         -> crate::Result<Vec<u64>> {
+            let expected = cpu.search_vectors(query, &cancellation)?;
+            for access in [ResidentVectorAccess::Exact, ResidentVectorAccess::IvfPq] {
+                let mut accelerated = query.clone();
+                accelerated.access = access;
+                let actual = resident.search_vectors(device, &accelerated, &cancellation)?;
+                assert_eq!(actual.access, access);
+                assert_eq!(actual.hits[0].len(), expected.hits[0].len());
+                for (actual, expected) in actual.hits[0].iter().zip(&expected.hits[0]) {
+                    assert_eq!(actual.entity_id, expected.entity_id);
+                    assert!(actual.score.is_finite());
+                    assert!((actual.score - expected.score).abs() < 0.001);
+                }
+            }
+            Ok(expected.hits[0].iter().map(|hit| hit.entity_id).collect())
+        };
+        assert_eq!(
+            compare(&resident, &cpu, &query)?,
+            (100..116).collect::<Vec<_>>()
+        );
+        query.layers = LayerMask::OBSERVED;
+        assert_eq!(
+            compare(&resident, &cpu, &query)?,
+            (100..112).collect::<Vec<_>>()
+        );
+        query.layers = LayerMask::ALL;
+        query.allowed_entities = Some(vec![115, 110, 112, 112, 999]);
+        assert_eq!(compare(&resident, &cpu, &query)?, vec![110, 112, 115]);
+        query.allowed_entities = Some(Vec::new());
+        assert!(compare(&resident, &cpu, &query)?.is_empty());
+        query.allowed_entities = None;
+        let update = ResidentProjectDelta {
+            project: query.project,
+            bookmark: Bookmark { term: 0, index: 2 },
+            graph: graph.device_delta(2)?,
+            temporal: Vec::new(),
+            vectors: [(105, 0.01), (106, 2.5), (107, 3.5)]
+                .into_iter()
+                .map(|(entity_id, value)| ResolvedVectorMutation::Upsert {
+                    property,
+                    entity_id,
+                    revision: 2,
+                    coordinates: vec![f16::from_f32(value).to_bits(), 0],
+                })
+                .collect(),
+            invalidate_derived: true,
+        };
+        let previous_mapping = resident
+            .vectors
+            .get(&property)
+            .ok_or_else(|| Error::internal("missing test vector column"))?
+            .clone();
+        resident = resident.stage_delta(&update, device)?;
+        let updated_mapping = resident
+            .vectors
+            .get(&property)
+            .ok_or_else(|| Error::internal("missing updated vector column"))?;
+        assert!(
+            previous_mapping
+                .entity_rows
+                .shared_with(&updated_mapping.entity_rows)
+        );
+        if device.is_metal() {
+            assert_eq!(
+                previous_mapping.entity_ids.as_ref().map(Tensor::id),
+                updated_mapping.entity_ids.as_ref().map(Tensor::id)
+            );
+            assert_eq!(
+                previous_mapping.node_rows.as_ref().map(Tensor::id),
+                updated_mapping.node_rows.as_ref().map(Tensor::id)
+            );
+            assert_eq!(
+                previous_mapping.node_backed.as_ref().map(Tensor::id),
+                updated_mapping.node_backed.as_ref().map(Tensor::id)
+            );
+        }
+        cpu.apply_project_delta(update)?;
+        assert_eq!(&compare(&resident, &cpu, &query)?[..3], &[100, 105, 101]);
+        let relationship_type = graph.catalog_mut().intern_relationship_type("KNOWS")?;
+        graph.insert_edge(EdgeInput {
+            id: EdgeId(117),
+            source: NodeId(1),
+            target: NodeId(2),
+            relationship_type,
+            layer: Layer::Observed,
+            revision: 3,
+            properties: Vec::new(),
+        })?;
+        let append = ResidentProjectDelta {
+            project: query.project,
+            bookmark: Bookmark { term: 0, index: 3 },
+            graph: graph.device_delta(3)?,
+            temporal: Vec::new(),
+            vectors: vec![ResolvedVectorMutation::Upsert {
+                property,
+                entity_id: 117,
+                revision: 3,
+                coordinates: vec![f16::from_f32(0.1).to_bits(), 0],
+            }],
+            invalidate_derived: true,
+        };
+        resident = resident.stage_delta(&append, device)?;
+        cpu.apply_project_delta(append)?;
+        query.limit = 17;
+        assert_eq!(
+            &compare(&resident, &cpu, &query)?[..4],
+            &[100, 105, 117, 101]
+        );
+        graph.delete_edge(EdgeId(100), 4)?;
+        graph.delete_node(NodeId(3), true, 4)?;
+        let deleted = ResidentProjectDelta {
+            project: query.project,
+            bookmark: Bookmark { term: 0, index: 4 },
+            graph: graph.device_delta(4)?,
+            temporal: Vec::new(),
+            vectors: vec![ResolvedVectorMutation::Remove {
+                property,
+                entity_id: 100,
+                revision: 4,
+            }],
+            invalidate_derived: true,
+        };
+        resident = resident.stage_delta(&deleted, device)?;
+        cpu.apply_project_delta(deleted)?;
+        let remaining = compare(&resident, &cpu, &query)?;
+        assert_eq!(remaining.len(), 15);
+        assert!(!remaining.contains(&100));
+        assert!(!remaining.contains(&114));
+        let cleared = ResidentProjectDelta {
+            project: query.project,
+            bookmark: Bookmark { term: 0, index: 5 },
+            graph: graph.device_delta(5)?,
+            temporal: Vec::new(),
+            vectors: vec![ResolvedVectorMutation::Remove {
+                property,
+                entity_id: 105,
+                revision: 5,
+            }],
+            invalidate_derived: true,
+        };
+        resident = resident.stage_delta(&cleared, device)?;
+        cpu.apply_project_delta(cleared)?;
+        query.allowed_entities = Some(vec![105]);
+        assert!(compare(&resident, &cpu, &query)?.is_empty());
+        semantic_relationship_sparse_owner_mapping_shape(device)?;
+        device.synchronize().map_err(super::candle_error)?;
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_relationship_cpu_reference_and_nonshared_resident_rank_updates() -> crate::Result<()>
+    {
+        semantic_relationship_search_on(&Device::Cpu)
+    }
+
+    #[cfg(all(feature = "accelerator", target_os = "macos"))]
+    #[test]
+    fn semantic_relationship_metal_resident_rank_layers_updates_and_topk_fill() -> crate::Result<()>
+    {
+        let _guard = metal_sort_test_guard();
+        let device = Device::new_metal(0).map_err(super::candle_error)?;
+        assert!(device.is_metal());
+        eprintln!("semantic_relationship: executing vector retrieval on Metal device 0");
+        semantic_relationship_search_on(&device)
     }
 
     #[test]
@@ -83831,18 +84552,20 @@ mod tests {
     }
 
     #[test]
-    fn native_vector_scoring_has_row_linear_widening_scratch() -> crate::Result<()> {
+    fn native_vector_scoring_reserves_native_gather_and_row_linear_widening_scratch()
+    -> crate::Result<()> {
         let rows = 1_000_000_usize;
+        let input_rows = rows.saturating_mul(2);
         let dimension = 384_usize;
-        let scratch = vector_query_scratch_bytes(rows.saturating_mul(2), dimension, 1, 100)?;
-        let full_matrix_widening = rows
+        let scratch = vector_query_scratch_bytes(input_rows, dimension, 1, 100)?;
+        let full_matrix_widening = input_rows
             .checked_mul(dimension)
             .and_then(|coordinates| coordinates.checked_mul(std::mem::size_of::<f32>()))
             .ok_or_else(|| Error::internal("test vector shape overflow"))?;
         assert!(scratch < full_matrix_widening);
         assert_eq!(
-            vector_query_scratch_bytes(rows.saturating_mul(2), dimension * 2, 1, 100)? - scratch,
-            dimension * 6
+            vector_query_scratch_bytes(input_rows, dimension * 2, 1, 100)? - scratch,
+            dimension * (6 + input_rows * 2)
         );
 
         let device = Device::Cpu;
@@ -83875,7 +84598,7 @@ mod tests {
             ),
             versions: None,
             active: Some(Tensor::from_slice(&[1_u8, 1], 2, &device).map_err(super::candle_error)?),
-            entity_rows: BTreeMap::new(),
+            entity_rows: crate::graph::PersistentMap::default(),
         };
         let candidates =
             Tensor::from_slice(&[0_u32, 1], 2, &device).map_err(super::candle_error)?;

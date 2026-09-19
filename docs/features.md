@@ -82,9 +82,28 @@ application deliberately writes domain data.
 
 ## Vectors, text embedding, and documents
 
-Nodes can store vectors and source text. Declared vector and embedding indexes support similarity
-search and automatic embedding while keeping derived representation separate from canonical graph
-entities.
+Nodes and relationships contribute meaningful content to automatic semantic search when the local
+embedding model is enabled. This includes documents, emails, tables, people, calendar plans, and
+tasks represented in the graph. Relationship meaning includes the relationship type, its content,
+and identifying names from its endpoints. Operational metadata, identifiers, and source URLs are
+excluded by field-selection rules.
+
+Existing content is embedded when the project is prepared; later writes maintain its searchable
+representation automatically. Source text remains complete. Derived vectors do not create extra
+graph entities. You can also declare an embedding index for a specific node text property or a
+vector index for vectors you supply.
+
+```cypher
+USE knowledge
+SEARCH entity IN (EMBEDDING INDEX graph_semantic
+                  FOR TEXT 'plans for the product launch' LIMIT 10)
+  SCORE AS score
+RETURN entity, score
+```
+
+The query returns up to ten nodes and relationships ordered by descending similarity score.
+Vector retrieval runs on the selected execution device; GPU-backed instances use their selected
+GPU, and CPU instances use the CPU backend.
 
 A document is an ordinary graph node:
 
@@ -120,7 +139,7 @@ choose one database directory and should protect and back up that directory as a
 
 The Query API is available at `POST /api/query`. It is the only browser-facing data endpoint and
 streams typed query results. The built-in web application provides Query, Streams, Documents,
-Training, and Docs below `/web/`. Graph is the Plot result view inside Query.
+Training, Docs, and Settings below `/web/`. Graph is the Plot result view inside Query.
 
 ## Kafka-compatible Streams
 
@@ -182,6 +201,7 @@ The web application is intentionally focused:
 - **Training** guides you through the open reference datasets and runs explained investigations.
 - **Docs** provides a searchable reader for the bundled public documentation and runs its Cypher
   examples.
+- **Settings** controls console preferences and local AI integrations.
 
 These views share the same database and public query surface. They do not introduce a parallel data
 model or administration API.

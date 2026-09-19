@@ -74,3 +74,38 @@ fn remote_connections_preserve_loopback_boundary() {
         Err(error) => assert_eq!(error.code, "CONFIGURATION"),
     }
 }
+
+#[test]
+#[ignore = "release qualification: loads the pinned local embedding model"]
+fn automatic_semantic_native_and_remote() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let device = match std::env::var("IRONGRAPH_QUALIFY_DEVICE").as_deref() {
+        Ok("metal") => ExecutionDevice::Metal(0),
+        Ok("cuda") => ExecutionDevice::Cuda(0),
+        _ => ExecutionDevice::Cpu,
+    };
+    let database = EmbeddedDatabase::open(
+        EmbeddedOptions::new(directory.path()).with_execution_device(device),
+    )?;
+    database.query(Query::new("CREATE PROJECT semantic"))?;
+    database.query(Query::new("USE semantic CREATE (p:Person {name:'Ada'}), (t:Task {title:'Arrange lessons'}), (t)-[:ASSIGNED_TO {description:'guitar music tuition'}]->(p)"))?;
+    let result = database.query(Query::new("USE semantic SEARCH entity IN (EMBEDDING INDEX graph_semantic FOR TEXT 'guitar music tuition' LIMIT 10) SCORE AS score RETURN entity, score"))?;
+    assert_eq!(result.rows.len(), 3);
+    assert_eq!(result.rows[0][0]["type"], "relationship");
+    assert!(
+        result
+            .rows
+            .windows(2)
+            .all(|pair| pair[0][1]["value"].as_f64().unwrap()
+                >= pair[1][1]["value"].as_f64().unwrap())
+    );
+    database.close()?;
+    if let Ok(url) = std::env::var("IRONGRAPH_QUALIFY_API") {
+        let client = RemoteClient::api(&url)?;
+        let result = client.query(Query::new("USE acceptance SEARCH entity IN (EMBEDDING INDEX graph_semantic FOR TEXT 'contract negotiation supplier agreements' LIMIT 8) SCORE AS score RETURN entity, score"))?;
+        assert_eq!(result.rows.len(), 8);
+        assert_eq!(result.rows[0][0]["type"], "relationship");
+        client.close()?;
+    }
+    Ok(())
+}

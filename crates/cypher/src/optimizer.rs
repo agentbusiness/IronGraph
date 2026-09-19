@@ -5,10 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use crate::{
     ScalarValue,
     execution::{BackendKind, metal_i64_sort_scratch_bytes},
-    graph::{
-        IVF_PQ_MIN_RECALL_BASIS_POINTS, IndexCatalog, LayerMask, NameCatalog,
-        OptimizerIndexStatistics, StatisticsSnapshot,
-    },
+    graph::{IndexCatalog, LayerMask, NameCatalog, OptimizerIndexStatistics, StatisticsSnapshot},
 };
 
 use super::{
@@ -1519,6 +1516,12 @@ fn choose_vector_access(
         .saturating_mul(2)
         .saturating_mul(256)
         .saturating_add(
+            resident_node_rows
+                .saturating_mul(2)
+                .saturating_mul(dimension)
+                .saturating_mul(2),
+        )
+        .saturating_add(
             result_limit
                 .saturating_mul(query_batch_u64)
                 .saturating_mul(32),
@@ -1547,12 +1550,10 @@ fn choose_vector_access(
         .saturating_mul(query_batch_u64);
     let ann_capable = backend_capability_bits(backend) & CAP_VECTOR_ANN != 0;
     let sufficiently_selective = filtered_rows > candidate_budget.saturating_mul(4).max(1);
-    let recall_eligible = statistics.ann_recall_basis_points >= IVF_PQ_MIN_RECALL_BASIS_POINTS;
     if !ann_capable
         || candidate_budget == 0
         || result_limit > candidate_budget
         || !sufficiently_selective
-        || !recall_eligible
         || ann_scratch > scratch_budget_bytes as u64
         || ann_work >= exact_work
     {
@@ -1566,7 +1567,6 @@ fn choose_vector_access(
         query_batch: query_batch.max(1),
         candidate_budget,
         scratch_bytes: ann_scratch,
-        recall_basis_points: statistics.ann_recall_basis_points,
     }
 }
 
@@ -2749,7 +2749,7 @@ fn pattern_external_requirements(pattern: &Pattern) -> BTreeSet<String> {
         .collect()
 }
 
-fn expression_variables(expression: &Expression) -> BTreeSet<String> {
+pub(crate) fn expression_variables(expression: &Expression) -> BTreeSet<String> {
     let mut output = BTreeSet::new();
     collect_expression_variables(expression, &mut output, &BTreeSet::new());
     output
@@ -4008,7 +4008,7 @@ mod tests {
     }
 
     #[test]
-    fn vector_access_is_population_recall_backend_and_scratch_gated() {
+    fn vector_access_is_population_backend_and_scratch_gated() {
         let statistics = OptimizerIndexStatistics {
             name: "semantic".to_owned(),
             kind: crate::graph::GraphIndexKind::Vector,
@@ -4019,7 +4019,6 @@ mod tests {
             largest_posting: 0,
             vector_rows: 1_000_000,
             ann_candidate_budget: 1_024,
-            ann_recall_basis_points: IVF_PQ_MIN_RECALL_BASIS_POINTS,
             resident_bytes: 1,
         };
         assert!(matches!(
@@ -4062,21 +4061,6 @@ mod tests {
                 100,
                 384,
                 BackendKind::Cpu,
-                usize::MAX,
-            ),
-            VectorAccessPath::Exact { .. }
-        ));
-        let mut unvalidated = statistics.clone();
-        unvalidated.ann_recall_basis_points = IVF_PQ_MIN_RECALL_BASIS_POINTS - 1;
-        assert!(matches!(
-            choose_vector_access(
-                Some(&unvalidated),
-                1_000_000,
-                1_000_000,
-                1,
-                100,
-                384,
-                BackendKind::Metal,
                 usize::MAX,
             ),
             VectorAccessPath::Exact { .. }

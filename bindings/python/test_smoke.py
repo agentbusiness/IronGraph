@@ -131,6 +131,18 @@ def embedding_qualification() -> None:
         with EmbeddedDatabase(temporary, device=device, load_embeddings=True) as database:
             database.query("CREATE PROJECT semantic")
             database.query(
+                "USE semantic CREATE (p:Person {name:'Ada'}), (t:Task {title:'Arrange lessons'}), "
+                "(t)-[:ASSIGNED_TO {description:'guitar music tuition'}]->(p)"
+            )
+            automatic = database.query(
+                "USE semantic SEARCH entity IN (EMBEDDING INDEX graph_semantic "
+                "FOR TEXT 'guitar music tuition' LIMIT 10) SCORE AS score RETURN entity, score"
+            )
+            assert len(automatic["rows"]) == 3
+            assert automatic["rows"][0][0]["type"] == "relationship"
+            scores = [row[1]["value"] for row in automatic["rows"]]
+            assert scores == sorted(scores, reverse=True)
+            database.query(
                 "USE semantic CREATE (:Document {id: 'graph', body: $body, embedding: [0.0]})",
                 parameters={"body": "Graph databases store nodes and relationships for connected data."},
             )
@@ -159,6 +171,10 @@ def embedding_qualification() -> None:
             assert result["rows"][0][1]["value"] == "Documents remain complete graph records after editing."
             database.snapshot()
         with EmbeddedDatabase(temporary, device=device, load_embeddings=True) as reopened:
+            assert len(reopened.query(
+                "USE semantic SEARCH entity IN (EMBEDDING INDEX graph_semantic "
+                "FOR TEXT 'guitar lessons' LIMIT 10) SCORE AS score RETURN entity"
+            )["rows"]) == 4
             assert len(reopened.query(search, parameters={"text": "complete documents"})["rows"]) == 1
             reopened.query("USE semantic MATCH (d:Document) DELETE d")
             assert not reopened.query(search, parameters={"text": "complete documents"})["rows"]

@@ -715,9 +715,6 @@ pub struct AnnDeviceImage {
     pub list_offsets: Vec<u32>,
     pub list_positions: Vec<u32>,
     pub built_versions: Vec<u64>,
-    /// Recall measured against deterministic exact top-k queries before publication.
-    pub recall_basis_points: u16,
-    pub validation_queries: u16,
     /// Stable identity of the complete validated derived page generation.
     pub build_generation: [u8; 32],
 }
@@ -1036,10 +1033,23 @@ impl VectorIndex {
     }
 
     pub fn exact_search(&self, query: &[f32], limit: usize) -> Result<Vec<VectorHit>> {
+        self.exact_search_where(query, limit, |_| true)
+    }
+
+    /// Filters visible owners before ranking so hidden or nonmatching entities never consume k.
+    pub fn exact_search_where(
+        &self,
+        query: &[f32],
+        limit: usize,
+        visible: impl Fn(u64) -> bool,
+    ) -> Result<Vec<VectorHit>> {
         let query = self.prepare(query)?;
         let mut hits = Vec::with_capacity(self.active.iter().filter(|active| **active).count());
         for row in 0..self.entity_ids.len() {
             if !self.active.get(row).copied().unwrap_or(false) {
+                continue;
+            }
+            if !visible(self.entity_ids.get(row).copied().unwrap_or_default()) {
                 continue;
             }
             let Some(vector) = self.vector(row) else {
@@ -1130,6 +1140,12 @@ impl VectorIndex {
         self.active.iter().filter(|active| **active).count()
     }
 
+    /// Allocated owner slots, available without scanning live flags.
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        self.entity_ids.len()
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -1161,8 +1177,12 @@ pub struct IvfPqConfig {
 
 /// Version of the deterministic row-count-to-IVF-PQ parameter table.
 pub const IVF_PQ_SIZE_CLASS_VERSION: u16 = 1;
-/// Minimum measured validation recall required before an IVF-PQ build may be planned.
-pub const IVF_PQ_MIN_RECALL_BASIS_POINTS: u16 = 9_000;
+/// Reserved derived vector columns. These are not properties on canonical graph records.
+pub const SEMANTIC_NODE_PROPERTY: PropertyId = PropertyId(u64::MAX - 1);
+pub const SEMANTIC_RELATIONSHIP_PROPERTY: PropertyId = PropertyId(u64::MAX - 2);
+pub const SEMANTIC_NODE_INDEX: &str = "semantic_nodes";
+pub const SEMANTIC_RELATIONSHIP_INDEX: &str = "semantic_relationships";
+pub const SEMANTIC_INDEX: &str = "graph_semantic";
 const MAX_IVF_PQ_TRAINING_ROWS: usize = 131_072;
 /// Fixed source-row batch used by device rebuild executors.
 pub const IVF_PQ_BUILD_BATCH_ROWS: usize = 16_384;
@@ -1399,10 +1419,6 @@ pub struct IvfPqIndex {
     list_positions: Vec<u32>,
     built_versions: Vec<u64>,
     #[serde(default)]
-    recall_basis_points: u16,
-    #[serde(default)]
-    validation_queries: u16,
-    #[serde(default)]
     build_generation: [u8; 32],
 }
 
@@ -1410,16 +1426,6 @@ impl IvfPqIndex {
     #[must_use]
     pub const fn config(&self) -> IvfPqConfig {
         self.config
-    }
-
-    #[must_use]
-    pub const fn recall_basis_points(&self) -> u16 {
-        self.recall_basis_points
-    }
-
-    #[must_use]
-    pub const fn validation_queries(&self) -> u16 {
-        self.validation_queries
     }
 
     #[must_use]
@@ -1502,11 +1508,6 @@ impl IvfPqIndex {
             list_offsets,
             list_positions,
             built_versions: remapped_versions,
-            // Filtering changes the validation population. The remapped pages remain a correct
-            // candidate accelerator with exact delta/reranking, but cannot be optimizer-selected
-            // as ANN until the filtered population is independently recall-validated.
-            recall_basis_points: 0,
-            validation_queries: 0,
             build_generation: [0_u8; 32],
         };
         remapped.refresh_generation()?;
@@ -1587,8 +1588,6 @@ impl IvfPqIndex {
             list_offsets: self.list_offsets.clone(),
             list_positions: self.list_positions.clone(),
             built_versions: self.built_versions.clone(),
-            recall_basis_points: self.recall_basis_points,
-            validation_queries: self.validation_queries,
             build_generation: self.build_generation,
         })
     }
@@ -1701,82 +1700,11 @@ impl IvfPqIndex {
             list_offsets: encoded.list_offsets,
             list_positions: encoded.list_positions,
             built_versions: encoded.built_versions,
-            recall_basis_points: 0,
-            validation_queries: 0,
             build_generation: [0_u8; 32],
         };
-        index.validate_recall(source, cancellation)?;
+        check_ivf_build_cancelled(cancellation)?;
         index.refresh_generation()?;
         Ok(index)
-    }
-
-    fn validate_recall(
-        &mut self,
-        source: &VectorIndex,
-        cancellation: &CancellationToken,
-    ) -> Result<()> {
-        const MAX_VALIDATION_QUERIES: usize = 64;
-        const VALIDATION_TOP_K: usize = 10;
-        let active = source
-            .active
-            .iter()
-            .copied()
-            .enumerate()
-            .filter_map(|(row, active)| active.then_some(row))
-            .collect::<Vec<_>>();
-        let query_count = active.len().min(MAX_VALIDATION_QUERIES);
-        if query_count == 0 {
-            return Err(Error::new(
-                ErrorCode::IndexUnavailable,
-                "IVF-PQ recall validation has no active queries",
-            ));
-        }
-        let mut expected = 0_u64;
-        let mut matched = 0_u64;
-        for ordinal in 0..query_count {
-            check_ivf_build_cancelled(cancellation)?;
-            let sampled = ordinal.saturating_mul(active.len()) / query_count;
-            let row = active[sampled.min(active.len() - 1)];
-            let query = source.vector(row).ok_or_else(|| {
-                Error::new(
-                    ErrorCode::CorruptStorage,
-                    "IVF-PQ validation row has no canonical vector",
-                )
-            })?;
-            let k = VALIDATION_TOP_K.min(active.len());
-            let exact = source.exact_search(&query, k)?;
-            let approximate = self.search(source, &query, k)?;
-            let approximate_ids = approximate
-                .iter()
-                .map(|hit| hit.entity_id)
-                .collect::<BTreeSet<_>>();
-            expected = expected.saturating_add(exact.len() as u64);
-            matched = matched.saturating_add(
-                exact
-                    .iter()
-                    .filter(|hit| approximate_ids.contains(&hit.entity_id))
-                    .count() as u64,
-            );
-        }
-        let recall = matched
-            .saturating_mul(10_000)
-            .checked_div(expected)
-            .unwrap_or(10_000_u64);
-        self.recall_basis_points = u16::try_from(recall.min(10_000)).map_err(|_| {
-            Error::internal("IVF-PQ recall basis points exceed their bounded representation")
-        })?;
-        self.validation_queries = u16::try_from(query_count)
-            .map_err(|_| Error::internal("IVF-PQ validation query count exceeds u16"))?;
-        if self.recall_basis_points < IVF_PQ_MIN_RECALL_BASIS_POINTS {
-            return Err(Error::new(
-                ErrorCode::IndexUnavailable,
-                format!(
-                    "IVF-PQ recall {}bp is below the {}bp publication floor",
-                    self.recall_basis_points, IVF_PQ_MIN_RECALL_BASIS_POINTS
-                ),
-            ));
-        }
-        Ok(())
     }
 
     fn refresh_generation(&mut self) -> Result<()> {
@@ -1813,15 +1741,22 @@ impl IvfPqIndex {
         coarse_order
             .sort_by(|left, right| total_f32(left.0, right.0).then_with(|| left.1.cmp(&right.1)));
         let mut approximate = Vec::new();
-        for (_, list_index) in coarse_order
-            .into_iter()
-            .take(self.config.probes.min(self.coarse.len()))
-        {
+        for (probe, (_, list_index)) in coarse_order.into_iter().enumerate() {
+            if probe >= self.config.probes && approximate.len() >= limit {
+                break;
+            }
             let Some(bounds) = self.list_offsets.get(list_index..=list_index + 1) else {
                 continue;
             };
             let residual = subtract(&query, &self.coarse[list_index])?;
             for position in &self.list_positions[bounds[0] as usize..bounds[1] as usize] {
+                if self
+                    .rows
+                    .get(*position as usize)
+                    .is_none_or(|row| !source.active.get(*row as usize).copied().unwrap_or(false))
+                {
+                    continue;
+                }
                 let mut distance = 0.0_f32;
                 for subspace in 0..self.config.subquantizers {
                     let code_offset = (*position as usize)
@@ -2321,8 +2256,6 @@ pub struct OptimizerIndexStatistics {
     pub largest_posting: u64,
     pub vector_rows: u64,
     pub ann_candidate_budget: u64,
-    /// Recall measured by the last validated build. Zero means no publishable ANN evidence.
-    pub ann_recall_basis_points: u16,
     pub resident_bytes: u64,
 }
 
@@ -2479,11 +2412,83 @@ pub struct IndexCatalog {
     profile: Option<EmbeddingProfile>,
     /// Vectors are canonical embedding rows; ANN structures in `entries` are derived.
     vector_columns: BTreeMap<PropertyId, Arc<VectorIndex>>,
+    /// Allocated source slots covered by the last successful automatic-index build. Deleted
+    /// owners keep their slots, so live ANN row counts cannot measure subsequent source growth.
+    #[serde(default)]
+    semantic_built_slots: BTreeMap<PropertyId, usize>,
     #[serde(skip)]
     optimizer_generation_cache: OnceLock<[u8; 32]>,
 }
 
 impl IndexCatalog {
+    /// Installs the two automatically maintained graph-content indexes. Their vector slots are
+    /// derived storage addresses and never become properties or entities in the user's graph.
+    pub fn initialize_semantic(&mut self, profile: EmbeddingProfile) -> Result<()> {
+        self.activate_profile(profile.clone())?;
+        for (name, property) in [
+            (SEMANTIC_NODE_INDEX, SEMANTIC_NODE_PROPERTY),
+            (SEMANTIC_RELATIONSHIP_INDEX, SEMANTIC_RELATIONSHIP_PROPERTY),
+        ] {
+            if let Some(entry) = self.entries.get(name) {
+                if entry.definition.properties != [property] {
+                    return Err(Error::new(
+                        ErrorCode::QueryType,
+                        "automatic semantic index name is reserved",
+                    ));
+                }
+                continue;
+            }
+            self.vector_columns.insert(
+                property,
+                Arc::new(VectorIndex::new_with_dtype(
+                    profile.dimension as usize,
+                    profile.similarity,
+                    profile.dtype,
+                )?),
+            );
+            self.entries.insert(
+                name.to_owned(),
+                Arc::new(IndexEntry {
+                    definition: GraphIndexDefinition {
+                        name: name.to_owned(),
+                        kind: GraphIndexKind::Vector,
+                        label: LabelId(u64::MAX),
+                        properties: vec![property],
+                        unique: false,
+                    },
+                    state: DerivedIndexState::Populating,
+                    diagnostic: None,
+                    runtime: None,
+                }),
+            );
+        }
+        self.invalidate_optimizer_generation();
+        Ok(())
+    }
+
+    /// A cold ANN build is amortized across growth; ordinary edits stay in the exact delta.
+    #[must_use]
+    pub fn semantic_rebuild_needed(&self) -> bool {
+        [SEMANTIC_NODE_INDEX, SEMANTIC_RELATIONSHIP_INDEX]
+            .iter()
+            .any(|name| {
+                self.vector_search_source(name).is_some_and(|(vectors, _)| {
+                    let property = if *name == SEMANTIC_NODE_INDEX {
+                        SEMANTIC_NODE_PROPERTY
+                    } else {
+                        SEMANTIC_RELATIONSHIP_PROPERTY
+                    };
+                    let built_slots = self
+                        .semantic_built_slots
+                        .get(&property)
+                        .copied()
+                        .unwrap_or(0);
+                    vectors.row_count() >= 1_024
+                        && vectors.row_count() >= built_slots.saturating_mul(2).max(1)
+                })
+            })
+    }
+
     fn invalidate_optimizer_generation(&mut self) {
         self.optimizer_generation_cache.take();
     }
@@ -2633,6 +2638,15 @@ impl IndexCatalog {
         definition: GraphIndexDefinition,
         populate_vector: bool,
     ) -> Result<()> {
+        if matches!(
+            definition.name.as_str(),
+            SEMANTIC_INDEX | SEMANTIC_NODE_INDEX | SEMANTIC_RELATIONSHIP_INDEX
+        ) {
+            return Err(Error::new(
+                ErrorCode::QueryType,
+                "automatic semantic index name is reserved",
+            ));
+        }
         validate_definition(graph, &definition)?;
         let is_vector = definition.kind == GraphIndexKind::Vector;
         if self.entries.contains_key(&definition.name) {
@@ -2722,6 +2736,15 @@ impl IndexCatalog {
         rows: Vec<(u64, Vec<u16>, u64)>,
         populate_vector: bool,
     ) -> Result<()> {
+        if matches!(
+            definition.name.as_str(),
+            SEMANTIC_INDEX | SEMANTIC_NODE_INDEX | SEMANTIC_RELATIONSHIP_INDEX
+        ) {
+            return Err(Error::new(
+                ErrorCode::QueryType,
+                "automatic semantic index name is reserved",
+            ));
+        }
         self.activate_profile(profile.clone())?;
         if self.entries.contains_key(&definition.name) {
             return Err(Error::new(
@@ -2843,6 +2866,17 @@ impl IndexCatalog {
         }
         match self.build_runtime(graph, &definition) {
             Ok(runtime) => {
+                if let Some(property) = definition.properties.first().copied().filter(|property| {
+                    matches!(
+                        *property,
+                        SEMANTIC_NODE_PROPERTY | SEMANTIC_RELATIONSHIP_PROPERTY
+                    )
+                }) {
+                    if let Some(source) = self.vector_columns.get(&property) {
+                        self.semantic_built_slots
+                            .insert(property, source.row_count());
+                    }
+                }
                 let entry = self
                     .entries
                     .get_mut(name)
@@ -2867,6 +2901,10 @@ impl IndexCatalog {
     /// Marks a vector rebuild request without executing a host builder during semantic
     /// validation. An existing validated runtime stays ONLINE until its replacement is ready.
     pub fn rebuild_deferred(&mut self, graph: &GraphStore, name: &str) -> Result<()> {
+        if name == SEMANTIC_INDEX {
+            self.rebuild_deferred(graph, SEMANTIC_NODE_INDEX)?;
+            return self.rebuild_deferred(graph, SEMANTIC_RELATIONSHIP_INDEX);
+        }
         let entry = self
             .entries
             .get(name)
@@ -2887,8 +2925,22 @@ impl IndexCatalog {
         Ok(())
     }
 
+    /// Retries failed derived vector builds when an execution backend is (re)admitted.
+    pub fn retry_failed_vectors(&mut self) {
+        for entry in self.entries.values_mut() {
+            if entry.definition.kind == GraphIndexKind::Vector
+                && entry.state == DerivedIndexState::Failed
+            {
+                let entry = Arc::make_mut(entry);
+                entry.state = DerivedIndexState::Populating;
+                entry.diagnostic = None;
+            }
+        }
+        self.invalidate_optimizer_generation();
+    }
+
     /// Builds every local vector generation through the selected backend and atomically replaces
-    /// each runtime only after cancellation, structural checks, and the recall floor pass.
+    /// each runtime after cancellation and structural checks.
     pub fn rebuild_vectors_with(
         &mut self,
         mut builder: impl FnMut(&VectorIndex, IvfPqConfig) -> Result<IvfPqIndex>,
@@ -2927,10 +2979,7 @@ impl IndexCatalog {
                 Ok(None)
             } else {
                 builder(&source, ivf_config(&source)).and_then(|index| {
-                    if index.recall_basis_points() < IVF_PQ_MIN_RECALL_BASIS_POINTS
-                        || index.validation_queries() == 0
-                        || index.build_generation() == [0_u8; 32]
-                    {
+                    if index.build_generation() == [0_u8; 32] {
                         return Err(Error::new(
                             ErrorCode::IndexUnavailable,
                             "IVF-PQ builder returned an unvalidated generation",
@@ -2952,6 +3001,13 @@ impl IndexCatalog {
                     entry.runtime = Some(Arc::new(replacement));
                     entry.state = DerivedIndexState::Online;
                     entry.diagnostic = None;
+                    if matches!(
+                        property,
+                        SEMANTIC_NODE_PROPERTY | SEMANTIC_RELATIONSHIP_PROPERTY
+                    ) {
+                        self.semantic_built_slots
+                            .insert(property, source.row_count());
+                    }
                 }
                 Err(error) => {
                     let entry = self.entries.get_mut(&name).ok_or_else(|| {
@@ -2988,8 +3044,21 @@ impl IndexCatalog {
             .map(|node| node.id().0)
             .collect::<BTreeSet<_>>();
         let mut vector_row_remaps = BTreeMap::new();
+        let retained_relationships = graph
+            .edges()
+            .map(|edge| edge.id().0)
+            .collect::<BTreeSet<_>>();
         for (property, column) in &mut self.vector_columns {
-            vector_row_remaps.insert(*property, Arc::make_mut(column).retain_entities(&retained)?);
+            let owners = if *property == SEMANTIC_RELATIONSHIP_PROPERTY {
+                &retained_relationships
+            } else {
+                &retained
+            };
+            let remap = Arc::make_mut(column).retain_entities(owners)?;
+            if let Some(built_slots) = self.semantic_built_slots.get_mut(property) {
+                *built_slots = remap.keys().filter(|row| **row < *built_slots).count();
+            }
+            vector_row_remaps.insert(*property, remap);
         }
         let names = self.entries.keys().cloned().collect::<Vec<_>>();
         for name in names {
@@ -3061,6 +3130,15 @@ impl IndexCatalog {
     }
 
     pub fn drop_index(&mut self, name: &str) -> Result<()> {
+        if matches!(
+            name,
+            SEMANTIC_INDEX | SEMANTIC_NODE_INDEX | SEMANTIC_RELATIONSHIP_INDEX
+        ) {
+            return Err(Error::new(
+                ErrorCode::QueryType,
+                "automatic semantic indexes are maintained with graph content and cannot be dropped",
+            ));
+        }
         if self
             .entries
             .get(name)
@@ -3131,12 +3209,38 @@ impl IndexCatalog {
     }
 
     pub fn statuses(&self) -> impl Iterator<Item = IndexStatus> + '_ {
-        self.entries.values().map(|entry| IndexStatus {
-            name: entry.definition.name.clone(),
-            kind: entry.definition.kind,
-            state: entry.state,
-            diagnostic: entry.diagnostic.clone(),
-        })
+        let combined = self
+            .entries
+            .get(SEMANTIC_NODE_INDEX)
+            .zip(self.entries.get(SEMANTIC_RELATIONSHIP_INDEX))
+            .map(|(nodes, edges)| IndexStatus {
+                name: SEMANTIC_INDEX.to_owned(),
+                kind: GraphIndexKind::Vector,
+                state: if nodes.state == DerivedIndexState::Failed
+                    || edges.state == DerivedIndexState::Failed
+                {
+                    DerivedIndexState::Failed
+                } else if nodes.state == DerivedIndexState::Online
+                    && edges.state == DerivedIndexState::Online
+                {
+                    DerivedIndexState::Online
+                } else {
+                    DerivedIndexState::Populating
+                },
+                diagnostic: nodes
+                    .diagnostic
+                    .clone()
+                    .or_else(|| edges.diagnostic.clone()),
+            });
+        self.entries
+            .values()
+            .map(|entry| IndexStatus {
+                name: entry.definition.name.clone(),
+                kind: entry.definition.kind,
+                state: entry.state,
+                diagnostic: entry.diagnostic.clone(),
+            })
+            .chain(combined)
     }
 
     /// Stable generation of the schema and local lifecycle facts that can change physical access
@@ -3188,20 +3292,19 @@ impl IndexCatalog {
                     largest_posting,
                     vector_rows,
                     candidate_budget,
-                    recall_basis_points,
                     resident_bytes,
                 ) = match runtime {
                     RuntimeIndex::Equality(index) => {
                         let shape = scalar_posting_shape(&index.postings, &index.deltas);
-                        (shape.0, shape.1, shape.2, 0, 0, 0, shape.3)
+                        (shape.0, shape.1, shape.2, 0, 0, shape.3)
                     }
                     RuntimeIndex::Range(index) => {
                         let shape = scalar_posting_shape(&index.postings, &index.deltas);
-                        (shape.0, shape.1, shape.2, 0, 0, 0, shape.3)
+                        (shape.0, shape.1, shape.2, 0, 0, shape.3)
                     }
                     RuntimeIndex::Text(index) => {
                         let shape = text_posting_shape(index);
-                        (shape.0, shape.1, shape.2, 0, 0, 0, shape.3)
+                        (shape.0, shape.1, shape.2, 0, 0, shape.3)
                     }
                     RuntimeIndex::Vector {
                         property,
@@ -3214,9 +3317,6 @@ impl IndexCatalog {
                         let candidate_budget = approximate
                             .as_ref()
                             .map_or(0_u64, |ann| ann.config.candidate_budget as u64);
-                        let recall_basis_points = approximate
-                            .as_ref()
-                            .map_or(0_u16, |ann| ann.recall_basis_points());
                         let dimension = self
                             .profile
                             .as_ref()
@@ -3227,7 +3327,7 @@ impl IndexCatalog {
                                 .saturating_add(1)
                                 .saturating_add(dimension.saturating_mul(2)),
                         );
-                        (0, 0, 0, rows, candidate_budget, recall_basis_points, bytes)
+                        (0, 0, 0, rows, candidate_budget, bytes)
                     }
                 };
                 Some(OptimizerIndexStatistics {
@@ -3240,7 +3340,6 @@ impl IndexCatalog {
                     largest_posting,
                     vector_rows,
                     ann_candidate_budget: candidate_budget,
-                    ann_recall_basis_points: recall_basis_points,
                     resident_bytes,
                 })
             })
@@ -4715,7 +4814,7 @@ mod tests {
     }
 
     #[test]
-    fn ivf_build_is_cancellable_recall_gated_and_searches_exact_delta() -> Result<()> {
+    fn ivf_build_is_cancellable_and_searches_exact_delta() -> Result<()> {
         let mut source = VectorIndex::new(2, Similarity::Euclidean)?;
         for (entity, value) in [(1_u64, 10.0_f32), (2, 20.0), (3, 30.0)] {
             source.upsert_quantized(
@@ -4734,8 +4833,6 @@ mod tests {
         assert_eq!(cancelled.code, ErrorCode::Cancelled);
 
         let index = IvfPqIndex::build(&source, ivf_config(&source))?;
-        assert!(index.recall_basis_points() >= IVF_PQ_MIN_RECALL_BASIS_POINTS);
-        assert!(index.validation_queries() > 0);
         assert_ne!(index.build_generation(), [0_u8; 32]);
 
         let zero = [f16::from_f32(0.0).to_bits(); 2];
@@ -4743,6 +4840,105 @@ mod tests {
         let hits = index.search(&source, &[0.0, 0.0], 1)?;
         assert_eq!(hits.first().map(|hit| hit.entity_id), Some(99));
         assert_eq!(hits.first().map(|hit| hit.score), Some(0.0));
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_rebuild_growth_ignores_deleted_slots_and_survives_recovery() -> Result<()> {
+        let profile = EmbeddingProfile::new(
+            [11; 32],
+            [17; 32],
+            4,
+            EmbeddingDType::F16,
+            true,
+            Similarity::Cosine,
+        )?;
+        let mut indexes = IndexCatalog::default();
+        indexes.initialize_semantic(profile.clone())?;
+        let coordinates = profile.quantize(&[1.0, 0.5, 0.25, 0.125])?;
+        for entity_id in 0..1_024 {
+            indexes.apply_vector_mutation(&ResolvedVectorMutation::Upsert {
+                property: SEMANTIC_NODE_PROPERTY,
+                entity_id,
+                coordinates: coordinates.clone(),
+                revision: 1,
+            })?;
+        }
+        let graph = GraphStore::default();
+        let build = |source: &VectorIndex, mut config: IvfPqConfig| {
+            config.coarse_centroids = 4;
+            config.probes = config.probes.min(4);
+            config.iterations = 1;
+            IvfPqIndex::build(source, config)
+        };
+        indexes.rebuild_vectors_with(build)?;
+        assert!(!indexes.semantic_rebuild_needed());
+        for entity_id in 0..768 {
+            indexes.apply_vector_mutation(&ResolvedVectorMutation::Remove {
+                property: SEMANTIC_NODE_PROPERTY,
+                entity_id,
+                revision: 2,
+            })?;
+        }
+        indexes.rebuild_deferred(&graph, SEMANTIC_NODE_INDEX)?;
+        indexes.rebuild_vectors_with(build)?;
+        let (_, ann) = indexes
+            .vector_search_source(SEMANTIC_NODE_INDEX)
+            .ok_or_else(|| Error::internal("semantic index missing"))?;
+        assert_eq!(ann.map(|ann| ann.rows.len()), Some(256));
+        for _ in 0..3 {
+            assert!(!indexes.semantic_rebuild_needed());
+        }
+
+        // Only newly allocated slots count as growth. A failed build must not advance the baseline.
+        for entity_id in 1_024..2_048 {
+            indexes.apply_vector_mutation(&ResolvedVectorMutation::Upsert {
+                property: SEMANTIC_NODE_PROPERTY,
+                entity_id,
+                coordinates: coordinates.clone(),
+                revision: 3,
+            })?;
+        }
+        assert!(indexes.semantic_rebuild_needed());
+        indexes.rebuild_deferred(&graph, SEMANTIC_NODE_INDEX)?;
+        indexes.rebuild_vectors_with(|_, _| {
+            Err(Error::new(
+                ErrorCode::Cancelled,
+                "test rebuild cancellation",
+            ))
+        })?;
+        assert!(indexes.semantic_rebuild_needed());
+        indexes.rebuild_deferred(&graph, SEMANTIC_NODE_INDEX)?;
+        indexes.rebuild_vectors_with(build)?;
+        assert!(!indexes.semantic_rebuild_needed());
+
+        // Empty source columns still remember their allocated slots after a successful build.
+        for entity_id in 0..2_048 {
+            indexes.apply_vector_mutation(&ResolvedVectorMutation::Remove {
+                property: SEMANTIC_NODE_PROPERTY,
+                entity_id,
+                revision: 4,
+            })?;
+        }
+        indexes.rebuild_deferred(&graph, SEMANTIC_NODE_INDEX)?;
+        indexes.rebuild_vectors_with(build)?;
+        assert!(
+            indexes
+                .vector_search_source(SEMANTIC_NODE_INDEX)
+                .is_some_and(|(_, ann)| ann.is_none())
+        );
+        let mut encoded = Vec::new();
+        ciborium::ser::into_writer(&indexes, &mut encoded)
+            .map_err(|error| Error::internal(error.to_string()))?;
+        let recovered: IndexCatalog = ciborium::de::from_reader(encoded.as_slice())
+            .map_err(|error| Error::internal(error.to_string()))?;
+        for _ in 0..3 {
+            assert!(!recovered.semantic_rebuild_needed());
+        }
+        assert_eq!(
+            recovered.semantic_built_slots[&SEMANTIC_NODE_PROPERTY],
+            2_048
+        );
         Ok(())
     }
 

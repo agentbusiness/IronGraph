@@ -1,111 +1,73 @@
 # `CREATE EMBEDDING INDEX`
 
-> Encodes a text property into vectors with the local model and keeps them searchable.
+Create a field-specific semantic index when you want to search one text property on one node label.
+Applications using automatic graph-wide semantic search do not need this statement.
 
 | | |
 | --- | --- |
 | Kind | Statement |
 | Signature | `CREATE EMBEDDING INDEX <name> FOR (<var>:<Label>) FROM <var>.<source> INTO <var>.<target> USING MODEL default SIMILARITY COSINE\|DOT\|EUCLIDEAN` |
 | Relationship to standard Cypher | IronGraph extension |
-| Reference dataset | [`library`](../../datasets.md#library) — Eight arXiv papers with embedded abstracts |
 
-## What it does
+## Prerequisites
 
-This statement declares that a text property on a label should be encoded into vectors by the database's own embedding model, and that those vectors should be maintained and searchable. `FROM` names the text, `INTO` names the vector property, and `SIMILARITY` fixes how distance is measured.
+Select an existing project with `USE` and enable the local embedding model. The node label and source
+text property must exist. `INTO` names the index's vector field; IronGraph declares that field when
+needed. You do not need to write placeholder vectors to graph nodes.
 
-It is what makes `SEARCH … FOR TEXT` possible: a query supplies a phrase, the database encodes it with the same model, and the comparison is meaningful because both sides came from one encoder.
+## Create and search a field index
 
-## How it behaves
-
-Both properties must already exist in the project's schema when the statement runs. The source is the text you already have; the target has to be brought into existence first, which in practice means writing a placeholder vector to every row. The bundled `library` dataset uses `embedding: [0.0]`.
-
-The vectors live in the index, not in the target property. That placeholder keeps whatever value it was given — reading it back shows the placeholder, not a 768-element vector — so the target property names the index's slot rather than storing its contents.
-
-`MODEL` accepts only `default`: the model is the one verified artifact the database loads at start-up, and the similarity must match the profile that artifact was activated with.
-
-The index validates itself before publishing. It runs a sample of queries through both the approximate index and exact search, and refuses to come online if agreement falls below 90%. On the real abstracts in this dataset that threshold is met at eight rows and not above it — measured agreement was 80% at 16 rows, 82% at 1,000 and 86% at 5,000. A vector index that misses the floor reports `FAILED` in `SHOW INDEXES` with the measured figure, and searching against it is rejected rather than silently answered from a worse index. There is no automatic fall back to exact search.
-
-## When to use it
-
-Declare one when retrieval should follow meaning rather than wording — finding the paper about horizon thermodynamics when the query says nothing about horizons. Where the words themselves are the query, a text index is the right tool and is far cheaper.
-
-## How it differs from its neighbours
-
-A `TEXT` index matches the words that are present. An embedding index matches what the text is about, and will rank a document that shares no vocabulary with the query above one that shares several words. A plain `VECTOR` index searches vectors you supply and computed yourself; an embedding index computes them for you and keeps them current.
-
-## Simple example
-
-The index in the reference dataset, as the bundled importer declares it. The statement returns no rows; `SHOW INDEXES` is how you see the result.
+Run these statements in order in an existing project named `knowledge`:
 
 ```cypher
-USE library
-SHOW INDEXES
+USE knowledge
+CREATE (:Document {
+  title: 'Device handbook',
+  body: 'The handbook explains how to configure the local execution device.'
+})
 ```
-
-Result:
-
-```
-name                | kind     | state  | diagnostic
---------------------+----------+--------+-----------
-abstract_semantic   | VECTOR   | ONLINE | null      
-library_paper_by_id | EQUALITY | ONLINE | null      
-library_title_text  | TEXT     | ONLINE | null      
-
-3 rows
-```
-
-## Advanced example
-
-The whole cycle on a fresh project: text written, a placeholder vector written so the target property exists, the index declared, and the index state read back. The corpus is four documents, comfortably inside the recall floor.
 
 ```cypher
-USE embedding_example
-MATCH (note:Note)
-SEARCH note IN (EMBEDDING INDEX note_semantic
-                FOR TEXT 'storing facts that change over time' LIMIT 4)
+USE knowledge
+CREATE EMBEDDING INDEX document_body_semantic
+FOR (document:Document)
+FROM document.body INTO document.embedding
+USING MODEL default SIMILARITY COSINE
+```
+
+```cypher
+USE knowledge
+MATCH (document:Document)
+SEARCH document IN (EMBEDDING INDEX document_body_semantic
+                    FOR TEXT 'configure the local device' LIMIT 10)
   SCORE AS score
-RETURN note.title AS title,
-       round(score * 10000) / 10000.0 AS score,
-       size(note.embedding) AS stored_property_size
+RETURN document, score
 ORDER BY score DESC
 ```
 
-Result:
+Expected result: matching `Document` nodes with numeric scores, ordered from highest score to lowest.
+The exact scores depend on your text and active model. Inspect `SHOW INDEXES` to confirm that
+`document_body_semantic` is `ONLINE`.
 
-```
-title              | score  | stored_property_size
--------------------+--------+---------------------
-Bitemporal records | 0.2607 | 1                   
-Bitemporal records | 0.2607 | 1                   
-Bitemporal records | 0.2607 | 1                   
-Bitemporal records | 0.2607 | 1                   
-Graph storage      | 0.1982 | 1                   
-Graph storage      | 0.1982 | 1                   
-Graph storage      | 0.1982 | 1                   
-Graph storage      | 0.1982 | 1                   
-Similarity search  | 0.0577 | 1                   
-Similarity search  | 0.0577 | 1                   
-Similarity search  | 0.0577 | 1                   
-Similarity search  | 0.0577 | 1                   
-... 4 more rows
+## Behavior
 
-16 rows
-```
+IronGraph embeds existing source text when the index is created and maintains the vectors as text
+changes or nodes are deleted. The complete text stays on its original node. Generated vectors are
+derived index data; reading `document.embedding` does not return the generated vector.
 
-## Where it earns its place
+`MODEL` accepts `default`, the verified local model loaded by the database. The similarity must match
+the active embedding profile. GPU-backed instances perform vector search on their selected device;
+CPU instances use the CPU backend.
 
-- Retrieval by meaning rather than by shared vocabulary.
-- Ranking documents against a phrase a user typed.
-- Combining a semantic ranking with ordinary graph filters in one query.
+Model availability, valid input, and device capacity remain operating requirements. Failed index
+operations report a diagnostic through `SHOW INDEXES`.
 
-## Limitations and trade-offs
+## Choose automatic or field-specific search
 
-- Both the source and target properties must exist before the statement runs.
-- The target property stores its placeholder, not the vectors; the index holds those.
-- Only `MODEL default` is accepted, and the similarity must match the active profile.
-- The index refuses to publish below 90% measured recall, which on real embeddings bounds the practical corpus size severely.
+Use `graph_semantic` to search meaningful content across all nodes and relationships without a
+declaration. Use a field-specific index when a particular property, such as `Document.body`, should
+determine the ranking. A plain vector index is for vectors you supply yourself. A text index searches
+the words present in the source.
 
-## See also
-
-- [`SEARCH`](./search.md) to query the index
-- [`vector.cosine`](../../functions/vector/vector-cosine.md) for the arithmetic it is built on
+Next, use [`SEARCH`](./search.md) to retrieve ranked entities or combine semantic retrieval with
+ordinary graph filters.

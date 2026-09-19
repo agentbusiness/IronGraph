@@ -1,7 +1,7 @@
 # Use IronGraph as an AI second brain
 
 Connect an MCP-capable AI host to IronGraph so it can query the graph, preserve durable context,
-save complete documents, retrieve documents by meaning, and read the exact IronGraph Cypher
+save complete documents, retrieve nodes and relationships by meaning, and read the exact IronGraph Cypher
 reference before composing unfamiliar statements.
 
 The MCP server supports local stdio and loopback-only Streamable HTTP. Both transports connect to
@@ -59,7 +59,7 @@ The MCP surface stays deliberately small:
 | `irongraph_run_cypher` | Every direct read, write, administration statement, graph algorithm, temporal query, and exact calculation over stored data |
 | `irongraph_get_schema` | Listing projects or reading a project's live labels, relationship types, properties, functions, indexes, and schema revision |
 | `irongraph_save_document` | Creating or updating a canonical `:Document` node with complete source text |
-| `irongraph_search` | Semantic retrieval over any indexed node label, optionally including connected relationships and neighboring nodes |
+| `irongraph_search` | Ranked semantic retrieval over nodes and relationships, optionally including connected graph context |
 | `irongraph_search_cypher_docs` | Finding the exact dialect page before writing unfamiliar IronGraph Cypher |
 
 Cypher reads and writes share one tool. IronGraph parses and executes the statement through its
@@ -84,8 +84,7 @@ CREATE (:Document {
   id: 'setup-document',
   title: 'IronGraph memory setup',
   body: 'This project stores durable context for AI hosts.',
-  source: 'setup',
-  embedding: [0.0]
+  source: 'setup'
 })
 ```
 
@@ -100,39 +99,36 @@ The host can now call `irongraph_save_document` with project `memory`. Supplying
 `document_id` updates that document. Omitting it creates a new UUID. Document bodies remain ordinary
 graph properties and follow the normal WAL and snapshot durability path.
 
-## Enable semantic document recall
+## Search by meaning
 
-Declare the embedding index explicitly after at least one `Document` node has both `body` and
-`embedding` properties:
+With the local embedding model enabled, IronGraph automatically embeds the meaningful content of
+nodes and relationships. Documents, emails, people, tables, calendar entries, and tasks participate
+as ordinary graph data. You do not need a placeholder vector or a manually declared index.
+Recognized operational metadata, identifiers, credentials, and URLs are excluded from automatic
+embedding input; complete source properties remain on their owning graph records.
 
-```cypher
-USE memory
-CREATE EMBEDDING INDEX document_semantic
-FOR (document:Document)
-FROM document.body
-INTO document.embedding
-USING MODEL default
-SIMILARITY COSINE
-```
-
-Check publication before search:
+Inspect the automatic indexes:
 
 ```cypher
 USE memory
 SHOW INDEXES
 ```
 
-The expected row for `document_semantic` has state `ONLINE`. The host then calls
-`irongraph_search` with project `memory`, index `document_semantic`, label `Document`, and the
-natural-language meaning to retrieve. IronGraph encodes the phrase with the same verified local
-model used by the index and returns complete matched nodes. By default, the result also includes
-their connected relationships and neighboring nodes. Set `include_connections` to `false` when only
-the ranked nodes and scores are needed.
+The automatic indexes are `graph_semantic`, `semantic_nodes`, and `semantic_relationships`.
+The host calls `irongraph_search` with project `memory` and a natural-language `query`.
+The default `graph_semantic` search returns the best matching nodes and relationships together,
+ranked by score and bounded by `limit`. Relationship meaning includes its type, meaningful
+properties, and endpoint names. Search returns the best available matches without a minimum
+similarity-score cutoff.
 
-The same tool works for any node label with a declared embedding index, such as `Person`, `Decision`,
-`Event`, `Product`, or `Concept`. Embedding indexes rank nodes through a declared text property.
-Relationship values enter the result through graph traversal from those matches; use
-`irongraph_run_cypher` when you need to filter or rank relationship properties directly.
+Set `index` to `semantic_nodes` or `semantic_relationships` to restrict the entity kind.
+An explicitly declared embedding index can still select one text field; supply its `index` and
+node `label` when using the tool.
+
+By default, the tool also retrieves connected graph context. These separate, bounded reads carry
+the search bookmark and may reflect newer committed changes. They preserve the original match
+ranking and report their own truncation. Set `include_connections` to `false` for just ranked
+matches and scores.
 
 ## Connect through remote mutual TLS
 
@@ -167,5 +163,5 @@ graph properties, MCP tool arguments, query results, or documents.
 - The host must confirm destructive statements such as `DROP`, `CLEAR`, `PURGE`, and `DELETE` before
   calling the unified Cypher tool.
 - MCP uses one selected IronGraph instance. Each Cypher operation still names its project explicitly.
-- Semantic search requires a declared, `ONLINE` embedding index. The MCP server never guesses or
-  silently creates one.
+- Automatic semantic search requires the local embedding model to be enabled and its indexes to be
+  `ONLINE`. Encoding or resource failures are reported explicitly.

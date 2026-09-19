@@ -663,6 +663,10 @@ pub(super) struct MutationValidation {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum AdministrativeMutation {
+    InitializeSemantic {
+        profile: crate::graph::EmbeddingProfile,
+        graph_revision: u64,
+    },
     CreateIndex {
         name: String,
         kind: String,
@@ -744,7 +748,9 @@ pub(super) struct DatabaseInner {
     ordered_overlay: Mutex<OrderedMutationOverlay>,
     broker_changes: tokio::sync::watch::Sender<u64>,
     text_embedding: RwLock<Option<Arc<dyn TextEmbedding>>>,
+    semantic_initialization: parking_lot::Mutex<()>,
     pub(super) execution: RwLock<Option<Box<dyn ExecutionBackend>>>,
+    selected_backend: OnceLock<crate::gpu::BackendKind>,
     store_id: StoreId,
     write_runtime: OnceLock<WriteBinding>,
     fatal_apply: AtomicBool,
@@ -804,7 +810,9 @@ impl Database {
             ordered_overlay: Mutex::new(OrderedMutationOverlay::default()),
             broker_changes,
             text_embedding: RwLock::new(None),
+            semantic_initialization: parking_lot::Mutex::new(()),
             execution: RwLock::new(None),
+            selected_backend: OnceLock::new(),
             store_id: identity.store_id,
             write_runtime: OnceLock::new(),
             fatal_apply: AtomicBool::new(false),
@@ -840,11 +848,12 @@ impl Database {
                 else {
                     return;
                 };
-                // Standalone has no leadership term — no sequencer changes to reconcile against.
-                let current = {
-                    let _ = &write_runtime;
-                    None
-                };
+                // A live standalone runtime remains its own sequencer. `None` means unavailable
+                // to the registry and would abort every transaction on the maintenance tick.
+                let current = Some((
+                    database.state.read().applied.term.max(1),
+                    write_runtime.node_id(),
+                ));
                 database.transactions.maintain(Instant::now(), current);
             }
         });
@@ -871,6 +880,7 @@ impl Database {
         let cancellation = tokio_util::sync::CancellationToken::new();
         for project in state.projects.values_mut() {
             let project = Arc::make_mut(project);
+            project.indexes.retry_failed_vectors();
             project.indexes.rebuild_vectors_with(|source, config| {
                 backend.build_ivf_pq(source, config, &cancellation)
             })?;
@@ -917,6 +927,7 @@ impl Database {
                 "database execution backend is already bound",
             ));
         }
+        let _ = self.0.selected_backend.set(backend.kind());
         *current = Some(backend);
         Ok(())
     }
@@ -1341,7 +1352,80 @@ impl Database {
         Ok(false)
     }
 
-    /// Ensures CREATE EMBEDDING cannot establish a profile by bypassing all-node readiness.
+    /// Initializes graph-wide semantic vectors through the same ordered WAL path as graph writes.
+    fn ensure_automatic_semantic(&self, project: ProjectId) -> Result<()> {
+        let Some(embedding) = self.0.text_embedding.read().clone() else {
+            return Ok(());
+        };
+        {
+            let state = self.0.state.read();
+            let project = state
+                .projects
+                .get(&project)
+                .ok_or_else(|| Error::new(ErrorCode::ProjectNotFound, "project does not exist"))?;
+            if project.indexes.contains(crate::graph::SEMANTIC_NODE_INDEX)
+                && project
+                    .indexes
+                    .contains(crate::graph::SEMANTIC_RELATIONSHIP_INDEX)
+                && !project.indexes.semantic_rebuild_needed()
+            {
+                return Ok(());
+            }
+        }
+        let _initialization = self.0.semantic_initialization.lock();
+        self.ensure_embedding_profile_activated(project)?;
+        let (snapshot, bookmark) = {
+            let state = self.0.state.read();
+            (
+                state.projects.get(&project).cloned().ok_or_else(|| {
+                    Error::new(ErrorCode::ProjectNotFound, "project does not exist")
+                })?,
+                state.applied,
+            )
+        };
+        let initialized = snapshot.indexes.contains(crate::graph::SEMANTIC_NODE_INDEX)
+            && snapshot
+                .indexes
+                .contains(crate::graph::SEMANTIC_RELATIONSHIP_INDEX);
+        if initialized && !snapshot.indexes.semantic_rebuild_needed() {
+            return Ok(());
+        }
+        let vectors = if initialized {
+            Vec::new()
+        } else {
+            resolve_semantic_texts(
+                crate::graph::semantic_texts(&snapshot.graph)?,
+                embedding.as_ref(),
+                bookmark.index,
+            )?
+        };
+        self.commit_scoped_from(
+            DatabaseMutation::Graph {
+                project,
+                validation: MutationValidation {
+                    snapshot: bookmark,
+                    dependencies: TransactionDependencies::default(),
+                },
+                graph: Vec::new(),
+                temporal: Vec::new(),
+                vectors,
+                administrative: Some(AdministrativeMutation::InitializeSemantic {
+                    profile: embedding.profile().clone(),
+                    graph_revision: snapshot.graph.revision(),
+                }),
+            },
+            MutationKind::Graph,
+            Some(project),
+            Some(Uuid::new_v4()),
+            AdmissionClass::Control,
+            CommitAcknowledgement::Published,
+            ConnectionId::new(),
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// Activates the selected local encoder before graph embeddings are resolved.
     fn ensure_embedding_profile_activated(&self, project: ProjectId) -> Result<()> {
         let profile = self.text_embedding()?.profile().clone();
         self.validate_embedding_profile_readiness(project, &profile)?;
@@ -1680,6 +1764,39 @@ impl Database {
         Ok((snapshot, bookmark, pinned))
     }
 
+    /// Semantic queries wait for an admitted GPU generation instead of silently scoring on CPU.
+    fn capture_semantic_execution(
+        &self,
+        project: ProjectId,
+    ) -> Result<(
+        Arc<ProjectState>,
+        Bookmark,
+        Option<Box<dyn ExecutionBackend>>,
+    )> {
+        let deadline = Instant::now() + self.0.request_timeout;
+        loop {
+            let captured = self.capture_project_execution(project)?;
+            if captured.2.is_some()
+                || self
+                    .0
+                    .selected_backend
+                    .get()
+                    .is_none_or(|kind| *kind == crate::gpu::BackendKind::Cpu)
+            {
+                return Ok(captured);
+            }
+            self.republish_resident_project(project, captured.0.graph.revision())?;
+            if Instant::now() >= deadline {
+                return Err(Error::retryable(
+                    ErrorCode::GpuAdmissionFailure,
+                    "semantic search is waiting for GPU publication",
+                    Some(25),
+                ));
+            }
+            std::thread::yield_now();
+        }
+    }
+
     /// Large projects whose resident device image lags the committed host graph.
     ///
     /// Returns projects covered by an explicitly enabled device-publication deferral policy.
@@ -1920,6 +2037,7 @@ impl Database {
             }
             Statement::ShowIndexes => {
                 let project = self.resolve_project(request.project_id, &request.query)?;
+                self.ensure_automatic_semantic(project)?;
                 return self.show_indexes(
                     request.request_id,
                     project,
@@ -2163,10 +2281,14 @@ impl Database {
             _ => {}
         }
         let project = self.resolve_project(request.project_id, &request.query)?;
+        self.ensure_automatic_semantic(project)?;
         if matches!(&parsed.statement, Statement::CreateEmbedding(_)) {
             self.ensure_embedding_profile_activated(project)?;
         }
-        let (snapshot, captured_bookmark, captured_execution) = if writes {
+        let semantic_search = matches!(&parsed.statement, Statement::Query(body) if body.clauses.iter().chain(body.unions.iter().flat_map(|branch| &branch.body)).any(|clause| matches!(clause, crate::cypher::Clause::Search(_))));
+        let (snapshot, captured_bookmark, captured_execution) = if semantic_search {
+            self.capture_semantic_execution(project)?
+        } else if writes {
             let state = self.0.state.read();
             let snapshot =
                 state.projects.get(&project).cloned().ok_or_else(|| {
@@ -2213,25 +2335,23 @@ impl Database {
             };
             emit_query_summary(request.request_id, output.result, rows, emit)
         } else {
-            let (snapshot, planning_bookmark) = {
+            let (snapshot, planning_bookmark, planning_execution) = if semantic_search {
+                (snapshot, captured_bookmark, captured_execution)
+            } else {
                 let state = self.0.state.read();
                 let snapshot = state.projects.get(&project).cloned().ok_or_else(|| {
                     Error::new(ErrorCode::ProjectNotFound, "project does not exist")
                 })?;
-                (snapshot, state.applied)
+                (snapshot, state.applied, None)
             };
             let next_index = planning_bookmark
                 .index
                 .checked_add(1)
                 .ok_or_else(|| Error::internal("log index exhausted"))?;
             let mut output = {
-                // Writes always plan and execute against the canonical host/unified-memory graph.
-                // The committed sparse `ResidentProjectDelta` is then published atomically to the
-                // accelerator. Executing the mutation against a resident generation first creates
-                // a second speculative graph path and made same-statement node/relationship writes
-                // depend on Metal overlay row numbering. One mutation path also means a normal
-                // edit patches only its affected resident columns; complete images are reserved for
-                // explicit rebuild impacts such as schema/layout changes and recovery.
+                // Semantic reads in a write statement use the pinned execution generation too.
+                // The canonical mutation and its derived vectors still commit together, then
+                // publish one sparse resident delta.
                 execute_on_project(
                     &snapshot,
                     &request,
@@ -2239,7 +2359,7 @@ impl Database {
                     next_index,
                     capabilities,
                     text_embedding.as_deref(),
-                    None,
+                    planning_execution.as_deref(),
                 )?
             };
             let administrative = administrative_mutation(
@@ -3433,16 +3553,35 @@ impl MutationStateBackend for Database {
                     }),
                     _ => false,
                 };
-                if resident_already_stale
-                    || match &device_impact {
-                        DeviceImpact::Project { project, .. } | DeviceImpact::Rebuild(project) => {
-                            staged_state
+                let semantic_project = match &device_impact {
+                    DeviceImpact::Project { project, .. } | DeviceImpact::Rebuild(project) => {
+                        staged_state
+                            .projects
+                            .get(project)
+                            .filter(|state| {
+                                state.indexes.contains(crate::graph::SEMANTIC_NODE_INDEX)
+                            })
+                            .map(|_| *project)
+                    }
+                    _ => None,
+                };
+                let device_impact = if resident_already_stale {
+                    semantic_project
+                        .map(DeviceImpact::Rebuild)
+                        .unwrap_or(device_impact)
+                } else {
+                    device_impact
+                };
+                if semantic_project.is_none()
+                    && (resident_already_stale
+                        || match &device_impact {
+                            DeviceImpact::Project { project, .. }
+                            | DeviceImpact::Rebuild(project) => staged_state
                                 .projects
                                 .get(project)
-                                .is_some_and(|state| should_defer_device_publish(&state.graph))
-                        }
-                        _ => false,
-                    }
+                                .is_some_and(|state| should_defer_device_publish(&state.graph)),
+                            _ => false,
+                        })
                 {
                     // Deferred: leave the resident image at its last-published revision so the query
                     // freshness check routes reads to host execution. The bookmark is intentionally
@@ -3794,7 +3933,8 @@ impl Database {
             Error::new(ErrorCode::ProjectNotFound, "transaction requires a project")
         })?;
         let barrier = self.consistency_barrier(consistency, bookmark)?;
-        let (snapshot, current_bookmark, execution) = self.capture_project_execution(project)?;
+        self.ensure_automatic_semantic(project)?;
+        let (snapshot, current_bookmark, execution) = self.capture_semantic_execution(project)?;
         self.wait_for_captured_all(consistency, barrier, current_bookmark)?;
         let fence = self.current_transaction_fence(current_bookmark)?;
         let deadline = Instant::now()
@@ -6291,6 +6431,25 @@ fn apply_administrative(
     resolved_commit_time_nanos: i64,
 ) -> Result<()> {
     match mutation {
+        AdministrativeMutation::InitializeSemantic {
+            profile,
+            graph_revision,
+        } => {
+            if project.graph.revision() != graph_revision {
+                return Err(Error::retryable(
+                    ErrorCode::TransactionConflict,
+                    "graph changed during semantic initialization; retry the query",
+                    None,
+                ));
+            }
+            project.indexes.initialize_semantic(profile)?;
+            for name in [
+                crate::graph::SEMANTIC_NODE_INDEX,
+                crate::graph::SEMANTIC_RELATIONSHIP_INDEX,
+            ] {
+                project.indexes.rebuild_deferred(&project.graph, name)?;
+            }
+        }
         AdministrativeMutation::CreateIndex {
             name,
             kind,
@@ -6785,6 +6944,49 @@ fn embed_complete_texts(embedding: &dyn TextEmbedding, texts: &[&str]) -> Result
         .collect()
 }
 
+fn resolve_semantic_texts(
+    texts: crate::graph::SemanticTextBatch,
+    embedding: &dyn TextEmbedding,
+    revision: u64,
+) -> Result<Vec<ResolvedVectorMutation>> {
+    let mut mutations = Vec::new();
+    for (property, owners) in [
+        (crate::graph::SEMANTIC_NODE_PROPERTY, texts.nodes),
+        (
+            crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY,
+            texts.relationships,
+        ),
+    ] {
+        let mut pending = Vec::new();
+        for owner in owners {
+            match owner.text {
+                Some(text) => pending.push((owner.entity_id, text)),
+                None => mutations.push(ResolvedVectorMutation::Remove {
+                    property,
+                    entity_id: owner.entity_id,
+                    revision,
+                }),
+            }
+        }
+        let encoded = embed_complete_texts(
+            embedding,
+            &pending
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>(),
+        )?;
+        for ((entity_id, _), vector) in pending.into_iter().zip(encoded) {
+            mutations.push(ResolvedVectorMutation::Upsert {
+                property,
+                entity_id,
+                coordinates: embedding.profile().quantize(&vector)?,
+                revision,
+            });
+        }
+    }
+    Ok(mutations)
+}
+
 fn resolve_embedding_mutations(
     project: &ProjectState,
     prior_graph_mutations: &[GraphMutation],
@@ -6792,8 +6994,30 @@ fn resolve_embedding_mutations(
     text_embedding: Option<&dyn TextEmbedding>,
     revision: u64,
 ) -> Result<Vec<ResolvedVectorMutation>> {
-    if graph_mutations.is_empty() || project.indexes.embedding_definitions().next().is_none() {
+    if graph_mutations.is_empty() {
         return Ok(Vec::new());
+    }
+    let mut vectors = if project.indexes.contains(crate::graph::SEMANTIC_NODE_INDEX) {
+        let embedding = text_embedding.ok_or_else(|| {
+            Error::new(
+                ErrorCode::EmbeddingUnavailable,
+                "automatic semantic updates require the active local encoder",
+            )
+        })?;
+        resolve_semantic_texts(
+            crate::graph::semantic_text_delta(
+                &project.graph,
+                prior_graph_mutations,
+                graph_mutations,
+            )?,
+            embedding,
+            revision,
+        )?
+    } else {
+        Vec::new()
+    };
+    if project.indexes.embedding_definitions().next().is_none() {
+        return Ok(vectors);
     }
     let definitions = project
         .indexes
@@ -6824,7 +7048,7 @@ fn resolve_embedding_mutations(
         }
     }
     if affected.is_empty() {
-        return Ok(Vec::new());
+        return Ok(vectors);
     }
 
     let states = crate::cypher::sparse_node_states_after_mutations(
@@ -6853,7 +7077,6 @@ fn resolve_embedding_mutations(
         ));
     }
 
-    let mut vectors = Vec::new();
     for definition in definitions {
         let mut pending = Vec::new();
         for entity_id in affected.keys().copied() {
@@ -6966,10 +7189,7 @@ fn emit_catalog(
                 .map(|(_, name)| name.to_owned())
                 .collect(),
             functions: builtin_functions(),
-            indexes: indexes
-                .definitions()
-                .map(|index| index.name.clone())
-                .collect(),
+            indexes: indexes.statuses().map(|index| index.name).collect(),
         },
     })
 }
@@ -8340,6 +8560,9 @@ fn unix_nanos(time: SystemTime) -> Result<i64> {
     )
     .map_err(|_| Error::invalid_data("time exceeds i64 nanoseconds"))
 }
+
+#[cfg(test)]
+mod automatic_semantic_tests;
 
 #[cfg(test)]
 mod project_lifecycle_tests {

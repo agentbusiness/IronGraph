@@ -217,8 +217,9 @@ python example.py
 ```
 
 Expected output: `Graphs connect facts.` The text document persists in the selected directory. Run
-the example again to update and read the same text document. Next, declare an embedding index on its
-text property and use `MATCH … SEARCH … RETURN` to combine retrieval with graph context.
+the example again to update and read the same text document. Its meaningful content is embedded
+automatically, together with other nodes and relationships. Next, use
+[`SEARCH … RETURN`](docs/cypher/clauses/search/search.md) with `graph_semantic` for ranked retrieval.
 
 The example selects CPU so the same code works across native release targets, while automatic
 text embedding stays enabled. Select `device="metal"` on a supported Mac to use Metal acceleration.

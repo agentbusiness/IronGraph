@@ -219,7 +219,7 @@ impl<D: Database> McpServer<D> {
             .document_id
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         let cypher = format!(
-            "USE {} MERGE (document:Document {{id: $document_id}}) SET document.title = $title, document.body = $body, document.source = $source, document.embedding = $embedding RETURN document",
+            "USE {} MERGE (document:Document {{id: $document_id}}) SET document.title = $title, document.body = $body, document.source = $source RETURN document",
             cypher_identifier(&input.project)?
         );
         let mut query = Query::new(cypher);
@@ -228,7 +228,6 @@ impl<D: Database> McpServer<D> {
             ("title".to_owned(), json!(input.title)),
             ("body".to_owned(), json!(input.body)),
             ("source".to_owned(), json!(input.source)),
-            ("embedding".to_owned(), json!([0.0])),
         ]);
         query.limits = result_limits(1);
         self.database
@@ -236,8 +235,7 @@ impl<D: Database> McpServer<D> {
             .map(|result| {
                 json!({
                     "document_id": document_id,
-                    "result": query_result_json(result),
-                    "next": "If this project has no embedding index for Document.body, create one with irongraph_run_cypher before semantic search."
+                    "result": query_result_json(result)
                 })
             })
             .map_err(|error| format!("IronGraph could not save the document: {error}"))
@@ -247,23 +245,98 @@ impl<D: Database> McpServer<D> {
         let input: SearchInput = parse_arguments(arguments)?;
         let limit = bounded_rows(Some(input.limit.unwrap_or(10)))?.min(100);
         let project = cypher_identifier(&input.project)?;
-        let index = cypher_identifier(&input.index)?;
-        let label = cypher_identifier(&input.label)?;
-        let continuation = if input.include_connections {
+        let index_name = input.index.as_deref().unwrap_or("graph_semantic");
+        let index = cypher_identifier(index_name)?;
+        if input.label.is_some() && input.index.is_none() {
+            return Err("label requires the name of its declared embedding index; omit both to search all nodes and relationships".to_owned());
+        }
+        if input.label.is_none()
+            && !matches!(
+                index_name,
+                "graph_semantic" | "semantic_nodes" | "semantic_relationships"
+            )
+        {
+            return Err("a declared node embedding index requires its label; use graph_semantic, semantic_nodes, or semantic_relationships without a label".to_owned());
+        }
+        let bound = input
+            .label
+            .as_deref()
+            .map(cypher_identifier)
+            .transpose()?
+            .map(|label| format!("MATCH (entity:{label}) "))
+            .unwrap_or_default();
+        let continuation = if input.include_connections && input.label.is_some() {
             "OPTIONAL MATCH (entity)-[relationship]-(neighbor) RETURN entity, score, collect(relationship) AS relationships, collect(neighbor) AS neighbors ORDER BY score DESC"
         } else {
             "RETURN entity, score ORDER BY score DESC"
         };
         let cypher = format!(
-            "USE {project} MATCH (entity:{label}) SEARCH entity IN (EMBEDDING INDEX {index} FOR TEXT $query LIMIT {limit}) SCORE AS score {continuation}"
+            "USE {project} {bound}SEARCH entity IN (EMBEDDING INDEX {index} FOR TEXT $query LIMIT {limit}) SCORE AS score {continuation}"
         );
         let mut query = Query::new(cypher);
         query.parameters = BTreeMap::from([("query".to_owned(), json!(input.query))]);
         query.limits = result_limits(limit);
-        self.database
+        let result = self
+            .database
             .query(query)
-            .map(query_result_json)
-            .map_err(|error| format!("IronGraph semantic graph search failed: {error}"))
+            .map_err(|error| format!("IronGraph semantic graph search failed: {error}"))?;
+        if !input.include_connections || input.label.is_some() {
+            return Ok(query_result_json(result));
+        }
+        // The semantic result can contain both entity kinds. Traverse each kind through its
+        // proper Cypher pattern, retaining the original ranking and each context read's limits.
+        let mut node_ids = Vec::new();
+        let mut relationship_ids = Vec::new();
+        let entity_column = result
+            .columns
+            .iter()
+            .position(|column| column.name == "entity");
+        if let Some(column) = entity_column {
+            for row in &result.rows {
+                let (id, ids) = match row.get(column) {
+                    Some(TypedValue::Node(node)) => (&node.id, &mut node_ids),
+                    Some(TypedValue::Relationship(relationship)) => {
+                        (&relationship.id, &mut relationship_ids)
+                    }
+                    _ => continue,
+                };
+                ids.push(
+                    id.parse::<u64>()
+                        .map_err(|_| "IronGraph returned an invalid graph identity".to_owned())?,
+                );
+            }
+        }
+        let mut connections = serde_json::Map::new();
+        for (kind, mut ids, pattern) in [
+            (
+                "nodes",
+                node_ids,
+                "MATCH (entity) WHERE id(entity) IN $ids OPTIONAL MATCH (entity)-[relationship]-(neighbor) RETURN entity, collect(relationship) AS relationships, collect(neighbor) AS neighbors",
+            ),
+            (
+                "relationships",
+                relationship_ids,
+                "MATCH (source)-[entity]->(target) WHERE id(entity) IN $ids RETURN entity, [entity] AS relationships, [source, target] AS neighbors",
+            ),
+        ] {
+            if ids.is_empty() {
+                continue;
+            }
+            ids.sort_unstable();
+            ids.dedup();
+            let mut query = Query::new(format!("USE {project} {pattern}"));
+            query.parameters.insert("ids".to_owned(), json!(ids));
+            query.bookmark = result.summary.bookmark;
+            query.limits = result_limits(limit);
+            let context = self
+                .database
+                .query(query)
+                .map_err(|error| format!("IronGraph semantic search context failed: {error}"))?;
+            connections.insert(kind.to_owned(), query_result_json(context));
+        }
+        let mut output = query_result_json(result);
+        output["connections"] = Value::Object(connections);
+        Ok(output)
     }
 }
 
@@ -382,8 +455,8 @@ struct SaveDocumentInput {
 #[serde(deny_unknown_fields)]
 struct SearchInput {
     project: String,
-    index: String,
-    label: String,
+    index: Option<String>,
+    label: Option<String>,
     query: String,
     limit: Option<u64>,
     #[serde(default = "default_true")]
@@ -419,7 +492,7 @@ fn initialize(params: &Value) -> Value {
             "Before asking the user to repeat durable context, search the relevant project. Save facts, decisions, documents, entities and relationships when the user asks to remember them or when durable reuse is clearly intended. ",
             "IronGraph has no implicit default project: call irongraph_get_schema and name the project in every operation. Never guess labels, relationship types, properties, indexes or Cypher syntax. ",
             "Use irongraph_search_cypher_docs when syntax is uncertain, then read the returned irongraph:// resource. Use irongraph_run_cypher for every direct read, write, administration statement, graph algorithm and exact calculation over stored data; do not split reads from writes or export stored data into host-side scripts. ",
-            "Use irongraph_save_document for durable source text and irongraph_search for semantic recall over any indexed node label, including its connected relationships and neighboring nodes. Confirm destructive Cypher with the user before execution. Exact query rows are authoritative; summarize them without inventing missing facts."
+            "Use irongraph_save_document for durable source text and irongraph_search for automatic semantic recall across nodes and relationships, including documents and their graph context. No index or label is required for default semantic search. Confirm destructive Cypher with the user before execution. Exact query rows are authoritative; summarize them without inventing missing facts."
         )
     })
 }
@@ -456,7 +529,7 @@ fn tool_definitions() -> Vec<Value> {
         json!({
             "name": "irongraph_save_document",
             "title": "Save durable source text",
-            "description": "Persist or update complete source text as an ordinary (:Document) graph node in the named project. Use this when the user asks IronGraph to remember a note, decision, document, source excerpt or reusable context. Reusing document_id updates the same document; omitting it creates a stable UUID. The full body remains canonical graph data in the normal WAL/snapshot path—there is no side store. This tool also maintains the placeholder embedding property required before declaring an embedding index. It does not create an index silently: inspect the schema and use irongraph_run_cypher to declare the project's explicit Document.body embedding index when needed.",
+            "description": "Persist or update complete source text as an ordinary (:Document) graph node in the named project. Use this when the user asks IronGraph to remember a note, decision, document, source excerpt or reusable context. Reusing document_id updates the same document; omitting it creates a stable UUID. The full body remains canonical graph data in the normal WAL/snapshot path. When the local embedding model is enabled, meaningful document content is embedded automatically and kept current. No placeholder vector or index declaration is required before using irongraph_search.",
             "inputSchema": {
                 "type": "object",
                 "required": ["project", "body"],
@@ -474,17 +547,17 @@ fn tool_definitions() -> Vec<Value> {
         json!({
             "name": "irongraph_search",
             "title": "Search the graph by meaning",
-            "description": "The semantic retrieval tool for IronGraph graph data—not only documentation and not only documents. Search any node label backed by a declared embedding index, returning the complete matched nodes and similarity scores. By default it also traverses each match's connected relationships and returns those relationship values plus neighboring nodes, so the host receives graph context rather than isolated text hits. Use this proactively before asking the user to repeat stored knowledge. Call irongraph_get_schema first and pass the exact project, label, and ONLINE embedding index names; never guess them. IronGraph embedding indexes are declared over node text properties, so semantic ranking starts from nodes; relationship meaning is recovered through the matched nodes' graph connections. Use irongraph_run_cypher when relationship properties themselves must be filtered or ranked explicitly.",
+            "description": "Search graph meaning using only project and query. Automatic embeddings cover nodes and relationships, including document text and other meaningful properties; metadata and opaque identifiers are excluded. Results contain complete matched entities and similarity scores in descending order. Use this proactively before asking the user to repeat stored knowledge. Optionally select semantic_nodes or semantic_relationships, or supply both a declared node embedding index and its label. With include_connections, mixed search adds bounded connections.nodes and connections.relationships query results: node hits include incident relationships and neighbors; relationship hits include their endpoints. Each context result reports its own truncation and may reflect newer committed data. Declared node searches include context in their result rows. Local embedding must be enabled.",
             "inputSchema": {
                 "type": "object",
-                "required": ["project", "index", "label", "query"],
+                "required": ["project", "query"],
                 "properties": {
                     "project": { "type": "string", "description": "Exact project display name." },
-                    "index": { "type": "string", "description": "Exact ONLINE embedding index declared for the selected label." },
-                    "label": { "type": "string", "description": "Exact indexed node label, for example Document, Person, Decision, Event, Product, or Concept." },
+                    "index": { "type": "string", "description": "Omit for all nodes and relationships. Use semantic_nodes or semantic_relationships to select one entity kind, or provide a declared node embedding index together with label." },
+                    "label": { "type": "string", "description": "Node label for an explicitly declared embedding index. Omit for automatic semantic search." },
                     "query": { "type": "string", "description": "Natural-language meaning to retrieve." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 10 },
-                    "include_connections": { "type": "boolean", "default": true, "description": "When true, return each matched node's connected relationships and neighboring nodes as graph context." }
+                    "include_connections": { "type": "boolean", "default": true, "description": "Include bounded node adjacency and relationship endpoint context. Mixed search returns separate connections query results; each reports truncation." }
                 },
                 "additionalProperties": false
             },
@@ -922,6 +995,33 @@ mod tests {
     }
 
     #[test]
+    fn semantic_reference_examples_use_parseable_current_cypher() {
+        let paths = [
+            "clauses/search/create-embedding-index.md",
+            "clauses/search/search.md",
+            "statements/indexes/show-indexes.md",
+        ];
+        let mut examples = 0;
+        for path in paths {
+            let doc = CYPHER_DOCS
+                .iter()
+                .find(|doc| doc.path == path)
+                .expect("reference page");
+            for block in doc.markdown.split("```cypher\n").skip(1) {
+                let cypher = block.split("```").next().expect("Cypher example");
+                assert!(
+                    irongraph_cypher::parse(cypher).is_ok(),
+                    "invalid example in {path}: {cypher}"
+                );
+                examples += 1;
+            }
+            assert!(!doc.markdown.contains("90%"));
+            assert!(!doc.markdown.contains("recall floor"));
+        }
+        assert_eq!(examples, 6);
+    }
+
+    #[test]
     fn document_save_is_parameterized_and_uses_the_canonical_document_label() {
         let database = FakeDatabase::new();
         let server = McpServer::new(database);
@@ -934,6 +1034,8 @@ mod tests {
         assert!(queries[0].cypher.contains("MERGE (document:Document"));
         assert_eq!(queries[0].parameters["body"], json!("Keep this"));
         assert!(!queries[0].cypher.contains("Keep this"));
+        assert!(!queries[0].cypher.contains("embedding"));
+        assert!(!queries[0].parameters.contains_key("embedding"));
     }
 
     #[test]
@@ -980,6 +1082,152 @@ mod tests {
                 .ends_with("RETURN entity, score ORDER BY score DESC")
         );
         assert!(irongraph_cypher::parse(&queries[0].cypher).is_ok());
+    }
+
+    #[test]
+    fn semantic_search_defaults_to_ranked_mixed_entities_without_setup() {
+        let server = McpServer::new(FakeDatabase::new());
+        let result = server.search(
+            json!({"project": "memory", "query": "launch plans", "include_connections": false}),
+        );
+        assert!(result.is_ok());
+        let queries = server.database.queries.lock().expect("queries");
+        assert_eq!(queries.len(), 1);
+        assert_eq!(
+            queries[0].cypher,
+            "USE `memory` SEARCH entity IN (EMBEDDING INDEX `graph_semantic` FOR TEXT $query LIMIT 10) SCORE AS score RETURN entity, score ORDER BY score DESC"
+        );
+        assert_eq!(queries[0].parameters["query"], json!("launch plans"));
+        assert!(irongraph_cypher::parse(&queries[0].cypher).is_ok());
+        let definitions = tool_definitions();
+        let tool = definitions
+            .iter()
+            .find(|tool| tool["name"] == "irongraph_search")
+            .expect("search tool");
+        assert_eq!(tool["inputSchema"]["required"], json!(["project", "query"]));
+    }
+
+    #[test]
+    fn semantic_search_supports_entity_kind_selection_and_rejects_incomplete_field_selection() {
+        for index in ["semantic_nodes", "semantic_relationships"] {
+            let server = McpServer::new(FakeDatabase::new());
+            assert!(server.search(json!({"project": "memory", "index": index, "query": "launch", "include_connections": false})).is_ok());
+            let queries = server.database.queries.lock().expect("queries");
+            assert!(
+                queries[0]
+                    .cypher
+                    .contains(&format!("EMBEDDING INDEX `{index}`"))
+            );
+            assert!(!queries[0].cypher.contains("MATCH"));
+            assert!(irongraph_cypher::parse(&queries[0].cypher).is_ok());
+        }
+        let server = McpServer::new(FakeDatabase::new());
+        assert!(
+            server
+                .search(json!({"project": "memory", "label": "Document", "query": "launch"}))
+                .is_err()
+        );
+        assert!(
+            server
+                .search(json!({"project": "memory", "index": "document_body", "query": "launch"}))
+                .is_err()
+        );
+        assert!(server.database.queries.lock().expect("queries").is_empty());
+    }
+
+    #[test]
+    fn mixed_semantic_connections_use_entity_specific_patterns_and_preserve_ranking() {
+        use irongraph_server::protocol::QueryColumn;
+
+        struct MixedDatabase {
+            queries: Mutex<Vec<Query>>,
+        }
+        impl Database for MixedDatabase {
+            fn query(&self, query: Query) -> irongraph_client::Result<QueryResult> {
+                let mut queries = self.queries.lock().expect("queries");
+                queries.push(query);
+                if queries.len() != 1 {
+                    return Ok(QueryResult::default());
+                }
+                let mut result = QueryResult {
+                    columns: vec![
+                        QueryColumn {
+                            name: "entity".into(),
+                            value_type: "ANY".into(),
+                            nullable: false,
+                        },
+                        QueryColumn {
+                            name: "score".into(),
+                            value_type: "FLOAT".into(),
+                            nullable: false,
+                        },
+                    ],
+                    rows: vec![
+                        vec![
+                            TypedValue::Relationship(RelationshipValue {
+                                id: "11".into(),
+                                source: "1".into(),
+                                target: "2".into(),
+                                relationship_type: "OWNS".into(),
+                                properties: BTreeMap::new(),
+                            }),
+                            TypedValue::Float(0.9),
+                        ],
+                        vec![
+                            TypedValue::Node(ResultNode {
+                                id: "11".into(),
+                                labels: vec!["Person".into()],
+                                properties: BTreeMap::new(),
+                            }),
+                            TypedValue::Float(0.8),
+                        ],
+                    ],
+                    ..QueryResult::default()
+                };
+                result.summary.bookmark =
+                    Some(serde_json::from_value(json!({"term": 1, "index": 7})).expect("bookmark"));
+                Ok(result)
+            }
+        }
+        let server = McpServer::new(MixedDatabase {
+            queries: Mutex::new(Vec::new()),
+        });
+        let result = server
+            .search(json!({"project": "memory", "query": "launch"}))
+            .expect("mixed search");
+        assert_eq!(result["rows"][0]["entity"]["_type"], "relationship");
+        assert_eq!(result["rows"][0]["score"], 0.9);
+        assert_eq!(result["rows"][1]["entity"]["_type"], "node");
+        assert!(result["connections"]["nodes"].is_object());
+        assert!(result["connections"]["relationships"].is_object());
+        let queries = server.database.queries.lock().expect("queries");
+        assert_eq!(queries.len(), 3);
+        assert!(
+            queries[1]
+                .cypher
+                .contains("MATCH (entity) WHERE id(entity) IN $ids")
+        );
+        assert!(
+            queries[2]
+                .cypher
+                .contains("MATCH (source)-[entity]->(target)")
+        );
+        assert!(queries[2].cypher.contains("[source, target] AS neighbors"));
+        for query in queries.iter().skip(1) {
+            assert_eq!(query.parameters["ids"], json!([11]));
+            assert_eq!(query.limits.rows, 10);
+            assert_eq!(query.bookmark.map(|bookmark| bookmark.index), Some(7));
+            assert!(irongraph_cypher::parse(&query.cypher).is_ok());
+        }
+        let server = McpServer::new(MixedDatabase {
+            queries: Mutex::new(Vec::new()),
+        });
+        let result = server
+            .search(json!({"project": "memory", "query": "launch", "include_connections": false}))
+            .expect("ranked search");
+        assert_eq!(result["rows"].as_array().map(Vec::len), Some(2));
+        assert!(result.get("connections").is_none());
+        assert_eq!(server.database.queries.lock().expect("queries").len(), 1);
     }
 
     #[test]

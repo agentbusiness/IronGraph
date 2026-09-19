@@ -124,7 +124,6 @@ pub enum VectorAccessPath {
         query_batch: u32,
         candidate_budget: u32,
         scratch_bytes: u64,
-        recall_basis_points: u16,
     },
 }
 

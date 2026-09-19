@@ -17,7 +17,7 @@
 
 It does not change any answer. An index is derived state, so a rebuild produces the same query results at possibly different cost.
 
-A rebuild cannot fix a structural failure. A vector index that missed its recall floor will miss it again on the same data, because the measurement is of the data and the parameters rather than of a stale build.
+A rebuild refreshes vector search structures from the stored vectors. It does not change your source text or require generating the embeddings again. Vector search results are ranked and are not blocked by a recall threshold.
 
 ## When to use it
 

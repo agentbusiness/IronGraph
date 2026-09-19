@@ -89,6 +89,24 @@ async function main() {
     assert.equal((await deleted.query('USE app MATCH (d:Document) RETURN d')).rows.length, 0)
     await deleted.close()
     await remoteApiSmoke()
+    if (process.env.IRONGRAPH_QUALIFY_EMBEDDINGS === '1') {
+      const semantic = await EmbeddedDatabase.open(path.join(directory, 'semantic'), process.env.IRONGRAPH_QUALIFY_DEVICE || 'cpu', 0, true)
+      try {
+        await semantic.query('CREATE PROJECT meaning')
+        await semantic.query("USE meaning CREATE (p:Person {name:'Ada'}), (t:Task {title:'Arrange lessons'}), (t)-[:ASSIGNED_TO {description:'guitar music tuition'}]->(p)")
+        const search = "USE meaning SEARCH entity IN (EMBEDDING INDEX graph_semantic FOR TEXT 'guitar music tuition' LIMIT 10) SCORE AS score RETURN entity, score"
+        const matches = await semantic.query(search)
+        assert.equal(matches.rows.length, 3)
+        assert.equal(matches.rows[0][0].type, 'relationship')
+        const scores = matches.rows.map((row) => row[1].value)
+        assert.deepEqual(scores, [...scores].sort((a, b) => b - a))
+        await semantic.query("USE meaning MATCH ()-[r]->() SET r.description = 'contract negotiation'")
+        assert.equal((await semantic.query(search.replace('guitar music tuition', 'contract negotiation').replace('LIMIT 10', 'LIMIT 1'))).rows[0][0].type, 'relationship')
+        await semantic.snapshot()
+      } finally {
+        await semantic.close()
+      }
+    }
   } finally {
     fs.rmSync(directory, { recursive: true, force: true })
   }

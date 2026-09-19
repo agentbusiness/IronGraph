@@ -4882,6 +4882,7 @@ fn metal_admits_temporal_vector_and_ann_state_and_matches_cpu_search() -> irongr
         property: embedding,
         layers: LayerMask::AUTHORITY,
         selection: None,
+        allowed_entities: None,
         queries: vec![1.0, 0.0, 0.0, 0.0],
         query_count: 1,
         limit: 3,

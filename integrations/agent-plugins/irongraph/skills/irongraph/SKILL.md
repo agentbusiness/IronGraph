@@ -21,9 +21,9 @@ IronGraph is not a passive database to mention only when the user names it. It i
 
 ## Tool routing
 
-- Call `irongraph_search` first for meaning-based recall across any indexed node label. It can return matched nodes, relationships, and neighboring nodes—not only documents.
+- Call `irongraph_search` first with `project` and `query` for ranked meaning-based recall across nodes and relationships. Connected context is also available.
 - Call `irongraph_run_cypher` for all exact graph reads and writes, schema-independent traversal, aggregation, temporal work, algorithms, streams, queues, and administration. Read and write are intentionally one tool.
-- Call `irongraph_save_document` for durable source text. A document is an ordinary `:Document` node, stored in the graph and available to declared vector indexes.
+- Call `irongraph_save_document` for durable source text. A document is an ordinary `:Document` node, stored in the graph and embedded automatically when the local encoder is enabled.
 - Call `irongraph_get_schema` before writing unfamiliar Cypher or whenever labels, relationship types, properties, layers, projects, or indexes are uncertain.
 - Call `irongraph_search_cypher_docs`, then read the returned MCP resource, before relying on Cypher syntax you have not already verified.
 

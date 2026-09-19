@@ -165,13 +165,17 @@ Eight arXiv papers with embedded abstracts
 | Source | https://snap.stanford.edu/data/cit-HepTh.html |
 | Licence | Public research dataset (SNAP), cite Leskovec et al. 2005 |
 
-Vector and text search: the largest corpus for which the vector index publishes.
+Vector and text search: a compact set of papers for exploring retrieval by meaning.
 
 **Graph model**
 
 `(:Paper {paper_id, arxiv_id, title, authors, submitted, abstract, embedding})`
 
-A subset of `citations` chosen for subject spread rather than size. It is eight papers because the vector index validates its own approximation against exact search and refuses to publish below 90% agreement, which on real embeddings is not reached above that size — so eight is the largest corpus on which semantic search can be demonstrated working. `embedding` holds the placeholder written before the index was declared; the vectors themselves live in the index.
+A subset of `citations` containing eight papers chosen for subject spread. This dataset size is an
+example choice, not a semantic-search limit. The complete abstracts remain on their paper nodes.
+Automatic semantic search includes their meaningful content, and the dataset also provides a
+field-specific index for abstract searches. Generated vectors are derived index data; applications
+do not need to write placeholder vectors before declaring an embedding index.
 
 ## social
 
