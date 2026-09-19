@@ -57,13 +57,13 @@ class NpmPrivacyTests(unittest.TestCase):
             config = root / "npmrc"
             config.write_text(f"registry={registry}\n//127.0.0.1:{server.server_port}/:_authToken=loopback-test-only\n")
             env = {"NPM_CONFIG_USERCONFIG": str(config), "NPM_CONFIG_GLOBALCONFIG": str(root / "empty-global"),
-                   "NPM_CONFIG_CACHE": str(root / "cache")}
+                   "NPM_CONFIG_CACHE": str(root / "cache"), "NPM_CONFIG_BROWSER": "false"}
             source = root / "source"
             source.mkdir()
             packed = root / "packed"
             packed.mkdir()
             for name in release.PUBLIC_FILES:
-                (source / name).write_text("Public package documentation.\n")
+                (source / name).write_text("Public package documentation. Set the option to false.\n")
             (source / "index.js").write_text("module.exports = 42;\n")
             for name in ("@irongraph/privacy-fixture", "irongraph-privacy-fixture"):
                 manifest = {"name": name, "version": "0.1.3", "license": "Apache-2.0", "main": "index.js"}

@@ -972,11 +972,13 @@ def publish_npm(path, env, registry="https://registry.npmjs.org/"):
     path = Path(path).resolve()
     with tarfile.open(path) as archive:
         manifest = json.load(archive.extractfile("package/package.json"))
+    secrets = tuple(value for key, value in env.items()
+                    if any(word in key.upper() for word in ("TOKEN", "PASSWORD", "SECRET", "CREDENTIAL")))
     audit_archive(path, "npm", manifest["version"])
-    audit_npm_metadata(manifest, tuple(env.values()))
+    audit_npm_metadata(manifest, secrets)
     for name, contents in archive_files(path):
         if PurePosixPath(name).name.lower().startswith("readme"):
-            audit_npm_metadata(contents.decode(), tuple(env.values()))
+            audit_npm_metadata(contents.decode(), secrets)
     # A tarball spec makes npm inject its absolute pathname into public metadata.
     # Directory specs avoid that path, while the CLI retains browser/OTP support.
     with tempfile.TemporaryDirectory(prefix="irongraph-npm-", dir="/tmp") as temporary:
