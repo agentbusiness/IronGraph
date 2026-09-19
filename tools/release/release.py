@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import tomllib
 import urllib.error
 import urllib.parse
@@ -546,9 +547,18 @@ def qualify_target(source, output, target, qualify=True, config=None):
         test = (source / "bindings/node/test.cjs").read_text()
         test = test.replace("require('./index.js')", "require('@irongraph/node')")
         (consumer / "test.cjs").write_text(test)
-        run(["node", "test.cjs"], consumer)
+        run(["node", "test.cjs"], consumer, qualification_env)
+        if qualify and sys.platform == "darwin":
+            run(["node", "test.cjs"], consumer,
+                {**qualification_env, "IRONGRAPH_QUALIFY_DEVICE": "metal"})
     sdk_env = {**env, "IRONGRAPH_NATIVE_DIR": str(native_dir)}
     run(["cargo", "test", "--manifest-path", "bindings/rust/Cargo.toml"], source, sdk_env)
+    if qualify:
+        semantic_test = ["cargo", "test", "--manifest-path", "bindings/rust/Cargo.toml",
+                         "--test", "embedded", "automatic_semantic_native_and_remote", "--", "--ignored"]
+        run(semantic_test, source, sdk_env)
+        if sys.platform == "darwin":
+            run(semantic_test, source, {**sdk_env, "IRONGRAPH_QUALIFY_DEVICE": "metal"})
     # Record linked system libraries and toolchain versions for later support qualification.
     inspection = run(["otool", "-L", node_dir / binary_name] if sys.platform == "darwin" else
                      ["ldd", node_dir / binary_name], source, capture=True)
@@ -933,6 +943,15 @@ def npm_publish_order(publication, version):
     return sorted(publication.glob("*.tgz"), key=lambda path: (path.name in parents, path.name))
 
 
+def wait_for_public_package(path, version):
+    deadline = time.monotonic() + 1200
+    while not existing_package(path, version):
+        if time.monotonic() >= deadline:
+            raise ReleaseError(f"Registry publication is still pending: {path.name}; resume after it becomes public.")
+        print(f"Waiting for public registry checksum: {path.name}", flush=True)
+        time.sleep(15)
+
+
 def publish(stage, config, state):
     publication = stage / "publish"
     if {p.name for p in publication.iterdir()} != set(state["checksums"]):
@@ -996,6 +1015,7 @@ def publish(stage, config, state):
                     publish_crate(path, config["CARGO_REGISTRY_TOKEN"])
                 except CargoPublishError as error:
                     raise ReleaseError(str(error)) from None
+            wait_for_public_package(path, state["version"])
             state.setdefault("published", []).append(path.name)
             write_json(stage / "state.json", state)
     finally:

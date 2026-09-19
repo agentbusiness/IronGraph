@@ -287,6 +287,24 @@ class ReleaseTests(unittest.TestCase):
             release.publish(self.root, {}, {"checksums": {}})
         network.assert_not_called()
 
+    def test_publication_waits_for_verified_registry_visibility(self):
+        archive = self.root / "package.tgz"
+        with patch.object(release, "existing_package", side_effect=[False, False, True]) as lookup, \
+             patch.object(release.time, "sleep") as sleep:
+            release.wait_for_public_package(archive, "0.1.2")
+        self.assertEqual(lookup.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_publication_wait_is_bounded_and_rejects_checksum_mismatch(self):
+        archive = self.root / "package.tgz"
+        with patch.object(release, "existing_package", return_value=False), \
+             patch.object(release.time, "monotonic", side_effect=[0, 1201]), \
+             self.assertRaisesRegex(release.ReleaseError, "still pending"):
+            release.wait_for_public_package(archive, "0.1.2")
+        with patch.object(release, "existing_package", side_effect=release.ReleaseError("checksum mismatch")), \
+             self.assertRaisesRegex(release.ReleaseError, "checksum mismatch"):
+            release.wait_for_public_package(archive, "0.1.2")
+
     def test_release_repository_must_match_origin_and_be_public(self):
         config = {"IRONGRAPH_BINARY_REPO": "owner/engine"}
         with patch.object(release.subprocess, "check_output", return_value="git@github.com:owner/engine.git"), \
