@@ -39,16 +39,20 @@ CONFIG_KEYS = set(SECRETS) | {
     "IRONGRAPH_BINARY_REPO", "IRONGRAPH_RELEASE_REVIEWED",
     "IRONGRAPH_MANYLINUX_ARM64", "IRONGRAPH_MANYLINUX_AMD64",
     "MACOSX_DEPLOYMENT_TARGET",
+    "IRONGRAPH_PRIVATE_AUDIT_PATTERN",
 }
 VERSION_RE = re.compile(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)\Z")
 PUBLIC_FILES = {"README.md", "LICENSE.txt", "THIRD_PARTY_NOTICES.txt"}
-# Keep private audit markers out of the public source text itself.
-PRIVATE_BYTES = re.compile(b"|".join(bytes.fromhex(value) for value in (
-    "6174686c657261", "6e657879726f6e", "676c6f62616c5b205f2d5d3f636f72746578",
-    "73696d616e6c616369", "6c61737a6c6f", "6cc3a1737a6cc3b3",
-    "5c626c6163695c62", "5c6273696d616e5c62", "5c62696e74656c6c6967656e63655c62",
-    "2f55736572732f",
-)), re.I)
+def private_audit_pattern(config=None):
+    """Personal audit values belong in ignored local configuration, never source."""
+    pattern = (config or {}).get("IRONGRAPH_PRIVATE_AUDIT_PATTERN", "")
+    patterns = [rb"/(?:Users|home)/[^/\s]+/", rb"[A-Za-z]:\\Users\\[^\\\s]+\\"]
+    if pattern:
+        patterns.append(pattern.encode())
+    return re.compile(b"|".join(patterns), re.I)
+
+
+PRIVATE_BYTES = private_audit_pattern()
 
 
 class ReleaseError(Exception):
@@ -1164,6 +1168,8 @@ def build_matrix(stage, config):
 
 
 def release(args, config):
+    global PRIVATE_BYTES
+    PRIVATE_BYTES = private_audit_pattern(config)
     version = (args.resume.removeprefix("v") if args.resume else
                next_version(current_version(), args.bump) if args.bump else current_version())
     if not VERSION_RE.fullmatch(version):

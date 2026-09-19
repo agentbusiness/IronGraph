@@ -15,6 +15,15 @@ SPEC.loader.exec_module(release)
 
 
 class NpmPrivacyTests(unittest.TestCase):
+    def test_personal_audit_values_are_private_configuration(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / '.env.publish'
+            config.touch(mode=0o600)
+            config.write_text('IRONGRAPH_PRIVATE_AUDIT_PATTERN="example-private-owner"\n')
+            pattern = release.private_audit_pattern(release.load_config(config))
+            self.assertIsNotNone(pattern.search(b'EXAMPLE-PRIVATE-OWNER'))
+            self.assertIsNone(release.private_audit_pattern().search(b'example-private-owner'))
+
     def test_metadata_rejects_paths_and_install_fields(self):
         for value in ("file:../source.tgz", "/home/private-owner/source.tgz", "%2Ftmp%2Fsource.tgz",
                       "C:\\private-owner\\source.tgz", "\\\\host\\private-owner", "secret-value",
