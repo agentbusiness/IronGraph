@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 from pathlib import Path
 import tarfile
 import tempfile
@@ -129,6 +130,41 @@ class ReleaseTests(unittest.TestCase):
             archive.addfile(item)
         with self.assertRaises(release.ReleaseError):
             list(release.archive_files(path))
+
+    def test_archive_ownership_and_extended_metadata_are_private(self):
+        for field in ("uname", "gname", "pax"):
+            path = self.root / "metadata.tgz"
+            with tarfile.open(path, "w:gz") as archive:
+                member = tarfile.TarInfo("package/index.js")
+                if field == "pax":
+                    member.pax_headers = {"comment": "fixture-private-owner"}
+                else:
+                    setattr(member, field, "fixture-private-owner")
+                archive.addfile(member, io.BytesIO(b""))
+            with patch.object(release, "PRIVATE_BYTES", re.compile(b"fixture-private-owner")):
+                with self.subTest(field=field), self.assertRaises(release.ReleaseError):
+                    list(release.archive_files(path))
+        path = self.root / "metadata.whl"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.comment = b"fixture-private-owner"
+            archive.writestr("irongraph/__init__.py", "")
+        with patch.object(release, "PRIVATE_BYTES", re.compile(b"fixture-private-owner")):
+            with self.assertRaises(release.ReleaseError):
+                list(release.archive_files(path))
+
+    def test_standalone_tar_filter_preserves_payload_and_executable_mode(self):
+        source = self.root / "irongraph"
+        source.write_bytes(b"executable payload")
+        source.chmod(0o755)
+        destination = self.root / "standalone.tar.gz"
+        with tarfile.open(destination, "w:gz") as archive:
+            archive.add(source, arcname="irongraph-0.1.3/bin/irongraph", filter=release.public_tar_member)
+        with tarfile.open(destination) as archive:
+            member, = archive.getmembers()
+            self.assertEqual((member.uid, member.gid, member.mtime, member.uname, member.gname, member.pax_headers),
+                             (0, 0, 0, "", "", {}))
+            self.assertEqual(member.mode, 0o755)
+            self.assertEqual(archive.extractfile(member).read(), b"executable payload")
 
     def test_wheel_rejects_private_workspace_sbom(self):
         path = self.root / "irongraph.whl"

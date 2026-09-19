@@ -391,6 +391,14 @@ def standalone_names(target, version):
             f"irongraph-{version}-{target}.tar.gz"}
 
 
+def public_tar_member(member):
+    """Keep executable permissions without publishing host ownership or times."""
+    member.uid = member.gid = member.mtime = 0
+    member.uname = member.gname = ""
+    member.pax_headers = {}
+    return member
+
+
 def build_standalone(source, output, target, config=None):
     """Build the server and MCP executable using the same native build cache as the SDKs."""
     if target != host_target():
@@ -423,7 +431,8 @@ def build_standalone(source, output, target, config=None):
     archive = output / f"irongraph-{version}-{target}.tar.gz"
     with tarfile.open(archive, "w:gz") as bundle:
         for name in sorted(PUBLIC_FILES | {"bin/irongraph", "bin/irongraph-mcp"}):
-            bundle.add(native / name, arcname=f"irongraph-{version}/{name}", recursive=False)
+            bundle.add(native / name, arcname=f"irongraph-{version}/{name}", recursive=False,
+                       filter=public_tar_member)
     audit_archive(archive, "standalone", version)
 
 
@@ -582,7 +591,11 @@ def archive_files(path):
     """Read contents without extracting paths or following links."""
     if path.suffix == ".whl":
         with zipfile.ZipFile(path) as archive:
+            if PRIVATE_BYTES.search(archive.comment):
+                raise ReleaseError("Private information in ZIP archive metadata.")
             for info in archive.infolist():
+                if PRIVATE_BYTES.search(info.filename.encode() + info.comment + info.extra):
+                    raise ReleaseError("Private information in ZIP member metadata.")
                 if stat.S_ISLNK(info.external_attr >> 16):
                     raise ReleaseError(f"Symlink in wheel: {info.filename}")
                 if not info.is_dir():
@@ -590,6 +603,10 @@ def archive_files(path):
     else:
         with tarfile.open(path, "r:gz") as archive:
             for member in archive:
+                metadata = json.dumps({"name": member.name, "uname": member.uname,
+                                       "gname": member.gname, "pax": member.pax_headers}, ensure_ascii=False).encode()
+                if PRIVATE_BYTES.search(metadata):
+                    raise ReleaseError("Private information in tar archive metadata.")
                 if member.isdir():
                     continue
                 if not member.isfile():
