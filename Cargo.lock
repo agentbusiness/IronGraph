@@ -2703,7 +2703,7 @@ checksum = "6a756c3fac73139e83f14c2d742155dd2b78d3ee56597b419a0579b7bdd6dd78"
 
 [[package]]
 name = "irongraph"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2739,7 +2739,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-artifact-loader"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "blake3",
  "candle-core",
@@ -2753,7 +2753,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-client"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "axum",
  "chrono",
@@ -2774,7 +2774,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-cypher"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "blake3",
  "chrono",
@@ -2797,7 +2797,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-embedded"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "irongraph-client",
  "irongraph-server",
@@ -2814,7 +2814,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-embedding"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "blake3",
  "candle-core",
@@ -2848,7 +2848,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-execution"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "blake3",
  "chrono",
@@ -2866,7 +2866,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-ffi"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "irongraph-client",
  "irongraph-embedded",
@@ -2877,7 +2877,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-gpu"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "blake3",
  "candle-core",
@@ -2898,7 +2898,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-graph"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bitflags 2.13.1",
  "bitvec",
@@ -2919,7 +2919,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-mcp"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -2936,7 +2936,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-node"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "irongraph-client",
  "irongraph-embedded",
@@ -2950,7 +2950,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-python"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "irongraph-client",
  "irongraph-embedded",
@@ -2964,7 +2964,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-server"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3030,7 +3030,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-storage"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "blake3",
  "crc32c",
@@ -3047,7 +3047,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-types"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ordered-float",
  "serde",
