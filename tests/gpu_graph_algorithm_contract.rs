@@ -1065,6 +1065,232 @@ impl ExecutionBackend for RejectingAccelerator {
     }
 }
 
+fn direct_scan_channels_graph() -> Result<GraphStore> {
+    let mut graph = GraphStore::default();
+    let channel = graph.catalog_mut().intern_label("Channel")?;
+    let document = graph.catalog_mut().intern_label("Document")?;
+    let selected = graph.catalog_mut().intern_label("Selected")?;
+    let body = graph.catalog_mut().intern_property("body")?;
+    let fields = [
+        "channel_id",
+        "external_id",
+        "source_id",
+        "name",
+        "stream_id",
+        "extract_policy",
+        "item_count",
+        "last_at",
+        "purpose",
+        "kind",
+    ]
+    .map(|name| graph.catalog_mut().intern_property(name))
+    .into_iter()
+    .collect::<Result<Vec<_>>>()?;
+    for id in 1..=256 {
+        graph.insert_node(NodeInput {
+            id: NodeId(id),
+            layer: Layer::Workspace,
+            revision: id,
+            labels: vec![document, selected],
+            properties: vec![(
+                body,
+                ScalarValue::String(Arc::from(format!("{id}:{}", "body ".repeat(2048)))),
+            )],
+        })?;
+    }
+    for id in 257..=263 {
+        graph.insert_node(NodeInput {
+            id: NodeId(id),
+            layer: if id == 263 {
+                Layer::Observed
+            } else {
+                Layer::Workspace
+            },
+            revision: id,
+            labels: if id == 258 || id == 260 {
+                vec![channel, selected]
+            } else {
+                vec![channel]
+            },
+            properties: fields
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != 7)
+                .map(|(index, property)| {
+                    (
+                        *property,
+                        if index == 6 {
+                            ScalarValue::Integer(id as i64)
+                        } else {
+                            ScalarValue::String(Arc::from(format!("{id}-{index}")))
+                        },
+                    )
+                })
+                .collect(),
+        })?;
+    }
+    graph.delete_node(NodeId(262), false, 264)?;
+    let link = graph.catalog_mut().intern_relationship_type("LINK")?;
+    for id in 1..=255 {
+        graph.insert_edge(EdgeInput {
+            id: EdgeId(id),
+            source: NodeId(id),
+            target: NodeId(id + 1),
+            relationship_type: link,
+            layer: Layer::Workspace,
+            revision: 264 + id,
+            properties: Vec::new(),
+        })?;
+    }
+    Ok(graph)
+}
+
+const CHANNELS_QUERY: &str = "USE LAYER WORKSPACE MATCH (c:Channel) RETURN \
+    c.channel_id AS channel_id, c.external_id AS external_id, c.source_id AS source_id, \
+    c.name AS name, c.stream_id AS stream_id, c.extract_policy AS extract_policy, \
+    c.item_count AS item_count, c.last_at AS last_at, c.purpose AS purpose, c.kind AS kind";
+
+fn assert_direct_scan_channels(graph: &GraphStore, backend: &dyn ExecutionBackend) -> Result<()> {
+    let expected = execute(graph, None, CHANNELS_QUERY)?;
+    let expected_rows = rows(&expected);
+    assert_eq!(expected_rows.len(), 5);
+    assert_eq!(
+        expected_rows[0][0],
+        ResultValue::Scalar(ScalarValue::String(Arc::from("257-0")))
+    );
+    assert_eq!(
+        expected_rows[0][6],
+        ResultValue::Scalar(ScalarValue::Integer(257))
+    );
+    assert_eq!(expected_rows[0][7], ResultValue::Scalar(ScalarValue::Null));
+    for _ in 0..2 {
+        // Repeat exact query texts to cover cached as well as newly prepared route decisions.
+        for (suffix, start, end) in [
+            ("", 0, 5),
+            (" LIMIT 9223372036854775807", 0, 5),
+            (" LIMIT 0", 0, 0),
+            (" LIMIT 2", 0, 2),
+            (" SKIP 2", 2, 5),
+            (" SKIP 2 LIMIT 2", 2, 4),
+            (" SKIP 10 LIMIT 2", 5, 5),
+        ] {
+            let mut execution_context = context(graph, Some(backend));
+            execution_context.capabilities.require_native_execution = false;
+            let actual = QueryEngine
+                .execute(&format!("{CHANNELS_QUERY}{suffix}"), &mut execution_context)?;
+            assert_eq!(rows(&actual), expected_rows[start..end], "{suffix}");
+            assert_eq!(actual.result.bookmark, expected.result.bookmark);
+            assert!(!actual.result.truncated);
+            assert!(actual.graph_mutations.is_empty());
+            if start != end {
+                assert_eq!(actual.result.schema, expected.result.schema);
+            }
+        }
+    }
+    for limit in [0, 2, 10] {
+        let mut execution_context = context(graph, Some(backend));
+        execution_context.capabilities.require_native_execution = false;
+        execution_context.parameters.insert(
+            "limit".to_owned(),
+            ResultValue::Scalar(ScalarValue::Integer(limit)),
+        );
+        let actual = QueryEngine.execute(
+            &format!("{CHANNELS_QUERY} LIMIT $limit"),
+            &mut execution_context,
+        )?;
+        assert_eq!(rows(&actual), expected_rows[..(limit as usize).min(5)]);
+    }
+    for (suffix, ids) in [
+        ("", vec![258, 260]),
+        (" LIMIT 1", vec![258]),
+        (" SKIP 1 LIMIT 1", vec![260]),
+    ] {
+        let mut execution_context = context(graph, Some(backend));
+        execution_context.capabilities.require_native_execution = false;
+        let actual = QueryEngine.execute(
+            &format!("USE LAYER WORKSPACE MATCH (c:Channel:Selected) RETURN id(c) AS id{suffix}"),
+            &mut execution_context,
+        )?;
+        assert_eq!(
+            rows(&actual)
+                .iter()
+                .map(|row| integer(&row[0]))
+                .collect::<Vec<_>>(),
+            ids
+        );
+    }
+    for suffix in ["", " LIMIT 9223372036854775807"] {
+        let mut execution_context = context(graph, Some(backend));
+        execution_context.capabilities.require_native_execution = false;
+        execution_context.max_result_rows = 4;
+        let error = QueryEngine
+            .execute(&format!("{CHANNELS_QUERY}{suffix}"), &mut execution_context)
+            .expect_err("an unlimited direct scan must preserve the result budget");
+        assert_eq!(error.code, ErrorCode::ResultBudgetExceeded);
+    }
+    let prior = [GraphMutation::InsertNode(NodeInput {
+        id: NodeId(1000),
+        layer: Layer::Workspace,
+        revision: graph.revision() + 1,
+        labels: vec![graph.catalog().label("Channel").expect("fixture label")],
+        properties: Vec::new(),
+    })];
+    for suffix in ["", " LIMIT 9223372036854775807"] {
+        let mut execution_context = context(graph, Some(backend));
+        execution_context.capabilities.require_native_execution = false;
+        execution_context.prior_graph_mutations = &prior;
+        let actual =
+            QueryEngine.execute(&format!("{CHANNELS_QUERY}{suffix}"), &mut execution_context)?;
+        let actual_rows = rows(&actual);
+        assert_eq!(&actual_rows[..5], expected_rows.as_slice());
+        assert_eq!(
+            actual_rows[5],
+            vec![ResultValue::Scalar(ScalarValue::Null); 10]
+        );
+        assert_eq!(actual_rows.len(), 6);
+    }
+    let mut cancelled = context(graph, Some(backend));
+    cancelled.capabilities.require_native_execution = false;
+    cancelled.cancellation.cancel();
+    assert_eq!(
+        QueryEngine
+            .execute(CHANNELS_QUERY, &mut cancelled)
+            .expect_err("direct scan must honor cancellation")
+            .code,
+        ErrorCode::Cancelled
+    );
+    Ok(())
+}
+
+#[test]
+fn direct_node_scan_channels_need_no_dummy_limit_on_an_accelerator() -> Result<()> {
+    let graph = direct_scan_channels_graph()?;
+    let mut cpu = CpuBackend::new(MEMORY_LIMIT_BYTES, RESERVED_BYTES);
+    cpu.admit_project(image(&graph)?)?;
+    let accelerator = RejectingAccelerator::new(cpu);
+    assert_direct_scan_channels(&graph, &accelerator)?;
+    assert_eq!(accelerator.forbidden_host_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(accelerator.graph_procedure_calls.load(Ordering::SeqCst), 0);
+    // This adapter deliberately cannot run a native query. Strict conformance must still fail.
+    for query in [CHANNELS_QUERY.to_owned(), format!(" {CHANNELS_QUERY} ")] {
+        // Exercise both exact-source and normalized cache lookups after ordinary execution.
+        let error = execute(&graph, Some(&accelerator), &query)
+            .expect_err("native conformance must not reuse a cached direct scan route");
+        assert_eq!(error.code, ErrorCode::GpuAdmissionFailure);
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[test]
+#[ignore = "requires an available physical Metal device"]
+fn real_metal_direct_node_scan_channels_need_no_dummy_limit() -> Result<()> {
+    let graph = direct_scan_channels_graph()?;
+    let mut metal = MetalBackend::new(0, MEMORY_LIMIT_BYTES, RESERVED_BYTES)?;
+    metal.admit_project(image(&graph)?)?;
+    assert_direct_scan_channels(&graph, &metal)
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn active_accelerator_dispatches_every_graph_algorithm_without_host_fallback() -> Result<()> {

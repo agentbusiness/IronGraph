@@ -374,7 +374,7 @@ fn prepared_plan(
         &collected
     };
     // Broad query classes stay on the admitted resident backend. Only a Metal-optimized plan can
-    // prove the selective/bounded host shapes below, after which it is re-planned once with CPU
+    // prove the selective/direct host shapes below, after which it is re-planned once with CPU
     // costs and both the plan and route bit are cached.
     let optimizer_backend = backend;
     // An explicitly admitted CPU backend has a real resident scratch limit too. Preserve that
@@ -432,9 +432,9 @@ fn prepared_plan(
     if let Some(cpu_physical) = host_replan_candidate
         && (plan_is_host_fast_read(&plan)
             || plan_is_host_indexed_seek_read(&plan)
-            || plan_bare_scan_row_cap(&plan).is_some())
+            || plan_direct_node_scan(&plan).is_some())
     {
-        // The Metal optimizer has now proved this is a bounded/selective host winner. Re-plan from
+        // The Metal optimizer has now proved a selective seek or direct node scan. Re-plan from
         // the unoptimized IR with CPU costs instead of executing a Metal-costed access path on the
         // host. This happens only on a cold cache miss; the plan and route bit are cached together.
         (plan, profile) = optimize(
@@ -1187,24 +1187,24 @@ fn execute_plan_inner(
             .backend
             .is_some_and(|backend| backend.kind() != crate::execution::BackendKind::Cpu)
         && (plan_is_host_fast_read(&plan) || plan_is_host_indexed_seek_read(&plan));
-    // A bare limited scan (`MATCH (n[:Label]) RETURN … [SKIP s] LIMIT k`, no filter/sort/aggregate/
-    // DISTINCT) is answered on the host in O(s + k) by stopping the label scan early. The resident
-    // node pipeline instead scans the whole label and truncates the output, which is O(label). Route
-    // these to the host bounded scan on every backend; the conformance gate still exercises native.
-    let force_host_bounded_scan =
-        !context.capabilities.require_native_execution && plan_bare_scan_row_cap(&plan).is_some();
+    // Bare node scans project directly from the canonical graph, with an optional early stop.
+    // Eligibility does not depend on LIMIT: an unlimited read must not pay resident compilation
+    // and property preparation that the identical read with a nonbinding LIMIT avoids.
+    // The conformance gate still exercises native execution.
+    let force_host_direct_scan =
+        !context.capabilities.require_native_execution && plan_direct_node_scan(&plan).is_some();
     // Production Metal nodes use the versioned measured crossover table. This is a pre-execution
     // choice against one pinned canonical generation, not a failure fallback: no work has started,
     // no graph is copied, and an unknown/unmeasured plan remains Metal-first.
     if !force_host_fast_read
-        && !force_host_bounded_scan
+        && !force_host_direct_scan
         && !force_host_adaptive
         && let Some(output) = execute_resident_plan(&plan, context, procedures, &mut stream)?
     {
         return Ok(output);
     }
     if !force_host_fast_read
-        && !force_host_bounded_scan
+        && !force_host_direct_scan
         && !force_host_adaptive
         && let Some(backend) = context.backend
         && backend.kind() != crate::execution::BackendKind::Cpu
@@ -1310,7 +1310,8 @@ fn execute_plan_inner(
             allow_context_backend: !force_host_adaptive,
             resident_overlay_mutations: 0,
             existential_subquery_depth: 0,
-            initial_scan_cap: plan_bare_scan_row_cap(&plan),
+            initial_scan_cap: plan_direct_node_scan(&plan)
+                .map(|scan| scan.row_cap.unwrap_or(usize::MAX)),
         };
         let mut rows = vec![Row::new()];
         let mut feedback = None;
@@ -2223,18 +2224,21 @@ fn plan_is_label_count(plan: &PhysicalPlan) -> Option<(Option<String>, String)> 
     Some((label, item.column_name(0)))
 }
 
-/// Row cap for a bare limited node scan: `MATCH (n[:Label]) [WITH/RETURN …] [SKIP s] LIMIT k` with no
-/// filter, no relationship steps, no `DISTINCT`, no aggregation, and no ordering. Every scanned node
-/// maps one-to-one to one output row through the projection, so the host scan needs to yield at most
-/// `s + k` nodes. Bounding it there turns an O(label) materialization — which trips the result-row
-/// budget once a label has more than `QUERY_EXECUTION_ROW_ADDRESS_SPACE` rows — into O(s + k), the
-/// difference between answering a top-N read and failing it at millions of nodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirectNodeScan {
+    /// No cap means consume every match; this does not introduce a logical LIMIT operator.
+    row_cap: Option<usize>,
+}
+
+/// Eligibility and optional stopping bound for a bare node scan. Every scanned node maps one-to-one
+/// through ordinary projections. With SKIP/LIMIT the scan may stop after `s + k` matches; without
+/// LIMIT it consumes all matches through the same direct path. The scan can still inspect unrelated
+/// node slots while checking labels/layers, but never needs resident property or adjacency setup.
 ///
-/// Returns `None` for any shape where fewer-than-all scanned rows could change the answer: a `Filter`
-/// (which may reject rows, so the scan must continue past `k`), `DISTINCT`, aggregation, `ORDER BY`
-/// (`Sort`/`TopK`), a second pattern/scan, `UNWIND`, or a non-literal `SKIP`/`LIMIT`. `SKIP`/`LIMIT`
-/// are already folded to integer literals by `resolve_plan_row_counts` before this runs.
-fn plan_bare_scan_row_cap(plan: &PhysicalPlan) -> Option<usize> {
+/// Filters, relationship steps, DISTINCT, aggregates, ordering, additional scans and UNWIND keep
+/// their existing execution strategies. Non-literal row counts are admitted only after
+/// `resolve_plan_row_counts` has validated and folded them.
+fn plan_direct_node_scan(plan: &PhysicalPlan) -> Option<DirectNodeScan> {
     if !plan.read_only || plan.at_time.is_some() || !plan.unions.is_empty() {
         return None;
     }
@@ -2291,9 +2295,10 @@ fn plan_bare_scan_row_cap(plan: &PhysicalPlan) -> Option<usize> {
             _ => return None,
         }
     }
-    // `s + k` is always a safe upper bound on the scanned rows the answer can depend on, regardless of
-    // SKIP/LIMIT order, so a plan that never limits (limit is None) is not capped.
-    limit.map(|limit| skip.saturating_add(limit))
+    // `s + k` remains safe across multiple pagination stages, including LIMIT before SKIP.
+    Some(DirectNodeScan {
+        row_cap: limit.map(|limit| skip.saturating_add(limit)),
+    })
 }
 
 fn plan_requires_native_resident_execution(plan: &PhysicalPlan) -> bool {
@@ -2310,6 +2315,88 @@ fn plan_requires_native_resident_execution(plan: &PhysicalPlan) -> bool {
                     | PhysicalOperator::TemporalHistoryWindow { .. }
             )
         })
+}
+
+#[cfg(test)]
+mod direct_node_scan_tests {
+    use super::*;
+
+    fn scan(source: &str) -> Result<Option<DirectNodeScan>> {
+        let mut graph = GraphStore::default();
+        graph.catalog_mut().intern_label("Channel")?;
+        let catalog = graph.catalog();
+        let bound = super::super::bind(parse(source)?, catalog, BindCapabilities::default())?;
+        let statistics = StatisticsSnapshot::collect(&graph);
+        let (plan, _) = optimize(
+            plan(bound)?,
+            OptimizerInput {
+                statistics: &statistics,
+                catalog,
+                indexes: None,
+                parameters: &BTreeMap::new(),
+                backend: crate::execution::BackendKind::Cpu,
+                scratch_budget_bytes: usize::MAX,
+                max_result_rows: 1024,
+                runtime_feedback: None,
+                allow_runtime_checkpoint: true,
+            },
+        );
+        Ok(plan_direct_node_scan(&plan))
+    }
+
+    #[test]
+    fn direct_node_scan_does_not_require_a_limit() -> Result<()> {
+        for source in [
+            "MATCH (c:Channel) RETURN c.name AS name",
+            "MATCH (c) RETURN c.name AS name",
+            "USE LAYER WORKSPACE MATCH (c:Channel) RETURN c.channel_id AS channel_id, c.external_id AS external_id, c.source_id AS source_id, c.name AS name, c.stream_id AS stream_id, c.extract_policy AS extract_policy, c.item_count AS item_count, c.last_at AS last_at, c.purpose AS purpose, c.kind AS kind",
+            "MATCH (c:Channel) WITH c.name AS name RETURN name SKIP 2",
+        ] {
+            assert_eq!(
+                scan(source)?,
+                Some(DirectNodeScan { row_cap: None }),
+                "{source}"
+            );
+            assert_eq!(
+                scan(&format!("{source} LIMIT 9223372036854775807"))?,
+                Some(DirectNodeScan {
+                    row_cap: Some(i64::MAX as usize + usize::from(source.ends_with("SKIP 2")) * 2)
+                }),
+                "{source}"
+            );
+        }
+        for (source, cap) in [
+            ("MATCH (c:Channel) RETURN c.name LIMIT 0", 0),
+            ("MATCH (c:Channel) RETURN c.name SKIP 2 LIMIT 3", 5),
+            (
+                "MATCH (c:Channel) WITH c LIMIT 3 RETURN c.name SKIP 2 LIMIT 4",
+                5,
+            ),
+        ] {
+            assert_eq!(scan(source)?, Some(DirectNodeScan { row_cap: Some(cap) }));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn direct_node_scan_keeps_non_streamable_shapes_on_existing_routes() -> Result<()> {
+        for source in [
+            "MATCH (c:Channel) WHERE c.name = 'x' RETURN c.name",
+            "MATCH (c:Channel {name: 'x'}) RETURN c.name",
+            "MATCH (c:Channel) RETURN DISTINCT c.name",
+            "MATCH (c:Channel) RETURN count(c)",
+            "MATCH (c:Channel) RETURN c.name ORDER BY c.name",
+            "MATCH (c:Channel)-[:LINK]->(d) RETURN d",
+            "MATCH (c:Channel), (d:Channel) RETURN c, d",
+            "OPTIONAL MATCH (c:Channel) RETURN c.name",
+            "MATCH (c:Channel) UNWIND [1, 2] AS x RETURN x",
+            "MATCH (c:Channel) RETURN c.name AS name UNION ALL MATCH (d:Channel) RETURN d.name AS name",
+            "MATCH (c:Channel) RETURN c.name LIMIT $limit",
+        ] {
+            assert_eq!(scan(source)?, None, "{source}");
+        }
+        Ok(())
+    }
 }
 
 /// Write plans may contain a bounded MATCH, but only when every graph access can remain on the
@@ -13474,8 +13561,8 @@ struct ExecutionState<'a> {
     allow_context_backend: bool,
     resident_overlay_mutations: usize,
     existential_subquery_depth: usize,
-    /// Upper bound on nodes the initial bare label/all-node scan needs to yield, when the plan is a
-    /// bare limited scan (`plan_bare_scan_row_cap`). `None` means scan the whole label. Consumed only
+    /// Selects the direct initial scan and its match cap. `Some(usize::MAX)` consumes all matches;
+    /// `None` leaves scan selection to the other execution strategies. Consumed only
     /// by the host unindexed scan in `start_candidates`; such plans have exactly one scan.
     initial_scan_cap: Option<usize>,
 }
@@ -15473,13 +15560,11 @@ fn start_candidates(
         Some(candidates) => candidates,
         None => {
             if let Some(cap) = state.initial_scan_cap {
-                // Bare limited scan (no filter/sort/aggregate/distinct): stop after `s + k` nodes
-                // even when a resident backend is present. `backend.scan_nodes` returns the whole
-                // label from the resident image, so honoring the cap here is what turns an
-                // O(label) scan into O(s + k) for `MATCH (n[:Label]) RETURN … LIMIT k`.
+                // Bare direct scan: consume every match or stop at the proven pagination bound,
+                // even when a resident backend is present. Both forms avoid resident preparation.
                 state
                     .graph
-                    .scan_node_denses_bounded(first_label, state.read_layers, cap)
+                    .scan_node_denses_bounded(&labels, state.read_layers, cap)
             } else if let Some(backend) = backend {
                 backend.scan_nodes(
                     context.project_id,

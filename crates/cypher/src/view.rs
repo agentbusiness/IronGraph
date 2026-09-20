@@ -594,14 +594,12 @@ impl<'a> GraphReadView<'a> {
             .collect()
     }
 
-    /// `scan_node_denses` that stops after `cap` matches. The scan is a lazy filtered iterator, so
-    /// `.take(cap)` terminates the sweep early instead of materializing the whole label. A bare
-    /// `MATCH (n[:Label]) ... SKIP s LIMIT k` (no filter/DISTINCT/aggregation/order) needs only the
-    /// first `s + k` nodes — this keeps that top-N read O(cap) rather than O(label), which is the
-    /// difference between answering and tripping the result-row budget at millions of nodes.
+    /// Direct scan that stops after `cap` matches. Apply every required label and the layer mask
+    /// before counting a match, so pagination cannot stop on rows a later label check would reject.
+    /// The sweep may inspect unrelated slots, but materializes at most `cap` matching node ids.
     pub fn scan_node_denses_bounded(
         &self,
-        label: Option<LabelId>,
+        labels: &[LabelId],
         layers: LayerMask,
         cap: usize,
     ) -> Vec<u32> {
@@ -614,7 +612,7 @@ impl<'a> GraphReadView<'a> {
                 let dense = u32::try_from(row).ok()?;
                 let node = self.node_dense(dense)?;
                 (layers.contains_layer(node.layer())
-                    && label.is_none_or(|label| node.labels().contains(&label)))
+                    && labels.iter().all(|label| node.labels().contains(label)))
                 .then_some(dense)
             })
             .take(cap)

@@ -98,7 +98,8 @@ impl PlanCacheKey {
             bind_capability_bits: u8::from(capabilities.write)
                 | (u8::from(capabilities.schema) << 1)
                 | (u8::from(capabilities.knowledge_write) << 2)
-                | (u8::from(capabilities.workspace_write) << 3),
+                | (u8::from(capabilities.workspace_write) << 3)
+                | (u8::from(capabilities.require_native_execution) << 4),
             layer_bits: layers.bits(),
             temporal_mode,
             runtime_checkpoint_eligible,
@@ -145,7 +146,8 @@ impl EarlyPlanCacheKey {
             bind_capability_bits: u8::from(capabilities.write)
                 | (u8::from(capabilities.schema) << 1)
                 | (u8::from(capabilities.knowledge_write) << 2)
-                | (u8::from(capabilities.workspace_write) << 3),
+                | (u8::from(capabilities.workspace_write) << 3)
+                | (u8::from(capabilities.require_native_execution) << 4),
             runtime_checkpoint_eligible,
             scratch_budget_bytes,
             max_result_rows,
