@@ -1,6 +1,6 @@
 {
   "name": "@irongraph/node",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Embed a GPU-first graph database in Node.js with automatic local embeddings, Cypher, vector search, streaming, and queues.",
   "license": "Apache-2.0",
   "repository": {
@@ -45,8 +45,8 @@
     "@napi-rs/cli": "3.6.0"
   },
   "optionalDependencies": {
-    "@irongraph/node-darwin-arm64": "0.1.3",
-    "@irongraph/node-linux-arm64-gnu": "0.1.3",
-    "@irongraph/node-linux-x64-gnu": "0.1.3"
+    "@irongraph/node-darwin-arm64": "0.1.4",
+    "@irongraph/node-linux-arm64-gnu": "0.1.4",
+    "@irongraph/node-linux-x64-gnu": "0.1.4"
   }
 }
