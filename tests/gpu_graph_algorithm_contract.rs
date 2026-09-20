@@ -1291,6 +1291,234 @@ fn real_metal_direct_node_scan_channels_need_no_dummy_limit() -> Result<()> {
     assert_direct_scan_channels(&graph, &metal)
 }
 
+fn direct_filter_contacts_graph() -> Result<GraphStore> {
+    let mut graph = direct_scan_channels_graph()?;
+    let contact = graph.catalog_mut().intern_label("Contact")?;
+    let card_id = graph.catalog_mut().intern_property("card_id")?;
+    let display = graph.catalog_mut().intern_property("display")?;
+    let value = graph.catalog_mut().intern_property("value")?;
+    let kind = graph.catalog_mut().intern_property("kind")?;
+    for index in 0..444 {
+        let mut properties = vec![
+            (
+                display,
+                ScalarValue::String(Arc::from(format!("Person {index}"))),
+            ),
+            (
+                value,
+                ScalarValue::String(Arc::from(format!("{index}@example.test"))),
+            ),
+            (kind, ScalarValue::String(Arc::from("email"))),
+        ];
+        if index >= 78 {
+            properties.push((
+                card_id,
+                ScalarValue::String(Arc::from(format!("card-{index}"))),
+            ));
+        } else if index < 26 {
+            properties.push((card_id, ScalarValue::String(Arc::from(""))));
+        } else if index < 52 {
+            properties.push((card_id, ScalarValue::Null));
+        }
+        graph.insert_node(NodeInput {
+            id: NodeId(1000 + index),
+            layer: Layer::Observed,
+            revision: graph.revision() + 1,
+            labels: vec![contact],
+            properties,
+        })?;
+    }
+    Ok(graph)
+}
+
+const CONTACT_RETURN: &str =
+    "RETURN c.card_id AS card_id, c.display AS display, c.value AS value, c.kind AS kind";
+
+fn assert_direct_filter_contacts(graph: &GraphStore, backend: &dyn ExecutionBackend) -> Result<()> {
+    let all = execute(graph, None, &format!("MATCH (c:Contact) {CONTACT_RETURN}"))?;
+    assert_eq!(rows(&all).len(), 444);
+    let expected = rows(&all)[78..].to_vec();
+    assert_eq!(expected.len(), 366);
+    for _ in 0..2 {
+        for predicate in [
+            "c.card_id <> ''",
+            "c.card_id <> $empty",
+            "c.card_id IS NOT NULL AND c.card_id <> ''",
+            "NOT (c.card_id = '')",
+            "coalesce(c.card_id, '') <> ''",
+            "c.card_id > ''",
+            "c.card_id STARTS WITH 'card-'",
+        ] {
+            for (suffix, start, end) in [
+                ("", 0, 366),
+                (" LIMIT 9223372036854775807", 0, 366),
+                (" LIMIT 2", 0, 2),
+                (" SKIP 2 LIMIT 3", 2, 5),
+                (" LIMIT 0", 0, 0),
+            ] {
+                let mut ctx = context(graph, Some(backend));
+                ctx.capabilities.require_native_execution = false;
+                ctx.parameters.insert(
+                    "empty".to_owned(),
+                    ResultValue::Scalar(ScalarValue::String(Arc::from(""))),
+                );
+                // Rejected contacts and skipped rows must not consume the final output budget.
+                ctx.max_result_rows = (end - start).max(1);
+                let query = format!("MATCH (c:Contact) WHERE {predicate} {CONTACT_RETURN}{suffix}");
+                let actual = QueryEngine.execute(&query, &mut ctx)?;
+                assert_eq!(rows(&actual), expected[start..end], "{query}");
+                assert_eq!(actual.result.bookmark, all.result.bookmark);
+                assert!(!actual.result.truncated);
+                assert!(actual.graph_mutations.is_empty());
+            }
+        }
+    }
+    for (query, start, end) in [
+        (
+            format!(
+                "MATCH (c:Contact) WITH c LIMIT 80 WITH c WHERE c.card_id <> '' {CONTACT_RETURN}"
+            ),
+            0,
+            2,
+        ),
+        (
+            format!(
+                "MATCH (c:Contact) WHERE c.card_id <> '' WITH c LIMIT 5 WITH c WHERE c.card_id <> 'card-78' {CONTACT_RETURN}"
+            ),
+            1,
+            5,
+        ),
+        (
+            format!("MATCH (c:Contact) WHERE NULL {CONTACT_RETURN}"),
+            0,
+            0,
+        ),
+        (
+            format!("MATCH (c:Contact {{card_id: 'card-78'}}) {CONTACT_RETURN}"),
+            0,
+            1,
+        ),
+    ] {
+        let mut ctx = context(graph, Some(backend));
+        ctx.capabilities.require_native_execution = false;
+        ctx.max_result_rows = (end - start).max(1);
+        let actual = QueryEngine.execute(&query, &mut ctx)?;
+        assert_eq!(rows(&actual), expected[start..end], "{query}");
+        assert_eq!(
+            actual
+                .result
+                .schema
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["card_id", "display", "value", "kind"]
+        );
+    }
+    let mut ctx = context(graph, Some(backend));
+    ctx.capabilities.require_native_execution = false;
+    ctx.max_result_rows = 365;
+    let query = format!("MATCH (c:Contact) WHERE c.card_id <> '' {CONTACT_RETURN}");
+    assert_eq!(
+        QueryEngine
+            .execute(&query, &mut ctx)
+            .expect_err("output budget must be enforced")
+            .code,
+        ErrorCode::ResultBudgetExceeded
+    );
+    let mut ctx = context(graph, Some(backend));
+    ctx.capabilities.require_native_execution = false;
+    ctx.max_result_rows = 2;
+    ctx.parameters.insert(
+        "take".to_owned(),
+        ResultValue::Scalar(ScalarValue::Integer(2)),
+    );
+    assert_eq!(
+        rows(&QueryEngine.execute(&format!("{query} LIMIT $take"), &mut ctx)?),
+        expected[..2]
+    );
+    let aliased = QueryEngine.execute(
+        "MATCH (c:Contact) WITH c.card_id AS id WHERE id <> '' RETURN id LIMIT 2",
+        &mut ctx,
+    )?;
+    assert_eq!(
+        rows(&aliased),
+        expected[..2]
+            .iter()
+            .map(|row| vec![row[0].clone()])
+            .collect::<Vec<_>>()
+    );
+    let prior = [
+        GraphMutation::SetNodeProperty {
+            node: NodeId(1078),
+            property: graph
+                .catalog()
+                .property("card_id")
+                .expect("fixture property"),
+            value: ScalarValue::String(Arc::from("")),
+            revision: graph.revision() + 1,
+        },
+        GraphMutation::DeleteNode {
+            node: NodeId(1079),
+            detach: false,
+            revision: graph.revision() + 2,
+        },
+    ];
+    ctx.prior_graph_mutations = &prior;
+    assert_eq!(
+        rows(&QueryEngine.execute(&format!("{query} LIMIT 2"), &mut ctx)?),
+        expected[2..4]
+    );
+    ctx.prior_graph_mutations = &[];
+    assert_eq!(
+        QueryEngine
+            .execute(
+                "MATCH (c:Contact) WHERE c.card_id RETURN c.card_id",
+                &mut ctx
+            )
+            .expect_err("a non-boolean predicate must not be treated as true")
+            .code,
+        ErrorCode::QueryType
+    );
+    ctx.cancellation.cancel();
+    assert_eq!(
+        QueryEngine
+            .execute(&query, &mut ctx)
+            .expect_err("cancelled filtered read must stop")
+            .code,
+        ErrorCode::Cancelled
+    );
+    Ok(())
+}
+
+#[test]
+fn direct_filter_contacts_do_not_enter_resident_preparation() -> Result<()> {
+    let graph = direct_filter_contacts_graph()?;
+    let mut cpu = CpuBackend::new(MEMORY_LIMIT_BYTES, RESERVED_BYTES);
+    cpu.admit_project(image(&graph)?)?;
+    let accelerator = RejectingAccelerator::new(cpu);
+    assert_direct_filter_contacts(&graph, &accelerator)?;
+    assert_eq!(accelerator.forbidden_host_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(accelerator.graph_procedure_calls.load(Ordering::SeqCst), 0);
+    let strict = format!("MATCH (c:Contact) WHERE c.card_id <> '' {CONTACT_RETURN}");
+    assert_eq!(
+        execute(&graph, Some(&accelerator), &strict)
+            .expect_err("native-only requests must retain their execution contract")
+            .code,
+        ErrorCode::GpuAdmissionFailure
+    );
+    Ok(())
+}
+
+#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[test]
+#[ignore = "requires an available physical Metal device"]
+fn real_metal_direct_filter_contacts_preserve_results() -> Result<()> {
+    let graph = direct_filter_contacts_graph()?;
+    let mut metal = MetalBackend::new(0, MEMORY_LIMIT_BYTES, RESERVED_BYTES)?;
+    metal.admit_project(image(&graph)?)?;
+    assert_direct_filter_contacts(&graph, &metal)
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn active_accelerator_dispatches_every_graph_algorithm_without_host_fallback() -> Result<()> {

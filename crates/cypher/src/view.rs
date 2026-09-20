@@ -578,12 +578,15 @@ impl<'a> GraphReadView<'a> {
         !self.nodes.is_empty()
     }
 
-    pub fn scan_node_denses(&self, label: Option<LabelId>, layers: LayerMask) -> Vec<u32> {
-        let capacity = self
-            .base
+    /// Includes deleted slots and transaction-local inserts, without materializing candidate ids.
+    pub fn node_slot_count(&self) -> usize {
+        self.base
             .node_slot_count()
-            .saturating_add(self.inserted_node_count());
-        (0..capacity)
+            .saturating_add(self.inserted_node_count())
+    }
+
+    pub fn scan_node_denses(&self, label: Option<LabelId>, layers: LayerMask) -> Vec<u32> {
+        (0..self.node_slot_count())
             .filter_map(|row| {
                 let dense = u32::try_from(row).ok()?;
                 let node = self.node_dense(dense)?;
@@ -603,11 +606,7 @@ impl<'a> GraphReadView<'a> {
         layers: LayerMask,
         cap: usize,
     ) -> Vec<u32> {
-        let capacity = self
-            .base
-            .node_slot_count()
-            .saturating_add(self.inserted_node_count());
-        (0..capacity)
+        (0..self.node_slot_count())
             .filter_map(|row| {
                 let dense = u32::try_from(row).ok()?;
                 let node = self.node_dense(dense)?;

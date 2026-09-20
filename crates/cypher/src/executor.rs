@@ -1187,7 +1187,8 @@ fn execute_plan_inner(
             .backend
             .is_some_and(|backend| backend.kind() != crate::execution::BackendKind::Cpu)
         && (plan_is_host_fast_read(&plan) || plan_is_host_indexed_seek_read(&plan));
-    // Bare node scans project directly from the canonical graph, with an optional early stop.
+    // Scalar node scans filter and project directly from the canonical graph, with an optional
+    // early stop after enough rows reach a LIMIT.
     // Eligibility does not depend on LIMIT: an unlimited read must not pay resident compilation
     // and property preparation that the identical read with a nonbinding LIMIT avoids.
     // The conformance gate still exercises native execution.
@@ -1316,17 +1317,26 @@ fn execute_plan_inner(
         let mut rows = vec![Row::new()];
         let mut feedback = None;
         let mut operator_index = 0_usize;
+        let direct_filter = !context.capabilities.require_native_execution
+            && plan_direct_node_scan(&plan).is_some_and(|scan| scan.filtered);
         while operator_index < plan.operators.len() {
             let operator = &plan.operators[operator_index];
             check_execution(context)?;
-            let (next_rows, consumed) = apply_operator_sequence_step(
-                &plan.operators,
-                operator_index,
-                rows,
-                &mut state,
-                context,
-                procedures,
-            )?;
+            let (next_rows, consumed) = if direct_filter && operator_index == 0 {
+                (
+                    direct_filtered_node_rows(&plan.operators, &mut state, context)?,
+                    plan.operators.len(),
+                )
+            } else {
+                apply_operator_sequence_step(
+                    &plan.operators,
+                    operator_index,
+                    rows,
+                    &mut state,
+                    context,
+                    procedures,
+                )?
+            };
             rows = next_rows;
             operator_index = operator_index.saturating_add(consumed);
             if runtime_replans == 0
@@ -2228,15 +2238,18 @@ fn plan_is_label_count(plan: &PhysicalPlan) -> Option<(Option<String>, String)> 
 struct DirectNodeScan {
     /// No cap means consume every match; this does not introduce a logical LIMIT operator.
     row_cap: Option<usize>,
+    /// Predicates require row-by-row execution so rejected rows cannot consume a pagination cap.
+    filtered: bool,
 }
 
-/// Eligibility and optional stopping bound for a bare node scan. Every scanned node maps one-to-one
-/// through ordinary projections. With SKIP/LIMIT the scan may stop after `s + k` matches; without
-/// LIMIT it consumes all matches through the same direct path. The scan can still inspect unrelated
-/// node slots while checking labels/layers, but never needs resident property or adjacency setup.
+/// Eligibility and optional stopping bound for a direct node scan. Unfiltered projections preserve
+/// cardinality, so their scan may stop after `s + k` matches. Filtered plans apply their operators
+/// row-by-row and count pagination at its actual position. Both paths may inspect unrelated node
+/// slots while checking labels/layers, but need no resident property or adjacency preparation.
 ///
-/// Filters, relationship steps, DISTINCT, aggregates, ordering, additional scans and UNWIND keep
-/// their existing execution strategies. Non-literal row counts are admitted only after
+/// Scalar filters use the same direct access, applying pagination after predicate evaluation.
+/// Relationship steps, correlated graph expressions, DISTINCT, aggregates, ordering, additional
+/// scans and UNWIND keep their existing strategies. Non-literal row counts are admitted only after
 /// `resolve_plan_row_counts` has validated and folded them.
 fn plan_direct_node_scan(plan: &PhysicalPlan) -> Option<DirectNodeScan> {
     if !plan.read_only || plan.at_time.is_some() || !plan.unions.is_empty() {
@@ -2254,29 +2267,42 @@ fn plan_direct_node_scan(plan: &PhysicalPlan) -> Option<DirectNodeScan> {
     if pattern.variable.is_some()
         || pattern.selector != PathSelector::All
         || pattern.mode != PathMode::DifferentRelationships
-        || pattern.start.property_predicate_present
-        || !pattern.start.properties.is_empty()
         || !pattern.steps.is_empty()
+        || pattern
+            .start
+            .properties
+            .iter()
+            .any(|(_, expression)| needs_correlated_graph_evaluation(expression))
     {
         return None;
     }
     if !matches!(
         access,
-        ScanAccessPath::Label { .. } | ScanAccessPath::AllNodes
+        ScanAccessPath::Label { .. }
+            | ScanAccessPath::AllNodes
+            | ScanAccessPath::ResidentProperty { .. }
     ) {
         return None;
     }
     let mut skip = 0_usize;
     let mut limit: Option<usize> = None;
+    let mut filtered =
+        pattern.start.property_predicate_present || !pattern.start.properties.is_empty();
     for operator in plan.operators.iter().skip(1) {
         match operator {
             PhysicalOperator::CardinalityCheckpoint { .. } => {}
+            PhysicalOperator::Filter(expression) => {
+                if needs_correlated_graph_evaluation(expression) {
+                    return None;
+                }
+                filtered = true;
+            }
             PhysicalOperator::Project { projection, .. } => {
                 if projection.distinct
-                    || projection
-                        .items
-                        .iter()
-                        .any(|item| super::expression::contains_aggregate(&item.expression))
+                    || projection.items.iter().any(|item| {
+                        super::expression::contains_aggregate(&item.expression)
+                            || needs_correlated_graph_evaluation(&item.expression)
+                    })
                 {
                     return None;
                 }
@@ -2297,7 +2323,12 @@ fn plan_direct_node_scan(plan: &PhysicalPlan) -> Option<DirectNodeScan> {
     }
     // `s + k` remains safe across multiple pagination stages, including LIMIT before SKIP.
     Some(DirectNodeScan {
-        row_cap: limit.map(|limit| skip.saturating_add(limit)),
+        row_cap: if filtered {
+            None
+        } else {
+            limit.map(|limit| skip.saturating_add(limit))
+        },
+        filtered,
     })
 }
 
@@ -2315,6 +2346,138 @@ fn plan_requires_native_resident_execution(plan: &PhysicalPlan) -> bool {
                     | PhysicalOperator::TemporalHistoryWindow { .. }
             )
         })
+}
+
+/// Executes the scalar scan/filter/project pipeline without collecting rejected candidates or
+/// compiling resident property buffers. Each pagination operator owns its own counter: moving a
+/// LIMIT across a filter, or capping raw candidates before WHERE, would change the answer.
+fn direct_filtered_node_rows(
+    operators: &[PhysicalOperator],
+    state: &mut ExecutionState<'_>,
+    context: &ExecutionContext<'_>,
+) -> Result<Vec<Row>> {
+    let Some(PhysicalOperator::ScanPattern {
+        match_group,
+        pattern,
+        ..
+    }) = operators.first()
+    else {
+        return Err(Error::internal("direct filtered read lost its node scan"));
+    };
+    let labels: Option<Vec<_>> = pattern
+        .start
+        .labels
+        .iter()
+        .map(|name| state.graph.label(name))
+        .collect();
+    extend_pattern_scope(&mut state.scope_columns, pattern);
+    let input_scope = state.scope_columns.clone();
+    // Resolve the final column names even if every candidate is rejected. Do not evaluate any
+    // projected expression until a real row reaches that projection.
+    for operator in operators.iter().skip(1) {
+        if matches!(operator, PhysicalOperator::Project { .. }) {
+            apply_operator(operator, Vec::new(), state, context, None)?;
+        }
+    }
+    let final_columns = state.final_columns.clone();
+    let final_scope = state.scope_columns.clone();
+    let Some(labels) = labels else {
+        return Ok(Vec::new());
+    };
+    let mut remaining = operators
+        .iter()
+        .map(|operator| match operator {
+            PhysicalOperator::Skip(expression) | PhysicalOperator::Limit(expression) => {
+                evaluate_non_negative_usize(expression, None, state, context)
+            }
+            _ => Ok(0),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut exhausted = operators.iter().enumerate().any(|(index, operator)| {
+        matches!(operator, PhysicalOperator::Limit(_)) && remaining[index] == 0
+    });
+    let mut output = Vec::new();
+    for slot in 0..state.graph.node_slot_count() {
+        if exhausted {
+            break;
+        }
+        check_execution(context)?;
+        let dense = u32::try_from(slot).map_err(|_| Error::internal("node slot exceeds u32"))?;
+        let Some(node) = state.graph.node_dense(dense) else {
+            continue;
+        };
+        if !state.read_layers.contains_layer(node.layer())
+            || !labels.iter().all(|label| node.labels().contains(label))
+        {
+            continue;
+        }
+        let id = node.id();
+        let mut row = Row::new();
+        row.enter_match_group(*match_group);
+        if !pattern.start.properties.is_empty()
+            && !node_matches(dense, &pattern.start, &row, state, context)?
+        {
+            continue;
+        }
+        if let Some(base) = context.graph.node(id) {
+            state
+                .dependencies
+                .entities
+                .insert(EntityDependency::Node(id), base.revision());
+        }
+        if let Some(variable) = &pattern.start.variable {
+            row.insert(variable.clone(), BindingValue::Node(dense));
+        }
+        state.scope_columns.clone_from(&input_scope);
+        let mut current = vec![row];
+        for (index, operator) in operators.iter().enumerate().skip(1) {
+            if current.is_empty() {
+                break;
+            }
+            check_execution(context)?;
+            match operator {
+                PhysicalOperator::CardinalityCheckpoint { .. } => {}
+                PhysicalOperator::Filter(expression) => {
+                    if !matches!(
+                        truth(&evaluate_state(expression, &current[0], state, context)?)?,
+                        Truth::True
+                    ) {
+                        current.clear();
+                    }
+                }
+                PhysicalOperator::Skip(_) => {
+                    if remaining[index] != 0 {
+                        remaining[index] -= 1;
+                        current.clear();
+                    }
+                }
+                PhysicalOperator::Limit(_) => {
+                    remaining[index] -= 1;
+                    exhausted |= remaining[index] == 0;
+                }
+                PhysicalOperator::Project { .. } => {
+                    current = apply_operator(operator, current, state, context, None)?;
+                }
+                _ => {
+                    return Err(Error::internal(
+                        "non-scalar operator in direct filtered read",
+                    ));
+                }
+            }
+        }
+        if !current.is_empty() {
+            if output.len() >= context.max_result_rows {
+                return Err(Error::new(
+                    ErrorCode::ResultBudgetExceeded,
+                    "query row budget exceeded",
+                ));
+            }
+            output.extend(current);
+        }
+    }
+    state.final_columns = final_columns;
+    state.scope_columns = final_scope;
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -2354,13 +2517,17 @@ mod direct_node_scan_tests {
         ] {
             assert_eq!(
                 scan(source)?,
-                Some(DirectNodeScan { row_cap: None }),
+                Some(DirectNodeScan {
+                    row_cap: None,
+                    filtered: false
+                }),
                 "{source}"
             );
             assert_eq!(
                 scan(&format!("{source} LIMIT 9223372036854775807"))?,
                 Some(DirectNodeScan {
-                    row_cap: Some(i64::MAX as usize + usize::from(source.ends_with("SKIP 2")) * 2)
+                    row_cap: Some(i64::MAX as usize + usize::from(source.ends_with("SKIP 2")) * 2),
+                    filtered: false,
                 }),
                 "{source}"
             );
@@ -2373,7 +2540,33 @@ mod direct_node_scan_tests {
                 5,
             ),
         ] {
-            assert_eq!(scan(source)?, Some(DirectNodeScan { row_cap: Some(cap) }));
+            assert_eq!(
+                scan(source)?,
+                Some(DirectNodeScan {
+                    row_cap: Some(cap),
+                    filtered: false
+                })
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn direct_node_scan_admits_scalar_filters_without_capping_raw_rows() -> Result<()> {
+        for source in [
+            "MATCH (c:Channel) WHERE c.name <> '' RETURN c.name",
+            "MATCH (c:Channel) WHERE c.name = 'x' RETURN c.name LIMIT 2",
+            "MATCH (c:Channel {name: 'x'}) RETURN c.name",
+            "MATCH (c:Channel) WITH c.name AS name WHERE name IS NOT NULL RETURN name SKIP 1 LIMIT 3",
+        ] {
+            assert_eq!(
+                scan(source)?,
+                Some(DirectNodeScan {
+                    row_cap: None,
+                    filtered: true
+                }),
+                "{source}"
+            );
         }
         Ok(())
     }
@@ -2381,8 +2574,7 @@ mod direct_node_scan_tests {
     #[test]
     fn direct_node_scan_keeps_non_streamable_shapes_on_existing_routes() -> Result<()> {
         for source in [
-            "MATCH (c:Channel) WHERE c.name = 'x' RETURN c.name",
-            "MATCH (c:Channel {name: 'x'}) RETURN c.name",
+            "MATCH (c:Channel) WHERE (c)-[:LINK]->() RETURN c.name",
             "MATCH (c:Channel) RETURN DISTINCT c.name",
             "MATCH (c:Channel) RETURN count(c)",
             "MATCH (c:Channel) RETURN c.name ORDER BY c.name",
