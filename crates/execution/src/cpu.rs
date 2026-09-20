@@ -142,6 +142,14 @@ const fn cpu_dense_key(row: u32) -> u128 {
     (row as u128) << 96
 }
 
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum CpuSortValue {
+    Boolean(bool),
+    Integer(i64),
+    Float(OrderedFloat<f64>),
+    String(Arc<str>),
+}
+
 fn compare_materialized_order(
     column: &super::ResidentOrderColumn,
     left: usize,
@@ -14144,33 +14152,77 @@ impl ExecutionBackend for CpuBackend {
             .transpose()?;
         for order in request.orders.iter().rev() {
             let binding_rows = resident_pipeline_node_rows(&node_rows, order.binding)?;
-            let positions = match resident.image.graph.node_properties.column(order.property) {
-                Some(TypedColumn::Integer { .. }) => stable_nullable_positions(
-                    &resident.integer_values(binding_rows, order.property, cancellation)?,
-                    order.descending,
-                    order.nulls_first,
-                ),
-                Some(TypedColumn::Boolean { .. }) => stable_nullable_positions(
-                    &resident.boolean_values(binding_rows, order.property, cancellation)?,
-                    order.descending,
-                    order.nulls_first,
-                ),
-                Some(TypedColumn::String { .. }) => stable_nullable_positions(
-                    &resident.string_values(binding_rows, order.property, cancellation)?,
-                    order.descending,
-                    order.nulls_first,
-                ),
-                Some(TypedColumn::Float { .. }) => stable_nullable_positions(
-                    &resident.float_values(binding_rows, order.property, cancellation)?,
-                    order.descending,
-                    order.nulls_first,
-                ),
-                _ => {
+            let cold_positions = if resident.nodes.len() == 0 {
+                match resident.image.graph.node_properties.column(order.property) {
+                    Some(TypedColumn::Integer { .. }) => Some(stable_nullable_positions(
+                        &resident.integer_values(binding_rows, order.property, cancellation)?,
+                        order.descending,
+                        order.nulls_first,
+                    )),
+                    Some(TypedColumn::Boolean { .. }) => Some(stable_nullable_positions(
+                        &resident.boolean_values(binding_rows, order.property, cancellation)?,
+                        order.descending,
+                        order.nulls_first,
+                    )),
+                    Some(TypedColumn::String { .. }) => Some(stable_nullable_positions(
+                        &resident.string_values(binding_rows, order.property, cancellation)?,
+                        order.descending,
+                        order.nulls_first,
+                    )),
+                    Some(TypedColumn::Float { .. }) => Some(stable_nullable_positions(
+                        &resident.float_values(binding_rows, order.property, cancellation)?,
+                        order.descending,
+                        order.nulls_first,
+                    )),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let positions = if let Some(positions) = cold_positions {
+                positions
+            } else {
+                // Sparse deltas can introduce a property after the cold image was admitted or
+                // remove it from an existing row. Read the current selected rows, not the cold
+                // image's column schema, and never resurrect a removed value from that image.
+                let values = binding_rows
+                    .iter()
+                    .enumerate()
+                    .map(|(position, row)| {
+                        if position & 4095 == 0 {
+                            ensure_not_cancelled(cancellation)?;
+                        }
+                        match resident.property_value(*row, order.property)? {
+                            None => Ok(None),
+                            Some(ScalarValue::Boolean(value)) => {
+                                Ok(Some(CpuSortValue::Boolean(value)))
+                            }
+                            Some(ScalarValue::Integer(value)) => {
+                                Ok(Some(CpuSortValue::Integer(value)))
+                            }
+                            Some(ScalarValue::Float(value)) => Ok(Some(CpuSortValue::Float(value))),
+                            Some(ScalarValue::String(value)) => {
+                                Ok(Some(CpuSortValue::String(value)))
+                            }
+                            Some(_) => Err(Error::new(
+                                ErrorCode::QueryType,
+                                "resident sort property has no supported scalar value",
+                            )),
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if let Some(first) = values.iter().flatten().next()
+                    && values
+                        .iter()
+                        .flatten()
+                        .any(|value| std::mem::discriminant(value) != std::mem::discriminant(first))
+                {
                     return Err(Error::new(
                         ErrorCode::QueryType,
-                        "resident sort property has no supported typed column",
+                        "resident sort property is not homogeneous",
                     ));
                 }
+                stable_nullable_positions(&values, order.descending, order.nulls_first)
             };
             select_pipeline_rows(&mut node_rows, &mut relationship_rows, &positions)?;
             if request.value_matrix.is_some() {
@@ -27821,6 +27873,152 @@ mod node_pipeline_cpu_tests {
     };
 
     const PROJECT: ProjectId = ProjectId(uuid::Uuid::nil());
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn sparse_sort_reads_new_updated_and_removed_properties() -> Result<()> {
+        for cold in [false, true] {
+            for values in [
+                vec![
+                    ScalarValue::Integer(3),
+                    ScalarValue::Integer(1),
+                    ScalarValue::Integer(2),
+                ],
+                vec![
+                    ScalarValue::Float(3.0.into()),
+                    ScalarValue::Float(1.0.into()),
+                    ScalarValue::Float(2.0.into()),
+                ],
+                vec![
+                    ScalarValue::String("z".into()),
+                    ScalarValue::String("a".into()),
+                    ScalarValue::String("m".into()),
+                ],
+                vec![
+                    ScalarValue::Boolean(true),
+                    ScalarValue::Boolean(false),
+                    ScalarValue::Boolean(true),
+                ],
+            ] {
+                let boolean = matches!(values[0], ScalarValue::Boolean(_));
+                let mut graph = GraphStore::default();
+                let label = graph.catalog_mut().intern_label("Document")?;
+                let key = graph.catalog_mut().intern_property("key")?;
+                let body = graph.catalog_mut().intern_property("body")?;
+                let mut cpu = CpuBackend::new(32 * 1024 * 1024, 4 * 1024 * 1024);
+                if !cold {
+                    cpu.admit_project(ResidentProjectImage::graph_only(Arc::new(
+                        graph.snapshot()?,
+                    )))?;
+                }
+                for row in 0..4 {
+                    let mut properties =
+                        vec![(body, ScalarValue::String("text ".repeat(32_768).into()))];
+                    if let Some(value) = values.get(row) {
+                        properties.push((key, value.clone()));
+                    }
+                    graph.insert_node(NodeInput {
+                        id: NodeId(row as u64),
+                        layer: Layer::Observed,
+                        revision: 1,
+                        labels: vec![label],
+                        properties,
+                    })?;
+                }
+                if cold {
+                    cpu.admit_project(ResidentProjectImage::graph_only(Arc::new(
+                        graph.snapshot()?,
+                    )))?;
+                } else {
+                    cpu.apply_project_delta(ResidentProjectDelta {
+                        project: PROJECT,
+                        bookmark: Bookmark { term: 0, index: 1 },
+                        graph: graph.device_delta(1)?,
+                        temporal: Vec::new(),
+                        vectors: Vec::new(),
+                        invalidate_derived: true,
+                    })?;
+                }
+                let mut request = ResidentNodePipelineRequest {
+                    project: PROJECT,
+                    labels: vec![label],
+                    layers: LayerMask::ALL,
+                    initial_optional: false,
+                    expansion: None,
+                    continuations: Vec::new(),
+                    correlated_optional: None,
+                    relationship_null_filter: None,
+                    predicates: Vec::new(),
+                    property_filters: Vec::new(),
+                    value_matrix: None,
+                    mutation: None,
+                    orders: vec![super::super::ResidentNodeOrder {
+                        binding: ResidentNodeBinding::Start,
+                        property: key,
+                        descending: false,
+                        nulls_first: false,
+                    }],
+                    offset: 0,
+                    limit: 4,
+                    integer_projections: Vec::new(),
+                    property_null_projections: Vec::new(),
+                    max_output_rows: 4,
+                };
+                let cancellation = CancellationToken::new();
+                assert_eq!(
+                    cpu.execute_node_pipeline(&request, &cancellation)?
+                        .start_rows,
+                    if boolean {
+                        vec![1, 0, 2, 3]
+                    } else {
+                        vec![1, 2, 0, 3]
+                    }
+                );
+                let revision = graph.revision().saturating_add(1);
+                graph.set_node_property(NodeId(0), key, ScalarValue::Null, revision)?;
+                graph.set_node_property(NodeId(1), key, values[0].clone(), revision)?;
+                cpu.apply_project_delta(ResidentProjectDelta {
+                    project: PROJECT,
+                    bookmark: Bookmark {
+                        term: 0,
+                        index: revision,
+                    },
+                    graph: graph.device_delta(revision)?,
+                    temporal: Vec::new(),
+                    vectors: Vec::new(),
+                    invalidate_derived: true,
+                })?;
+                assert_eq!(
+                    cpu.execute_node_pipeline(&request, &cancellation)?
+                        .start_rows,
+                    if boolean {
+                        vec![1, 2, 0, 3]
+                    } else {
+                        vec![2, 1, 0, 3]
+                    }
+                );
+                request.orders[0].descending = true;
+                request.orders[0].nulls_first = true;
+                request.offset = 1;
+                request.limit = 2;
+                assert_eq!(
+                    cpu.execute_node_pipeline(&request, &cancellation)?
+                        .start_rows,
+                    vec![3, 1]
+                );
+                assert_eq!(
+                    cpu.resident[&PROJECT]
+                        .image
+                        .graph
+                        .node_properties
+                        .column(key)
+                        .is_some(),
+                    cold
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn sparse_appended_nodes_expand_both_directions_without_base_adjacency() -> Result<()> {
