@@ -1340,6 +1340,10 @@ fn assert_native_array_boundary(
     Ok(())
 }
 
+#[cfg_attr(
+    not(all(feature = "accelerator", target_os = "macos")),
+    allow(dead_code)
+)]
 fn execute_strict_create(
     graph: &GraphStore,
     backend: &ObservedBackend,

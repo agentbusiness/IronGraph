@@ -1,6 +1,11 @@
 //! Bounded, rebuildable statistics for logical cardinality and physical device planning.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
+
+use super::persistent::PersistentMap;
 
 use crate::{
     Layer, ScalarValue,
@@ -181,10 +186,15 @@ pub struct FanoutStatistics {
     pub mean_incoming_active: f64,
 }
 
-/// Immutable statistics generation tied to one canonical graph revision.
+/// Exact current cardinalities with immutable sampled cost estimates. `graph_revision` identifies
+/// the count generation; `sampled_graph_revision` identifies the retained empirical samples.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StatisticsSnapshot {
     pub graph_revision: u64,
+    pub sampled_graph_revision: Option<u64>,
+    sampled_node_counts: [u64; LAYER_COUNT],
+    sampled_edge_counts: [u64; LAYER_COUNT],
+    sampled_derived_bytes: u64,
     pub schema_generation: [u8; 32],
     pub index_generation: [u8; 32],
     pub resident_graph_bytes: u64,
@@ -194,13 +204,27 @@ pub struct StatisticsSnapshot {
     node_slot_count: u64,
     node_counts: [u64; LAYER_COUNT],
     edge_counts: [u64; LAYER_COUNT],
-    label_counts: BTreeMap<LabelId, [u64; LAYER_COUNT]>,
-    relationship_counts: BTreeMap<RelationshipTypeId, [u64; LAYER_COUNT]>,
-    node_properties: BTreeMap<PropertyId, [PropertyStatistics; LAYER_COUNT]>,
-    relationship_properties: BTreeMap<PropertyId, [PropertyStatistics; LAYER_COUNT]>,
-    fanout: BTreeMap<RelationshipTypeId, [FanoutStatistics; LAYER_COUNT]>,
-    online_indexes: Vec<OptimizerIndexStatistics>,
-    temporal: Vec<TemporalOptimizerColumnStatistics>,
+    label_counts: CountGeneration,
+    relationship_counts: CountGeneration,
+    node_properties: Arc<BTreeMap<PropertyId, [PropertyStatistics; LAYER_COUNT]>>,
+    relationship_properties: Arc<BTreeMap<PropertyId, [PropertyStatistics; LAYER_COUNT]>>,
+    fanout: Arc<BTreeMap<RelationshipTypeId, [FanoutStatistics; LAYER_COUNT]>>,
+    online_indexes: Arc<Vec<OptimizerIndexStatistics>>,
+    temporal: Arc<Vec<TemporalOptimizerColumnStatistics>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CountGeneration(PersistentMap<[u64; LAYER_COUNT]>);
+
+impl PartialEq for CountGeneration {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len() && self.0.iter().eq(other.0.iter())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static STATISTICS_COLLECT_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl StatisticsSnapshot {
@@ -220,8 +244,7 @@ impl StatisticsSnapshot {
     ) -> Self {
         let mut node_counts = [0_u64; LAYER_COUNT];
         let mut edge_counts = [0_u64; LAYER_COUNT];
-        let mut label_counts = BTreeMap::<LabelId, [u64; LAYER_COUNT]>::new();
-        let mut relationship_counts = BTreeMap::<RelationshipTypeId, [u64; LAYER_COUNT]>::new();
+        let (label_counts, relationship_counts) = graph.optimizer_count_generations();
         let mut fanout = BTreeMap::<RelationshipTypeId, [FanoutAccumulator; LAYER_COUNT]>::new();
         let mut node_accumulators =
             BTreeMap::<PropertyId, [PropertyAccumulator; LAYER_COUNT]>::new();
@@ -235,15 +258,13 @@ impl StatisticsSnapshot {
         let mut relationship_resident_bytes = 0_u64;
 
         for node in graph.nodes() {
+            #[cfg(test)]
+            STATISTICS_COLLECT_ROWS.with(|rows| rows.set(rows.get() + 1));
             let layer = layer_index(node.layer());
             node_counts[layer] = node_counts[layer].saturating_add(1);
             node_resident_bytes = node_resident_bytes
                 .saturating_add(17)
                 .saturating_add((node.labels().len() as u64).saturating_mul(8));
-            for label in node.labels() {
-                let counts = label_counts.entry(*label).or_default();
-                counts[layer] = counts[layer].saturating_add(1);
-            }
             for (property, value) in node.properties() {
                 node_resident_bytes = node_resident_bytes
                     .saturating_add(9)
@@ -258,13 +279,11 @@ impl StatisticsSnapshot {
         }
 
         for relationship in graph.edges() {
+            #[cfg(test)]
+            STATISTICS_COLLECT_ROWS.with(|rows| rows.set(rows.get() + 1));
             let layer = layer_index(relationship.layer());
             edge_counts[layer] = edge_counts[layer].saturating_add(1);
             relationship_resident_bytes = relationship_resident_bytes.saturating_add(41);
-            let counts = relationship_counts
-                .entry(relationship.relationship_type())
-                .or_default();
-            counts[layer] = counts[layer].saturating_add(1);
             fanout.entry(relationship.relationship_type()).or_default()[layer]
                 .insert(relationship.source().0, relationship.target().0);
             for (property, value) in relationship.properties() {
@@ -294,6 +313,10 @@ impl StatisticsSnapshot {
 
         Self {
             graph_revision: graph.revision(),
+            sampled_graph_revision: Some(graph.revision()),
+            sampled_node_counts: node_counts,
+            sampled_edge_counts: edge_counts,
+            sampled_derived_bytes: index_bytes.saturating_add(temporal_bytes),
             schema_generation: graph.catalog().optimizer_generation(),
             index_generation,
             resident_graph_bytes: node_resident_bytes
@@ -309,17 +332,67 @@ impl StatisticsSnapshot {
             node_slot_count: u64::try_from(graph.node_slot_count()).unwrap_or(u64::MAX),
             node_counts,
             edge_counts,
-            label_counts,
-            relationship_counts,
-            node_properties: finalize_properties(node_accumulators, &node_counts),
-            relationship_properties: finalize_properties(relationship_accumulators, &edge_counts),
-            fanout: fanout
-                .into_iter()
-                .map(|(kind, layers)| (kind, layers.map(FanoutAccumulator::finish)))
-                .collect(),
-            online_indexes,
-            temporal,
+            label_counts: CountGeneration(label_counts),
+            relationship_counts: CountGeneration(relationship_counts),
+            node_properties: Arc::new(finalize_properties(node_accumulators, &node_counts)),
+            relationship_properties: Arc::new(finalize_properties(
+                relationship_accumulators,
+                &edge_counts,
+            )),
+            fanout: Arc::new(
+                fanout
+                    .into_iter()
+                    .map(|(kind, layers)| (kind, layers.map(FanoutAccumulator::finish)))
+                    .collect(),
+            ),
+            online_indexes: Arc::new(online_indexes),
+            temporal: Arc::new(temporal),
         }
+    }
+
+    /// Builds a bounded planning summary without reading canonical rows. Counts are exact; no
+    /// empirical property, index or history samples are claimed for this generation.
+    #[must_use]
+    pub fn count_summary(graph: &GraphStore, index_generation: [u8; 32]) -> Self {
+        let mut summary = Self {
+            average_node_row_bytes: 17,
+            average_relationship_row_bytes: 41,
+            ..Self::default()
+        };
+        summary.refresh_counts(graph, index_generation);
+        summary
+    }
+
+    /// Advances only current cardinalities and provenance. Heavy samples remain at their recorded
+    /// sampling revision; this method shares persistent counter roots and never walks graph rows,
+    /// prior changes, property schemas, postings or temporal history.
+    pub fn refresh_counts(&mut self, graph: &GraphStore, index_generation: [u8; 32]) {
+        let (labels, relationships) = graph.optimizer_count_generations();
+        self.label_counts = CountGeneration(labels);
+        self.relationship_counts = CountGeneration(relationships);
+        for layer in Layer::ALL {
+            let mask = match layer {
+                Layer::Observed => LayerMask::OBSERVED,
+                Layer::Knowledge => LayerMask::KNOWLEDGE,
+                Layer::Workspace => LayerMask::WORKSPACE,
+            };
+            self.node_counts[layer as usize] = graph.node_count_in_layers(mask);
+            self.edge_counts[layer as usize] = graph.edge_count_in_layers(mask);
+        }
+        self.node_slot_count = graph.node_slot_count() as u64;
+        self.graph_revision = graph.revision();
+        self.schema_generation = graph.catalog().optimizer_generation();
+        self.index_generation = index_generation;
+        // This is a cost estimate. Actual admission and execution reserve canonical resident and
+        // scratch bytes independently; a retained average is never an allocation guarantee.
+        self.resident_graph_bytes = self
+            .average_node_row_bytes
+            .saturating_mul(graph.node_count() as u64)
+            .saturating_add(
+                self.average_relationship_row_bytes
+                    .saturating_mul(graph.edge_count() as u64),
+            )
+            .saturating_add(self.sampled_derived_bytes);
     }
 
     /// Binds one statistics snapshot to the physical capability set used for this plan. The
@@ -350,7 +423,8 @@ impl StatisticsSnapshot {
     #[must_use]
     pub fn label_count(&self, label: LabelId, layers: LayerMask) -> u64 {
         self.label_counts
-            .get(&label)
+            .0
+            .get(u128::from(label.0))
             .map_or(0, |counts| count_layers(counts, layers))
     }
 
@@ -361,7 +435,8 @@ impl StatisticsSnapshot {
         layers: LayerMask,
     ) -> u64 {
         self.relationship_counts
-            .get(&relationship_type)
+            .0
+            .get(u128::from(relationship_type.0))
             .map_or(0, |counts| count_layers(counts, layers))
     }
 
@@ -371,7 +446,12 @@ impl StatisticsSnapshot {
         property: PropertyId,
         layers: LayerMask,
     ) -> Option<PropertyStatistics> {
-        merge_property_layers(self.node_properties.get(&property)?, layers)
+        self.sampled_property(
+            self.node_properties.get(&property)?,
+            layers,
+            &self.sampled_node_counts,
+            &self.node_counts,
+        )
     }
 
     #[must_use]
@@ -380,7 +460,38 @@ impl StatisticsSnapshot {
         property: PropertyId,
         layers: LayerMask,
     ) -> Option<PropertyStatistics> {
-        merge_property_layers(self.relationship_properties.get(&property)?, layers)
+        self.sampled_property(
+            self.relationship_properties.get(&property)?,
+            layers,
+            &self.sampled_edge_counts,
+            &self.edge_counts,
+        )
+    }
+
+    // Samples estimate selectivity, never predicate truth. When counts have changed, scale the
+    // sampled presence fraction to current rows. An old zero sample cannot prove a current empty
+    // property, so report it as unknown until an explicit cold sampling operation.
+    fn sampled_property(
+        &self,
+        samples: &[PropertyStatistics; LAYER_COUNT],
+        layers: LayerMask,
+        sampled_rows: &[u64; LAYER_COUNT],
+        current_rows: &[u64; LAYER_COUNT],
+    ) -> Option<PropertyStatistics> {
+        let mut result = merge_property_layers(samples, layers)?;
+        if self.sampled_graph_revision != Some(self.graph_revision) {
+            let previous = count_layers(sampled_rows, layers);
+            let current = count_layers(current_rows, layers);
+            if previous == 0 || result.present == 0 {
+                return None;
+            }
+            result.present = ((u128::from(result.present) * u128::from(current))
+                .div_ceil(u128::from(previous)))
+            .min(u128::from(current)) as u64;
+            result.null_or_missing = current.saturating_sub(result.present);
+            result.distinct = result.distinct.min(result.present);
+        }
+        Some(result)
     }
 
     /// Mean directional fanout for a type selection. A known-empty selection remains zero.
@@ -410,7 +521,8 @@ impl StatisticsSnapshot {
         layers: LayerMask,
         outgoing: bool,
     ) -> f64 {
-        if relationship_types.is_empty() {
+        if relationship_types.is_empty() || self.sampled_graph_revision != Some(self.graph_revision)
+        {
             return self.mean_fanout(relationship_types, layers);
         }
         let mut edges = 0_u64;
@@ -439,11 +551,14 @@ impl StatisticsSnapshot {
     }
 
     #[must_use]
+    /// Retained cold index cost samples. Current index validity and access eligibility come from
+    /// the canonical index catalog, never from these estimates.
     pub fn online_indexes(&self) -> &[OptimizerIndexStatistics] {
         &self.online_indexes
     }
 
     #[must_use]
+    /// Retained cold history cost samples, not current history cardinality or query bounds.
     pub fn temporal_columns(&self) -> &[TemporalOptimizerColumnStatistics] {
         &self.temporal
     }
@@ -791,6 +906,119 @@ mod tests {
     use crate::{GraphMutation, Layer, NodeId, NodeInput, ScalarValue};
 
     use super::*;
+
+    #[test]
+    fn surgical_statistics_share_samples_and_advance_counts_across_revision_thresholds()
+    -> crate::Result<()> {
+        for rows in [4_096_u64, 16_384] {
+            let mut graph = GraphStore::default();
+            let label = graph.catalog_mut().intern_label("Data")?;
+            let changed = graph.catalog_mut().intern_label("Changed")?;
+            let value = graph.catalog_mut().intern_property("value")?;
+            let body = graph.catalog_mut().intern_property("body")?;
+            let missing = graph.catalog_mut().intern_property("missing")?;
+            let kind = graph.catalog_mut().intern_relationship_type("LINK")?;
+            let payload = ScalarValue::String(Arc::from("complete source content ".repeat(192)));
+            for id in 1..=rows {
+                graph.insert_node(NodeInput {
+                    id: NodeId(id),
+                    layer: Layer::Observed,
+                    revision: 1,
+                    labels: vec![label],
+                    properties: vec![
+                        (value, ScalarValue::Integer(id as i64)),
+                        (body, payload.clone()),
+                    ],
+                })?;
+                if id > 1 {
+                    graph.insert_edge(crate::EdgeInput {
+                        id: crate::EdgeId(id - 1),
+                        source: NodeId(id - 1),
+                        target: NodeId(id),
+                        relationship_type: kind,
+                        layer: Layer::Observed,
+                        revision: 1,
+                        properties: Vec::new(),
+                    })?;
+                }
+            }
+            graph.add_node_labels(NodeId(17), vec![changed], 2)?;
+            graph.delete_edge(crate::EdgeId(31), 2)?;
+            let pinned = StatisticsSnapshot::collect(&graph);
+            let mut current = pinned.clone();
+            STATISTICS_COLLECT_ROWS.with(|count| count.set(0));
+            for revision in 3..=520 {
+                graph.set_node_property(
+                    NodeId(1),
+                    value,
+                    ScalarValue::Integer(revision as i64),
+                    revision,
+                )?;
+                if revision == 256 {
+                    graph.add_node_labels(NodeId(1), vec![changed], revision)?;
+                    graph.set_node_property(
+                        NodeId(1),
+                        missing,
+                        ScalarValue::Integer(1),
+                        revision,
+                    )?;
+                }
+                if revision == 512 {
+                    graph.delete_node(NodeId(2), true, revision)?;
+                }
+                current.refresh_counts(&graph, [0; 32]);
+                assert_eq!(current.graph_revision, revision);
+                assert_eq!(
+                    current.node_count(LayerMask::ALL),
+                    graph.node_count() as u64
+                );
+                assert_eq!(
+                    current.label_count(changed, LayerMask::ALL),
+                    if revision >= 256 { 2 } else { 1 }
+                );
+                assert_eq!(
+                    current.relationship_count(kind, LayerMask::ALL),
+                    graph.edge_count() as u64
+                );
+                assert_eq!(current.sampled_graph_revision, Some(2));
+                assert!(Arc::ptr_eq(
+                    &current.node_properties,
+                    &pinned.node_properties
+                ));
+                assert!(Arc::ptr_eq(
+                    &current.relationship_properties,
+                    &pinned.relationship_properties
+                ));
+                assert!(Arc::ptr_eq(&current.fanout, &pinned.fanout));
+                assert!(Arc::ptr_eq(&current.online_indexes, &pinned.online_indexes));
+                assert!(Arc::ptr_eq(&current.temporal, &pinned.temporal));
+                assert!(current.node_property(missing, LayerMask::ALL).is_none());
+            }
+            let (labels, relationships) = graph.optimizer_count_generations();
+            assert!(current.label_counts.0.shared_with(&labels));
+            assert!(current.relationship_counts.0.shared_with(&relationships));
+            assert_eq!(pinned.graph_revision, 2);
+            assert_eq!(pinned.node_count(LayerMask::ALL), rows);
+            assert_eq!(pinned.label_count(changed, LayerMask::ALL), 1);
+            assert_eq!(
+                current
+                    .node_property(value, LayerMask::ALL)
+                    .map(|stats| stats.present),
+                Some(rows - 1)
+            );
+            let summary = StatisticsSnapshot::count_summary(&graph, [0; 32]);
+            assert_eq!(summary.node_count(LayerMask::ALL), rows - 1);
+            assert_eq!(summary.sampled_graph_revision, None);
+            assert!(summary.node_property(value, LayerMask::ALL).is_none());
+            STATISTICS_COLLECT_ROWS.with(|count| {
+                assert_eq!(count.get(), 0, "ordinary refresh collected unrelated rows")
+            });
+            eprintln!(
+                "surgical statistics: {rows} rows, 518 revisions, zero collected rows; all cold sample allocations shared"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn empty_statistics_preserve_known_zero() {

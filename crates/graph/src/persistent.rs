@@ -66,23 +66,22 @@ impl<T> ValuePage<T> {
         T: Clone,
     {
         match self {
-            Self::Owned(values) => values.push(value),
+            Self::Owned(values) => {
+                if values.len() == values.capacity() && values.len() > page_capacity::<T>() / 2 {
+                    values.reserve_exact(page_capacity::<T>().saturating_sub(values.len()));
+                }
+                values.push(value);
+            }
             Self::Shared(values) => {
-                let mut detached = values.as_slice().to_vec();
+                let mut detached = if values.len() > page_capacity::<T>() / 2 {
+                    let mut detached = Vec::with_capacity(page_capacity::<T>());
+                    detached.extend_from_slice(values.as_slice());
+                    detached
+                } else {
+                    values.as_slice().to_vec()
+                };
                 detached.push(value);
                 *self = Self::Owned(detached);
-            }
-        }
-    }
-
-    fn index_mut(&mut self, index: usize) -> &mut T
-    where
-        T: Clone,
-    {
-        loop {
-            match self {
-                Self::Owned(values) => return &mut values[index],
-                Self::Shared(values) => *self = Self::Owned(values.as_slice().to_vec()),
             }
         }
     }
@@ -90,130 +89,61 @@ impl<T> ValuePage<T> {
 
 #[derive(Clone)]
 struct PageLeaf<T> {
-    pages: Vec<Arc<ValuePage<T>>>,
-    len: usize,
+    pages: Vec<Option<Arc<ValuePage<T>>>>,
 }
 
 #[derive(Clone)]
 struct PageDirectory<T> {
-    // Retired leading leaves become `None` instead of shifting the complete directory. This
-    // releases their value pages in bounded chunks while preserving stable locations for every
-    // remaining leaf and every concurrently pinned generation.
-    leaves: Vec<Option<Arc<PageLeaf<T>>>>,
-    first_leaf: usize,
+    leaves: PersistentMap<Arc<PageLeaf<T>>>,
+    first_page: usize,
     len: usize,
+    default: Option<Arc<T>>,
 }
 
-/// A flat logical vector backed by a two-level immutable page directory.
+impl<T> PageDirectory<T> {
+    fn page(&self, page: usize) -> Option<&Arc<ValuePage<T>>> {
+        self.leaves
+            .get(((page / PAGES_PER_LEAF) as u128).reverse_bits())?
+            .pages
+            .get(page % PAGES_PER_LEAF)?
+            .as_ref()
+    }
+}
+
+impl<T: Clone> PageDirectory<T> {
+    #[allow(clippy::expect_used)] // The missing leaf is inserted immediately before this lookup.
+    fn page_mut(&mut self, page: usize) -> &mut Option<Arc<ValuePage<T>>> {
+        let key = ((page / PAGES_PER_LEAF) as u128).reverse_bits();
+        if !self.leaves.contains_key(key) {
+            self.leaves
+                .insert_cow(key, Arc::new(PageLeaf { pages: Vec::new() }));
+        }
+        let leaf = Arc::make_mut(self.leaves.get_mut(key).expect("page leaf was inserted"));
+        let slot = page % PAGES_PER_LEAF;
+        if leaf.pages.len() <= slot {
+            leaf.pages.resize_with(slot + 1, || None);
+        }
+        &mut leaf.pages[slot]
+    }
+}
+
+/// A flat logical vector backed by an immutable radix page directory.
 ///
-/// Cloning is one `Arc` increment. A point write copies one 16-KiB page, one bounded leaf
-/// directory, and the small root directory. Serialization remains a flat sequence.
+/// Cloning is one `Arc` increment. A point write copies one 16-KiB page, at most 256 page
+/// references, and a bounded radix path. Sparse default rows have no allocated page.
+/// Serialization remains a flat sequence.
 pub struct PagedVec<T> {
     root: Arc<PageDirectory<T>>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ArenaSpan {
-    pub page: u32,
-    pub start: u32,
-    pub len: u32,
-}
-
-/// Append-only typed arena. Small values share 16-KiB pages and every span remains contiguous;
-/// replacing a row therefore appends one range and retargets one paged descriptor.
-#[derive(Clone, Debug)]
-pub struct PagedArena<T> {
-    pages: PagedVec<Arc<Vec<T>>>,
-    elements: usize,
-}
-
-impl<T> Default for PagedArena<T> {
-    fn default() -> Self {
-        Self {
-            pages: PagedVec::default(),
-            elements: 0,
-        }
-    }
-}
-
-impl<T> PagedArena<T> {
-    pub fn append<I>(&mut self, values: I) -> Result<ArenaSpan, &'static str>
-    where
-        I: IntoIterator<Item = T>,
-        T: Clone,
-    {
-        let values = values.into_iter().collect::<Vec<_>>();
-        if values.is_empty() {
-            return Ok(ArenaSpan::default());
-        }
-        let len = u32::try_from(values.len()).map_err(|_| "arena value range exceeds u32")?;
-        let final_elements = self
-            .elements
-            .checked_add(len as usize)
-            .ok_or("arena element count overflow")?;
-        let capacity = page_capacity::<T>();
-        let page_index = self.pages.len().saturating_sub(1);
-        let reuse = self
-            .pages
-            .get(page_index)
-            .is_some_and(|page| page.capacity().saturating_sub(page.len()) >= values.len());
-        if reuse {
-            let page = self
-                .pages
-                .get_mut(page_index)
-                .ok_or("arena page directory is inconsistent")?;
-            let page = Arc::make_mut(page);
-            let start = u32::try_from(page.len()).map_err(|_| "arena page offset exceeds u32")?;
-            page.extend(values);
-            self.elements = final_elements;
-            return Ok(ArenaSpan {
-                page: u32::try_from(page_index).map_err(|_| "arena page count exceeds u32")?,
-                start,
-                len,
-            });
-        }
-        let mut page = Vec::with_capacity(capacity.max(values.len()));
-        page.extend(values);
-        let page_index =
-            u32::try_from(self.pages.len()).map_err(|_| "arena page count exceeds u32")?;
-        self.pages.push(Arc::new(page));
-        self.elements = final_elements;
-        Ok(ArenaSpan {
-            page: page_index,
-            start: 0,
-            len,
-        })
-    }
-
-    #[must_use]
-    pub fn get(&self, span: ArenaSpan) -> Option<&[T]> {
-        if span.len == 0 {
-            return Some(&[]);
-        }
-        let page = self.pages.get(span.page as usize)?;
-        let start = span.start as usize;
-        let end = start.checked_add(span.len as usize)?;
-        page.get(start..end)
-    }
-
-    #[must_use]
-    pub fn estimated_bytes(&self) -> usize {
-        self.elements.saturating_mul(size_of::<T>())
-    }
-
-    #[must_use]
-    pub const fn elements(&self) -> usize {
-        self.elements
-    }
 }
 
 impl<T> Default for PagedVec<T> {
     fn default() -> Self {
         Self {
             root: Arc::new(PageDirectory {
-                leaves: Vec::new(),
-                first_leaf: 0,
+                leaves: PersistentMap::default(),
+                first_page: 0,
                 len: 0,
+                default: None,
             }),
         }
     }
@@ -242,34 +172,35 @@ impl<T> PagedVec<T> {
         T: Clone,
     {
         let capacity = page_capacity::<T>();
-        let mut leaves = Vec::<Option<Arc<PageLeaf<T>>>>::new();
+        let mut directory = PageDirectory {
+            leaves: PersistentMap::default(),
+            first_page: 0,
+            len: values.len(),
+            default: None,
+        };
         let mut offset = 0_usize;
         while offset < values.len() {
-            let leaf_index = (offset / capacity) / PAGES_PER_LEAF;
-            if leaves.len() == leaf_index {
-                leaves.push(Some(Arc::new(PageLeaf {
-                    pages: Vec::new(),
-                    len: 0,
-                })));
-            }
             let page_len = capacity.min(values.len() - offset);
             let page = ValuePage::Shared(values.slice(offset, page_len)?);
-            let leaf = leaves
-                .get_mut(leaf_index)
-                .and_then(Option::as_mut)
-                .ok_or("shared page directory is inconsistent")?;
-            let leaf = Arc::make_mut(leaf);
-            leaf.pages.push(Arc::new(page));
-            leaf.len += page_len;
+            *directory.page_mut(offset / capacity) = Some(Arc::new(page));
             offset += page_len;
         }
         Ok(Self {
-            root: Arc::new(PageDirectory {
-                leaves,
-                first_leaf: 0,
-                len: values.len(),
-            }),
+            root: Arc::new(directory),
         })
+    }
+
+    /// Creates a logical repeated vector without allocating or visiting its rows. Only pages
+    /// subsequently changed become materialized; checkpoints still serialize a flat sequence.
+    pub fn repeat(value: T, len: usize) -> Self {
+        Self {
+            root: Arc::new(PageDirectory {
+                leaves: PersistentMap::default(),
+                first_page: 0,
+                len,
+                default: Some(Arc::new(value)),
+            }),
+        }
     }
 
     #[cfg_attr(
@@ -294,30 +225,17 @@ impl<T> PagedVec<T> {
         self.root.len == 0
     }
 
-    fn location(index: usize) -> (usize, usize, usize) {
-        let page_capacity = page_capacity::<T>();
-        let page = index / page_capacity;
-        (
-            page / PAGES_PER_LEAF,
-            page % PAGES_PER_LEAF,
-            index % page_capacity,
-        )
-    }
-
     #[must_use]
     pub fn get(&self, index: usize) -> Option<&T> {
         if index >= self.root.len {
             return None;
         }
-        let (leaf, page, offset) = Self::location(index);
+        let capacity = page_capacity::<T>();
+        let page = self.root.first_page.checked_add(index / capacity)?;
         self.root
-            .leaves
-            .get(self.root.first_leaf.checked_add(leaf)?)?
-            .as_ref()?
-            .pages
-            .get(page)?
-            .as_slice()
-            .get(offset)
+            .page(page)
+            .and_then(|page| page.as_slice().get(index % capacity))
+            .or(self.root.default.as_deref())
     }
 
     pub fn get_mut(&mut self, index: usize) -> Option<&mut T>
@@ -327,11 +245,15 @@ impl<T> PagedVec<T> {
         if index >= self.root.len {
             return None;
         }
-        let (leaf_index, page_index, offset) = Self::location(index);
+        let capacity = page_capacity::<T>();
         let directory = Arc::make_mut(&mut self.root);
-        let physical_leaf = directory.first_leaf.checked_add(leaf_index)?;
-        let leaf = Arc::make_mut(directory.leaves.get_mut(physical_leaf)?.as_mut()?);
-        Arc::make_mut(leaf.pages.get_mut(page_index)?).get_mut(offset)
+        let page_index = directory.first_page.checked_add(index / capacity)?;
+        if directory.page(page_index).is_none() {
+            let value = directory.default.as_deref()?.clone();
+            let len = capacity.min(directory.len - index / capacity * capacity);
+            *directory.page_mut(page_index) = Some(Arc::new(ValuePage::Owned(vec![value; len])));
+        }
+        Arc::make_mut(directory.page_mut(page_index).as_mut()?).get_mut(index % capacity)
     }
 
     pub fn replace(&mut self, index: usize, value: T) -> Result<(), &'static str>
@@ -351,48 +273,36 @@ impl<T> PagedVec<T> {
     {
         let capacity = page_capacity::<T>();
         let directory = Arc::make_mut(&mut self.root);
-        let needs_leaf = directory
-            .leaves
-            .last()
-            .and_then(Option::as_ref)
-            .is_none_or(|leaf| {
-                leaf.pages.len() == PAGES_PER_LEAF
-                    && leaf.pages.last().is_some_and(|page| page.len() == capacity)
-            });
-        if needs_leaf {
-            directory.leaves.push(Some(Arc::new(PageLeaf {
-                pages: Vec::new(),
-                len: 0,
-            })));
-        }
-        let leaf = loop {
-            if let Some(leaf) = directory.leaves.last_mut().and_then(Option::as_mut) {
-                break Arc::make_mut(leaf);
+        let page_index = directory.first_page + directory.len / capacity;
+        let offset = directory.len % capacity;
+        let default = directory.default.clone();
+        let page = directory.page_mut(page_index).get_or_insert_with(|| {
+            let mut values = Vec::with_capacity(capacity);
+            if offset != 0
+                && let Some(default) = default.as_deref()
+            {
+                values.resize(offset, default.clone());
             }
-            directory.leaves.push(Some(Arc::new(PageLeaf {
-                pages: Vec::new(),
-                len: 0,
-            })));
-        };
-        if leaf.pages.last().is_none_or(|page| page.len() == capacity) {
-            leaf.pages
-                .push(Arc::new(ValuePage::Owned(Vec::with_capacity(capacity))));
-        }
-        let page_index = leaf.pages.len() - 1;
-        Arc::make_mut(&mut leaf.pages[page_index]).push(value);
-        leaf.len += 1;
+            Arc::new(ValuePage::Owned(values))
+        });
+        Arc::make_mut(page).push(value);
         directory.len += 1;
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &T> + DoubleEndedIterator {
-        self.root
-            .leaves
-            .get(self.root.first_leaf..)
-            .into_iter()
-            .flatten()
-            .filter_map(Option::as_ref)
-            .flat_map(|leaf| leaf.pages.iter())
-            .flat_map(|page| page.as_slice().iter())
+        let capacity = page_capacity::<T>();
+        (0..self.len().div_ceil(capacity)).flat_map(move |page| {
+            let len = capacity.min(self.len() - page * capacity);
+            let values = self.root.page(self.root.first_page + page);
+            let allocated = values.map_or(&[][..], |values| &values.as_slice()[..len]);
+            allocated.iter().chain(
+                self.root
+                    .default
+                    .as_deref()
+                    .into_iter()
+                    .flat_map(move |value| std::iter::repeat_n(value, len - allocated.len())),
+            )
+        })
     }
 
     /// Releases complete leading leaf allocations covered by `elements` and returns the exact
@@ -402,49 +312,35 @@ impl<T> PagedVec<T> {
     where
         T: Clone,
     {
-        let mut removable = 0_usize;
-        let mut leaves = 0_usize;
-        for leaf in self
-            .root
-            .leaves
-            .get(self.root.first_leaf..)
-            .into_iter()
-            .flatten()
-            .filter_map(Option::as_ref)
-        {
-            let Some(next) = removable.checked_add(leaf.len) else {
-                break;
-            };
-            if next > elements {
-                break;
-            }
-            removable = next;
-            leaves += 1;
-        }
-        if leaves == 0 {
+        let capacity = page_capacity::<T>();
+        let leaf_capacity = capacity * PAGES_PER_LEAF;
+        let removable = if elements >= self.len() {
+            self.len()
+        } else {
+            elements / leaf_capacity * leaf_capacity
+        };
+        if removable == 0 {
             return 0;
         }
         let directory = Arc::make_mut(&mut self.root);
-        let end = directory.first_leaf.saturating_add(leaves);
-        for leaf in &mut directory.leaves[directory.first_leaf..end] {
-            *leaf = None;
+        let page_count = removable.div_ceil(capacity);
+        for leaf in directory.first_page / PAGES_PER_LEAF
+            ..(directory.first_page + page_count).div_ceil(PAGES_PER_LEAF)
+        {
+            directory.leaves.remove((leaf as u128).reverse_bits());
         }
-        directory.first_leaf = end;
+        directory.first_page += page_count;
         directory.len = directory.len.saturating_sub(removable);
         if directory.len == 0 {
-            directory.leaves.clear();
-            directory.first_leaf = 0;
+            directory.leaves = PersistentMap::default();
+            directory.first_page = 0;
         }
         removable
     }
 
     #[must_use]
     pub fn first_leaf_len(&self) -> usize {
-        self.root
-            .leaves
-            .get(self.root.first_leaf)
-            .and_then(Option::as_ref)
-            .map_or(0, |leaf| leaf.len)
+        self.len().min(page_capacity::<T>() * PAGES_PER_LEAF)
     }
 
     #[must_use]
@@ -455,6 +351,22 @@ impl<T> PagedVec<T> {
         self.iter().cloned().collect()
     }
 
+    /// Inspects materialized value allocations, excluding unmaterialized default rows. This
+    /// instrumentation walks allocated pages; it must not be used to plan a point mutation.
+    #[doc(hidden)]
+    pub fn allocated_value_bytes(&self) -> usize {
+        self.root
+            .leaves
+            .iter()
+            .flat_map(|(_, leaf)| leaf.pages.iter().flatten())
+            .map(|page| match page.as_ref() {
+                ValuePage::Owned(values) => values.capacity().saturating_mul(size_of::<T>()),
+                ValuePage::Shared(values) => values.len().saturating_mul(size_of::<T>()),
+            })
+            .sum::<usize>()
+            .saturating_add(usize::from(self.root.default.is_some()) * size_of::<T>())
+    }
+
     /// Actual value-page bytes no longer shared with `previous` at the same logical positions.
     /// This inspects allocation identity and is used by scale tests rather than an estimated
     /// mutation counter.
@@ -463,23 +375,23 @@ impl<T> PagedVec<T> {
         self.root
             .leaves
             .iter()
-            .enumerate()
-            .filter_map(|(leaf_index, leaf)| leaf.as_ref().map(|leaf| (leaf_index, leaf)))
-            .flat_map(|(leaf_index, leaf)| {
+            .flat_map(|(key, leaf)| {
+                let first_page = key.reverse_bits() as usize * PAGES_PER_LEAF;
                 leaf.pages
                     .iter()
                     .enumerate()
-                    .map(move |(page_index, page)| {
-                        let shared = previous
-                            .root
-                            .leaves
-                            .get(leaf_index)
-                            .and_then(Option::as_ref)
-                            .and_then(|leaf| leaf.pages.get(page_index))
-                            .is_some_and(|old| Arc::ptr_eq(old, page));
-                        (!shared)
-                            .then_some(page.len().saturating_mul(size_of::<T>()))
-                            .unwrap_or(0)
+                    .filter_map(move |(slot, page)| {
+                        page.as_ref().map(|page| {
+                            let shared = previous
+                                .root
+                                .page(first_page + slot)
+                                .is_some_and(|old| Arc::ptr_eq(old, page));
+                            if shared {
+                                0
+                            } else {
+                                page.len().saturating_mul(size_of::<T>())
+                            }
+                        })
                     })
             })
             .sum()
@@ -490,8 +402,7 @@ impl<T> PagedVec<T> {
         self.root
             .leaves
             .iter()
-            .filter_map(Option::as_ref)
-            .flat_map(|leaf| leaf.pages.iter())
+            .flat_map(|(_, leaf)| leaf.pages.iter().flatten())
             .filter_map(|page| match page.as_ref() {
                 ValuePage::Shared(values) => Some(values.len().saturating_mul(size_of::<T>())),
                 ValuePage::Owned(_) => None,
@@ -503,29 +414,17 @@ impl<T> PagedVec<T> {
 impl<T> Index<usize> for PagedVec<T> {
     type Output = T;
 
+    #[allow(clippy::expect_used)] // Index follows the standard slice out-of-bounds contract.
     fn index(&self, index: usize) -> &Self::Output {
-        let (leaf, page, offset) = Self::location(index);
-        let physical_leaf = self.root.first_leaf + leaf;
-        let pages = self.root.leaves[physical_leaf]
-            .as_ref()
-            .map_or(&[][..], |leaf| leaf.pages.as_slice());
-        &pages[page].as_slice()[offset]
+        self.get(index).expect("paged vector index out of bounds")
     }
 }
 
 impl<T: Clone> IndexMut<usize> for PagedVec<T> {
+    #[allow(clippy::expect_used)] // IndexMut follows the standard slice out-of-bounds contract.
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        let (leaf, page, offset) = Self::location(index);
-        let directory = Arc::make_mut(&mut self.root);
-        let physical_leaf = directory.first_leaf + leaf;
-        let leaf = directory.leaves[physical_leaf].get_or_insert_with(|| {
-            Arc::new(PageLeaf {
-                pages: Vec::new(),
-                len: 0,
-            })
-        });
-        let leaf = Arc::make_mut(leaf);
-        Arc::make_mut(&mut leaf.pages[page]).index_mut(offset)
+        self.get_mut(index)
+            .expect("paged vector index out of bounds")
     }
 }
 
@@ -596,6 +495,7 @@ enum RadixNode<V> {
 /// project size; stable numeric keys make traversal and serialization deterministic.
 pub struct PersistentMap<V> {
     root: Option<Arc<RadixNode<V>>>,
+    root_depth: u32,
     len: usize,
 }
 
@@ -616,7 +516,11 @@ pub fn stable_id_row(map: &PersistentMap<u32>, id: u64) -> Option<&u32> {
 
 impl<V> Default for PersistentMap<V> {
     fn default() -> Self {
-        Self { root: None, len: 0 }
+        Self {
+            root: None,
+            root_depth: 0,
+            len: 0,
+        }
     }
 }
 
@@ -624,6 +528,7 @@ impl<V> Clone for PersistentMap<V> {
     fn clone(&self) -> Self {
         Self {
             root: self.root.clone(),
+            root_depth: self.root_depth,
             len: self.len,
         }
     }
@@ -653,7 +558,10 @@ impl<V> PersistentMap<V> {
     #[must_use]
     pub fn get(&self, key: u128) -> Option<&V> {
         let mut node = self.root.as_deref()?;
-        for depth in 0..=RADIX_LEVELS {
+        if key.leading_zeros() / RADIX_BITS < self.root_depth {
+            return None;
+        }
+        for depth in self.root_depth..=RADIX_LEVELS {
             match node {
                 RadixNode::Branch(children) => {
                     if depth == RADIX_LEVELS {
@@ -680,16 +588,109 @@ impl<V> PersistentMap<V> {
         self.get(key).is_some()
     }
 
+    /// Changed radix allocations, identified by prefix and nibble depth. Shared subtrees stop
+    /// immediately; leaf splits include every newly born sibling, not only the inserted key.
+    /// Counts cover node/branch/entry storage and exclude separately owned value payloads.
+    #[must_use]
+    pub fn changed_path_nodes(&self, previous: &Self) -> Vec<(u128, u8, usize, usize)> {
+        fn bytes<V>(node: Option<&Arc<RadixNode<V>>>) -> usize {
+            let Some(node) = node else {
+                return 0;
+            };
+            let allocation = size_of::<RadixNode<V>>() + 2 * size_of::<usize>();
+            allocation.saturating_add(match node.as_ref() {
+                RadixNode::Branch(children) => size_of_val(children.as_ref()),
+                RadixNode::Leaf(entries) => {
+                    entries.capacity().saturating_mul(size_of::<(u128, V)>())
+                }
+            })
+        }
+        fn visit<V>(
+            current: Option<&Arc<RadixNode<V>>>,
+            previous: Option<&Arc<RadixNode<V>>>,
+            current_depth: u32,
+            previous_depth: u32,
+            prefix: u128,
+            depth: u32,
+            changed: &mut Vec<(u128, u8, usize, usize)>,
+        ) {
+            if current.is_none() && previous.is_none()
+                || current
+                    .zip(previous)
+                    .is_some_and(|(current, previous)| Arc::ptr_eq(current, previous))
+            {
+                return;
+            }
+            let old_bytes = if depth >= previous_depth {
+                bytes(previous)
+            } else {
+                0
+            };
+            let new_bytes = if depth >= current_depth {
+                bytes(current)
+            } else {
+                0
+            };
+            if old_bytes != 0 || new_bytes != 0 {
+                changed.push((prefix, depth as u8, old_bytes, new_bytes));
+            }
+            if depth == RADIX_LEVELS {
+                return;
+            }
+            let current_children = match current.map(AsRef::as_ref) {
+                Some(RadixNode::Branch(children)) => Some(children),
+                _ => None,
+            };
+            let previous_children = match previous.map(AsRef::as_ref) {
+                Some(RadixNode::Branch(children)) => Some(children),
+                _ => None,
+            };
+            if current_children.is_none()
+                && previous_children.is_none()
+                && depth >= current_depth
+                && depth >= previous_depth
+            {
+                return;
+            }
+            let shift = 128 - RADIX_BITS * (depth + 1);
+            for slot in 0..RADIX_FANOUT {
+                visit(
+                    if depth < current_depth {
+                        (slot == 0).then_some(current).flatten()
+                    } else {
+                        current_children.and_then(|children| children[slot].as_ref())
+                    },
+                    if depth < previous_depth {
+                        (slot == 0).then_some(previous).flatten()
+                    } else {
+                        previous_children.and_then(|children| children[slot].as_ref())
+                    },
+                    current_depth.max(depth + 1),
+                    previous_depth.max(depth + 1),
+                    prefix | ((slot as u128) << shift),
+                    depth + 1,
+                    changed,
+                );
+            }
+        }
+        let mut changed = Vec::new();
+        visit(
+            self.root.as_ref(),
+            previous.root.as_ref(),
+            self.root_depth,
+            previous.root_depth,
+            0,
+            self.root_depth.min(previous.root_depth),
+            &mut changed,
+        );
+        changed
+    }
+
     pub fn insert(&mut self, key: u128, value: V) -> Option<V>
     where
         V: Clone,
     {
-        let previous = self.get(key).cloned();
-        self.root = Some(insert_radix(self.root.as_ref(), 0, key, value));
-        if previous.is_none() {
-            self.len += 1;
-        }
-        previous
+        self.insert_cow(key, value)
     }
 
     /// Inserts into an unpublished COW generation without allocating an immutable intermediate
@@ -699,13 +700,30 @@ impl<V> PersistentMap<V> {
     where
         V: Clone,
     {
-        let previous = self.get(key).cloned();
-        match self.root.as_mut() {
-            Some(root) => insert_radix_cow(root, 0, key, value),
+        // Omit leading zero levels without changing keys or their serialized order.
+        // A larger key promotes only the root; already published subtrees remain shared.
+        let key_depth = (key.leading_zeros() / RADIX_BITS).min(RADIX_LEVELS - 1);
+        if let Some(root) = &mut self.root {
+            if matches!(root.as_ref(), RadixNode::Leaf(_)) {
+                self.root_depth = self.root_depth.min(key_depth);
+            } else {
+                while self.root_depth > key_depth {
+                    let mut children = Box::new(std::array::from_fn(|_| None));
+                    children[0] = Some(Arc::clone(root));
+                    *root = Arc::new(RadixNode::Branch(children));
+                    self.root_depth -= 1;
+                }
+            }
+        } else {
+            self.root_depth = key_depth;
+        }
+        let previous = match self.root.as_mut() {
+            Some(root) => insert_radix_cow(root, self.root_depth, key, value),
             None => {
                 self.root = Some(Arc::new(RadixNode::Leaf(vec![(key, value)])));
+                None
             }
-        }
+        };
         if previous.is_none() {
             self.len += 1;
         }
@@ -716,14 +734,20 @@ impl<V> PersistentMap<V> {
     where
         V: Clone,
     {
-        get_radix_mut(Arc::make_mut(self.root.as_mut()?), 0, key)
+        if key.leading_zeros() / RADIX_BITS < self.root_depth {
+            return None;
+        }
+        get_radix_mut(Arc::make_mut(self.root.as_mut()?), self.root_depth, key)
     }
 
     pub fn remove(&mut self, key: u128) -> Option<V>
     where
         V: Clone,
     {
-        let (root, removed) = remove_radix(self.root.as_ref(), 0, key);
+        if key.leading_zeros() / RADIX_BITS < self.root_depth {
+            return None;
+        }
+        let (root, removed) = remove_radix(self.root.as_ref(), self.root_depth, key);
         if removed.is_some() {
             self.root = root;
             self.len = self.len.saturating_sub(1);
@@ -743,42 +767,42 @@ impl<V> PersistentMap<V> {
     /// with `previous`. Allocation identity, rather than an operation counter, determines sharing.
     #[cfg(test)]
     pub fn detached_node_bytes_from(&self, previous: &Self) -> usize {
-        fn detached<V>(
-            current: Option<&Arc<RadixNode<V>>>,
-            previous: Option<&Arc<RadixNode<V>>>,
-        ) -> usize {
-            let Some(current) = current else {
-                return 0;
-            };
-            if previous.is_some_and(|previous| Arc::ptr_eq(current, previous)) {
-                return 0;
-            }
-            let allocation = size_of::<RadixNode<V>>()
-                .saturating_add(2_usize.saturating_mul(size_of::<usize>()));
-            match (current.as_ref(), previous.map(AsRef::as_ref)) {
-                (RadixNode::Branch(children), Some(RadixNode::Branch(old_children))) => allocation
-                    .saturating_add(size_of_val(children.as_ref()))
-                    .saturating_add(
-                        children
-                            .iter()
-                            .zip(old_children.iter())
-                            .map(|(child, old_child)| detached(child.as_ref(), old_child.as_ref()))
-                            .fold(0_usize, usize::saturating_add),
-                    ),
-                (RadixNode::Branch(children), _) => allocation
-                    .saturating_add(size_of_val(children.as_ref()))
-                    .saturating_add(
-                        children
-                            .iter()
-                            .map(|child| detached(child.as_ref(), None))
-                            .fold(0_usize, usize::saturating_add),
-                    ),
-                (RadixNode::Leaf(entries), _) => allocation
-                    .saturating_add(entries.capacity().saturating_mul(size_of::<(u128, V)>())),
+        // Test oracle follows allocation identity even when root promotion moves a shared
+        // subtree to a different depth. Production accounting remains a bounded path walk.
+        fn collect<V>(node: &Arc<RadixNode<V>>, known: &mut std::collections::HashSet<usize>) {
+            known.insert(Arc::as_ptr(node) as usize);
+            if let RadixNode::Branch(children) = node.as_ref() {
+                for child in children.iter().flatten() {
+                    collect(child, known);
+                }
             }
         }
-
-        detached(self.root.as_ref(), previous.root.as_ref())
+        fn detached<V>(
+            node: &Arc<RadixNode<V>>,
+            known: &std::collections::HashSet<usize>,
+        ) -> usize {
+            if known.contains(&(Arc::as_ptr(node) as usize)) {
+                return 0;
+            }
+            let allocation = size_of::<RadixNode<V>>() + 2 * size_of::<usize>();
+            allocation.saturating_add(match node.as_ref() {
+                RadixNode::Branch(children) => size_of_val(children.as_ref()).saturating_add(
+                    children
+                        .iter()
+                        .flatten()
+                        .map(|child| detached(child, known))
+                        .fold(0_usize, usize::saturating_add),
+                ),
+                RadixNode::Leaf(entries) => {
+                    entries.capacity().saturating_mul(size_of::<(u128, V)>())
+                }
+            })
+        }
+        let mut known = std::collections::HashSet::new();
+        if let Some(root) = &previous.root {
+            collect(root, &mut known);
+        }
+        self.root.as_ref().map_or(0, |root| detached(root, &known))
     }
 }
 
@@ -834,48 +858,12 @@ fn remove_radix<V: Clone>(
     }
 }
 
-fn insert_radix<V: Clone>(
-    current: Option<&Arc<RadixNode<V>>>,
+fn insert_radix_cow<V: Clone>(
+    current: &mut Arc<RadixNode<V>>,
     depth: u32,
     key: u128,
     value: V,
-) -> Arc<RadixNode<V>> {
-    match current.map(AsRef::as_ref) {
-        Some(RadixNode::Branch(current_children)) if depth < RADIX_LEVELS => {
-            let mut children = current_children.clone();
-            let shift = 128 - RADIX_BITS * (depth + 1);
-            let slot = ((key >> shift) & ((1 << RADIX_BITS) - 1)) as usize;
-            children[slot] = Some(insert_radix(children[slot].as_ref(), depth + 1, key, value));
-            Arc::new(RadixNode::Branch(children))
-        }
-        Some(RadixNode::Leaf(current_entries)) => {
-            let mut entries = current_entries.clone();
-            match entries.binary_search_by_key(&key, |(stored, _)| *stored) {
-                Ok(index) => entries[index].1 = value,
-                Err(index) => entries.insert(index, (key, value)),
-            }
-            if entries.len() <= RADIX_LEAF_CAPACITY || depth == RADIX_LEVELS {
-                return Arc::new(RadixNode::Leaf(entries));
-            }
-            let mut children: Box<[Option<Arc<RadixNode<V>>>; RADIX_FANOUT]> =
-                Box::new(std::array::from_fn(|_| None));
-            let shift = 128 - RADIX_BITS * (depth + 1);
-            for (entry_key, entry_value) in entries {
-                let slot = ((entry_key >> shift) & ((1 << RADIX_BITS) - 1)) as usize;
-                children[slot] = Some(insert_radix(
-                    children[slot].as_ref(),
-                    depth + 1,
-                    entry_key,
-                    entry_value,
-                ));
-            }
-            Arc::new(RadixNode::Branch(children))
-        }
-        Some(RadixNode::Branch(_)) | None => Arc::new(RadixNode::Leaf(vec![(key, value)])),
-    }
-}
-
-fn insert_radix_cow<V: Clone>(current: &mut Arc<RadixNode<V>>, depth: u32, key: u128, value: V) {
+) -> Option<V> {
     let node = Arc::make_mut(current);
     match node {
         RadixNode::Branch(children) if depth < RADIX_LEVELS => {
@@ -885,16 +873,20 @@ fn insert_radix_cow<V: Clone>(current: &mut Arc<RadixNode<V>>, depth: u32, key: 
                 Some(child) => insert_radix_cow(child, depth + 1, key, value),
                 None => {
                     children[slot] = Some(Arc::new(RadixNode::Leaf(vec![(key, value)])));
+                    None
                 }
             }
         }
         RadixNode::Leaf(entries) => {
-            match entries.binary_search_by_key(&key, |(stored, _)| *stored) {
-                Ok(index) => entries[index].1 = value,
-                Err(index) => entries.insert(index, (key, value)),
-            }
+            let previous = match entries.binary_search_by_key(&key, |(stored, _)| *stored) {
+                Ok(index) => Some(std::mem::replace(&mut entries[index].1, value)),
+                Err(index) => {
+                    entries.insert(index, (key, value));
+                    None
+                }
+            };
             if entries.len() <= RADIX_LEAF_CAPACITY || depth == RADIX_LEVELS {
-                return;
+                return previous;
             }
             let split = std::mem::take(entries);
             let mut children: Box<[Option<Arc<RadixNode<V>>>; RADIX_FANOUT]> =
@@ -913,6 +905,7 @@ fn insert_radix_cow<V: Clone>(current: &mut Arc<RadixNode<V>>, depth: u32, key: 
                 }
             }
             *node = RadixNode::Branch(children);
+            previous
         }
         RadixNode::Branch(_) => unreachable!("radix branch exceeded its fixed depth"),
     }
@@ -1012,6 +1005,81 @@ mod tests {
     };
 
     #[test]
+    fn surgical_radix_changes_include_split_siblings_and_skip_shared_subtrees() {
+        let mut original = PersistentMap::default();
+        for slot in 0..8_u128 {
+            original.insert_cow(slot << 124, slot as u64);
+        }
+        let mut split = original.clone();
+        split.insert_cow(8_u128 << 124, 8);
+        let changes = split.changed_path_nodes(&original);
+        assert_eq!(changes.len(), 10);
+        assert!(changes[0].2 > 0 && changes[0].3 > 0);
+        for slot in 0..9_u128 {
+            assert!(
+                changes
+                    .iter()
+                    .any(|(prefix, depth, old, new)| *prefix == slot << 124
+                        && *depth == 1
+                        && *old == 0
+                        && *new > 0)
+            );
+        }
+        assert_eq!(
+            changes.iter().map(|entry| entry.3).sum::<usize>(),
+            split.detached_node_bytes_from(&original)
+        );
+        assert!(split.changed_path_nodes(&split.clone()).is_empty());
+        for rows in [4_096_u64, 32_768] {
+            let mut before = PersistentMap::default();
+            for id in 0..rows {
+                before.insert_cow(stable_id_key(id.wrapping_mul(0x9e37_79b9_7f4a_7c15)), id);
+            }
+            let mut after = before.clone();
+            let key = stable_id_key(17_u64.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            after.insert_cow(key, u64::MAX);
+            let changes = after.changed_path_nodes(&before);
+            assert!(changes.len() <= 33);
+            assert_eq!(
+                changes.iter().map(|entry| entry.3).sum::<usize>(),
+                after.detached_node_bytes_from(&before)
+            );
+            assert!(changes.iter().all(|entry| entry.2 != 0 && entry.3 != 0));
+            assert_eq!(before.get(key), Some(&17));
+            assert_eq!(after.get(key), Some(&u64::MAX));
+        }
+    }
+
+    #[test]
+    fn paged_iteration_preserves_sparse_defaults_and_both_ends() {
+        let capacity = page_capacity::<u64>();
+        let mut values = PagedVec::repeat(17_u64, capacity * 3 + 11);
+        let mut expected = vec![17_u64; values.len()];
+        for (row, value) in [
+            (0, 31),
+            (capacity - 1, 37),
+            (capacity * 2 + 3, 41),
+            (capacity * 3 + 10, 43),
+        ] {
+            values[row] = value;
+            expected[row] = value;
+        }
+        assert_eq!(values.iter().copied().collect::<Vec<_>>(), expected);
+        assert_eq!(
+            values.iter().rev().copied().collect::<Vec<_>>(),
+            expected.iter().rev().copied().collect::<Vec<_>>()
+        );
+        let mut actual = values.iter();
+        let mut expected = expected.iter();
+        while let Some(front) = expected.next() {
+            assert_eq!(actual.next(), Some(front));
+            assert_eq!(actual.next_back(), expected.next_back());
+        }
+        assert!(actual.next().is_none());
+        assert!(actual.next_back().is_none());
+    }
+
+    #[test]
     fn point_update_detaches_one_value_page() {
         let mut original = PagedVec::default();
         for value in 0_u64..100_000 {
@@ -1022,6 +1090,40 @@ mod tests {
         assert_eq!(original[50_000], 50_000);
         assert_eq!(updated[50_000], 7);
         assert!(updated.detached_page_bytes_from(&original) <= PAGE_BYTES);
+    }
+
+    #[test]
+    fn point_update_keeps_untouched_leaf_directories_at_large_sizes() {
+        for rows in [64_000, 2_000_000] {
+            let values: Arc<[u64]> = vec![37_u64; rows].into();
+            let flat = SharedFlat::from_arc_slice(values).expect("shared fixture");
+            let original = PagedVec::from_shared(flat).expect("paged fixture");
+            let mut updated = original.clone();
+            updated[rows / 2] = 41;
+            assert_eq!(original[rows / 2], 37);
+            assert_eq!(updated.detached_page_bytes_from(&original), PAGE_BYTES);
+            let changed = updated
+                .root
+                .leaves
+                .iter()
+                .filter(|(key, leaf)| {
+                    !original
+                        .root
+                        .leaves
+                        .get(*key)
+                        .is_some_and(|old| Arc::ptr_eq(old, leaf))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(changed.len(), 1);
+            assert!(changed[0].1.pages.len() <= PAGES_PER_LEAF);
+            assert!(
+                updated
+                    .root
+                    .leaves
+                    .detached_node_bytes_from(&original.root.leaves)
+                    <= 16 * 1024
+            );
+        }
     }
 
     #[test]
@@ -1057,6 +1159,24 @@ mod tests {
             values.len() * size_of::<u64>() - page_capacity::<u64>() * size_of::<u64>()
         );
         assert!(paged.detached_page_bytes_from(&pinned) <= PAGE_BYTES);
+    }
+
+    #[test]
+    fn append_to_mostly_full_shared_page_keeps_one_page_of_capacity() {
+        let len = page_capacity::<u64>() / 2 + 17;
+        let values = (0..len as u64).collect::<Vec<_>>();
+        let shared = SharedFlat::from_arc_slice(values.clone().into()).expect("shared fixture");
+        let mut current = PagedVec::from_shared(shared).expect("paged fixture");
+        let pinned = current.clone();
+        current.push(7919);
+        assert_eq!(pinned.to_vec(), values);
+        assert_eq!(current.get(len), Some(&7919));
+        assert_eq!(current.allocated_value_bytes(), PAGE_BYTES);
+        let retained = current.clone();
+        current.push(7920);
+        assert_eq!(retained.get(len + 1), None);
+        assert_eq!(current.get(len + 1), Some(&7920));
+        assert_eq!(current.allocated_value_bytes(), PAGE_BYTES);
     }
 
     #[test]
@@ -1108,10 +1228,12 @@ mod tests {
     }
 
     #[test]
-    fn radix_cow_batch_preserves_pinned_generation_and_matches_persistent_insert() {
+    fn radix_batch_preserves_pinned_generation_and_matches_ordered_map() {
         let mut base = PersistentMap::default();
+        let mut ordered = std::collections::BTreeMap::new();
         for key in 0_u128..10_000 {
             base.insert(key.saturating_mul(97), key as u32);
+            ordered.insert(key.saturating_mul(97), key as u32);
         }
         let pinned = base.clone();
         let mut cow = base.clone();
@@ -1120,11 +1242,179 @@ mod tests {
             let key = key.saturating_mul(97);
             assert_eq!(cow.insert_cow(key, key as u32), None);
             assert_eq!(persistent.insert(key, key as u32), None);
+            ordered.insert(key, key as u32);
         }
         assert_eq!(cow.len(), persistent.len());
         assert!(cow.iter().eq(persistent.iter()));
+        assert!(
+            persistent
+                .iter()
+                .eq(ordered.iter().map(|(key, value)| (*key, value)))
+        );
         assert_eq!(pinned.len(), 10_000);
         assert_eq!(pinned.get(11_000_u128 * 97), None);
+    }
+
+    #[test]
+    fn radix_replacement_moves_unique_values_and_preserves_pinned_values() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Value {
+            body: Arc<str>,
+            clones: Arc<AtomicUsize>,
+        }
+        impl Clone for Value {
+            fn clone(&self) -> Self {
+                self.clones.fetch_add(1, Ordering::Relaxed);
+                Self {
+                    body: self.body.clone(),
+                    clones: self.clones.clone(),
+                }
+            }
+        }
+        let clones = Arc::new(AtomicUsize::new(0));
+        let first: Arc<str> = "old ".repeat(65_536).into();
+        let second: Arc<str> = "new ".repeat(65_536).into();
+        let value = |body: Arc<str>| Value {
+            body,
+            clones: clones.clone(),
+        };
+        let mut map = PersistentMap::default();
+        assert!(map.insert(7, value(first.clone())).is_none());
+        let previous = map
+            .insert(7, value(second.clone()))
+            .expect("previous value");
+        assert!(Arc::ptr_eq(&previous.body, &first));
+        assert_eq!(
+            clones.load(Ordering::Relaxed),
+            0,
+            "unique replacements must move the old value"
+        );
+        let pinned = map.clone();
+        let previous = map.insert(7, value(first.clone())).expect("previous value");
+        assert!(Arc::ptr_eq(&previous.body, &second));
+        assert!(Arc::ptr_eq(
+            &pinned.get(7).expect("pinned value").body,
+            &second
+        ));
+        assert!(Arc::ptr_eq(
+            &map.get(7).expect("current value").body,
+            &first
+        ));
+        assert_eq!(
+            clones.load(Ordering::Relaxed),
+            1,
+            "detach the retained leaf once"
+        );
+    }
+
+    #[test]
+    fn ordinary_radix_inserts_reuse_unique_paths_and_keep_large_pinned_values() {
+        let payload: Arc<str> = Arc::from("x".repeat(256 * 1024));
+        let mut current = PersistentMap::default();
+        for id in 0..65_536_u64 {
+            current.insert(stable_id_key(id), Arc::clone(&payload));
+        }
+        let pinned = current.clone();
+        let changed: Arc<str> = Arc::from("changed");
+        current.insert(stable_id_key(17), Arc::clone(&changed));
+        // The first larger ID promotes the root once; subsequent batch inserts reuse it.
+        assert_eq!(
+            current.insert(stable_id_key(65_536), Arc::clone(&changed)),
+            None
+        );
+        let root = Arc::as_ptr(current.root.as_ref().expect("radix root"));
+        for id in 65_537..66_560_u64 {
+            assert_eq!(
+                current.insert(stable_id_key(id), Arc::clone(&changed)),
+                None
+            );
+            assert_eq!(
+                Arc::as_ptr(current.root.as_ref().expect("radix root")),
+                root
+            );
+        }
+        assert!(Arc::ptr_eq(
+            pinned.get(stable_id_key(17)).expect("pinned row"),
+            &payload
+        ));
+        assert_eq!(pinned.len(), 65_536);
+        assert_eq!(pinned.get(stable_id_key(65_536)), None);
+        assert_eq!(current.len(), 66_560);
+        assert!(current.detached_node_bytes_from(&pinned) < 1024 * 1024);
+    }
+
+    #[test]
+    fn leading_zero_levels_are_skipped_without_changing_keys_or_pinned_generations() {
+        let mut original = PersistentMap::default();
+        for id in 0..4096_u64 {
+            original.insert_cow(stable_id_key(id), id);
+        }
+        assert_eq!(original.root_depth, 13);
+        let mut updated = original.clone();
+        updated.insert_cow(stable_id_key(4096), 4096);
+        assert_eq!(updated.root_depth, 12);
+        assert_eq!(original.get(stable_id_key(4096)), None);
+        assert_eq!(updated.get(stable_id_key(4096)), Some(&4096));
+        let changes = updated.changed_path_nodes(&original);
+        assert_eq!(
+            changes.len(),
+            2,
+            "promotion shares the complete older subtree"
+        );
+        assert!(changes.iter().all(|entry| entry.2 == 0 && entry.3 > 0));
+        assert_eq!(
+            changes.iter().map(|entry| entry.3).sum::<usize>(),
+            updated.detached_node_bytes_from(&original)
+        );
+        assert_eq!(updated.get(1_u128 << 127), None);
+        assert_eq!(updated.get_mut(1_u128 << 127), None);
+        assert_eq!(updated.remove(1_u128 << 127), None);
+        *updated.get_mut(stable_id_key(17)).expect("stored key") = 99;
+        assert_eq!(updated.remove(stable_id_key(18)), Some(18));
+        assert_eq!(original.get(stable_id_key(17)), Some(&17));
+        assert_eq!(original.get(stable_id_key(18)), Some(&18));
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&updated, &mut bytes).expect("serialize map");
+        let decoded: PersistentMap<u64> =
+            ciborium::from_reader(bytes.as_slice()).expect("decode map");
+        assert_eq!(
+            updated.iter().collect::<Vec<_>>(),
+            decoded.iter().collect::<Vec<_>>()
+        );
+        let mut encoded_again = Vec::new();
+        ciborium::into_writer(&decoded, &mut encoded_again).expect("serialize decoded map");
+        assert_eq!(bytes, encoded_again);
+    }
+
+    #[test]
+    fn root_promotions_account_for_new_allocations_only_across_key_shapes() {
+        let mut map = PersistentMap::default();
+        let mut oracle = std::collections::BTreeMap::new();
+        for key in 0..256_u128 {
+            map.insert_cow(key, key);
+            oracle.insert(key, key);
+        }
+        for key in [4096, 1_u128 << 64, 1_u128 << 124, u128::MAX, 17, 0] {
+            let previous = map.clone();
+            map.insert_cow(key, key + u128::from(key != u128::MAX));
+            oracle.insert(key, key + u128::from(key != u128::MAX));
+            assert_eq!(
+                map.iter()
+                    .map(|(key, value)| (key, *value))
+                    .collect::<Vec<_>>(),
+                oracle
+                    .iter()
+                    .map(|(key, value)| (*key, *value))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                map.changed_path_nodes(&previous)
+                    .iter()
+                    .map(|entry| entry.3)
+                    .sum::<usize>(),
+                map.detached_node_bytes_from(&previous)
+            );
+        }
     }
 
     #[test]

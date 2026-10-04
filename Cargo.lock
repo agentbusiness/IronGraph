@@ -2880,6 +2880,7 @@ name = "irongraph-gpu"
 version = "0.1.5"
 dependencies = [
  "blake3",
+ "block2",
  "candle-core",
  "candle-metal-kernels",
  "chrono",
@@ -2888,6 +2889,7 @@ dependencies = [
  "irongraph-execution",
  "irongraph-graph",
  "irongraph-types",
+ "libc",
  "objc2-metal",
  "ordered-float",
  "parking_lot",

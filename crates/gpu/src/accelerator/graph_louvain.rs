@@ -3,9 +3,9 @@
 //! The public graph is unweighted, so every weight produced by coarsening is an exact integer.
 //! Apple GPUs do not expose native binary64 arithmetic; modularity-gain comparisons therefore use
 //! exact wide-integer cross products in `graph_louvain.metal` rather than silently weakening the
-//! CPU contract to FP32. Each pass proposes every strictly beneficial move, then applies a
-//! deterministic maximal matching whose moves touch disjoint pairs of communities. Their
-//! modularity deltas are additive, proving that every applied parallel batch is non-decreasing.
+//! CPU contract to FP32. Local passes visit nodes in dense order and publish each beneficial
+//! move immediately, matching the reference exactly. Bounded device chunks preserve cancellation
+//! between adjacency scans; sorting and coarsening remain parallel.
 
 use std::{sync::OnceLock, time::Instant};
 
@@ -13,24 +13,18 @@ use candle_core::{
     CpuStorage, CustomOp1, CustomOp2, DType, Device, Layout, MetalStorage, Shape, Storage, Tensor,
     backend::BackendStorage,
 };
-use objc2_metal::MTLDevice;
+use objc2_metal::{MTLComputePipelineState, MTLDevice};
 use tokio_util::sync::CancellationToken;
 
 use crate::{Error, ErrorCode, Result, graph::LayerMask};
 
-use super::{CandleResident, candle_error};
+use super::{CandleResident, candle_error, shared_flat_from_metal_buffer};
 use crate::ResidentGraphProcedureResult;
 use crate::ensure_graph_execution;
 
 const THREADS: usize = 256;
 const WORK_TILE_ROWS: usize = 262_144;
-const BOUNDED_SCAN_NODE_TILE_ROWS: usize = 4_096;
 const RADIX_BLOCKS_PER_SUBMISSION: usize = 256;
-const DIRECT_NEIGHBOR_FAST_LIMIT: u64 = 128;
-const DIRECT_NEIGHBOR_HARD_LIMIT: u64 = 256;
-const SORTED_DECISION_CHUNK_ROWS: u32 = 1_024;
-const SORTED_CANDIDATE_FIXED_WORK: u64 = 1_000_000;
-const SORTED_CANDIDATE_RADIX_PASSES: u64 = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -123,18 +117,6 @@ enum Stage {
     Degree,
     HighDegree,
     InitializeLevel,
-    CandidateKeys,
-    CandidateAggregate,
-    SortedInitialize,
-    SortedChunk,
-    Decide,
-    DecideSorted,
-    MatchingInitialize,
-    MatchingMinimum,
-    MatchingWinners,
-    MatchingAdvance,
-    ApplyMatching,
-    UpdateCommunityWeights,
     RebuildActive,
     MapOriginal,
     CoarsenPairs,
@@ -147,6 +129,8 @@ enum Stage {
 
 #[derive(Clone)]
 struct Pipelines {
+    sequential_chunk: candle_metal_kernels::metal::ComputePipeline,
+    simd_chunk: candle_metal_kernels::metal::ComputePipeline,
     arange_i64: candle_metal_kernels::metal::ComputePipeline,
     radix_clear: candle_metal_kernels::metal::ComputePipeline,
     radix_histogram: candle_metal_kernels::metal::ComputePipeline,
@@ -157,8 +141,6 @@ struct Pipelines {
     gather_i64: candle_metal_kernels::metal::ComputePipeline,
     gather_u32: candle_metal_kernels::metal::ComputePipeline,
     read_u32: candle_metal_kernels::metal::ComputePipeline,
-    sum_u32_clear: candle_metal_kernels::metal::ComputePipeline,
-    sum_u32: candle_metal_kernels::metal::ComputePipeline,
     sum_i64_clear: candle_metal_kernels::metal::ComputePipeline,
     sum_i64: candle_metal_kernels::metal::ComputePipeline,
     zero_u32: candle_metal_kernels::metal::ComputePipeline,
@@ -174,24 +156,6 @@ struct Pipelines {
     high_degree_clear: candle_metal_kernels::metal::ComputePipeline,
     high_degree: candle_metal_kernels::metal::ComputePipeline,
     initialize_level: candle_metal_kernels::metal::ComputePipeline,
-    candidate_keys: candle_metal_kernels::metal::ComputePipeline,
-    candidate_aggregate_clear: candle_metal_kernels::metal::ComputePipeline,
-    candidate_aggregate: candle_metal_kernels::metal::ComputePipeline,
-    sorted_initialize: candle_metal_kernels::metal::ComputePipeline,
-    sorted_chunk: candle_metal_kernels::metal::ComputePipeline,
-    decide_clear: candle_metal_kernels::metal::ComputePipeline,
-    decide: candle_metal_kernels::metal::ComputePipeline,
-    decide_sorted: candle_metal_kernels::metal::ComputePipeline,
-    matching_initialize: candle_metal_kernels::metal::ComputePipeline,
-    clear_u32_max: candle_metal_kernels::metal::ComputePipeline,
-    matching_priority: candle_metal_kernels::metal::ComputePipeline,
-    matching_minimum: candle_metal_kernels::metal::ComputePipeline,
-    matching_clear: candle_metal_kernels::metal::ComputePipeline,
-    matching_winners: candle_metal_kernels::metal::ComputePipeline,
-    matching_advance: candle_metal_kernels::metal::ComputePipeline,
-    apply_matching: candle_metal_kernels::metal::ComputePipeline,
-    copy_community_weights: candle_metal_kernels::metal::ComputePipeline,
-    update_community_weights: candle_metal_kernels::metal::ComputePipeline,
     active_clear: candle_metal_kernels::metal::ComputePipeline,
     rebuild_active: candle_metal_kernels::metal::ComputePipeline,
     map_original: candle_metal_kernels::metal::ComputePipeline,
@@ -238,6 +202,8 @@ fn pipelines(device: &candle_core::MetalDevice) -> candle_core::Result<Pipelines
         Ok(candle_metal_kernels::metal::ComputePipeline::new(raw))
     };
     let result = Pipelines {
+        sequential_chunk: pipeline("ig_louvain_sequential_chunk")?,
+        simd_chunk: pipeline("ig_louvain_simd_chunk")?,
         arange_i64: pipeline("ig_louvain_arange_i64")?,
         radix_clear: pipeline("ig_louvain_radix_clear")?,
         radix_histogram: pipeline("ig_louvain_radix_histogram")?,
@@ -248,8 +214,6 @@ fn pipelines(device: &candle_core::MetalDevice) -> candle_core::Result<Pipelines
         gather_i64: pipeline("ig_louvain_gather_i64")?,
         gather_u32: pipeline("ig_louvain_gather_u32")?,
         read_u32: pipeline("ig_louvain_read_u32")?,
-        sum_u32_clear: pipeline("ig_louvain_sum_u32_clear")?,
-        sum_u32: pipeline("ig_louvain_sum_u32")?,
         sum_i64_clear: pipeline("ig_louvain_sum_i64_clear")?,
         sum_i64: pipeline("ig_louvain_sum_i64")?,
         zero_u32: pipeline("ig_louvain_zero_u32")?,
@@ -265,24 +229,6 @@ fn pipelines(device: &candle_core::MetalDevice) -> candle_core::Result<Pipelines
         high_degree_clear: pipeline("ig_louvain_high_degree_clear")?,
         high_degree: pipeline("ig_louvain_high_degree")?,
         initialize_level: pipeline("ig_louvain_initialize_level")?,
-        candidate_keys: pipeline("ig_louvain_candidate_keys")?,
-        candidate_aggregate_clear: pipeline("ig_louvain_candidate_aggregate_clear")?,
-        candidate_aggregate: pipeline("ig_louvain_candidate_aggregate")?,
-        sorted_initialize: pipeline("ig_louvain_sorted_initialize")?,
-        sorted_chunk: pipeline("ig_louvain_sorted_chunk")?,
-        decide_clear: pipeline("ig_louvain_decide_clear")?,
-        decide: pipeline("ig_louvain_decide")?,
-        decide_sorted: pipeline("ig_louvain_decide_sorted")?,
-        matching_initialize: pipeline("ig_louvain_matching_initialize")?,
-        clear_u32_max: pipeline("ig_louvain_clear_u32_max")?,
-        matching_priority: pipeline("ig_louvain_matching_priority")?,
-        matching_minimum: pipeline("ig_louvain_matching_minimum")?,
-        matching_clear: pipeline("ig_louvain_matching_clear")?,
-        matching_winners: pipeline("ig_louvain_matching_winners")?,
-        matching_advance: pipeline("ig_louvain_matching_advance")?,
-        apply_matching: pipeline("ig_louvain_apply_matching")?,
-        copy_community_weights: pipeline("ig_louvain_copy_community_weights")?,
-        update_community_weights: pipeline("ig_louvain_update_community_weights")?,
         active_clear: pipeline("ig_louvain_active_clear")?,
         rebuild_active: pipeline("ig_louvain_rebuild_active")?,
         map_original: pipeline("ig_louvain_map_original")?,
@@ -306,8 +252,6 @@ fn pipelines(device: &candle_core::MetalDevice) -> candle_core::Result<Pipelines
         &result.gather_i64,
         &result.gather_u32,
         &result.read_u32,
-        &result.sum_u32_clear,
-        &result.sum_u32,
         &result.sum_i64_clear,
         &result.sum_i64,
         &result.zero_u32,
@@ -323,24 +267,6 @@ fn pipelines(device: &candle_core::MetalDevice) -> candle_core::Result<Pipelines
         &result.high_degree_clear,
         &result.high_degree,
         &result.initialize_level,
-        &result.candidate_keys,
-        &result.candidate_aggregate_clear,
-        &result.candidate_aggregate,
-        &result.sorted_initialize,
-        &result.sorted_chunk,
-        &result.decide_clear,
-        &result.decide,
-        &result.decide_sorted,
-        &result.matching_initialize,
-        &result.clear_u32_max,
-        &result.matching_priority,
-        &result.matching_minimum,
-        &result.matching_clear,
-        &result.matching_winners,
-        &result.matching_advance,
-        &result.apply_matching,
-        &result.copy_community_weights,
-        &result.update_community_weights,
         &result.active_clear,
         &result.rebuild_active,
         &result.map_original,
@@ -965,7 +891,6 @@ impl CustomOp1 for LouvainU8ToU32 {
 #[derive(Clone, Copy, Debug)]
 enum U32ScalarMode {
     Read(usize),
-    Sum,
 }
 
 #[derive(Clone, Debug)]
@@ -1034,34 +959,6 @@ impl CustomOp1 for LouvainU32Scalar {
                     encoder.set_output_buffer(1, Some(&output), 0);
                     encoder.set_bytes(2, &args);
                     encoder.dispatch_thread_groups(groups(1), threads());
-                }
-            }
-            U32ScalarMode::Sum => {
-                {
-                    let encoder = device.command_encoder()?;
-                    let encoder = encoder.as_ref();
-                    encoder.set_compute_pipeline_state(&pipelines.sum_u32_clear);
-                    encoder.set_output_buffer(0, Some(&output), 0);
-                    encoder.dispatch_thread_groups(groups(1), threads());
-                }
-                let base_args = RadixArgs::new(rows, 0, 0)?;
-                for offset in (0..rows).step_by(WORK_TILE_ROWS) {
-                    metal_checkpoint(&self.cancellation, self.deadline)?;
-                    let count = WORK_TILE_ROWS.min(rows - offset);
-                    let args = base_args.with_work(offset, count)?;
-                    {
-                        let encoder = device.command_encoder()?;
-                        let encoder = encoder.as_ref();
-                        encoder.set_compute_pipeline_state(&pipelines.sum_u32);
-                        encoder.set_input_buffer(
-                            0,
-                            Some(values.buffer()),
-                            layout.start_offset() * DType::U32.size_in_bytes(),
-                        );
-                        encoder.set_output_buffer(1, Some(&output), 0);
-                        encoder.set_bytes(2, &args);
-                        encoder.dispatch_thread_groups(groups(count), threads());
-                    }
                 }
             }
         }
@@ -1174,25 +1071,6 @@ fn read_u32_scalar(
         .ok_or_else(|| Error::internal("Metal Louvain scalar read returned no value"))
 }
 
-fn sum_u32(
-    tensor: &Tensor,
-    cancellation: &CancellationToken,
-    deadline: Option<Instant>,
-) -> Result<u32> {
-    let values = tensor
-        .apply_op1_no_bwd(&LouvainU32Scalar {
-            mode: U32ScalarMode::Sum,
-            cancellation: cancellation.clone(),
-            deadline,
-        })
-        .and_then(|scalar| scalar.to_vec1::<u32>())
-        .map_err(|error| louvain_candle_error(error, cancellation, deadline))?;
-    values
-        .first()
-        .copied()
-        .ok_or_else(|| Error::internal("Metal Louvain U32 sum returned no value"))
-}
-
 fn sum_i64(
     tensor: &Tensor,
     cancellation: &CancellationToken,
@@ -1249,9 +1127,6 @@ impl LouvainOp {
         let nodes = self.args.node_count as usize;
         let pairs = usize::try_from(self.args.pair_capacity)
             .map_err(|_| candle_core::Error::Msg("Louvain pair capacity overflow".to_owned()))?;
-        let oriented = usize::try_from(self.args.oriented_capacity).map_err(|_| {
-            candle_core::Error::Msg("Louvain oriented capacity overflow".to_owned())
-        })?;
         match self.stage {
             Stage::Validate | Stage::HighDegree => Ok((1, DType::U32)),
             Stage::BasePairs | Stage::ReducePairs | Stage::CoarsenPairs => pairs
@@ -1264,55 +1139,28 @@ impl LouvainOp {
                 .ok_or_else(|| {
                     candle_core::Error::Msg("Louvain adjacency output overflow".to_owned())
                 }),
-            Stage::Degree | Stage::UpdateCommunityWeights | Stage::CanonicalKeys => {
-                Ok((nodes, DType::I64))
+            Stage::Degree | Stage::CanonicalKeys => Ok((nodes, DType::I64)),
+            Stage::InitializeLevel | Stage::MapOriginal | Stage::CanonicalPublish => {
+                Ok((nodes, DType::U32))
             }
-            Stage::CandidateKeys => pairs
-                .checked_mul(2)
-                .map(|rows| (rows, DType::I64))
-                .ok_or_else(|| {
-                    candle_core::Error::Msg("Louvain candidate output overflow".to_owned())
-                }),
-            Stage::CandidateAggregate => Ok((oriented, DType::I64)),
-            Stage::SortedInitialize | Stage::SortedChunk => nodes
-                .checked_mul(3)
-                .map(|rows| (rows, DType::I64))
-                .ok_or_else(|| candle_core::Error::Msg("Louvain sorted state overflow".to_owned())),
-            Stage::InitializeLevel
-            | Stage::MatchingInitialize
-            | Stage::ApplyMatching
-            | Stage::MapOriginal
-            | Stage::CanonicalPublish => Ok((nodes, DType::U32)),
-            Stage::MatchingMinimum => nodes
-                .checked_mul(2)
+            Stage::RebuildActive | Stage::CanonicalFirst => nodes
+                .checked_add(1)
                 .map(|rows| (rows, DType::U32))
                 .ok_or_else(|| {
-                    candle_core::Error::Msg("Louvain matching minimum overflow".to_owned())
-                }),
-            Stage::Decide | Stage::DecideSorted | Stage::RebuildActive | Stage::CanonicalFirst => {
-                nodes
-                    .checked_add(1)
-                    .map(|rows| (rows, DType::U32))
-                    .ok_or_else(|| {
-                        candle_core::Error::Msg("Louvain control output overflow".to_owned())
-                    })
-            }
-            Stage::MatchingWinners => nodes
-                .checked_mul(2)
-                .and_then(|rows| rows.checked_add(1))
-                .map(|rows| (rows, DType::U32))
-                .ok_or_else(|| {
-                    candle_core::Error::Msg("Louvain matching output overflow".to_owned())
-                }),
-            Stage::MatchingAdvance => nodes
-                .checked_mul(2)
-                .map(|rows| (rows, DType::U32))
-                .ok_or_else(|| {
-                    candle_core::Error::Msg("Louvain matching state overflow".to_owned())
+                    candle_core::Error::Msg("Louvain control output overflow".to_owned())
                 }),
             Stage::CsrOffsets => nodes
                 .checked_add(1)
-                .map(|rows| (rows, DType::U32))
+                .map(|rows| {
+                    (
+                        rows,
+                        if self.args.reduce_mode == 1 {
+                            DType::I64
+                        } else {
+                            DType::U32
+                        },
+                    )
+                })
                 .ok_or_else(|| {
                     candle_core::Error::Msg("Louvain CSR offset shape overflow".to_owned())
                 }),
@@ -1362,15 +1210,6 @@ impl CustomOp1 for LouvainOp {
         let oriented = usize::try_from(self.args.oriented_capacity).map_err(|_| {
             candle_core::Error::Msg("Louvain oriented capacity overflow".to_owned())
         })?;
-        let two_nodes = nodes.checked_mul(2).ok_or_else(|| {
-            candle_core::Error::Msg("Louvain two-node input shape overflow".to_owned())
-        })?;
-        let three_nodes = nodes.checked_mul(3).ok_or_else(|| {
-            candle_core::Error::Msg("Louvain three-node input shape overflow".to_owned())
-        })?;
-        let winner_rows = two_nodes.checked_add(1).ok_or_else(|| {
-            candle_core::Error::Msg("Louvain winner input shape overflow".to_owned())
-        })?;
         let require_primary = |dtype: DType, rows: usize| -> candle_core::Result<()> {
             if primary.dtype() != dtype || primary_layout.shape().elem_count() != rows {
                 return Err(candle_core::Error::Msg(
@@ -1419,7 +1258,7 @@ impl CustomOp1 for LouvainOp {
                 require_auxiliary(0, DType::I64, oriented)?;
                 require_auxiliary(1, DType::U32, nodes)?;
             }
-            Stage::HighDegree | Stage::CandidateKeys => {
+            Stage::HighDegree => {
                 require_primary(DType::I64, oriented)?;
                 require_auxiliary_count(1)?;
                 require_auxiliary(0, DType::U32, nodes)?;
@@ -1428,71 +1267,15 @@ impl CustomOp1 for LouvainOp {
                 require_primary(DType::U32, nodes)?;
                 require_auxiliary_count(0)?;
             }
-            Stage::CandidateAggregate | Stage::CsrOffsets | Stage::CsrNeighbors => {
+            Stage::CsrOffsets | Stage::CsrNeighbors => {
                 require_primary(DType::I64, oriented)?;
                 require_auxiliary_count(1)?;
                 require_auxiliary(0, DType::I64, oriented)?;
             }
-            Stage::SortedInitialize | Stage::RebuildActive | Stage::MapOriginal => {
+            Stage::RebuildActive | Stage::MapOriginal => {
                 require_primary(DType::U32, nodes)?;
                 require_auxiliary_count(1)?;
                 require_auxiliary(0, DType::U32, nodes)?;
-            }
-            Stage::SortedChunk => {
-                require_primary(DType::I64, three_nodes)?;
-                require_auxiliary_count(6)?;
-                require_auxiliary(0, DType::U32, nodes)?;
-                require_auxiliary(1, DType::U32, nodes)?;
-                require_auxiliary(2, DType::I64, nodes)?;
-                require_auxiliary(3, DType::I64, nodes)?;
-                require_auxiliary(4, DType::I64, oriented)?;
-                require_auxiliary(5, DType::I64, oriented)?;
-            }
-            Stage::Decide => {
-                require_primary(DType::U32, nodes)?;
-                require_auxiliary_count(5)?;
-                require_auxiliary(0, DType::U32, nodes)?;
-                require_auxiliary(1, DType::I64, nodes)?;
-                require_auxiliary(2, DType::I64, nodes)?;
-                require_auxiliary(3, DType::I64, oriented)?;
-                require_auxiliary(4, DType::I64, oriented)?;
-            }
-            Stage::DecideSorted => {
-                require_primary(DType::I64, three_nodes)?;
-                require_auxiliary_count(4)?;
-                require_auxiliary(0, DType::U32, nodes)?;
-                require_auxiliary(1, DType::U32, nodes)?;
-                require_auxiliary(2, DType::I64, nodes)?;
-                require_auxiliary(3, DType::I64, nodes)?;
-            }
-            Stage::MatchingInitialize | Stage::MatchingMinimum | Stage::ApplyMatching => {
-                require_primary(DType::U32, nodes)?;
-                require_auxiliary_count(2)?;
-                require_auxiliary(0, DType::U32, nodes)?;
-                require_auxiliary(1, DType::U32, nodes)?;
-            }
-            Stage::MatchingWinners => {
-                require_primary(DType::U32, nodes)?;
-                require_auxiliary_count(3)?;
-                require_auxiliary(0, DType::U32, nodes)?;
-                require_auxiliary(1, DType::U32, nodes)?;
-                require_auxiliary(2, DType::U32, two_nodes)?;
-            }
-            Stage::MatchingAdvance => {
-                require_primary(DType::U32, nodes)?;
-                require_auxiliary_count(4)?;
-                require_auxiliary(0, DType::U32, nodes)?;
-                require_auxiliary(1, DType::U32, nodes)?;
-                require_auxiliary(2, DType::U32, nodes)?;
-                require_auxiliary(3, DType::U32, winner_rows)?;
-            }
-            Stage::UpdateCommunityWeights => {
-                require_primary(DType::I64, nodes)?;
-                require_auxiliary_count(4)?;
-                require_auxiliary(0, DType::U32, nodes)?;
-                require_auxiliary(1, DType::U32, nodes)?;
-                require_auxiliary(2, DType::U32, nodes)?;
-                require_auxiliary(3, DType::I64, nodes)?;
             }
             Stage::CoarsenPairs => {
                 require_primary(DType::I64, pairs)?;
@@ -1552,26 +1335,16 @@ impl CustomOp1 for LouvainOp {
             | Stage::ReducePairs
             | Stage::Degree
             | Stage::HighDegree
-            | Stage::CandidateAggregate
-            | Stage::Decide
-            | Stage::DecideSorted
-            | Stage::MatchingWinners
-            | Stage::UpdateCommunityWeights
             | Stage::RebuildActive
             | Stage::CanonicalFirst
             | Stage::CanonicalPublish => 2,
-            Stage::MatchingMinimum => 3,
             _ => 1,
         };
         for phase in 0..phase_count {
             let (phase_rows, tile_rows) = match (self.stage, phase) {
-                (Stage::Validate | Stage::HighDegree | Stage::Decide | Stage::DecideSorted, 0) => {
-                    (1, 1)
-                }
+                (Stage::Validate | Stage::HighDegree, 0) => (1, 1),
                 (Stage::Validate, 1) => (nodes.max(edges), WORK_TILE_ROWS),
-                (Stage::Degree, 1) | (Stage::CandidateKeys | Stage::CandidateAggregate, _) => {
-                    (oriented, WORK_TILE_ROWS)
-                }
+                (Stage::Degree, 1) => (oriented, WORK_TILE_ROWS),
                 (Stage::CsrOffsets, _) => (
                     nodes.checked_add(1).ok_or_else(|| {
                         candle_core::Error::Msg("Louvain CSR offset work shape overflow".to_owned())
@@ -1586,9 +1359,6 @@ impl CustomOp1 for LouvainOp {
                     })?,
                     WORK_TILE_ROWS,
                 ),
-                (Stage::SortedChunk, _) | (Stage::Decide, 1) => {
-                    (nodes, BOUNDED_SCAN_NODE_TILE_ROWS)
-                }
                 (Stage::CanonicalFirst, 1)
                 | (
                     Stage::BasePairs
@@ -1808,469 +1578,6 @@ impl CustomOp1 for LouvainOp {
                             encoder.set_bytes(2, &chunk_args);
                             encoder.dispatch_thread_groups(groups(work_count), threads);
                         }
-                        Stage::CandidateKeys => {
-                            auxiliary!(0, a0_storage, a0_layout, a0);
-                            encoder.set_compute_pipeline_state(&pipeline.candidate_keys);
-                            encoder.set_input_buffer(
-                                0,
-                                Some(primary.buffer()),
-                                bytes(primary_layout, DType::I64),
-                            );
-                            encoder.set_input_buffer(
-                                1,
-                                Some(a0.buffer()),
-                                bytes(a0_layout, DType::U32),
-                            );
-                            encoder.set_output_buffer(2, Some(&output), 0);
-                            encoder.set_bytes(3, &chunk_args);
-                            encoder.dispatch_thread_groups(groups(work_count), threads);
-                        }
-                        Stage::CandidateAggregate => {
-                            auxiliary!(0, a0_storage, a0_layout, a0);
-                            if phase == 0 {
-                                encoder.set_compute_pipeline_state(
-                                    &pipeline.candidate_aggregate_clear,
-                                );
-                                encoder.set_output_buffer(0, Some(&output), 0);
-                                encoder.set_bytes(1, &chunk_args);
-                                encoder.dispatch_thread_groups(groups(work_count), threads);
-                            } else {
-                                encoder.set_compute_pipeline_state(&pipeline.candidate_aggregate);
-                                encoder.set_input_buffer(
-                                    0,
-                                    Some(primary.buffer()),
-                                    bytes(primary_layout, DType::I64),
-                                );
-                                encoder.set_input_buffer(
-                                    1,
-                                    Some(a0.buffer()),
-                                    bytes(a0_layout, DType::I64),
-                                );
-                                encoder.set_output_buffer(2, Some(&output), 0);
-                                encoder.set_bytes(3, &chunk_args);
-                                encoder.dispatch_thread_groups(groups(work_count), threads);
-                            }
-                        }
-                        Stage::SortedInitialize => {
-                            auxiliary!(0, a0_storage, a0_layout, a0);
-                            encoder.set_compute_pipeline_state(&pipeline.sorted_initialize);
-                            encoder.set_input_buffer(
-                                0,
-                                Some(primary.buffer()),
-                                bytes(primary_layout, DType::U32),
-                            );
-                            encoder.set_input_buffer(
-                                1,
-                                Some(a0.buffer()),
-                                bytes(a0_layout, DType::U32),
-                            );
-                            encoder.set_output_buffer(2, Some(&output), 0);
-                            encoder.set_bytes(3, &chunk_args);
-                            encoder.dispatch_thread_groups(groups(work_count), threads);
-                        }
-                        Stage::SortedChunk => {
-                            auxiliary!(0, a0_storage, a0_layout, a0);
-                            auxiliary!(1, a1_storage, a1_layout, a1);
-                            auxiliary!(2, a2_storage, a2_layout, a2);
-                            auxiliary!(3, a3_storage, a3_layout, a3);
-                            auxiliary!(4, a4_storage, a4_layout, a4);
-                            auxiliary!(5, a5_storage, a5_layout, a5);
-                            encoder.set_compute_pipeline_state(&pipeline.sorted_chunk);
-                            encoder.set_input_buffer(
-                                0,
-                                Some(primary.buffer()),
-                                bytes(primary_layout, DType::I64),
-                            );
-                            encoder.set_input_buffer(
-                                1,
-                                Some(a0.buffer()),
-                                bytes(a0_layout, DType::U32),
-                            );
-                            encoder.set_input_buffer(
-                                2,
-                                Some(a1.buffer()),
-                                bytes(a1_layout, DType::U32),
-                            );
-                            encoder.set_input_buffer(
-                                3,
-                                Some(a2.buffer()),
-                                bytes(a2_layout, DType::I64),
-                            );
-                            encoder.set_input_buffer(
-                                4,
-                                Some(a3.buffer()),
-                                bytes(a3_layout, DType::I64),
-                            );
-                            encoder.set_input_buffer(
-                                5,
-                                Some(a4.buffer()),
-                                bytes(a4_layout, DType::I64),
-                            );
-                            encoder.set_input_buffer(
-                                6,
-                                Some(a5.buffer()),
-                                bytes(a5_layout, DType::I64),
-                            );
-                            encoder.set_output_buffer(7, Some(&output), 0);
-                            encoder.set_bytes(8, &chunk_args);
-                            encoder.dispatch_thread_groups(groups(work_count), threads);
-                        }
-                        Stage::Decide => {
-                            auxiliary!(0, a0_storage, a0_layout, a0);
-                            auxiliary!(1, a1_storage, a1_layout, a1);
-                            auxiliary!(2, a2_storage, a2_layout, a2);
-                            auxiliary!(3, a3_storage, a3_layout, a3);
-                            auxiliary!(4, a4_storage, a4_layout, a4);
-                            if phase == 0 {
-                                encoder.set_compute_pipeline_state(&pipeline.decide_clear);
-                                encoder.set_output_buffer(
-                                    0,
-                                    Some(&output),
-                                    nodes * DType::U32.size_in_bytes(),
-                                );
-                                encoder.dispatch_thread_groups(groups(1), threads);
-                            } else {
-                                encoder.set_compute_pipeline_state(&pipeline.decide);
-                                encoder.set_input_buffer(
-                                    0,
-                                    Some(primary.buffer()),
-                                    bytes(primary_layout, DType::U32),
-                                );
-                                encoder.set_input_buffer(
-                                    1,
-                                    Some(a0.buffer()),
-                                    bytes(a0_layout, DType::U32),
-                                );
-                                encoder.set_input_buffer(
-                                    2,
-                                    Some(a1.buffer()),
-                                    bytes(a1_layout, DType::I64),
-                                );
-                                encoder.set_input_buffer(
-                                    3,
-                                    Some(a2.buffer()),
-                                    bytes(a2_layout, DType::I64),
-                                );
-                                encoder.set_input_buffer(
-                                    4,
-                                    Some(a3.buffer()),
-                                    bytes(a3_layout, DType::I64),
-                                );
-                                encoder.set_input_buffer(
-                                    5,
-                                    Some(a4.buffer()),
-                                    bytes(a4_layout, DType::I64),
-                                );
-                                encoder.set_output_buffer(6, Some(&output), 0);
-                                encoder.set_output_buffer(
-                                    7,
-                                    Some(&output),
-                                    nodes * DType::U32.size_in_bytes(),
-                                );
-                                encoder.set_bytes(8, &chunk_args);
-                                encoder.dispatch_thread_groups(groups(work_count), threads);
-                            }
-                        }
-                        Stage::DecideSorted => {
-                            auxiliary!(0, a0_storage, a0_layout, a0);
-                            auxiliary!(1, a1_storage, a1_layout, a1);
-                            auxiliary!(2, a2_storage, a2_layout, a2);
-                            auxiliary!(3, a3_storage, a3_layout, a3);
-                            if phase == 0 {
-                                encoder.set_compute_pipeline_state(&pipeline.decide_clear);
-                                encoder.set_output_buffer(
-                                    0,
-                                    Some(&output),
-                                    nodes * DType::U32.size_in_bytes(),
-                                );
-                                encoder.dispatch_thread_groups(groups(1), threads);
-                            } else {
-                                encoder.set_compute_pipeline_state(&pipeline.decide_sorted);
-                                encoder.set_input_buffer(
-                                    0,
-                                    Some(primary.buffer()),
-                                    bytes(primary_layout, DType::I64),
-                                );
-                                encoder.set_input_buffer(
-                                    1,
-                                    Some(a0.buffer()),
-                                    bytes(a0_layout, DType::U32),
-                                );
-                                encoder.set_input_buffer(
-                                    2,
-                                    Some(a1.buffer()),
-                                    bytes(a1_layout, DType::U32),
-                                );
-                                encoder.set_input_buffer(
-                                    3,
-                                    Some(a2.buffer()),
-                                    bytes(a2_layout, DType::I64),
-                                );
-                                encoder.set_input_buffer(
-                                    4,
-                                    Some(a3.buffer()),
-                                    bytes(a3_layout, DType::I64),
-                                );
-                                encoder.set_output_buffer(5, Some(&output), 0);
-                                encoder.set_output_buffer(
-                                    6,
-                                    Some(&output),
-                                    nodes * DType::U32.size_in_bytes(),
-                                );
-                                encoder.set_bytes(7, &chunk_args);
-                                encoder.dispatch_thread_groups(groups(work_count), threads);
-                            }
-                        }
-                        Stage::MatchingInitialize => {
-                            auxiliary!(0, a0_storage, a0_layout, a0);
-                            auxiliary!(1, a1_storage, a1_layout, a1);
-                            encoder.set_compute_pipeline_state(&pipeline.matching_initialize);
-                            encoder.set_input_buffer(
-                                0,
-                                Some(primary.buffer()),
-                                bytes(primary_layout, DType::U32),
-                            );
-                            encoder.set_input_buffer(
-                                1,
-                                Some(a0.buffer()),
-                                bytes(a0_layout, DType::U32),
-                            );
-                            encoder.set_input_buffer(
-                                2,
-                                Some(a1.buffer()),
-                                bytes(a1_layout, DType::U32),
-                            );
-                            encoder.set_output_buffer(3, Some(&output), 0);
-                            encoder.set_bytes(4, &chunk_args);
-                            encoder.dispatch_thread_groups(groups(work_count), threads);
-                        }
-                        Stage::MatchingMinimum => {
-                            auxiliary!(0, a0_storage, a0_layout, a0);
-                            auxiliary!(1, a1_storage, a1_layout, a1);
-                            match phase {
-                                0 => {
-                                    encoder.set_compute_pipeline_state(&pipeline.clear_u32_max);
-                                    encoder.set_output_buffer(0, Some(&output), 0);
-                                    encoder.set_bytes(1, &chunk_args);
-                                    encoder.dispatch_thread_groups(groups(work_count), threads);
-                                }
-                                1 => {
-                                    encoder.set_compute_pipeline_state(&pipeline.matching_priority);
-                                    encoder.set_input_buffer(
-                                        0,
-                                        Some(primary.buffer()),
-                                        bytes(primary_layout, DType::U32),
-                                    );
-                                    encoder.set_input_buffer(
-                                        1,
-                                        Some(a0.buffer()),
-                                        bytes(a0_layout, DType::U32),
-                                    );
-                                    encoder.set_input_buffer(
-                                        2,
-                                        Some(a1.buffer()),
-                                        bytes(a1_layout, DType::U32),
-                                    );
-                                    encoder.set_output_buffer(3, Some(&output), 0);
-                                    encoder.set_bytes(4, &chunk_args);
-                                    encoder.dispatch_thread_groups(groups(work_count), threads);
-                                }
-                                _ => {
-                                    encoder.set_compute_pipeline_state(&pipeline.matching_minimum);
-                                    encoder.set_input_buffer(
-                                        0,
-                                        Some(primary.buffer()),
-                                        bytes(primary_layout, DType::U32),
-                                    );
-                                    encoder.set_input_buffer(
-                                        1,
-                                        Some(a0.buffer()),
-                                        bytes(a0_layout, DType::U32),
-                                    );
-                                    encoder.set_input_buffer(
-                                        2,
-                                        Some(a1.buffer()),
-                                        bytes(a1_layout, DType::U32),
-                                    );
-                                    encoder.set_input_buffer(3, Some(&output), 0);
-                                    encoder.set_output_buffer(
-                                        4,
-                                        Some(&output),
-                                        nodes * DType::U32.size_in_bytes(),
-                                    );
-                                    encoder.set_bytes(5, &chunk_args);
-                                    encoder.dispatch_thread_groups(groups(work_count), threads);
-                                }
-                            }
-                        }
-                        Stage::MatchingWinners => {
-                            auxiliary!(0, a0_storage, a0_layout, a0);
-                            auxiliary!(1, a1_storage, a1_layout, a1);
-                            auxiliary!(2, a2_storage, a2_layout, a2);
-                            if phase == 0 {
-                                encoder.set_compute_pipeline_state(&pipeline.matching_clear);
-                                encoder.set_output_buffer(0, Some(&output), 0);
-                                encoder.set_output_buffer(
-                                    1,
-                                    Some(&output),
-                                    nodes * DType::U32.size_in_bytes(),
-                                );
-                                encoder.set_output_buffer(
-                                    2,
-                                    Some(&output),
-                                    nodes * 2 * DType::U32.size_in_bytes(),
-                                );
-                                encoder.set_bytes(3, &chunk_args);
-                                encoder.dispatch_thread_groups(groups(work_count), threads);
-                            } else {
-                                encoder.set_compute_pipeline_state(&pipeline.matching_winners);
-                                encoder.set_input_buffer(
-                                    0,
-                                    Some(primary.buffer()),
-                                    bytes(primary_layout, DType::U32),
-                                );
-                                encoder.set_input_buffer(
-                                    1,
-                                    Some(a0.buffer()),
-                                    bytes(a0_layout, DType::U32),
-                                );
-                                encoder.set_input_buffer(
-                                    2,
-                                    Some(a1.buffer()),
-                                    bytes(a1_layout, DType::U32),
-                                );
-                                encoder.set_input_buffer(
-                                    3,
-                                    Some(a2.buffer()),
-                                    bytes(a2_layout, DType::U32),
-                                );
-                                encoder.set_output_buffer(4, Some(&output), 0);
-                                encoder.set_output_buffer(
-                                    5,
-                                    Some(&output),
-                                    nodes * DType::U32.size_in_bytes(),
-                                );
-                                encoder.set_output_buffer(
-                                    6,
-                                    Some(&output),
-                                    nodes * 2 * DType::U32.size_in_bytes(),
-                                );
-                                encoder.set_bytes(7, &chunk_args);
-                                encoder.dispatch_thread_groups(groups(work_count), threads);
-                            }
-                        }
-                        Stage::MatchingAdvance => {
-                            auxiliary!(0, a0_storage, a0_layout, a0);
-                            auxiliary!(1, a1_storage, a1_layout, a1);
-                            auxiliary!(2, a2_storage, a2_layout, a2);
-                            auxiliary!(3, a3_storage, a3_layout, a3);
-                            encoder.set_compute_pipeline_state(&pipeline.matching_advance);
-                            encoder.set_input_buffer(
-                                0,
-                                Some(primary.buffer()),
-                                bytes(primary_layout, DType::U32),
-                            );
-                            encoder.set_input_buffer(
-                                1,
-                                Some(a0.buffer()),
-                                bytes(a0_layout, DType::U32),
-                            );
-                            encoder.set_input_buffer(
-                                2,
-                                Some(a1.buffer()),
-                                bytes(a1_layout, DType::U32),
-                            );
-                            encoder.set_input_buffer(
-                                3,
-                                Some(a2.buffer()),
-                                bytes(a2_layout, DType::U32),
-                            );
-                            encoder.set_input_buffer(
-                                4,
-                                Some(a3.buffer()),
-                                bytes(a3_layout, DType::U32),
-                            );
-                            encoder.set_input_buffer(
-                                5,
-                                Some(a3.buffer()),
-                                bytes(a3_layout, DType::U32) + nodes * DType::U32.size_in_bytes(),
-                            );
-                            encoder.set_output_buffer(6, Some(&output), 0);
-                            encoder.set_output_buffer(
-                                7,
-                                Some(&output),
-                                nodes * DType::U32.size_in_bytes(),
-                            );
-                            encoder.set_bytes(8, &chunk_args);
-                            encoder.dispatch_thread_groups(groups(work_count), threads);
-                        }
-                        Stage::ApplyMatching => {
-                            auxiliary!(0, a0_storage, a0_layout, a0);
-                            auxiliary!(1, a1_storage, a1_layout, a1);
-                            encoder.set_compute_pipeline_state(&pipeline.apply_matching);
-                            encoder.set_input_buffer(
-                                0,
-                                Some(primary.buffer()),
-                                bytes(primary_layout, DType::U32),
-                            );
-                            encoder.set_input_buffer(
-                                1,
-                                Some(a0.buffer()),
-                                bytes(a0_layout, DType::U32),
-                            );
-                            encoder.set_input_buffer(
-                                2,
-                                Some(a1.buffer()),
-                                bytes(a1_layout, DType::U32),
-                            );
-                            encoder.set_output_buffer(3, Some(&output), 0);
-                            encoder.set_bytes(4, &chunk_args);
-                            encoder.dispatch_thread_groups(groups(work_count), threads);
-                        }
-                        Stage::UpdateCommunityWeights => {
-                            auxiliary!(0, a0_storage, a0_layout, a0);
-                            auxiliary!(1, a1_storage, a1_layout, a1);
-                            auxiliary!(2, a2_storage, a2_layout, a2);
-                            auxiliary!(3, a3_storage, a3_layout, a3);
-                            if phase == 0 {
-                                encoder
-                                    .set_compute_pipeline_state(&pipeline.copy_community_weights);
-                                encoder.set_input_buffer(
-                                    0,
-                                    Some(primary.buffer()),
-                                    bytes(primary_layout, DType::I64),
-                                );
-                                encoder.set_output_buffer(1, Some(&output), 0);
-                                encoder.set_bytes(2, &chunk_args);
-                                encoder.dispatch_thread_groups(groups(work_count), threads);
-                            } else {
-                                encoder
-                                    .set_compute_pipeline_state(&pipeline.update_community_weights);
-                                encoder.set_input_buffer(
-                                    0,
-                                    Some(a0.buffer()),
-                                    bytes(a0_layout, DType::U32),
-                                );
-                                encoder.set_input_buffer(
-                                    1,
-                                    Some(a1.buffer()),
-                                    bytes(a1_layout, DType::U32),
-                                );
-                                encoder.set_input_buffer(
-                                    2,
-                                    Some(a2.buffer()),
-                                    bytes(a2_layout, DType::U32),
-                                );
-                                encoder.set_input_buffer(
-                                    3,
-                                    Some(a3.buffer()),
-                                    bytes(a3_layout, DType::I64),
-                                );
-                                encoder.set_output_buffer(4, Some(&output), 0);
-                                encoder.set_bytes(5, &chunk_args);
-                                encoder.dispatch_thread_groups(groups(work_count), threads);
-                            }
-                        }
                         Stage::RebuildActive => {
                             auxiliary!(0, a0_storage, a0_layout, a0);
                             if phase == 0 {
@@ -2462,6 +1769,171 @@ impl CustomOp1 for LouvainOp {
     }
 }
 
+#[derive(Clone, Debug)]
+struct SequentialLouvainChunk {
+    membership: Tensor,
+    active: Tensor,
+    degree: Tensor,
+    keys: Tensor,
+    weights: Tensor,
+    feedback: std::sync::Arc<candle_metal_kernels::metal::Buffer>,
+    offsets: Tensor,
+    active_rows: Tensor,
+    args: GraphArgs,
+    cancellation: CancellationToken,
+    deadline: Option<Instant>,
+}
+
+impl CustomOp1 for SequentialLouvainChunk {
+    fn name(&self) -> &'static str {
+        "irongraph-metal-louvain-dense-order-chunk"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _storage: &CpuStorage,
+        _layout: &Layout,
+    ) -> candle_core::Result<(CpuStorage, Shape)> {
+        Err(candle_core::Error::Msg(
+            "Metal Louvain chunk cannot execute on CPU".into(),
+        ))
+    }
+
+    fn metal_fwd(
+        &self,
+        state: &MetalStorage,
+        layout: &Layout,
+    ) -> candle_core::Result<(MetalStorage, Shape)> {
+        metal_checkpoint(&self.cancellation, self.deadline)?;
+        let nodes = self.args.node_count as usize;
+        let state_rows = nodes
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(16))
+            .ok_or_else(|| candle_core::Error::Msg("Louvain state size overflow".into()))?;
+        if state.dtype() != DType::I64
+            || !layout.is_contiguous()
+            || layout.dims().len() != 1
+            || layout.shape().elem_count() != state_rows
+        {
+            return Err(candle_core::Error::Msg(
+                "Metal Louvain state contract is invalid".into(),
+            ));
+        }
+        let inputs = [
+            (&self.membership, DType::U32, nodes),
+            (&self.active, DType::U32, nodes),
+            (&self.degree, DType::I64, nodes),
+            (&self.keys, DType::I64, self.args.oriented_capacity as usize),
+            (
+                &self.weights,
+                DType::I64,
+                self.args.oriented_capacity as usize,
+            ),
+        ];
+        let guards = inputs
+            .iter()
+            .map(|(tensor, _, _)| tensor.storage_and_layout())
+            .collect::<Vec<_>>();
+        let device = state.device();
+        let pipeline = pipelines(device)?;
+        {
+            let encoder = device.command_encoder()?;
+            let encoder = encoder.as_ref();
+            let simd = self.args.reduce_mode & 2 != 0
+                && pipeline.simd_chunk.as_ref().threadExecutionWidth() == 32
+                && pipeline.simd_chunk.max_total_threads_per_threadgroup() >= 32;
+            encoder.set_compute_pipeline_state(if simd {
+                &pipeline.simd_chunk
+            } else {
+                &pipeline.sequential_chunk
+            });
+            encoder.set_output_buffer(0, Some(state.buffer()), layout.start_offset() * 8);
+            for (index, ((_, dtype, rows), (storage, layout))) in
+                inputs.iter().zip(&guards).enumerate()
+            {
+                let Storage::Metal(storage) = &**storage else {
+                    return Err(candle_core::Error::Msg(
+                        "Metal Louvain state input moved off device".into(),
+                    ));
+                };
+                if storage.dtype() != *dtype
+                    || !layout.is_contiguous()
+                    || layout.dims().len() != 1
+                    || layout.shape().elem_count() != *rows
+                {
+                    return Err(candle_core::Error::Msg(
+                        "Metal Louvain state input contract is invalid".into(),
+                    ));
+                }
+                encoder.set_input_buffer(
+                    index + 1,
+                    Some(storage.buffer()),
+                    layout.start_offset() * dtype.size_in_bytes(),
+                );
+            }
+            let mut args = self.args;
+            args.reduce_mode &= 1;
+            encoder.set_bytes(6, &args);
+            encoder.set_output_buffer(7, Some(self.feedback.as_ref()), 0);
+            let (offset_storage, offset_layout) = self.offsets.storage_and_layout();
+            let Storage::Metal(offset_storage) = &*offset_storage else {
+                return Err(candle_core::Error::Msg(
+                    "Louvain offsets moved off device".into(),
+                ));
+            };
+            if offset_storage.dtype() != DType::I64
+                || !offset_layout.is_contiguous()
+                || offset_layout.shape().elem_count() != nodes + 1
+            {
+                return Err(candle_core::Error::Msg(
+                    "Louvain offsets have an invalid shape".into(),
+                ));
+            }
+            encoder.set_input_buffer(
+                8,
+                Some(offset_storage.buffer()),
+                offset_layout.start_offset() * 8,
+            );
+            let (row_storage, row_layout) = self.active_rows.storage_and_layout();
+            let Storage::Metal(row_storage) = &*row_storage else {
+                return Err(candle_core::Error::Msg(
+                    "Louvain active rows moved off device".into(),
+                ));
+            };
+            if row_storage.dtype() != DType::U32
+                || !row_layout.is_contiguous()
+                || row_layout.shape().elem_count() != self.args.work_offset as usize
+            {
+                return Err(candle_core::Error::Msg(
+                    "Louvain active row shape is invalid".into(),
+                ));
+            }
+            encoder.set_input_buffer(9, Some(row_storage.buffer()), row_layout.start_offset() * 4);
+            let one = objc2_metal::MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            };
+            let group = objc2_metal::MTLSize {
+                width: if simd { 32 } else { 1 },
+                ..one
+            };
+            encoder.dispatch_thread_groups(one, group);
+        }
+        device.wait_until_completed()?;
+        metal_checkpoint(&self.cancellation, self.deadline)?;
+        Ok((
+            MetalStorage::new(
+                std::sync::Arc::new(state.buffer().clone()),
+                device.clone(),
+                state_rows,
+                DType::I64,
+            ),
+            Shape::from(state_rows),
+        ))
+    }
+}
+
 fn apply(
     stage: Stage,
     primary: &Tensor,
@@ -2486,6 +1958,30 @@ fn split_i64(workspace: &Tensor, rows: usize) -> Result<(Tensor, Tensor)> {
         workspace.narrow(0, 0, rows).map_err(candle_error)?,
         workspace.narrow(0, rows, rows).map_err(candle_error)?,
     ))
+}
+
+fn compact_live_pairs(
+    keys: &Tensor,
+    weights: &Tensor,
+    cancellation: &CancellationToken,
+    deadline: Option<Instant>,
+) -> Result<(Tensor, Tensor)> {
+    let mask = weights.gt(0_i64).map_err(candle_error)?;
+    let positions = super::selected_positions_with_deadline(
+        &mask,
+        weights.elem_count(),
+        weights.device(),
+        cancellation,
+        deadline,
+    )?;
+    drop(mask);
+    if positions.elem_count() == weights.elem_count() {
+        return Ok((keys.clone(), weights.clone()));
+    }
+    let compact_keys = super::device_index_select(keys, &positions, 0)?;
+    let compact_weights = super::device_index_select(weights, &positions, 0)?;
+    ensure_graph_execution(cancellation, deadline)?;
+    Ok((compact_keys, compact_weights))
 }
 
 fn stable_sort(
@@ -2530,42 +2026,9 @@ fn stable_sort(
     ))
 }
 
-fn use_sorted_candidate_path(
-    maximum_degree: u32,
-    total_weight: u64,
-    oriented_capacity: usize,
-) -> Result<bool> {
-    let maximum_degree = u64::from(maximum_degree);
-    if maximum_degree <= DIRECT_NEIGHBOR_FAST_LIMIT {
-        return Ok(false);
-    }
-    // This hard ceiling is also enforced by the direct Metal kernel. It bounds cancellation
-    // latency and makes every direct lane's quadratic work finite independent of graph size.
-    if maximum_degree > DIRECT_NEIGHBOR_HARD_LIMIT {
-        return Ok(true);
-    }
-    // Direct row aggregation is bounded by max(d)*sum(d). The fallback performs eight stable
-    // radix passes across the fixed oriented capacity and pays substantial command-buffer setup.
-    // The fixed work term is calibrated by the real-Metal crossover gates: a 160-edge hub remains
-    // direct, while the 24,963-edge dense fixture routes sorted. This avoids both tiny-hub launch
-    // domination and unbounded O(sum d^2) work on dense/power-law levels.
-    let direct_upper = maximum_degree.checked_mul(total_weight).ok_or_else(|| {
-        Error::new(
-            ErrorCode::ResultBudgetExceeded,
-            "Metal Louvain direct-work estimate overflow",
-        )
-    })?;
-    let sorted_work = u64::try_from(oriented_capacity)
-        .ok()
-        .and_then(|rows| rows.checked_mul(SORTED_CANDIDATE_RADIX_PASSES))
-        .and_then(|work| work.checked_add(SORTED_CANDIDATE_FIXED_WORK))
-        .ok_or_else(|| {
-            Error::new(
-                ErrorCode::ResultBudgetExceeded,
-                "Metal Louvain sorted-work estimate overflow",
-            )
-        })?;
-    Ok(direct_upper > sorted_work)
+/// High-degree rows yield more frequently so one row cannot delay cancellation.
+const fn use_short_local_chunks(maximum_degree: u32) -> bool {
+    maximum_degree > 256
 }
 
 const RADIX_TILE_ROWS: usize = 1_024;
@@ -2677,13 +2140,45 @@ fn stable_sort_scratch(rows: usize) -> Result<StableSortScratchBreakdown> {
     })
 }
 
+fn pair_compaction_scratch(rows: usize) -> Result<usize> {
+    let positions = pooled_rows(
+        rows.checked_add(1)
+            .ok_or_else(|| scratch_overflow("pair selection rows overflow"))?,
+        4,
+        "pair selection allocation overflow",
+    )?;
+    let scan = checked_sum(
+        [
+            pooled_rows(rows, 1, "pair selection mask overflow")?,
+            positions,
+            pooled_rows(rows, 4, "pair selection prefix overflow")?,
+            pooled_rows(
+                rows.div_ceil(super::METAL_SORT_THREADS),
+                4,
+                "pair selection blocks overflow",
+            )?,
+            4,
+            4,
+        ],
+        "pair selection scratch overflow",
+    )?;
+    let gather = checked_sum(
+        [
+            positions,
+            pooled_rows(rows, 8, "compact pair keys overflow")?,
+            pooled_rows(rows, 8, "compact pair weights overflow")?,
+        ],
+        "pair compaction gather overflow",
+    )?;
+    Ok(scan.max(gather))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LouvainScratchBreakdown {
     selection_and_node_readback: usize,
     base_preprocess: usize,
     oriented_sort_and_level_setup: usize,
-    direct_local_move: usize,
-    sorted_local_move: usize,
+    dense_local_move: usize,
     coarsening: usize,
     result_readback: usize,
 }
@@ -2693,8 +2188,7 @@ impl LouvainScratchBreakdown {
         self.selection_and_node_readback
             .max(self.base_preprocess)
             .max(self.oriented_sort_and_level_setup)
-            .max(self.direct_local_move)
-            .max(self.sorted_local_move)
+            .max(self.dense_local_move)
             .max(self.coarsening)
             .max(self.result_readback)
     }
@@ -2707,8 +2201,7 @@ fn scratch_breakdown(node_count: usize, edge_count: usize) -> Result<LouvainScra
             selection_and_node_readback: 0,
             base_preprocess: 0,
             oriented_sort_and_level_setup: 0,
-            direct_local_move: 0,
-            sorted_local_move: 0,
+            dense_local_move: 0,
             coarsening: 0,
             result_readback: 0,
         });
@@ -2740,22 +2233,6 @@ fn scratch_breakdown(node_count: usize, edge_count: usize) -> Result<LouvainScra
             .ok_or_else(|| scratch_overflow("Metal Louvain node control shape overflow"))?,
         std::mem::size_of::<u32>(),
         "Metal Louvain node control allocation overflow",
-    )?;
-    let u32_two_nodes = pooled_rows(
-        node_count
-            .checked_mul(2)
-            .ok_or_else(|| scratch_overflow("Metal Louvain two-node shape overflow"))?,
-        std::mem::size_of::<u32>(),
-        "Metal Louvain two-node allocation overflow",
-    )?;
-    let winner_rows = node_count
-        .checked_mul(2)
-        .and_then(|rows| rows.checked_add(1))
-        .ok_or_else(|| scratch_overflow("Metal Louvain winner shape overflow"))?;
-    let winners = pooled_rows(
-        winner_rows,
-        std::mem::size_of::<u32>(),
-        "Metal Louvain winner allocation overflow",
     )?;
     let scalar_u32 = pooled_rows(
         1,
@@ -2827,8 +2304,7 @@ fn scratch_breakdown(node_count: usize, edge_count: usize) -> Result<LouvainScra
             selection_and_node_readback,
             base_preprocess: 0,
             oriented_sort_and_level_setup: 0,
-            direct_local_move: 0,
-            sorted_local_move: 0,
+            dense_local_move: 0,
             coarsening: 0,
             result_readback,
         });
@@ -2884,10 +2360,15 @@ fn scratch_breakdown(node_count: usize, edge_count: usize) -> Result<LouvainScra
         [front, pair_workspace, u32_nodes, u32_nodes],
         "Metal Louvain base initialization peak overflow",
     )?;
+    let base_compact = checked_sum(
+        [front, pair_workspace, pair_compaction_scratch(edge_count)?],
+        "Metal Louvain base compaction peak overflow",
+    )?;
     let base_preprocess = base_sort
         .max(base_reduce)
         .max(base_weight_readback)
-        .max(base_initialize);
+        .max(base_initialize)
+        .max(base_compact);
 
     // After the first coarsening, `active` is a view into a V+1 control allocation, so the
     // allocator-rounded control size (not merely 4V logical bytes) is the persistent upper bound.
@@ -2918,107 +2399,71 @@ fn scratch_breakdown(node_count: usize, edge_count: usize) -> Result<LouvainScra
     )?;
     let oriented_sort_and_level_setup = oriented_sort.max(level_setup);
 
-    // `degree`, an independently updated community-weight vector, and membership all remain live
-    // across subsequent local passes. Tensor views/clones that share one allocation are counted
-    // once; every listed entry below is a distinct live Metal buffer.
+    // Degree and membership remain live while a private state holds community weights,
+    // candidate weights and sixteen control words. Initialization overlaps its zero tail;
+    // each bounded chunk copies only sixteen control words into private, shared and host memory.
     let local_common = checked_sum(
         [
             level_persistent,
             oriented_i64,
             oriented_i64,
             i64_nodes,
-            i64_nodes,
             u32_nodes,
         ],
         "Metal Louvain local-move common scratch overflow",
     )?;
-    let control_readback = checked_sum(
-        [control, scalar_u32, scalar_u32, 4],
-        "Metal Louvain proposal readback overflow",
+    let state_rows = node_count
+        .checked_mul(2)
+        .and_then(|rows| rows.checked_add(16))
+        .ok_or_else(|| scratch_overflow("Metal Louvain dense-state shape overflow"))?;
+    let state = pooled_rows(
+        state_rows,
+        8,
+        "Metal Louvain dense-state allocation overflow",
     )?;
-    let matching_minimum = checked_sum(
-        [control, u32_nodes, u32_nodes, u32_two_nodes],
-        "Metal Louvain matching-minimum scratch overflow",
-    )?;
-    let matching_winners = checked_sum(
-        [
-            control,
-            u32_nodes,
-            u32_nodes,
-            u32_two_nodes,
-            winners,
-            scalar_u32,
-            scalar_u32,
-            4,
-        ],
-        "Metal Louvain matching-winner scratch overflow",
-    )?;
-    let matching_advance = checked_sum(
-        [control, u32_nodes, u32_nodes, winners, u32_two_nodes],
-        "Metal Louvain matching-advance scratch overflow",
-    )?;
-    let update_community = checked_sum(
-        [control, u32_nodes, i64_nodes],
-        "Metal Louvain community-update scratch overflow",
-    )?;
-    let apply_membership = checked_sum(
-        [control, u32_nodes, u32_nodes],
-        "Metal Louvain membership-update scratch overflow",
-    )?;
-    let direct_extra = control_readback
-        .max(matching_minimum)
-        .max(matching_winners)
-        .max(matching_advance)
-        .max(update_community)
-        .max(apply_membership);
-    let direct_local_move = checked_sum(
-        [local_common, direct_extra],
-        "Metal Louvain direct local-move peak overflow",
-    )?;
-
-    let candidate_i64 = oriented_i64;
-    let candidate_sort = checked_sum(
-        [
-            candidate_i64,
-            stable_sort_scratch(oriented_count)?.required_bytes(),
-        ],
-        "Metal Louvain candidate-sort scratch overflow",
-    )?;
-    let sorted_state = pooled_rows(
+    let zero_tail = pooled_rows(
         node_count
-            .checked_mul(3)
-            .ok_or_else(|| scratch_overflow("Metal Louvain sorted-state shape overflow"))?,
-        std::mem::size_of::<i64>(),
-        "Metal Louvain sorted-state allocation overflow",
+            .checked_add(16)
+            .ok_or_else(|| scratch_overflow("Metal Louvain zero-tail shape overflow"))?,
+        8,
+        "Metal Louvain zero-tail allocation overflow",
     )?;
-    let candidate_aggregate = checked_product(
-        candidate_i64,
-        3,
-        "Metal Louvain candidate-aggregate scratch overflow",
+    let readback = checked_sum(
+        [
+            pooled_rows(16, 8, "Metal Louvain control readback overflow")?,
+            16 * 8,
+            16 * 8,
+        ],
+        "Metal Louvain control readback overflow",
     )?;
-    let sorted_initialize = checked_sum(
-        [candidate_i64, candidate_i64, sorted_state],
-        "Metal Louvain sorted-state initialization scratch overflow",
-    )?;
-    let sorted_chunk = checked_sum(
-        [candidate_i64, candidate_i64, sorted_state, sorted_state],
-        "Metal Louvain sorted-chunk scratch overflow",
-    )?;
-    let sorted_finalize = checked_sum(
-        [sorted_state, control, scalar_u32, scalar_u32, 4],
-        "Metal Louvain sorted-finalize scratch overflow",
-    )?;
-    let sorted_local_move = checked_sum(
+    let dense_local_move = checked_sum(
         [
             local_common,
-            candidate_sort
-                .max(candidate_aggregate)
-                .max(sorted_initialize)
-                .max(sorted_chunk)
-                .max(sorted_finalize)
-                .max(direct_extra),
+            state,
+            zero_tail
+                .max(pair_compaction_scratch(node_count)?)
+                .max(checked_sum(
+                    [
+                        readback,
+                        pooled_rows(
+                            node_count
+                                .checked_add(1)
+                                .ok_or_else(|| scratch_overflow("Louvain active rows overflow"))?,
+                            4,
+                            "Louvain active rows allocation overflow",
+                        )?,
+                    ],
+                    "Louvain active-row readback peak overflow",
+                )?),
+            pooled_rows(
+                node_count
+                    .checked_add(1)
+                    .ok_or_else(|| scratch_overflow("Louvain local offset rows overflow"))?,
+                8,
+                "Louvain local offset allocation overflow",
+            )?,
         ],
-        "Metal Louvain sorted local-move peak overflow",
+        "Metal Louvain dense local-move peak overflow",
     )?;
 
     let coarsen_nodes = checked_sum(
@@ -3069,7 +2514,17 @@ fn scratch_breakdown(node_count: usize, edge_count: usize) -> Result<LouvainScra
         .max(rebuild_active)
         .max(map_pairs)
         .max(coarsen_sort)
-        .max(coarsen_reduce);
+        .max(coarsen_reduce)
+        .max(checked_sum(
+            [
+                front,
+                u32_nodes,
+                control,
+                pair_workspace,
+                pair_compaction_scratch(edge_count)?,
+            ],
+            "Metal Louvain coarse compaction peak overflow",
+        )?);
 
     // Pair/oriented/local state is explicitly dropped before canonical publication. Community
     // meaning stays on device: first-visible positions are atomically collected, sorted, published
@@ -3117,8 +2572,7 @@ fn scratch_breakdown(node_count: usize, edge_count: usize) -> Result<LouvainScra
         selection_and_node_readback,
         base_preprocess,
         oriented_sort_and_level_setup,
-        direct_local_move,
-        sorted_local_move,
+        dense_local_move,
         coarsening,
         result_readback,
     })
@@ -3512,10 +2966,10 @@ pub fn execute(
 struct LouvainProgress {
     total_local_passes: usize,
     max_level_local_passes: usize,
-    sorted_candidate_levels: usize,
-    sorted_candidate_chunks: usize,
+    high_degree_levels: usize,
+    local_chunks: usize,
     #[cfg(test)]
-    cancel_after_sorted_candidate_chunks: Option<usize>,
+    cancel_after_local_chunks: Option<usize>,
     #[cfg(test)]
     cancellation_triggered_at: Option<std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>>,
 }
@@ -3566,10 +3020,12 @@ fn execute_with_progress(
     }
     let device = visible_mask.device();
     let prepared = prepare_unique_pairs(resident, visible_mask, layers, cancellation, deadline)?;
-    let mut pair_keys = prepared.keys;
-    let mut pair_weights = prepared.weights;
+    let (mut pair_keys, mut pair_weights) =
+        compact_live_pairs(&prepared.keys, &prepared.weights, cancellation, deadline)?;
     let total_weight = prepared.total_weight;
-    let args = GraphArgs::new(node_count, edge_count, edge_count, total_weight, layers, 0)?;
+    drop(prepared);
+    let mut pair_count = pair_keys.elem_count();
+    let mut args = GraphArgs::new(node_count, edge_count, pair_count, total_weight, layers, 0)?;
     let mut active = visible_mask
         .apply_op1_no_bwd(&LouvainU8ToU32 {
             cancellation: cancellation.clone(),
@@ -3589,7 +3045,7 @@ fn execute_with_progress(
     if total_weight != 0 {
         for _level in 0..node_count {
             ensure_graph_execution(cancellation, deadline)?;
-            let oriented_count = edge_count.checked_mul(2).ok_or_else(|| {
+            let oriented_count = pair_count.checked_mul(2).ok_or_else(|| {
                 Error::new(
                     ErrorCode::ResultBudgetExceeded,
                     "Metal Louvain oriented row count overflow",
@@ -3634,20 +3090,17 @@ fn execute_with_progress(
             .first()
             .copied()
             .unwrap_or(u32::MAX);
-            let use_sorted_candidates =
-                use_sorted_candidate_path(maximum_degree, total_weight, oriented_count)?;
-            if use_sorted_candidates && let Some(progress) = progress.as_deref_mut() {
-                progress.sorted_candidate_levels = progress
-                    .sorted_candidate_levels
-                    .checked_add(1)
-                    .ok_or_else(|| {
+            let high_degree_level = use_short_local_chunks(maximum_degree);
+            if high_degree_level && let Some(progress) = progress.as_deref_mut() {
+                progress.high_degree_levels =
+                    progress.high_degree_levels.checked_add(1).ok_or_else(|| {
                         Error::new(
                             ErrorCode::ResultBudgetExceeded,
-                            "Metal Louvain sorted-level count overflow",
+                            "Metal Louvain high-degree level count overflow",
                         )
                     })?;
             }
-            let mut membership = apply(
+            let membership = apply(
                 Stage::InitializeLevel,
                 &active,
                 Vec::new(),
@@ -3655,265 +3108,120 @@ fn execute_with_progress(
                 cancellation,
                 deadline,
             )?;
-            let mut community_weights = degree.clone();
+            let zeros = Tensor::zeros(node_count + 16, DType::I64, device).map_err(candle_error)?;
+            let mut local_state = Tensor::cat(&[&degree, &zeros], 0).map_err(candle_error)?;
+            drop(zeros);
+            let mut offset_args = args;
+            offset_args.reduce_mode = 1;
+            let local_offsets = apply(
+                Stage::CsrOffsets,
+                &oriented_keys,
+                vec![oriented_weights.clone()],
+                offset_args,
+                cancellation,
+                deadline,
+            )?;
+            let Device::Metal(metal) = device else {
+                return Err(Error::internal("Louvain checkpoint moved off Metal"));
+            };
+            let active_mask = active.to_dtype(DType::U8).map_err(candle_error)?;
+            let active_rows = super::selected_positions_with_deadline(
+                &active_mask,
+                node_count,
+                device,
+                cancellation,
+                deadline,
+            )?;
+            drop(active_mask);
+            let feedback = metal
+                .new_buffer_builder()
+                .with_size(16 * 8)
+                .with_label("irongraph Louvain bounded checkpoint")
+                .build()
+                .map_err(candle_error)?;
             let mut level_local_passes = 0_usize;
-
-            // No heuristic pass cap: every continuing pass applies at least one exact,
-            // strictly beneficial move. The accepted moves touch disjoint source/target
-            // communities, so their modularity deltas are additive and strictly positive.
-            // Since the membership state space is finite, that is the termination invariant.
             loop {
-                ensure_graph_execution(cancellation, deadline)?;
-                let decision = if use_sorted_candidates {
-                    let (candidate_keys, candidate_weights) = {
-                        let candidate_keys = apply(
-                            Stage::CandidateKeys,
-                            &oriented_keys,
-                            vec![membership.clone()],
-                            args,
-                            cancellation,
+                let mut reset = true;
+                let accepted = loop {
+                    ensure_graph_execution(cancellation, deadline)?;
+                    let mut chunk_args = args
+                        .with_work(0, if high_degree_level { 4_096 } else { 65_536 })
+                        .map_err(candle_error)?;
+                    chunk_args.reduce_mode =
+                        u32::from(reset) | (u32::from(maximum_degree <= 32) << 1);
+                    // Local chunks use this otherwise-unused offset as their active-row limit.
+                    chunk_args.work_offset = active_rows.elem_count() as u64;
+                    local_state = local_state
+                        .apply_op1_no_bwd(&SequentialLouvainChunk {
+                            membership: membership.clone(),
+                            active: active.clone(),
+                            degree: degree.clone(),
+                            keys: oriented_keys.clone(),
+                            weights: oriented_weights.clone(),
+                            feedback: feedback.clone(),
+                            offsets: local_offsets.clone(),
+                            active_rows: active_rows.clone(),
+                            args: chunk_args,
+                            cancellation: cancellation.clone(),
                             deadline,
-                        )?;
-                        stable_sort(
-                            &candidate_keys,
-                            &oriented_weights,
-                            device,
-                            cancellation,
-                            deadline,
-                        )?
+                        })
+                        .map_err(|error| louvain_candle_error(error, cancellation, deadline))?;
+                    reset = false;
+                    let control = {
+                        // The chunk waits for Metal before returning. Read its sixteen
+                        // shared control words directly, then release the view before
+                        // the next chunk mutates this private scratch allocation.
+                        let shared = shared_flat_from_metal_buffer::<i64>(feedback.clone(), 16)
+                            .map_err(Error::internal)?;
+                        let mut control = [0_i64; 16];
+                        control.copy_from_slice(shared.as_slice());
+                        control
                     };
-                    let candidate_aggregate = apply(
-                        Stage::CandidateAggregate,
-                        &candidate_keys,
-                        vec![candidate_weights],
-                        args,
-                        cancellation,
-                        deadline,
-                    )?;
-                    let mut sorted_state = apply(
-                        Stage::SortedInitialize,
-                        &active,
-                        vec![membership.clone()],
-                        args,
-                        cancellation,
-                        deadline,
-                    )?;
-                    let maximum_degree = usize::try_from(maximum_degree).map_err(|_| {
-                        Error::new(
-                            ErrorCode::ResultBudgetExceeded,
-                            "Metal Louvain maximum degree exceeds usize",
-                        )
-                    })?;
-                    for chunk_base in
-                        (0..maximum_degree).step_by(SORTED_DECISION_CHUNK_ROWS as usize)
-                    {
-                        ensure_graph_execution(cancellation, deadline)?;
-                        let chunk_args = GraphArgs {
-                            reduce_mode: u32::try_from(chunk_base).map_err(|_| {
-                                Error::new(
-                                    ErrorCode::ResultBudgetExceeded,
-                                    "Metal Louvain sorted chunk offset exceeds u32",
-                                )
-                            })?,
-                            ..args
-                        };
-                        sorted_state = apply(
-                            Stage::SortedChunk,
-                            &sorted_state,
-                            vec![
-                                active.clone(),
-                                membership.clone(),
-                                degree.clone(),
-                                community_weights.clone(),
-                                candidate_keys.clone(),
-                                candidate_aggregate.clone(),
-                            ],
-                            chunk_args,
-                            cancellation,
-                            deadline,
-                        )?;
-                        if let Some(progress) = progress.as_deref_mut() {
-                            progress.sorted_candidate_chunks = progress
-                                .sorted_candidate_chunks
-                                .checked_add(1)
-                                .ok_or_else(|| {
-                                    Error::new(
-                                        ErrorCode::ResultBudgetExceeded,
-                                        "Metal Louvain sorted-chunk count overflow",
-                                    )
-                                })?;
-                            #[cfg(test)]
-                            if progress.cancel_after_sorted_candidate_chunks
-                                == Some(progress.sorted_candidate_chunks)
-                            {
-                                if let Some(triggered_at) = &progress.cancellation_triggered_at {
-                                    *triggered_at.lock().map_err(|_| {
-                                        Error::internal(
-                                            "Metal Louvain cancellation test clock was poisoned",
-                                        )
-                                    })? = Some(std::time::Instant::now());
-                                }
-                                cancellation.cancel();
+                    if control[11] != 0 {
+                        return Err(Error::new(
+                            ErrorCode::CorruptStorage,
+                            format!(
+                                "Metal Louvain dense-order state rejected graph with status {}",
+                                control[11]
+                            ),
+                        ));
+                    }
+                    if let Some(progress) = progress.as_deref_mut() {
+                        progress.local_chunks += 1;
+                        #[cfg(test)]
+                        if progress
+                            .cancel_after_local_chunks
+                            .is_some_and(|limit| progress.local_chunks >= limit)
+                        {
+                            if let Some(triggered_at) = &progress.cancellation_triggered_at {
+                                *triggered_at.lock().map_err(|_| {
+                                    Error::internal("Louvain cancellation clock poisoned")
+                                })? = Some(Instant::now());
                             }
+                            cancellation.cancel();
                         }
                     }
-                    drop(candidate_keys);
-                    drop(candidate_aggregate);
-                    apply(
-                        Stage::DecideSorted,
-                        &sorted_state,
-                        vec![
-                            active.clone(),
-                            membership.clone(),
-                            degree.clone(),
-                            community_weights.clone(),
-                        ],
-                        args,
-                        cancellation,
-                        deadline,
-                    )?
-                } else {
-                    apply(
-                        Stage::Decide,
-                        &active,
-                        vec![
-                            membership.clone(),
-                            degree.clone(),
-                            community_weights.clone(),
-                            oriented_keys.clone(),
-                            oriented_weights.clone(),
-                        ],
-                        args,
-                        cancellation,
-                        deadline,
-                    )?
+                    ensure_graph_execution(cancellation, deadline)?;
+                    if control[10] != 0 {
+                        break control[9];
+                    }
                 };
-                let proposals = decision.narrow(0, 0, node_count).map_err(candle_error)?;
-                let has_proposal = read_u32_scalar(&decision, node_count, cancellation, deadline)?;
-                if has_proposal > 1 {
-                    return Err(Error::new(
-                        ErrorCode::CorruptStorage,
-                        "Metal Louvain direct-candidate router exceeded its hard row bound",
-                    ));
-                }
-                if has_proposal == 0 {
+                if accepted == 0 {
                     break;
                 }
-
-                // Proposals are edges in a community-conflict graph. A deterministic parallel
-                // greedy matching accepts batches whose source/target community pairs are
-                // disjoint. The exact individual modularity deltas are therefore additive.
-                let mut active_proposals = apply(
-                    Stage::MatchingInitialize,
-                    &active,
-                    vec![membership.clone(), proposals.clone()],
-                    args,
-                    cancellation,
-                    deadline,
-                )?;
-                let mut accepted = visible_mask
-                    .apply_op1_no_bwd(&LouvainZeroU32 {
-                        rows: node_count,
-                        cancellation: cancellation.clone(),
-                        deadline,
-                    })
-                    .map_err(|error| louvain_candle_error(error, cancellation, deadline))?;
-                let mut accepted_any = false;
-                for _round in 0..node_count {
-                    ensure_graph_execution(cancellation, deadline)?;
-                    let minimum = apply(
-                        Stage::MatchingMinimum,
-                        &active_proposals,
-                        vec![membership.clone(), proposals.clone()],
-                        args,
-                        cancellation,
-                        deadline,
-                    )?;
-                    let winners = apply(
-                        Stage::MatchingWinners,
-                        &active_proposals,
-                        vec![membership.clone(), proposals.clone(), minimum],
-                        args,
-                        cancellation,
-                        deadline,
-                    )?;
-                    let winner_count =
-                        read_u32_scalar(&winners, node_count * 2, cancellation, deadline)?;
-                    if winner_count == 0 {
-                        let remaining = sum_u32(&active_proposals, cancellation, deadline)?;
-                        if remaining != 0 {
-                            return Err(Error::new(
-                                ErrorCode::CorruptStorage,
-                                "Metal Louvain proposal matching stalled with active moves",
-                            ));
-                        }
-                        break;
-                    }
-                    accepted_any = true;
-                    let advanced = apply(
-                        Stage::MatchingAdvance,
-                        &active_proposals,
-                        vec![accepted, membership.clone(), proposals.clone(), winners],
-                        args,
-                        cancellation,
-                        deadline,
-                    )?;
-                    active_proposals = advanced.narrow(0, 0, node_count).map_err(candle_error)?;
-                    accepted = advanced
-                        .narrow(0, node_count, node_count)
-                        .map_err(candle_error)?;
-                }
-                if !accepted_any {
-                    return Err(Error::new(
-                        ErrorCode::CorruptStorage,
-                        "Metal Louvain proposal matching made no progress",
-                    ));
-                }
-                drop(active_proposals);
-                community_weights = apply(
-                    Stage::UpdateCommunityWeights,
-                    &community_weights,
-                    vec![
-                        membership.clone(),
-                        proposals.clone(),
-                        accepted.clone(),
-                        degree.clone(),
-                    ],
-                    args,
-                    cancellation,
-                    deadline,
-                )?;
-                membership = apply(
-                    Stage::ApplyMatching,
-                    &membership,
-                    vec![proposals, accepted],
-                    args,
-                    cancellation,
-                    deadline,
-                )?;
-                level_local_passes = level_local_passes.checked_add(1).ok_or_else(|| {
-                    Error::new(
-                        ErrorCode::ResultBudgetExceeded,
-                        "Metal Louvain local-pass count overflow",
-                    )
-                })?;
+                level_local_passes += 1;
                 if let Some(progress) = progress.as_deref_mut() {
-                    progress.total_local_passes =
-                        progress.total_local_passes.checked_add(1).ok_or_else(|| {
-                            Error::new(
-                                ErrorCode::ResultBudgetExceeded,
-                                "Metal Louvain progress count overflow",
-                            )
-                        })?;
+                    progress.total_local_passes += 1;
                     progress.max_level_local_passes =
                         progress.max_level_local_passes.max(level_local_passes);
                 }
             }
-
+            drop(local_state);
+            drop(local_offsets);
+            drop(active_rows);
             drop(oriented_keys);
             drop(oriented_weights);
             drop(degree);
-            drop(community_weights);
 
             original_map = apply(
                 Stage::MapOriginal,
@@ -3950,7 +3258,7 @@ fn execute_with_progress(
                 )?;
                 drop(pair_keys);
                 drop(pair_weights);
-                let (mapped_keys, mapped_weights) = split_i64(&mapped, edge_count)?;
+                let (mapped_keys, mapped_weights) = split_i64(&mapped, pair_count)?;
                 stable_sort(
                     &mapped_keys,
                     &mapped_weights,
@@ -3972,7 +3280,11 @@ fn execute_with_progress(
                 deadline,
             )?;
             drop(mapped_keys);
-            (pair_keys, pair_weights) = split_i64(&coarse, edge_count)?;
+            let (coarse_keys, coarse_weights) = split_i64(&coarse, pair_count)?;
+            (pair_keys, pair_weights) =
+                compact_live_pairs(&coarse_keys, &coarse_weights, cancellation, deadline)?;
+            pair_count = pair_keys.elem_count();
+            args = GraphArgs::new(node_count, edge_count, pair_count, total_weight, layers, 0)?;
             active_count = next_count;
         }
     }
@@ -4069,6 +3381,7 @@ mod tests {
         assert_eq!(pooled_bytes(3, "test")?, 4);
         assert_eq!(pooled_bytes(4_095, "test")?, 4_096);
         assert_eq!(pooled_bytes(4_097, "test")?, 8_192);
+        assert_eq!(pair_compaction_scratch(3)?, 80);
         assert_eq!(
             stable_sort_scratch(3)?,
             StableSortScratchBreakdown {
@@ -4087,13 +3400,12 @@ mod tests {
                 selection_and_node_readback: 180,
                 base_preprocess: 7_456,
                 oriented_sort_and_level_setup: 7_872,
-                direct_local_move: 652,
-                sorted_local_move: 8_080,
+                dense_local_move: 1_184,
                 coarsening: 7_488,
                 result_readback: 7_312,
             }
         );
-        assert_eq!(scratch_bytes(3, 5)?, 8_080);
+        assert_eq!(scratch_bytes(3, 5)?, 7_872);
         assert_eq!(unique_undirected_csr_scratch_bytes(3, 5)?, 7_680);
         assert_eq!(unique_undirected_csr_retained_bytes(3, 5)?, 80);
         let edgeless = scratch_breakdown(3, 0)?;
@@ -4102,7 +3414,7 @@ mod tests {
         assert_eq!(scratch_bytes(3, 0)?, 180);
 
         let high_cardinality = scratch_breakdown(1_024, 8_192)?;
-        assert!(high_cardinality.sorted_local_move > high_cardinality.direct_local_move);
+        assert!(high_cardinality.dense_local_move > 0);
         assert_eq!(
             scratch_bytes(1_024, 8_192)?,
             high_cardinality.required_bytes()
@@ -4114,12 +3426,12 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_candidate_router_keeps_tiny_hubs_direct_and_dense_levels_sorted() -> Result<()> {
-        assert!(!use_sorted_candidate_path(160, 320, 320)?);
-        assert!(use_sorted_candidate_path(130, 49_926, 49_926)?);
-        assert!(!use_sorted_candidate_path(50, 393_472, 393_472)?);
-        assert!(use_sorted_candidate_path(257, 514, 514)?);
-        Ok(())
+    fn local_chunk_router_bounds_large_hubs() {
+        assert!(!use_short_local_chunks(0));
+        assert!(!use_short_local_chunks(160));
+        assert!(!use_short_local_chunks(256));
+        assert!(use_short_local_chunks(257));
+        assert!(use_short_local_chunks(u32::MAX));
     }
 
     #[test]
@@ -4148,10 +3460,11 @@ mod tests {
     }
 
     #[test]
-    fn metal_source_hard_bounds_quadratic_rows_and_parallelizes_coarsening_runs() {
+    fn metal_source_bounds_local_steps_and_parallelizes_coarsening_runs() {
         let source = include_str!("../../../../kernels/metal/graph_louvain.metal");
-        assert!(source.contains("IG_LV_DIRECT_NEIGHBOR_HARD_LIMIT = 256ul"));
-        assert!(source.contains("end - begin > IG_LV_DIRECT_NEIGHBOR_HARD_LIMIT"));
+        assert!(source.contains("kernel void ig_louvain_sequential_chunk"));
+        assert!(source.contains("step < args.work_count"));
+        assert!(!source.contains("kernel void ig_louvain_matching"));
         assert!(source.contains("kernel void ig_louvain_reduce_pairs_clear"));
         assert!(source.contains("ig_lv_lower_bound_key("));
         assert!(source.contains("ig_lv_atomic_add_u64("));
@@ -4439,7 +3752,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn real_metal_star_executes_more_than_one_hundred_local_passes() -> Result<()> {
+    fn real_metal_star_matches_dense_order_local_passes() -> Result<()> {
         if crate::metal_test_device().is_none() {
             return Ok(());
         }
@@ -4461,16 +3774,101 @@ mod tests {
             ));
         };
         assert!(community.iter().all(|label| *label == community[0]));
-        assert_eq!(progress.max_level_local_passes, leaf_count);
-        assert_eq!(progress.total_local_passes, leaf_count);
-        assert_eq!(progress.sorted_candidate_levels, 0);
-        assert_eq!(progress.sorted_candidate_chunks, 0);
+        assert_eq!(progress.max_level_local_passes, 1);
+        assert_eq!(progress.total_local_passes, 1);
+        assert_eq!(progress.high_degree_levels, 0);
+        assert!(progress.local_chunks >= 2);
         Ok(())
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn real_metal_single_hub_cancels_between_bounded_sorted_chunks() -> Result<()> {
+    fn real_metal_small_rows_and_hubs_match_cpu_communities() -> Result<()> {
+        let _guard = crate::metal_test_guard();
+        use crate::{
+            Bookmark, EdgeId, Layer, NodeId, ProjectId,
+            execution::ResidentProjectImage,
+            graph::{EdgeInput, GraphStore, IndexCatalog, NodeInput, TemporalStore},
+        };
+        let Some(device) = crate::metal_test_device() else {
+            return Ok(());
+        };
+        for seed in 0..6_u32 {
+            let node_count = if seed == 0 { 4_093 } else { 67 };
+            let mut graph = GraphStore::default();
+            let connected = graph.catalog_mut().intern_relationship_type("EDGE")?;
+            for node in 0..node_count as u64 {
+                graph.insert_node(NodeInput {
+                    id: NodeId(node + 1),
+                    layer: Layer::Observed,
+                    revision: node + 1,
+                    labels: Vec::new(),
+                    properties: Vec::new(),
+                })?;
+            }
+            // Two disconnected regions, one isolate, duplicate/reverse edges,
+            // and a hub above the private accumulator's sixteen-row bound.
+            let mut triples = Vec::new();
+            for source in 0..node_count as u32 - 1 {
+                let region = source / 33 * 33;
+                let fanout = if source == region { 25 } else { 2 + seed };
+                for step in 1..=fanout {
+                    let target = region + ((source - region + step * 7 + seed) % 33);
+                    let id = triples.len() as u64 + node_count as u64 + 1;
+                    triples.push((source, target, triples.len() as u32));
+                    graph.insert_edge(EdgeInput {
+                        id: EdgeId(id),
+                        source: NodeId(u64::from(source) + 1),
+                        target: NodeId(u64::from(target) + 1),
+                        relationship_type: connected,
+                        layer: Layer::Observed,
+                        revision: id,
+                        properties: Vec::new(),
+                    })?;
+                }
+            }
+            let outgoing = crate::graph::Csr::build(node_count, &triples)?;
+            let incoming = crate::graph::Csr::build_transposed(node_count, &triples)?;
+            let expected = crate::graph::louvain_communities(&outgoing, &incoming)?;
+            let image = ResidentProjectImage::build(
+                ProjectId(uuid::Uuid::nil()),
+                Bookmark {
+                    term: 0,
+                    index: graph.revision(),
+                },
+                &graph,
+                &TemporalStore::default(),
+                &IndexCatalog::default(),
+            )?;
+            let resident = CandleResident::upload(image, &device)?;
+            let visible_mask =
+                Tensor::ones(node_count, DType::U8, &device).map_err(candle_error)?;
+            let visible_rows = Tensor::from_vec(
+                (0..node_count as u32).collect::<Vec<_>>(),
+                node_count,
+                &device,
+            )
+            .map_err(candle_error)?;
+            let result = execute_with_progress(
+                &resident,
+                &visible_mask,
+                &visible_rows,
+                LayerMask::OBSERVED,
+                &CancellationToken::new(),
+                None,
+                None,
+            )?;
+            let ResidentGraphProcedureResult::Louvain { community, .. } = result else {
+                return Err(Error::internal("Metal parity result has the wrong shape"));
+            };
+            assert_eq!(community, expected.component, "mixed fixture seed {seed}");
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn real_metal_single_hub_cancels_between_bounded_local_chunks() -> Result<()> {
         if crate::metal_test_device().is_none() {
             return Ok(());
         }
@@ -4479,7 +3877,7 @@ mod tests {
         let cancellation = CancellationToken::new();
         let triggered_at = std::sync::Arc::new(std::sync::Mutex::new(None));
         let mut progress = LouvainProgress {
-            cancel_after_sorted_candidate_chunks: Some(1),
+            cancel_after_local_chunks: Some(1),
             cancellation_triggered_at: Some(triggered_at.clone()),
             ..LouvainProgress::default()
         };
@@ -4492,10 +3890,10 @@ mod tests {
             None,
             Some(&mut progress),
         )
-        .expect_err("bounded sorted decision must observe active cancellation");
+        .expect_err("bounded dense-order decision must observe active cancellation");
         assert_eq!(error.code, ErrorCode::Cancelled);
-        assert_eq!(progress.sorted_candidate_levels, 1);
-        assert_eq!(progress.sorted_candidate_chunks, 1);
+        assert_eq!(progress.high_degree_levels, 1);
+        assert_eq!(progress.local_chunks, 1);
         let triggered_at = triggered_at
             .lock()
             .map_err(|_| Error::internal("Metal Louvain cancellation clock was poisoned"))?

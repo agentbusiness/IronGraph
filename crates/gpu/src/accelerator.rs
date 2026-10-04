@@ -1,11 +1,22 @@
 //! Typed Candle residency and device-side operators shared by Metal and CUDA.
 
+mod derived_delta;
+#[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+mod dictionary_order;
 #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
 mod graph_components_metrics;
 #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
 mod graph_louvain;
 #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
 mod graph_paths;
+#[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+pub(super) mod metal_pages;
+#[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+mod property_delta;
+mod structure_delta;
+#[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+mod temporal_order;
+mod variable_payload;
 
 #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
 pub fn metal_louvain_scratch_bytes(node_count: usize, edge_count: usize) -> Result<usize> {
@@ -267,6 +278,68 @@ struct MixedColumn {
     bytes: Option<Tensor>,
     validity: Option<Tensor>,
     maximum_string_bytes: usize,
+    base: Option<Box<MixedBaseColumn>>,
+    overrides: Option<Tensor>,
+    allocator: variable_payload::Allocator,
+}
+
+#[derive(Clone)]
+enum MixedBaseColumn {
+    Boolean(BooleanColumn),
+    Integer(IntegerColumn),
+    Float(FloatColumn),
+    String(StringColumn),
+    Date(IntegerColumn),
+    LocalTime(IntegerColumn),
+    ZonedTime(ZonedTimeColumn),
+    LocalDateTime(LocalDateTimeColumn),
+    ZonedDateTime(ZonedDateTimeColumn),
+    Duration(DurationColumn),
+    Bytes(DocumentColumn),
+    List(DocumentColumn),
+    Map(DocumentColumn),
+}
+
+impl MixedBaseColumn {
+    fn tensors(&self) -> Vec<&Tensor> {
+        macro_rules! lanes { ($c:ident; $first:ident $(,$field:ident)*) => { $c.$first.iter()$(.chain(&$c.$field))*.collect() }; }
+        match self {
+            Self::Boolean(c) => lanes!(c; values,validity),
+            Self::Integer(c) | Self::Date(c) | Self::LocalTime(c) => lanes!(c; values,validity),
+            Self::Float(c) => lanes!(c; values,order_keys,validity),
+            Self::String(c) => lanes!(c; values,validity),
+            Self::ZonedTime(c) => lanes!(c; nanos,offsets,validity),
+            Self::LocalDateTime(c) => lanes!(c; seconds,nanos,validity),
+            Self::ZonedDateTime(c) => lanes!(c; seconds,nanos,timezones,validity),
+            Self::Duration(c) => lanes!(c; months,days,seconds,nanos,validity),
+            Self::Bytes(c) | Self::List(c) | Self::Map(c) => std::iter::once(&c.offsets)
+                .chain(&c.bytes)
+                .chain(&c.validity)
+                .collect(),
+        }
+    }
+
+    fn shape_rows(&self) -> (u32, usize) {
+        match self {
+            Self::Boolean(c) => (1, c.rows),
+            Self::Integer(c) => (2, c.rows),
+            Self::Float(c) => (3, c.rows),
+            Self::String(c) => (4, c.rows),
+            Self::Date(c) | Self::LocalTime(c) => (5, c.rows),
+            Self::ZonedTime(c) => (5, c.rows),
+            Self::LocalDateTime(c) => (5, c.rows),
+            Self::ZonedDateTime(c) => (5, c.rows),
+            Self::Duration(c) => (5, c.rows),
+            Self::Bytes(c) | Self::List(c) | Self::Map(c) => (6, c.rows),
+        }
+    }
+    fn string_values(&self) -> Option<&Tensor> {
+        if let Self::String(c) = self {
+            c.values.as_ref()
+        } else {
+            None
+        }
+    }
 }
 
 /// Canonical flat LIST or MAP property bytes. These tensors were always part of the resident
@@ -279,6 +352,7 @@ struct DocumentColumn {
     validity: Option<Tensor>,
     rows: usize,
     maximum_bytes: usize,
+    allocator: variable_payload::Allocator,
 }
 
 /// Device-resident UTF-8 dictionary shared by all property columns of one entity kind. The
@@ -291,6 +365,8 @@ struct StringDictionary {
     /// Exact lexicographic rank for every dictionary ID. Query-time STRING ordering gathers this
     /// device-resident derived index; dictionary IDs themselves never acquire ordering meaning.
     ranks: Option<Tensor>,
+    #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+    order: Option<dictionary_order::LexicalOrder>,
     maximum_bytes: usize,
     /// Host view of the same entries, kept so applying a delta does not have to rebuild it.
     ///
@@ -312,6 +388,32 @@ struct StringDictionary {
 struct HostStringDictionary {
     entries: Vec<String>,
     ids: BTreeMap<String, u32>,
+}
+
+impl StringDictionary {
+    fn ranks_for(&self, ids: &Tensor, device: &Device) -> Result<Tensor> {
+        #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+        if matches!(device, Device::Metal(_)) {
+            return dictionary_order::ranks(self, ids, device);
+        }
+        match &self.ranks {
+            Some(ranks) => ranks.index_select(ids, 0).map_err(candle_error),
+            None if self.offsets.elem_count() <= 1 => {
+                Tensor::zeros(ids.shape(), DType::U32, device).map_err(candle_error)
+            }
+            None => Err(Error::internal(
+                "resident dictionary has no lexical order index",
+            )),
+        }
+    }
+
+    fn has_order(&self) -> bool {
+        #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+        if self.order.is_some() {
+            return true;
+        }
+        self.ranks.is_some()
+    }
 }
 
 /// One immutable UTC interval from the IANA rules image supplied to the native named-zone
@@ -343,6 +445,16 @@ struct MetalNamedZoneTable {
     bytes: Vec<u8>,
 }
 
+#[derive(Clone)]
+struct TemporalMetadata {
+    entity_ids: Option<Tensor>,
+    event_times: Option<Tensor>,
+    sequences: Option<Tensor>,
+    #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+    order: Option<temporal_order::TemporalOrder>,
+}
+
+#[derive(Clone)]
 struct UploadedPropertyColumns {
     integer: BTreeMap<PropertyId, IntegerColumn>,
     boolean: BTreeMap<PropertyId, BooleanColumn>,
@@ -357,12 +469,82 @@ struct UploadedPropertyColumns {
     mixed: BTreeMap<PropertyId, MixedColumn>,
     lists: BTreeMap<PropertyId, DocumentColumn>,
     maps: BTreeMap<PropertyId, DocumentColumn>,
+    bytes: BTreeMap<PropertyId, DocumentColumn>,
     /// Canonical validity for opaque scalar columns which intentionally have no typed query
     /// value lane. `keys(entity)` needs only presence, so retaining this existing device lane is
     /// sufficient without admitting the opaque value shape itself.
     opaque_validity: BTreeMap<PropertyId, Option<Tensor>>,
     unsupported: BTreeSet<PropertyId>,
     dictionary: Option<StringDictionary>,
+    temporal_metadata: Option<TemporalMetadata>,
+}
+
+impl UploadedPropertyColumns {
+    fn tensors(&self) -> Vec<&Tensor> {
+        let mut tensors = Vec::new();
+        macro_rules! lanes { ($map:ident; $first:ident $(,$field:ident)*) => {
+            for c in self.$map.values() { tensors.extend(c.$first.iter()$(.chain(&c.$field))*); }
+        }; }
+        lanes!(integer; values,validity);
+        lanes!(boolean; values,validity);
+        lanes!(float; values,order_keys,validity);
+        lanes!(string; values,validity);
+        lanes!(date; values,validity);
+        lanes!(local_time; values,validity);
+        lanes!(zoned_time; nanos,offsets,validity);
+        lanes!(local_datetime; seconds,nanos,validity);
+        lanes!(zoned_datetime; seconds,nanos,timezones,validity);
+        lanes!(duration; months,days,seconds,nanos,validity);
+        for c in self.mixed.values() {
+            tensors.extend(
+                std::iter::once(&c.offsets)
+                    .chain(&c.bytes)
+                    .chain(&c.validity)
+                    .chain(&c.overrides),
+            );
+            if let Some(base) = &c.base {
+                tensors.extend(base.tensors());
+            }
+        }
+        for c in self
+            .bytes
+            .values()
+            .chain(self.lists.values())
+            .chain(self.maps.values())
+        {
+            tensors.extend(
+                std::iter::once(&c.offsets)
+                    .chain(&c.bytes)
+                    .chain(&c.validity),
+            );
+        }
+        tensors.extend(self.opaque_validity.values().flatten());
+        if let Some(dictionary) = &self.dictionary {
+            tensors.extend(
+                std::iter::once(&dictionary.offsets)
+                    .chain(&dictionary.bytes)
+                    .chain(&dictionary.ranks),
+            );
+            #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+            if let Some(order) = &dictionary.order {
+                tensors.extend(&order.packet);
+            }
+        }
+        if let Some(metadata) = &self.temporal_metadata {
+            tensors.extend(
+                metadata
+                    .entity_ids
+                    .iter()
+                    .chain(&metadata.event_times)
+                    .chain(&metadata.sequences),
+            );
+            #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+            if let Some(order) = &metadata.order {
+                tensors.extend(&order.packet);
+            }
+        }
+        tensors
+    }
 }
 
 #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
@@ -407,7 +589,7 @@ struct AnnIndex {
     subspace_centroid_offsets: Vec<u32>,
     codebook_vector_offsets: Vec<u32>,
     stale_row_ids: Option<Tensor>,
-    stale_row_set: BTreeSet<u32>,
+    stale_row_set: derived_delta::StaleRows,
     build_generation: [u8; 32],
 }
 
@@ -421,91 +603,7 @@ struct IntegerTemporalColumn {
     validity: Option<Tensor>,
 }
 
-/// Complete replacement rows layered over the immutable cold CSR. The host map is canonical for
-/// bounded CPU-addressable expansion; the four compact tensors are the same rows flattened once
-/// for device lookup. Work therefore scales with topology changed since compaction, not with the
-/// unrelated cold graph. A compaction may fold this overlay into a new cold CSR off the commit
-/// path, but publication never needs that fold.
-#[derive(Clone, Default)]
-struct ResidentCsrOverlay {
-    rows: BTreeMap<u32, (Vec<u32>, Vec<u32>)>,
-    packet: Option<Tensor>,
-}
-
-impl ResidentCsrOverlay {
-    fn merge_rows(
-        &mut self,
-        replacements: &[AdjacencyRowDeviceDelta],
-        node_count: usize,
-    ) -> Result<()> {
-        for replacement in replacements {
-            if replacement.dense as usize >= node_count
-                || replacement.neighbors.len() != replacement.edges.len()
-                || replacement
-                    .neighbors
-                    .iter()
-                    .any(|neighbor| *neighbor as usize >= node_count)
-            {
-                return Err(Error::new(
-                    ErrorCode::CorruptStorage,
-                    "resident CSR overlay row is structurally invalid",
-                ));
-            }
-            self.rows.insert(
-                replacement.dense,
-                (replacement.neighbors.clone(), replacement.edges.clone()),
-            );
-        }
-        Ok(())
-    }
-
-    fn tensor_bytes(&self) -> usize {
-        self.packet
-            .iter()
-            .map(|tensor| {
-                tensor
-                    .elem_count()
-                    .saturating_mul(tensor.dtype().size_in_bytes())
-            })
-            .fold(0_usize, usize::saturating_add)
-    }
-
-    fn rebuild_tensors(&mut self, upload: &mut TensorUpload<'_>) -> Result<()> {
-        let mut row_ids = Vec::with_capacity(self.rows.len());
-        let mut offsets = Vec::with_capacity(self.rows.len().saturating_add(1));
-        let mut neighbors = Vec::new();
-        let mut edges = Vec::new();
-        offsets.push(0_u32);
-        for (row, (row_neighbors, row_edges)) in &self.rows {
-            if row_neighbors.len() != row_edges.len() {
-                return Err(Error::new(
-                    ErrorCode::CorruptStorage,
-                    "resident CSR overlay columns have different lengths",
-                ));
-            }
-            row_ids.push(*row);
-            neighbors.extend_from_slice(row_neighbors);
-            edges.extend_from_slice(row_edges);
-            offsets.push(checked_u32(neighbors.len(), "resident CSR overlay")?);
-        }
-        let mut packet = Vec::with_capacity(
-            row_ids
-                .len()
-                .saturating_add(offsets.len())
-                .saturating_add(neighbors.len())
-                .saturating_add(edges.len()),
-        );
-        packet.extend(row_ids);
-        packet.extend(offsets);
-        packet.extend(neighbors);
-        packet.extend(edges);
-        self.packet = match upload.metal_shared(&packet, DType::U32)? {
-            Some((tensor, _shared)) => tensor,
-            None => upload.optional(&packet)?,
-        };
-        Ok(())
-    }
-}
+use structure_delta::ResidentCsrOverlay;
 
 /// One complete device allocation set. No canonical host graph is retained here.
 #[derive(Clone)]
@@ -561,6 +659,7 @@ pub struct CandleResident {
     mixed_nodes: BTreeMap<PropertyId, MixedColumn>,
     list_nodes: BTreeMap<PropertyId, DocumentColumn>,
     map_nodes: BTreeMap<PropertyId, DocumentColumn>,
+    byte_nodes: BTreeMap<PropertyId, DocumentColumn>,
     opaque_node_validity: BTreeMap<PropertyId, Option<Tensor>>,
     unsupported_node_properties: BTreeSet<PropertyId>,
     node_string_dictionary: StringDictionary,
@@ -577,12 +676,14 @@ pub struct CandleResident {
     mixed_edges: BTreeMap<PropertyId, MixedColumn>,
     list_edges: BTreeMap<PropertyId, DocumentColumn>,
     map_edges: BTreeMap<PropertyId, DocumentColumn>,
+    byte_edges: BTreeMap<PropertyId, DocumentColumn>,
     opaque_edge_validity: BTreeMap<PropertyId, Option<Tensor>>,
     unsupported_edge_properties: BTreeSet<PropertyId>,
     edge_string_dictionary: StringDictionary,
     vectors: BTreeMap<PropertyId, VectorColumn>,
     ann: BTreeMap<PropertyId, AnnIndex>,
     temporal_integer: BTreeMap<(u8, u64, PropertyId), IntegerTemporalColumn>,
+    temporal_properties: BTreeMap<(u8, u64, PropertyId), UploadedPropertyColumns>,
     profile: Option<crate::graph::EmbeddingProfile>,
     /// Canonical CPU graph views. Cold columns share the exact immutable Metal buffers; bounded
     /// in-capacity appends remain COW tail pages so publication never rebuilds page directories for
@@ -877,6 +978,38 @@ impl CandleResident {
         self.vectors.get(&property).map_or(0, |column| column.rows)
     }
 
+    pub fn vector_dense_row(&self, property: PropertyId, entity: u64) -> Option<u32> {
+        self.vectors
+            .get(&property)
+            .and_then(|column| stable_id_row(&column.entity_rows, entity).copied())
+    }
+
+    #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+    pub fn identity_map_changes(
+        &self,
+        previous: &Self,
+        domain: u8,
+        property: PropertyId,
+    ) -> Vec<(u128, u8, usize, usize)> {
+        match domain {
+            0 => self.node_id_rows.changed_path_nodes(&previous.node_id_rows),
+            1 => self.edge_id_rows.changed_path_nodes(&previous.edge_id_rows),
+            2 => {
+                let empty = PersistentMap::default();
+                let current = self
+                    .vectors
+                    .get(&property)
+                    .map_or(&empty, |column| &column.entity_rows);
+                let previous = previous
+                    .vectors
+                    .get(&property)
+                    .map_or(&empty, |column| &column.entity_rows);
+                current.changed_path_nodes(previous)
+            }
+            _ => Vec::new(),
+        }
+    }
+
     #[must_use]
     pub fn vector_dimension(&self, property: PropertyId) -> usize {
         self.vectors
@@ -966,13 +1099,7 @@ impl CandleResident {
             )
             .saturating_sub(current_node_property_bytes)
         };
-        let label_bitmap_bytes = graph
-            .node_labels
-            .values()
-            .iter()
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
-            .saturating_mul(graph.node_ids.len());
+        let label_bitmap_bytes = label_count.saturating_mul(graph.node_ids.len());
         let ann_mask_bytes = image
             .indexes
             .indexes
@@ -1021,7 +1148,7 @@ impl CandleResident {
                     .map(crate::graph::RollupDeviceColumn::resident_bytes),
             )
             .fold(0_usize, usize::saturating_add);
-        fixed
+        let logical = fixed
             .saturating_add(reserved_edge_bytes)
             .saturating_add(reserved_adjacency_offset_bytes)
             .saturating_add(reserved_node_fixed_bytes)
@@ -1058,11 +1185,37 @@ impl CandleResident {
                         | DerivedIndexDeviceImage::Vector { name, .. } => name.len(),
                     })
                     .sum::<usize>(),
-            )
+            );
+        #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+        {
+            // Native allocations round independently, including raw and query lanes.
+            let property_lanes = graph.node_properties.columns().count()
+                + graph.edge_properties.columns().count()
+                + image
+                    .temporal_canonical
+                    .iter()
+                    .map(|column| column.values.columns().count())
+                    .sum::<usize>();
+            let lanes = 40
+                + label_count
+                + property_lanes * 12
+                + image.temporal_canonical.len() * 12
+                + image.indexes.vectors.len() * 16
+                + image.indexes.indexes.len() * 16
+                + image.temporal.rollups.len() * 12;
+            return logical.saturating_add(lanes.saturating_mul(metal_pages::page_bytes()));
+        }
+        #[cfg(not(all(feature = "accelerator", any(target_os = "macos", target_os = "ios"))))]
+        logical
     }
 
+    #[cfg(any(test, feature = "cuda"))]
     pub fn planned_delta_staging_bytes(&self, delta: &ResidentProjectDelta) -> Result<usize> {
-        let Some(current_graph) = self.shared_graph.as_ref() else {
+        #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+        if self.shared_graph.is_some() {
+            return self.prepare_delta_staging(delta).map(|(bytes, _)| bytes);
+        }
+        if self.shared_graph.is_none() {
             // The per-column tensor path. This is the branch that calls `ensure_tensor_capacity`
             // and grows every node-indexed column through `Tensor::cat`, and its estimate used to
             // be `allocated_bytes + delta.staging_bytes()` — current size plus the delta's own
@@ -1095,392 +1248,36 @@ impl CandleResident {
             // per write. This is the line that answers "did the admission path run at all", which
             // is otherwise unobservable from outside the process.
             return Ok(estimate);
-        };
-        if self.delta_publish_is_host_complete(delta) {
-            // Fixed columns write into already-admitted tail capacity and overlay packets replace
-            // only their previous compact allocations. Charging the complete current resident plus
-            // the delta's own explicit bytes is conservative without simulating a cold CSR rebuild.
-            return Ok(self.allocated_bytes.saturating_add(delta.staging_bytes()));
         }
-        if self.delta_is_contiguous_node_append(delta) {
-            // The old generation remains live while staging replaces node-indexed columns. Their
-            // current bytes are the dominant peak; the appended rows are bounded by the explicit
-            // delta because this classifier forbids new label/property columns. Avoid cloning and
-            // applying the entire canonical graph merely to recover those already-known sizes.
-            let replaced = shared_graph_replaced_bytes(current_graph, true, false, true);
-            return Ok(self
-                .allocated_bytes
-                .saturating_add(replaced)
-                .saturating_add(delta.staging_bytes().saturating_mul(4))
-                .saturating_add(delta.graph.nodes.len().saturating_mul(64)));
-        }
-        let node_changed = !delta.graph.nodes.is_empty();
-        let edge_changed = !delta.graph.edges.is_empty();
-        let adjacency_changed = current_graph.adjacency_delta_changes(&delta.graph);
-        let property_only =
-            graph_delta_is_property_only(current_graph, &delta.graph, adjacency_changed);
-        let node_properties = if property_only {
-            changed_property_ids(
-                &current_graph.node_properties,
-                delta
-                    .graph
-                    .nodes
-                    .iter()
-                    .map(|row| (row.dense, row.properties.as_slice())),
-            )
-        } else {
-            BTreeSet::new()
-        };
-        let edge_properties = if property_only {
-            changed_property_ids(
-                &current_graph.edge_properties,
-                delta
-                    .graph
-                    .edges
-                    .iter()
-                    .map(|row| (row.dense, row.properties.as_slice())),
-            )
-        } else {
-            BTreeSet::new()
-        };
-        let node_dictionary_shape = (
-            current_graph.node_properties.string_dictionary().len(),
-            current_graph
-                .node_properties
-                .string_dictionary()
-                .bytes()
-                .len(),
-        );
-        let edge_dictionary_shape = (
-            current_graph.edge_properties.string_dictionary().len(),
-            current_graph
-                .edge_properties
-                .string_dictionary()
-                .bytes()
-                .len(),
-        );
-        let mut next_graph = current_graph.clone();
-        next_graph.apply_device_delta(&delta.graph)?;
-        let mut bytes = if property_only {
-            let node_dictionary_changed = node_dictionary_shape
-                != (
-                    next_graph.node_properties.string_dictionary().len(),
-                    next_graph.node_properties.string_dictionary().bytes().len(),
-                );
-            let edge_dictionary_changed = edge_dictionary_shape
-                != (
-                    next_graph.edge_properties.string_dictionary().len(),
-                    next_graph.edge_properties.string_dictionary().bytes().len(),
-                );
-            metal_shared_selected_property_bytes(
-                &next_graph.node_properties,
-                &node_properties,
-                node_dictionary_changed,
-            )
-            .saturating_add(metal_shared_selected_property_bytes(
-                &next_graph.edge_properties,
-                &edge_properties,
-                edge_dictionary_changed,
-            ))
-        } else {
-            shared_graph_replaced_bytes(&next_graph, node_changed, edge_changed, adjacency_changed)
-        };
-
-        if !delta.temporal.is_empty() {
-            let mut temporal = self.shared_temporal.clone();
-            let mut affected = BTreeSet::new();
-            for mutation in &delta.temporal {
-                let key = (
-                    mutation.entity_kind as u8,
-                    mutation.target,
-                    mutation.sample.property,
-                );
-                let backing = temporal
-                    .iter_mut()
-                    .find(|backing| {
-                        backing.entity_kind as u8 == key.0
-                            && backing.target == key.1
-                            && backing.property == key.2
-                    })
-                    .ok_or_else(|| {
-                        Error::new(
-                            ErrorCode::CorruptStorage,
-                            "temporal delta targets a non-resident shared column",
-                        )
-                    })?;
-                backing.push_and_sort(&mutation.sample)?;
-                affected.insert(key);
-            }
-            bytes = bytes.saturating_add(
-                temporal
-                    .iter()
-                    .filter(|backing| {
-                        affected.contains(&(
-                            backing.entity_kind as u8,
-                            backing.target,
-                            backing.property,
-                        ))
-                    })
-                    .map(shared_temporal_column_bytes)
-                    .fold(0_usize, usize::saturating_add),
-            );
-        }
-
-        if !delta.vectors.is_empty() {
-            let mut rows = self
-                .vectors
-                .iter()
-                .map(|(property, column)| (*property, column.entity_rows.clone()))
-                .collect::<BTreeMap<_, _>>();
-            let mut affected = BTreeSet::new();
-            for mutation in &delta.vectors {
-                let (property, entity) = match mutation {
-                    ResolvedVectorMutation::Upsert {
-                        property,
-                        entity_id,
-                        ..
-                    }
-                    | ResolvedVectorMutation::Remove {
-                        property,
-                        entity_id,
-                        ..
-                    } => (*property, *entity_id),
-                };
-                let property_rows = rows.get_mut(&property).ok_or_else(|| {
-                    Error::new(
-                        ErrorCode::EmbeddingProfileMismatch,
-                        "vector delta targets a non-resident shared column",
-                    )
-                })?;
-                if matches!(mutation, ResolvedVectorMutation::Upsert { .. })
-                    && !property_rows.contains_key(stable_id_key(entity))
-                {
-                    let row = u32::try_from(property_rows.len()).map_err(|_| {
-                        Error::new(ErrorCode::ResultBudgetExceeded, "vector row exceeds u32")
-                    })?;
-                    property_rows.insert_cow(stable_id_key(entity), row);
-                }
-                affected.insert(property);
-            }
-            for property in affected {
-                let column = self.vectors.get(&property).ok_or_else(|| {
-                    Error::new(
-                        ErrorCode::CorruptStorage,
-                        "shared vector column disappeared during admission",
-                    )
-                })?;
-                bytes = bytes.saturating_add(shared_vector_column_bytes(
-                    rows.get(&property).map_or(0, PersistentMap::len),
-                    column.dimension,
-                ));
-            }
-        }
-        Ok(bytes.saturating_add(delta.staging_bytes()))
-    }
-
-    /// True only when staging this delta writes previously unreachable bytes in shared Metal
-    /// allocations and performs no device command. Older pinned generations retain a smaller
-    /// logical row count, so they cannot observe the initialized tail before the owner swap.
-    #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-    pub fn delta_publish_is_host_complete(&self, delta: &ResidentProjectDelta) -> bool {
-        let Some(backing) = self.shared_graph.as_ref() else {
-            return false;
-        };
-        let old_edge_count = backing.edge_ids.len();
-        let edge_append_only = !delta.graph.edges.is_empty()
-            && delta.graph.node_capacity == self.node_count
-            && delta.graph.edge_capacity == old_edge_count.saturating_add(delta.graph.edges.len())
-            && delta.graph.nodes.is_empty()
-            && delta.temporal.is_empty()
-            && delta.vectors.is_empty()
-            && delta.graph.edges.iter().enumerate().all(|(offset, edge)| {
-                edge.dense as usize == old_edge_count + offset && edge.properties.is_empty()
-            })
-            && backing.edge_properties.property_ids().next().is_none();
-        let node_append_only = self.delta_is_contiguous_node_append(delta)
-            && self.fixed_node_tail_has_capacity(delta.graph.node_capacity)
-            && self.node_label_tails_have_capacity(delta)
-            && self.node_property_tails_have_capacity(delta)
-            && self.outgoing_offsets.elem_count() == backing.outgoing.offsets().len()
-            && self.incoming_offsets.elem_count() == backing.incoming.offsets().len()
-            && self.outgoing_offsets.elem_count() <= delta.graph.node_capacity.saturating_add(1)
-            && self.incoming_offsets.elem_count() <= delta.graph.node_capacity.saturating_add(1)
-            && metal_tensor_has_capacity(
-                &self.outgoing_offsets,
-                delta.graph.node_capacity.saturating_add(1),
-            )
-            && metal_tensor_has_capacity(
-                &self.incoming_offsets,
-                delta.graph.node_capacity.saturating_add(1),
-            );
-        edge_append_only && self.fixed_edge_tail_has_capacity(delta.graph.edge_capacity)
-            || node_append_only
-    }
-
-    /// A node-only append whose schema already exists in the resident. Admission can bound this
-    /// from current column sizes plus delta bytes; it does not need to clone/apply the full graph.
-    fn delta_is_contiguous_node_append(&self, delta: &ResidentProjectDelta) -> bool {
-        let Some(backing) = self.shared_graph.as_ref() else {
-            return false;
-        };
-        let old_node_count = backing.node_ids.len();
-        let existing_properties = backing
-            .node_properties
-            .property_ids()
-            .collect::<BTreeSet<_>>();
-        !delta.graph.nodes.is_empty()
-            && delta.graph.edges.is_empty()
-            && delta.graph.outgoing.is_empty()
-            && delta.graph.incoming.is_empty()
-            && delta.temporal.is_empty()
-            && delta.vectors.is_empty()
-            && !delta.invalidate_derived
-            && delta.graph.node_capacity == old_node_count.saturating_add(delta.graph.nodes.len())
-            && delta.graph.edge_capacity == backing.edge_ids.len()
-            && delta.graph.nodes.iter().enumerate().all(|(offset, node)| {
-                node.dense as usize == old_node_count + offset
-                    && node
-                        .labels
-                        .iter()
-                        .all(|label| self.node_labels.contains_key(label))
-                    && node
-                        .properties
-                        .iter()
-                        .all(|(property, _)| existing_properties.contains(property))
-            })
+        Err(Error::internal(
+            "shared delta publisher is unavailable on this device",
+        ))
     }
 
     #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-    fn fixed_edge_tail_has_capacity(&self, required: usize) -> bool {
-        let current = self
-            .shared_graph
-            .as_ref()
-            .map_or(self.edge_count, |backing| backing.edge_ids.len());
-        [
-            self.edge_entity_ids.as_ref(),
-            self.edge_sources.as_ref(),
-            self.edge_targets.as_ref(),
-            self.edge_types.as_ref(),
-            self.edge_layers.as_ref(),
-            self.edge_active.as_ref(),
-        ]
-        .into_iter()
-        .all(|tensor| {
-            tensor.is_some_and(|tensor| {
-                let (storage, _) = tensor.storage_and_layout();
-                tensor.elem_count() == current
-                    && matches!(&*storage, Storage::Metal(storage)
-                    if storage.buffer().length() / tensor.dtype().size_in_bytes() >= required)
-            })
-        })
+    pub(crate) fn prepare_delta_staging(
+        &self,
+        delta: &ResidentProjectDelta,
+    ) -> Result<(usize, property_delta::Plan)> {
+        let plan = property_delta::plan(self, delta)?.ok_or_else(|| {
+            Error::internal("shared graph publisher requires a native resident backing")
+        })?;
+        let bytes = plan
+            .bytes
+            .saturating_add(derived_delta::staging_bytes(self, delta)?)
+            .saturating_add(delta.staging_bytes().saturating_mul(4));
+        Ok((bytes, plan))
     }
 
+    /// Native shared publication initializes private pages on the host before publication.
     #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-    fn fixed_node_tail_has_capacity(&self, required: usize) -> bool {
-        let current = self
-            .shared_graph
-            .as_ref()
-            .map_or(self.node_count, |backing| backing.node_ids.len());
-        [
-            self.node_entity_ids.as_ref(),
-            self.node_id_order_keys.as_ref(),
-            self.node_revisions.as_ref(),
-            self.node_layers.as_ref(),
-            self.node_active.as_ref(),
-        ]
-        .into_iter()
-        .all(|tensor| {
-            tensor.is_some_and(|tensor| {
-                tensor.elem_count() == current && metal_tensor_has_capacity(tensor, required)
-            })
-        })
-    }
-
-    #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-    fn node_label_tails_have_capacity(&self, delta: &ResidentProjectDelta) -> bool {
-        let current = self
-            .shared_graph
-            .as_ref()
-            .map_or(self.node_count, |backing| backing.node_ids.len());
-        let appended_values = delta
-            .graph
-            .nodes
-            .iter()
-            .map(|node| node.labels.len())
-            .fold(0_usize, usize::saturating_add);
-        let old_values = self
-            .node_label_values
-            .as_ref()
-            .map_or(0, Tensor::elem_count);
-        metal_tensor_has_capacity(
-            &self.node_label_offsets,
-            delta.graph.node_capacity.saturating_add(1),
-        ) && self.node_label_offsets.elem_count() == current.saturating_add(1)
-            && (appended_values == 0
-                || self.node_label_values.as_ref().is_some_and(|values| {
-                    self.shared_graph.as_ref().is_some_and(|backing| {
-                        values.elem_count() == backing.node_labels.values().len()
-                    }) && metal_tensor_has_capacity(
-                        values,
-                        old_values.saturating_add(appended_values),
-                    )
-                }))
-            && self.node_labels.values().all(|bitmap| {
-                bitmap.elem_count() == current
-                    && metal_tensor_has_capacity(bitmap, delta.graph.node_capacity)
-            })
-    }
-
-    #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-    fn node_property_tails_have_capacity(&self, delta: &ResidentProjectDelta) -> bool {
-        let Some(backing) = self.shared_graph.as_ref() else {
-            return false;
-        };
-        let current = backing.node_ids.len();
-        let supported_schema = backing.node_properties.columns().all(|(property, column)| {
-            matches!(column, TypedColumn::Integer { .. })
-                && self.integer_nodes.contains_key(&property)
-                || matches!(column, TypedColumn::String { .. })
-                    && self.string_nodes.contains_key(&property)
-        });
-        let supported_values = delta.graph.nodes.iter().all(|node| {
-            node.properties.iter().all(|(property, value)| match value {
-                ScalarValue::Integer(_) => self.integer_nodes.contains_key(property),
-                ScalarValue::Null => {
-                    self.integer_nodes.contains_key(property)
-                        || self.string_nodes.contains_key(property)
-                }
-                _ => false,
-            })
-        });
-        supported_schema
-            && supported_values
-            && self.integer_nodes.values().all(|column| {
-                column.rows == current
-                    && column.values.as_ref().is_some_and(|tensor| {
-                        tensor.elem_count() == current
-                            && metal_tensor_has_capacity(tensor, delta.graph.node_capacity)
-                    })
-                    && column.validity.as_ref().is_some_and(|tensor| {
-                        tensor.elem_count() == current
-                            && metal_tensor_has_capacity(tensor, delta.graph.node_capacity)
-                    })
-            })
-            && self.string_nodes.values().all(|column| {
-                column.rows == current
-                    && column.values.as_ref().is_some_and(|tensor| {
-                        tensor.elem_count() == current
-                            && metal_tensor_has_capacity(tensor, delta.graph.node_capacity)
-                    })
-                    && column.validity.as_ref().is_some_and(|tensor| {
-                        tensor.elem_count() == current
-                            && metal_tensor_has_capacity(tensor, delta.graph.node_capacity)
-                    })
-            })
+    pub fn delta_publish_is_host_complete(&self, _delta: &ResidentProjectDelta) -> bool {
+        self.shared_graph.is_some()
     }
 
     pub fn upload(image: ResidentProjectImage, device: &Device) -> Result<Self> {
         let mut upload = TensorUpload::new(device);
+        upload.immutable_properties = true;
         let graph = &image.graph;
         let mut node_id_rows = image.node_id_rows.clone();
         if node_id_rows.len() != graph.node_ids.len() {
@@ -1725,6 +1522,7 @@ impl CandleResident {
         let mixed_nodes = node_properties.mixed;
         let list_nodes = node_properties.lists;
         let map_nodes = node_properties.maps;
+        let byte_nodes = node_properties.bytes;
         let opaque_node_validity = node_properties.opaque_validity;
         let unsupported_node_properties = node_properties.unsupported;
         let node_string_dictionary = node_properties
@@ -1744,6 +1542,7 @@ impl CandleResident {
         let mixed_edges = edge_properties.mixed;
         let list_edges = edge_properties.lists;
         let map_edges = edge_properties.maps;
+        let byte_edges = edge_properties.bytes;
         let opaque_edge_validity = edge_properties.opaque_validity;
         let unsupported_edge_properties = edge_properties.unsupported;
         let edge_string_dictionary = edge_properties.dictionary.ok_or_else(|| {
@@ -1751,10 +1550,9 @@ impl CandleResident {
         })?;
 
         let (outgoing_offsets, outgoing_neighbors, outgoing_edges, shared_outgoing) = match (
-            upload.metal_shared_reserved(
+            upload.metal_shared_csr_offsets(
                 graph.outgoing.offsets(),
                 node_device_capacity.saturating_add(1),
-                DType::U32,
                 "irongraph reserved outgoing offsets",
             )?,
             upload.metal_shared(graph.outgoing.neighbors(), DType::U32)?,
@@ -1796,10 +1594,9 @@ impl CandleResident {
             )?
         };
         let (incoming_offsets, incoming_neighbors, incoming_edges, shared_incoming) = match (
-            upload.metal_shared_reserved(
+            upload.metal_shared_csr_offsets(
                 graph.incoming.offsets(),
                 node_device_capacity.saturating_add(1),
-                DType::U32,
                 "irongraph reserved incoming offsets",
             )?,
             upload.metal_shared(graph.incoming.neighbors(), DType::U32)?,
@@ -1915,7 +1712,8 @@ impl CandleResident {
             }
         };
 
-        let (temporal_integer, shared_temporal) = upload_temporal(&mut upload, &image)?;
+        let (temporal_integer, shared_temporal, temporal_properties) =
+            upload_temporal(&mut upload, &image)?;
         let (vectors, ann, shared_vectors) =
             upload_indexes(&mut upload, &image, &node_id_rows, &edge_id_rows)?;
         let allocated_bytes = upload.allocated_bytes;
@@ -1981,6 +1779,7 @@ impl CandleResident {
             mixed_nodes,
             list_nodes,
             map_nodes,
+            byte_nodes,
             opaque_node_validity,
             unsupported_node_properties,
             node_string_dictionary,
@@ -1997,12 +1796,14 @@ impl CandleResident {
             mixed_edges,
             list_edges,
             map_edges,
+            byte_edges,
             opaque_edge_validity,
             unsupported_edge_properties,
             edge_string_dictionary,
             vectors,
             ann,
             temporal_integer,
+            temporal_properties,
             profile: image.indexes.profile,
             shared_graph,
             shared_temporal,
@@ -2013,11 +1814,27 @@ impl CandleResident {
         Ok(resident)
     }
 
-    /// Builds a replacement resident image without changing the visible owner.
-    /// Candle tensor handles share interior-mutable storage. Unchanged allocations remain shared,
-    /// while every column that an in-place kernel can touch is explicitly copied first. The caller
-    /// publishes the returned owner with one map entry swap only after memory admission succeeds.
+    /// Builds an unpublished resident generation. Shared Metal storage patches changed native
+    /// pages and persistent host rows; untouched data stays shared with existing readers. The
+    /// contiguous CUDA path still detaches touched columns before its in-place kernels run.
+    /// Publication replaces the owner only after staging and memory admission succeed.
+    #[cfg(any(test, feature = "cuda"))]
     pub fn stage_delta(&self, delta: &ResidentProjectDelta, device: &Device) -> Result<Self> {
+        self.stage_delta_prepared(
+            delta,
+            device,
+            #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+            None,
+        )
+    }
+
+    pub(crate) fn stage_delta_prepared(
+        &self,
+        delta: &ResidentProjectDelta,
+        device: &Device,
+        #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+        plan: Option<property_delta::Plan>,
+    ) -> Result<Self> {
         let mut staged = self.clone();
         let active_node_count = staged.active_node_count_after(&delta.graph)?;
         let active_edge_count = staged.active_edge_count_after(&delta.graph)?;
@@ -2032,13 +1849,18 @@ impl CandleResident {
         let temporal_changed = !delta.temporal.is_empty();
         let vectors_changed = !delta.vectors.is_empty();
         let shared_temporal = shared_graph && temporal_changed;
-        let shared_vectors = shared_graph && vectors_changed;
+        let shared_vectors = shared_graph && (vectors_changed || graph_changed);
         let apply_graph = graph_changed && !shared_graph;
         let apply_temporal = temporal_changed && !shared_temporal;
         let apply_vectors = vectors_changed && !shared_vectors;
         staged.detach_mutated_tensors(delta, apply_graph, apply_temporal, apply_vectors)?;
         if shared_graph {
-            staged.apply_shared_graph_delta(delta, device)?;
+            staged.apply_shared_graph_delta(
+                delta,
+                device,
+                #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+                plan,
+            )?;
         }
         if shared_temporal {
             staged.apply_shared_temporal_deltas(delta, device)?;
@@ -2431,1151 +2253,20 @@ impl CandleResident {
         &mut self,
         delta: &ResidentProjectDelta,
         device: &Device,
+        #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+        prepared: Option<property_delta::Plan>,
     ) -> Result<()> {
-        let mut backing = self
-            .shared_graph
-            .clone()
-            .ok_or_else(|| Error::internal("shared graph generation is absent"))?;
-        let previous_node_count = backing.node_ids.len();
-        let node_changed = !delta.graph.nodes.is_empty();
-        let edge_changed = !delta.graph.edges.is_empty();
         #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-        let contiguous_node_append = self.delta_is_contiguous_node_append(delta);
-        #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-        let node_append_uses_reserved_fixed =
-            contiguous_node_append && self.fixed_node_tail_has_capacity(delta.graph.node_capacity);
-        #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-        let node_append_uses_reserved_labels =
-            contiguous_node_append && self.node_label_tails_have_capacity(delta);
-        #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-        let node_append_uses_reserved_properties =
-            contiguous_node_append && self.node_property_tails_have_capacity(delta);
-        #[cfg(not(all(feature = "accelerator", any(target_os = "macos", target_os = "ios"))))]
-        let node_append_uses_reserved_fixed = false;
-        #[cfg(not(all(feature = "accelerator", any(target_os = "macos", target_os = "ios"))))]
-        let node_append_uses_reserved_labels = false;
-        #[cfg(not(all(feature = "accelerator", any(target_os = "macos", target_os = "ios"))))]
-        let node_append_uses_reserved_properties = false;
-        let edge_append_only = edge_changed
-            && delta.graph.edge_capacity
-                == backing
-                    .edge_ids
-                    .len()
-                    .saturating_add(delta.graph.edges.len())
-            && delta
-                .graph
-                .edges
-                .iter()
-                .enumerate()
-                .all(|(offset, edge)| edge.dense as usize == backing.edge_ids.len() + offset);
-        #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-        let edge_append_uses_reserved_tail =
-            edge_append_only && self.fixed_edge_tail_has_capacity(delta.graph.edge_capacity);
-        #[cfg(not(all(feature = "accelerator", any(target_os = "macos", target_os = "ios"))))]
-        let edge_append_uses_reserved_tail = false;
-        let edge_properties_empty = backing.edge_properties.property_ids().next().is_none();
-        let edge_append_has_properties = edge_append_only
-            && delta
-                .graph
-                .edges
-                .iter()
-                .any(|edge| !edge.properties.is_empty());
-        let node_columns_reused = node_append_uses_reserved_fixed
-            && node_append_uses_reserved_labels
-            && node_append_uses_reserved_properties;
-        let edge_null_integer_append = edge_append_only
-            && delta
-                .graph
-                .edges
-                .iter()
-                .all(|edge| edge.properties.is_empty())
-            && self.boolean_edges.is_empty()
-            && self.float_edges.is_empty()
-            && self.string_edges.is_empty()
-            && self.date_edges.is_empty()
-            && self.local_time_edges.is_empty()
-            && self.zoned_time_edges.is_empty()
-            && self.local_datetime_edges.is_empty()
-            && self.zoned_datetime_edges.is_empty()
-            && self.duration_edges.is_empty()
-            && self.mixed_edges.is_empty()
-            && self.list_edges.is_empty()
-            && self.map_edges.is_empty()
-            && self.opaque_edge_validity.is_empty()
-            && self.unsupported_edge_properties.is_empty();
-        let null_integer_replaced_bytes = usize::from(edge_null_integer_append).saturating_mul(
-            self.integer_edges
-                .values()
-                .flat_map(|column| column.values.iter().chain(&column.validity))
-                .map(|tensor| {
-                    tensor
-                        .elem_count()
-                        .saturating_mul(tensor.dtype().size_in_bytes())
-                })
-                .fold(0_usize, usize::saturating_add),
-        );
-        let adjacency_changed = backing.adjacency_delta_changes(&delta.graph);
-        let adjacency_appends_empty_rows = adjacency_changed
-            && delta.graph.outgoing.is_empty()
-            && delta.graph.incoming.is_empty()
-            && delta.graph.node_capacity > backing.node_ids.len();
-        #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-        let adjacency_empty_uses_reserved_tail = adjacency_appends_empty_rows
-            && self.outgoing_offsets.elem_count() == backing.outgoing.offsets().len()
-            && self.incoming_offsets.elem_count() == backing.incoming.offsets().len()
-            && self.outgoing_offsets.elem_count() <= delta.graph.node_capacity.saturating_add(1)
-            && self.incoming_offsets.elem_count() <= delta.graph.node_capacity.saturating_add(1)
-            && metal_tensor_has_capacity(
-                &self.outgoing_offsets,
-                delta.graph.node_capacity.saturating_add(1),
-            )
-            && metal_tensor_has_capacity(
-                &self.incoming_offsets,
-                delta.graph.node_capacity.saturating_add(1),
-            );
-        #[cfg(not(all(feature = "accelerator", any(target_os = "macos", target_os = "ios"))))]
-        let adjacency_empty_uses_reserved_tail = false;
-        #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-        {
-            let node_column_rebuild = contiguous_node_append
-                && (!node_append_uses_reserved_fixed
-                    || !node_append_uses_reserved_labels
-                    || !node_append_uses_reserved_properties
-                    || adjacency_appends_empty_rows && !adjacency_empty_uses_reserved_tail);
-            let edge_column_rebuild = edge_append_only && !edge_append_uses_reserved_tail;
-            if node_column_rebuild || edge_column_rebuild {
-                eprintln!(
-                    "------------------------------ RESIDENT COLUMN REBUILD TRIGGERED ------------------------------\nproject={} bookmark={} nodes={} -> {} edges={} -> {} fixed_nodes={} labels={} properties={} adjacency_tail={} fixed_edges={}\n------------------------------------------------------------------------------------------------",
-                    delta.project,
-                    delta.bookmark.index,
-                    previous_node_count,
-                    delta.graph.node_capacity,
-                    backing.edge_ids.len(),
-                    delta.graph.edge_capacity,
-                    node_append_uses_reserved_fixed,
-                    node_append_uses_reserved_labels,
-                    node_append_uses_reserved_properties,
-                    adjacency_empty_uses_reserved_tail,
-                    edge_append_uses_reserved_tail,
-                );
-            }
+        if let Some(plan) = match prepared {
+            Some(plan) => Some(plan),
+            None => property_delta::plan(self, delta)?,
+        } {
+            return plan.apply(self, delta, device);
         }
-        #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-        let device_patch_adjacency = adjacency_changed && !adjacency_appends_empty_rows;
-        #[cfg(not(all(feature = "accelerator", any(target_os = "macos", target_os = "ios"))))]
-        let device_patch_adjacency = false;
-        let property_only = graph_delta_is_property_only(&backing, &delta.graph, adjacency_changed);
-        if property_only {
-            let node_properties = changed_property_ids(
-                &backing.node_properties,
-                delta
-                    .graph
-                    .nodes
-                    .iter()
-                    .map(|row| (row.dense, row.properties.as_slice())),
-            );
-            let edge_properties = changed_property_ids(
-                &backing.edge_properties,
-                delta
-                    .graph
-                    .edges
-                    .iter()
-                    .map(|row| (row.dense, row.properties.as_slice())),
-            );
-            let node_replaced_property_bytes = metal_shared_selected_property_bytes(
-                &backing.node_properties,
-                &node_properties,
-                false,
-            )
-            .saturating_add(metal_reserved_selected_node_property_spare_bytes(
-                &backing.node_properties,
-                &node_properties,
-            ));
-            let edge_replaced_property_bytes = metal_shared_selected_property_bytes(
-                &backing.edge_properties,
-                &edge_properties,
-                false,
-            );
-            let empty_properties = BTreeSet::new();
-            let node_dictionary_bytes = metal_shared_selected_property_bytes(
-                &backing.node_properties,
-                &empty_properties,
-                true,
-            );
-            let edge_dictionary_bytes = metal_shared_selected_property_bytes(
-                &backing.edge_properties,
-                &empty_properties,
-                true,
-            );
-            let node_dictionary_shape = (
-                backing.node_properties.string_dictionary().len(),
-                backing.node_properties.string_dictionary().bytes().len(),
-            );
-            let edge_dictionary_shape = (
-                backing.edge_properties.string_dictionary().len(),
-                backing.edge_properties.string_dictionary().bytes().len(),
-            );
-            backing.apply_device_delta(&delta.graph)?;
-            let node_dictionary_changed = node_dictionary_shape
-                != (
-                    backing.node_properties.string_dictionary().len(),
-                    backing.node_properties.string_dictionary().bytes().len(),
-                );
-            let edge_dictionary_changed = edge_dictionary_shape
-                != (
-                    backing.edge_properties.string_dictionary().len(),
-                    backing.edge_properties.string_dictionary().bytes().len(),
-                );
-            let replaced_bytes = node_replaced_property_bytes
-                .saturating_add(edge_replaced_property_bytes)
-                .saturating_add(
-                    usize::from(node_dictionary_changed).saturating_mul(node_dictionary_bytes),
-                )
-                .saturating_add(
-                    usize::from(edge_dictionary_changed).saturating_mul(edge_dictionary_bytes),
-                );
-            let mut upload = TensorUpload::new(device);
-            if !node_properties.is_empty() || node_dictionary_changed {
-                let properties = upload_properties_selected(
-                    &mut upload,
-                    &mut backing.node_properties,
-                    Some(&node_properties),
-                    node_dictionary_changed,
-                    true,
-                )?;
-                self.merge_node_property_delta(&node_properties, properties);
-            }
-            if !edge_properties.is_empty() || edge_dictionary_changed {
-                let properties = upload_properties_selected(
-                    &mut upload,
-                    &mut backing.edge_properties,
-                    Some(&edge_properties),
-                    edge_dictionary_changed,
-                    false,
-                )?;
-                self.merge_edge_property_delta(&edge_properties, properties);
-            }
-            self.shared_graph = Some(backing);
-            self.allocated_bytes = self
-                .allocated_bytes
-                .saturating_sub(replaced_bytes)
-                .saturating_add(upload.allocated_bytes);
-            self._all_tensors.extend(upload.tensors);
-            self.drop_named_tensor_owners();
-            return Ok(());
-        }
-        let replaced_bytes = shared_graph_replaced_bytes(
-            &backing,
-            node_changed && !node_columns_reused,
-            edge_changed && !edge_append_only,
-            false,
-        )
-        .saturating_sub(usize::from(node_append_uses_reserved_fixed).saturating_mul(
-            previous_node_count.saturating_mul(size_of::<i64>() * 3 + size_of::<u8>() * 2),
+        let _ = (delta, device);
+        Err(Error::internal(
+            "shared graph publisher requires a native resident backing",
         ))
-        .saturating_sub(
-            usize::from(node_append_uses_reserved_labels).saturating_mul(
-                backing
-                    .node_labels
-                    .offsets()
-                    .len()
-                    .saturating_mul(size_of::<u32>())
-                    .saturating_add(
-                        backing
-                            .node_labels
-                            .values()
-                            .len()
-                            .saturating_mul(size_of::<i64>()),
-                    )
-                    .saturating_add(
-                        self.node_labels
-                            .values()
-                            .map(|bitmap| {
-                                bitmap
-                                    .elem_count()
-                                    .saturating_mul(bitmap.dtype().size_in_bytes())
-                            })
-                            .fold(0_usize, usize::saturating_add),
-                    ),
-            ),
-        )
-        .saturating_sub(
-            usize::from(node_append_uses_reserved_properties)
-                .saturating_mul(metal_shared_property_bytes(&backing.node_properties)),
-        )
-        .saturating_add(
-            usize::from(edge_append_only && !edge_append_uses_reserved_tail).saturating_mul(
-                backing.edge_ids.len().saturating_mul(
-                    size_of::<u64>() * 2 + size_of::<u32>() * 2 + size_of::<u8>() * 2,
-                ),
-            ),
-        )
-        .saturating_add(
-            usize::from(
-                edge_append_only
-                    && (!edge_properties_empty || edge_append_has_properties)
-                    && !edge_null_integer_append,
-            )
-            .saturating_mul(metal_shared_property_bytes(&backing.edge_properties)),
-        )
-        .saturating_add(null_integer_replaced_bytes)
-        .saturating_add(
-            usize::from(device_patch_adjacency).saturating_mul(
-                self.outgoing_overlay
-                    .tensor_bytes()
-                    .saturating_add(self.incoming_overlay.tensor_bytes()),
-            ),
-        )
-        .saturating_add(
-            usize::from(adjacency_appends_empty_rows && !adjacency_empty_uses_reserved_tail)
-                .saturating_mul(
-                    (backing.outgoing.offsets().len() + backing.incoming.offsets().len())
-                        .saturating_mul(size_of::<u32>()),
-                ),
-        );
-        if device_patch_adjacency {
-            backing.apply_device_delta_columns(&delta.graph)?;
-        } else if adjacency_empty_uses_reserved_tail {
-            // Both offset tails are already admitted and are rebound below before publication.
-            // Extending the cloned host CSR here would copy two complete unrelated row domains.
-            backing.apply_device_delta_deferred_empty_rows(&delta.graph)?;
-        } else {
-            backing.apply_device_delta(&delta.graph)?;
-        }
-        let mut upload = TensorUpload::new(device);
-
-        if node_changed {
-            #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-            if node_append_uses_reserved_fixed {
-                let appended_ids = delta
-                    .graph
-                    .nodes
-                    .iter()
-                    .map(|node| node.id)
-                    .collect::<Vec<_>>();
-                let appended_order_keys = delta
-                    .graph
-                    .nodes
-                    .iter()
-                    .map(|node| u64_order_key(node.id.0))
-                    .collect::<Vec<_>>();
-                let appended_revisions = delta
-                    .graph
-                    .nodes
-                    .iter()
-                    .map(|node| node.revision)
-                    .collect::<Vec<_>>();
-                let appended_layers = delta
-                    .graph
-                    .nodes
-                    .iter()
-                    .map(|node| node.layer)
-                    .collect::<Vec<_>>();
-                let appended_active = delta
-                    .graph
-                    .nodes
-                    .iter()
-                    .map(|node| u8::from(node.active))
-                    .collect::<Vec<_>>();
-                self.node_entity_ids = Some(
-                    metal_extend_reserved_shared_tensor(
-                        self.node_entity_ids
-                            .as_ref()
-                            .ok_or_else(|| Error::internal("reserved node IDs are absent"))?,
-                        previous_node_count,
-                        delta.graph.node_capacity,
-                        &appended_ids,
-                    )?
-                    .ok_or_else(|| Error::internal("reserved node ID tail disappeared"))?,
-                );
-                self.node_id_order_keys = Some(
-                    metal_extend_reserved_shared_tensor(
-                        self.node_id_order_keys.as_ref().ok_or_else(|| {
-                            Error::internal("reserved node order keys are absent")
-                        })?,
-                        previous_node_count,
-                        delta.graph.node_capacity,
-                        &appended_order_keys,
-                    )?
-                    .ok_or_else(|| Error::internal("reserved node order-key tail disappeared"))?,
-                );
-                self.node_revisions = Some(
-                    metal_extend_reserved_shared_tensor(
-                        self.node_revisions
-                            .as_ref()
-                            .ok_or_else(|| Error::internal("reserved node revisions are absent"))?,
-                        previous_node_count,
-                        delta.graph.node_capacity,
-                        &appended_revisions,
-                    )?
-                    .ok_or_else(|| Error::internal("reserved node revision tail disappeared"))?,
-                );
-                self.node_layers = Some(
-                    metal_extend_reserved_shared_tensor(
-                        self.node_layers
-                            .as_ref()
-                            .ok_or_else(|| Error::internal("reserved node layers are absent"))?,
-                        previous_node_count,
-                        delta.graph.node_capacity,
-                        &appended_layers,
-                    )?
-                    .ok_or_else(|| Error::internal("reserved node layer tail disappeared"))?,
-                );
-                self.node_active = Some(
-                    metal_extend_reserved_shared_tensor(
-                        self.node_active.as_ref().ok_or_else(|| {
-                            Error::internal("reserved node active lane is absent")
-                        })?,
-                        previous_node_count,
-                        delta.graph.node_capacity,
-                        &appended_active,
-                    )?
-                    .ok_or_else(|| Error::internal("reserved node active tail disappeared"))?,
-                );
-            } else {
-                let capacity = resident_growth_target(delta.graph.node_capacity);
-                self.node_entity_ids = metal_share_paged_reserved(
-                    &mut upload,
-                    &mut backing.node_ids,
-                    capacity,
-                    DType::I64,
-                    "irongraph grown node ids",
-                )?;
-                let order_keys = backing
-                    .node_ids
-                    .iter()
-                    .map(|id| u64_order_key(id.0))
-                    .collect::<Vec<_>>();
-                self.node_id_order_keys = upload
-                    .metal_shared_reserved(
-                        &order_keys,
-                        capacity,
-                        DType::I64,
-                        "irongraph grown node order keys",
-                    )?
-                    .map_or_else(
-                        || upload.optional(&order_keys),
-                        |(tensor, _shared)| Ok(tensor),
-                    )?;
-                self.node_layers = metal_share_paged_reserved(
-                    &mut upload,
-                    &mut backing.node_layers,
-                    capacity,
-                    DType::U8,
-                    "irongraph grown node layers",
-                )?;
-                self.node_revisions = metal_share_paged_reserved(
-                    &mut upload,
-                    &mut backing.node_revisions,
-                    capacity,
-                    DType::I64,
-                    "irongraph grown node revisions",
-                )?;
-                self.node_active = metal_share_paged_reserved(
-                    &mut upload,
-                    &mut backing.node_active,
-                    capacity,
-                    DType::U8,
-                    "irongraph grown node active",
-                )?;
-            }
-            #[cfg(not(all(feature = "accelerator", any(target_os = "macos", target_os = "ios"))))]
-            {
-                self.node_entity_ids =
-                    metal_share_paged(&mut upload, &mut backing.node_ids, DType::I64)?;
-                self.node_id_order_keys =
-                    upload.u64_order_keys(backing.node_ids.iter().map(|id| id.0))?;
-                self.node_layers =
-                    metal_share_paged(&mut upload, &mut backing.node_layers, DType::U8)?;
-                self.node_revisions =
-                    metal_share_paged(&mut upload, &mut backing.node_revisions, DType::I64)?;
-                self.node_active =
-                    metal_share_paged(&mut upload, &mut backing.node_active, DType::U8)?;
-            }
-
-            #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-            if node_append_uses_reserved_labels {
-                let old_value_count = self
-                    .node_label_values
-                    .as_ref()
-                    .map_or(0, Tensor::elem_count);
-                let mut appended_offsets = Vec::with_capacity(delta.graph.nodes.len());
-                let mut appended_values = Vec::new();
-                let mut value_count = old_value_count;
-                for node in &delta.graph.nodes {
-                    appended_values.extend_from_slice(&node.labels);
-                    value_count = value_count.checked_add(node.labels.len()).ok_or_else(|| {
-                        Error::new(
-                            ErrorCode::ResultBudgetExceeded,
-                            "appended node labels exceed usize",
-                        )
-                    })?;
-                    appended_offsets.push(checked_u32(value_count, "appended node labels")?);
-                }
-                self.node_label_offsets = metal_extend_reserved_shared_tensor(
-                    &self.node_label_offsets,
-                    previous_node_count.saturating_add(1),
-                    delta.graph.node_capacity.saturating_add(1),
-                    &appended_offsets,
-                )?
-                .ok_or_else(|| Error::internal("reserved label-offset tail disappeared"))?;
-                if !appended_values.is_empty() {
-                    self.node_label_values = Some(
-                        metal_extend_reserved_shared_tensor(
-                            self.node_label_values.as_ref().ok_or_else(|| {
-                                Error::internal("reserved label values are absent")
-                            })?,
-                            old_value_count,
-                            value_count,
-                            &appended_values,
-                        )?
-                        .ok_or_else(|| Error::internal("reserved label-value tail disappeared"))?,
-                    );
-                }
-                for (label, bitmap) in &mut self.node_labels {
-                    let appended = delta
-                        .graph
-                        .nodes
-                        .iter()
-                        .map(|node| u8::from(node.labels.contains(label)))
-                        .collect::<Vec<_>>();
-                    *bitmap = metal_extend_reserved_shared_tensor(
-                        bitmap,
-                        previous_node_count,
-                        delta.graph.node_capacity,
-                        &appended,
-                    )?
-                    .ok_or_else(|| Error::internal("reserved label bitmap tail disappeared"))?;
-                }
-                let shared_offsets = metal_shared_tensor_prefix(
-                    &self.node_label_offsets,
-                    delta.graph.node_capacity.saturating_add(1),
-                )?;
-                let shared_values = match self.node_label_values.as_ref() {
-                    Some(values) => metal_shared_tensor_prefix(values, value_count)?,
-                    None => crate::graph::SharedFlat::empty(),
-                };
-                backing
-                    .node_labels
-                    .rebase_shared_extension(shared_offsets, shared_values)?;
-            } else {
-                let label_offsets = backing.node_labels.offsets().to_vec();
-                let label_values = backing.node_labels.values().to_vec();
-                let capacity = resident_growth_target(delta.graph.node_capacity);
-                let Some((Some(offsets), shared_offsets)) = upload.metal_shared_reserved(
-                    &label_offsets,
-                    capacity.saturating_add(1),
-                    DType::U32,
-                    "irongraph grown node label offsets",
-                )?
-                else {
-                    return Err(Error::internal("shared node label offsets moved off Metal"));
-                };
-                let Some((values, shared_values)) = upload.metal_shared_reserved(
-                    &label_values,
-                    resident_growth_target(label_values.len()),
-                    DType::I64,
-                    "irongraph grown node label values",
-                )?
-                else {
-                    return Err(Error::internal("shared node label values moved off Metal"));
-                };
-                backing
-                    .node_labels
-                    .rebase_shared(shared_offsets, shared_values)?;
-                self.node_label_offsets = offsets;
-                self.node_label_values = values;
-                self.node_labels = upload_packed_label_bitmaps(
-                    &mut upload,
-                    delta.graph.node_capacity,
-                    &backing.node_labels,
-                )?;
-            }
-            #[cfg(not(all(feature = "accelerator", any(target_os = "macos", target_os = "ios"))))]
-            {
-                let label_offsets = backing.node_labels.offsets().to_vec();
-                let label_values = backing.node_labels.values().to_vec();
-                self.node_label_offsets = upload.required(&label_offsets)?;
-                self.node_label_values =
-                    upload.u64_bits(label_values.iter().map(|label| label.0))?;
-                self.node_labels = upload_packed_label_bitmaps(
-                    &mut upload,
-                    delta.graph.node_capacity,
-                    &backing.node_labels,
-                )?;
-            }
-            #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-            if node_append_uses_reserved_properties {
-                self.extend_reserved_node_properties(
-                    &mut backing,
-                    previous_node_count,
-                    delta.graph.node_capacity,
-                )?;
-            }
-            let node_properties = {
-                #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-                {
-                    if node_append_uses_reserved_properties {
-                        None
-                    } else {
-                        Some(upload_properties(
-                            &mut upload,
-                            &mut backing.node_properties,
-                            true,
-                        )?)
-                    }
-                }
-                #[cfg(not(all(
-                    feature = "accelerator",
-                    any(target_os = "macos", target_os = "ios")
-                )))]
-                {
-                    Some(upload_properties(
-                        &mut upload,
-                        &mut backing.node_properties,
-                        true,
-                    )?)
-                }
-            };
-            if let Some(node_properties) = node_properties {
-                self.integer_nodes = node_properties.integer;
-                self.boolean_nodes = node_properties.boolean;
-                self.float_nodes = node_properties.float;
-                self.string_nodes = node_properties.string;
-                self.date_nodes = node_properties.date;
-                self.local_time_nodes = node_properties.local_time;
-                self.zoned_time_nodes = node_properties.zoned_time;
-                self.local_datetime_nodes = node_properties.local_datetime;
-                self.zoned_datetime_nodes = node_properties.zoned_datetime;
-                self.duration_nodes = node_properties.duration;
-                self.mixed_nodes = node_properties.mixed;
-                self.list_nodes = node_properties.lists;
-                self.map_nodes = node_properties.maps;
-                self.opaque_node_validity = node_properties.opaque_validity;
-                self.unsupported_node_properties = node_properties.unsupported;
-                self.node_string_dictionary = node_properties.dictionary.ok_or_else(|| {
-                    Error::internal("full node property delta omitted its dictionary")
-                })?;
-            }
-            // Stable IDs never change dense rows. The cloned resident map already contains every
-            // old row, so only appended delta rows belong on this path; rebuilding it from every
-            // unrelated node made a point property update O(total nodes) on the host.
-            for node in &delta.graph.nodes {
-                match stable_id_row(&self.node_id_rows, node.id.0) {
-                    Some(existing) if *existing != node.dense => {
-                        return Err(Error::new(
-                            ErrorCode::CorruptStorage,
-                            "stable node ID moved to a different dense row",
-                        ));
-                    }
-                    None => {
-                        self.node_id_rows
-                            .insert_cow(stable_id_key(node.id.0), node.dense);
-                    }
-                    Some(_) => {}
-                }
-            }
-        }
-
-        if edge_changed {
-            for edge in &delta.graph.edges {
-                match stable_id_row(&self.edge_id_rows, edge.id.0) {
-                    Some(existing) if *existing != edge.dense => {
-                        return Err(Error::new(
-                            ErrorCode::CorruptStorage,
-                            "stable relationship ID moved to a different dense row",
-                        ));
-                    }
-                    None => {
-                        self.edge_id_rows
-                            .insert_cow(stable_id_key(edge.id.0), edge.dense);
-                    }
-                    Some(_) => {}
-                }
-            }
-            if edge_append_only {
-                #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-                {
-                    (
-                        self.edge_entity_ids,
-                        self.edge_sources,
-                        self.edge_targets,
-                        self.edge_types,
-                        self.edge_layers,
-                        self.edge_active,
-                    ) = metal_append_shared_edge_columns(
-                        &mut upload,
-                        &mut backing,
-                        self.edge_entity_ids.as_ref(),
-                        self.edge_sources.as_ref(),
-                        self.edge_targets.as_ref(),
-                        self.edge_types.as_ref(),
-                        self.edge_layers.as_ref(),
-                        self.edge_active.as_ref(),
-                        &delta.graph.edges,
-                    )?;
-                }
-                #[cfg(not(all(
-                    feature = "accelerator",
-                    any(target_os = "macos", target_os = "ios")
-                )))]
-                return Err(Error::internal(
-                    "device relationship append requested outside Metal",
-                ));
-            } else {
-                self.edge_entity_ids =
-                    metal_share_paged(&mut upload, &mut backing.edge_ids, DType::I64)?;
-                self.edge_sources =
-                    metal_share_paged(&mut upload, &mut backing.edge_sources, DType::U32)?;
-                self.edge_targets =
-                    metal_share_paged(&mut upload, &mut backing.edge_targets, DType::U32)?;
-                self.edge_types =
-                    metal_share_paged(&mut upload, &mut backing.edge_types, DType::I64)?;
-                self.edge_layers =
-                    metal_share_paged(&mut upload, &mut backing.edge_layers, DType::U8)?;
-                let _edge_revisions =
-                    metal_share_paged(&mut upload, &mut backing.edge_revisions, DType::I64)?;
-                self.edge_active =
-                    metal_share_paged(&mut upload, &mut backing.edge_active, DType::U8)?;
-            }
-            if edge_null_integer_append {
-                let appended_rows = delta.graph.edges.len();
-                let zero_values =
-                    Tensor::zeros(appended_rows, DType::I64, device).map_err(candle_error)?;
-                let zero_validity =
-                    Tensor::zeros(appended_rows, DType::U8, device).map_err(candle_error)?;
-                for column in self.integer_edges.values_mut() {
-                    column.values = Some(match column.values.as_ref() {
-                        Some(values) => {
-                            Tensor::cat(&[values, &zero_values], 0).map_err(candle_error)?
-                        }
-                        None => Tensor::zeros(delta.graph.edge_capacity, DType::I64, device)
-                            .map_err(candle_error)?,
-                    });
-                    column.validity = Some(match column.validity.as_ref() {
-                        Some(validity) => {
-                            Tensor::cat(&[validity, &zero_validity], 0).map_err(candle_error)?
-                        }
-                        None => Tensor::zeros(delta.graph.edge_capacity, DType::U8, device)
-                            .map_err(candle_error)?,
-                    });
-                    column.rows = delta.graph.edge_capacity;
-                }
-                upload.allocated_bytes = upload.allocated_bytes.saturating_add(
-                    self.integer_edges
-                        .values()
-                        .flat_map(|column| column.values.iter().chain(&column.validity))
-                        .map(|tensor| {
-                            tensor
-                                .elem_count()
-                                .saturating_mul(tensor.dtype().size_in_bytes())
-                        })
-                        .fold(0_usize, usize::saturating_add),
-                );
-            } else if !edge_append_only || !edge_properties_empty || edge_append_has_properties {
-                // An append that introduces the first relationship property must publish that
-                // column now; the previous condition inspected only the pre-delta schema and left
-                // the resident value NULL until a cold rebuild. Multi-row source batches are
-                // deferred off the commit path, while this bounded inline path tracks the appended
-                // edge rows and never scans unrelated graph topology.
-                let edge_properties =
-                    upload_properties(&mut upload, &mut backing.edge_properties, false)?;
-                self.integer_edges = edge_properties.integer;
-                self.boolean_edges = edge_properties.boolean;
-                self.float_edges = edge_properties.float;
-                self.string_edges = edge_properties.string;
-                self.date_edges = edge_properties.date;
-                self.local_time_edges = edge_properties.local_time;
-                self.zoned_time_edges = edge_properties.zoned_time;
-                self.local_datetime_edges = edge_properties.local_datetime;
-                self.zoned_datetime_edges = edge_properties.zoned_datetime;
-                self.duration_edges = edge_properties.duration;
-                self.mixed_edges = edge_properties.mixed;
-                self.list_edges = edge_properties.lists;
-                self.map_edges = edge_properties.maps;
-                self.opaque_edge_validity = edge_properties.opaque_validity;
-                self.unsupported_edge_properties = edge_properties.unsupported;
-                self.edge_string_dictionary = edge_properties.dictionary.ok_or_else(|| {
-                    Error::internal("full relationship property delta omitted its dictionary")
-                })?;
-            }
-        }
-
-        if adjacency_changed {
-            if adjacency_appends_empty_rows {
-                let target_offset_count = delta.graph.node_capacity.saturating_add(1);
-                let outgoing_old_count = self.outgoing_offsets.elem_count();
-                let incoming_old_count = self.incoming_offsets.elem_count();
-                let outgoing_terminal =
-                    backing.outgoing.offsets().last().copied().ok_or_else(|| {
-                        Error::new(ErrorCode::CorruptStorage, "outgoing offsets are empty")
-                    })?;
-                let incoming_terminal =
-                    backing.incoming.offsets().last().copied().ok_or_else(|| {
-                        Error::new(ErrorCode::CorruptStorage, "incoming offsets are empty")
-                    })?;
-                let outgoing_values = reserved_adjacency_empty_tail(
-                    outgoing_old_count,
-                    target_offset_count,
-                    outgoing_terminal,
-                )?;
-                let incoming_values = reserved_adjacency_empty_tail(
-                    incoming_old_count,
-                    target_offset_count,
-                    incoming_terminal,
-                )?;
-                #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-                if adjacency_empty_uses_reserved_tail {
-                    self.outgoing_offsets = metal_extend_reserved_shared_tensor(
-                        &self.outgoing_offsets,
-                        outgoing_old_count,
-                        target_offset_count,
-                        &outgoing_values,
-                    )?
-                    .ok_or_else(|| Error::internal("reserved outgoing offset tail disappeared"))?;
-                    self.incoming_offsets = metal_extend_reserved_shared_tensor(
-                        &self.incoming_offsets,
-                        incoming_old_count,
-                        target_offset_count,
-                        &incoming_values,
-                    )?
-                    .ok_or_else(|| Error::internal("reserved incoming offset tail disappeared"))?;
-                    backing.outgoing.rebase_shared_offsets_extension(
-                        metal_shared_tensor_prefix(
-                            &self.outgoing_offsets,
-                            delta.graph.node_capacity.saturating_add(1),
-                        )?,
-                    )?;
-                    backing.incoming.rebase_shared_offsets_extension(
-                        metal_shared_tensor_prefix(
-                            &self.incoming_offsets,
-                            delta.graph.node_capacity.saturating_add(1),
-                        )?,
-                    )?;
-                } else {
-                    let capacity =
-                        resident_growth_target(delta.graph.node_capacity).saturating_add(1);
-                    let Some((Some(outgoing), shared_outgoing)) = upload.metal_shared_reserved(
-                        backing.outgoing.offsets(),
-                        capacity,
-                        DType::U32,
-                        "irongraph grown outgoing offsets",
-                    )?
-                    else {
-                        return Err(Error::internal("outgoing offsets moved off shared Metal"));
-                    };
-                    let Some((Some(incoming), shared_incoming)) = upload.metal_shared_reserved(
-                        backing.incoming.offsets(),
-                        capacity,
-                        DType::U32,
-                        "irongraph grown incoming offsets",
-                    )?
-                    else {
-                        return Err(Error::internal("incoming offsets moved off shared Metal"));
-                    };
-                    backing.outgoing.rebase_shared_offsets(shared_outgoing)?;
-                    backing.incoming.rebase_shared_offsets(shared_incoming)?;
-                    self.outgoing_offsets = outgoing;
-                    self.incoming_offsets = incoming;
-                }
-                #[cfg(not(all(
-                    feature = "accelerator",
-                    any(target_os = "macos", target_os = "ios")
-                )))]
-                {
-                    let outgoing_tail = Tensor::from_slice(&outgoing_values, appended_rows, device)
-                        .map_err(candle_error)?;
-                    let incoming_tail = Tensor::from_slice(&incoming_values, appended_rows, device)
-                        .map_err(candle_error)?;
-                    self.outgoing_offsets =
-                        Tensor::cat(&[&self.outgoing_offsets, &outgoing_tail], 0)
-                            .map_err(candle_error)?;
-                    self.incoming_offsets =
-                        Tensor::cat(&[&self.incoming_offsets, &incoming_tail], 0)
-                            .map_err(candle_error)?;
-                    upload.allocated_bytes = upload.allocated_bytes.saturating_add(
-                        (self.outgoing_offsets.elem_count() + self.incoming_offsets.elem_count())
-                            .saturating_mul(size_of::<u32>()),
-                    );
-                }
-            } else if device_patch_adjacency {
-                #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-                {
-                    // Delta rows are complete replacements over the immutable cold CSR. Publishing
-                    // them is O(changed topology); folding them into a new cold base is compaction
-                    // work and must never rebuild the graph on the commit path.
-                    self.outgoing_overlay
-                        .merge_rows(&delta.graph.outgoing, delta.graph.node_capacity)?;
-                    self.incoming_overlay
-                        .merge_rows(&delta.graph.incoming, delta.graph.node_capacity)?;
-                    self.outgoing_overlay.rebuild_tensors(&mut upload)?;
-                    self.incoming_overlay.rebuild_tensors(&mut upload)?;
-                }
-                #[cfg(not(all(
-                    feature = "accelerator",
-                    any(target_os = "macos", target_os = "ios")
-                )))]
-                return Err(Error::internal(
-                    "device-native adjacency patching requested outside Metal",
-                ));
-            } else {
-                let (
-                    Some((Some(outgoing_offsets), shared_outgoing_offsets)),
-                    Some((outgoing_neighbors, shared_outgoing_neighbors)),
-                    Some((outgoing_edges, shared_outgoing_edges)),
-                    Some((Some(incoming_offsets), shared_incoming_offsets)),
-                    Some((incoming_neighbors, shared_incoming_neighbors)),
-                    Some((incoming_edges, shared_incoming_edges)),
-                ) = (
-                    upload.metal_shared(backing.outgoing.offsets(), DType::U32)?,
-                    upload.metal_shared(backing.outgoing.neighbors(), DType::U32)?,
-                    upload.metal_shared(backing.outgoing.edges(), DType::U32)?,
-                    upload.metal_shared(backing.incoming.offsets(), DType::U32)?,
-                    upload.metal_shared(backing.incoming.neighbors(), DType::U32)?,
-                    upload.metal_shared(backing.incoming.edges(), DType::U32)?,
-                )
-                else {
-                    return Err(Error::internal(
-                        "shared adjacency generation moved to a non-Metal device",
-                    ));
-                };
-                backing.outgoing = Csr::from_shared(
-                    shared_outgoing_offsets,
-                    shared_outgoing_neighbors,
-                    shared_outgoing_edges,
-                )?;
-                backing.incoming = Csr::from_shared(
-                    shared_incoming_offsets,
-                    shared_incoming_neighbors,
-                    shared_incoming_edges,
-                )?;
-                self.outgoing_offsets = outgoing_offsets;
-                self.outgoing_neighbors = outgoing_neighbors;
-                self.outgoing_edges = outgoing_edges;
-                self.incoming_offsets = incoming_offsets;
-                self.incoming_neighbors = incoming_neighbors;
-                self.incoming_edges = incoming_edges;
-            }
-            // Shared Metal adjacency is CPU-addressable canonical storage. Scalar bounded
-            // expansions read those exact rows directly; retaining one Tensor view per node
-            // duplicated node-count metadata and made every resident owner clone O(nodes).
-            self.outgoing_rows = PagedVec::default();
-            self.incoming_rows = PagedVec::default();
-        }
-
-        backing.revision = delta.graph.revision;
-        self.shared_graph = Some(backing);
-        self.node_count = delta.graph.node_capacity;
-        self.edge_count = delta.graph.edge_capacity;
-        self.allocated_bytes = self
-            .allocated_bytes
-            .saturating_sub(replaced_bytes)
-            .saturating_add(upload.allocated_bytes);
-        self._all_tensors.extend(upload.tensors);
-        self.drop_named_tensor_owners();
-        Ok(())
-    }
-
-    fn merge_node_property_delta(
-        &mut self,
-        selected: &BTreeSet<PropertyId>,
-        properties: UploadedPropertyColumns,
-    ) {
-        for property in selected {
-            self.integer_nodes.remove(property);
-            self.boolean_nodes.remove(property);
-            self.float_nodes.remove(property);
-            self.string_nodes.remove(property);
-            self.date_nodes.remove(property);
-            self.local_time_nodes.remove(property);
-            self.zoned_time_nodes.remove(property);
-            self.local_datetime_nodes.remove(property);
-            self.zoned_datetime_nodes.remove(property);
-            self.duration_nodes.remove(property);
-            self.mixed_nodes.remove(property);
-            self.list_nodes.remove(property);
-            self.map_nodes.remove(property);
-            self.opaque_node_validity.remove(property);
-            self.unsupported_node_properties.remove(property);
-        }
-        self.integer_nodes.extend(properties.integer);
-        self.boolean_nodes.extend(properties.boolean);
-        self.float_nodes.extend(properties.float);
-        self.string_nodes.extend(properties.string);
-        self.date_nodes.extend(properties.date);
-        self.local_time_nodes.extend(properties.local_time);
-        self.zoned_time_nodes.extend(properties.zoned_time);
-        self.local_datetime_nodes.extend(properties.local_datetime);
-        self.zoned_datetime_nodes.extend(properties.zoned_datetime);
-        self.duration_nodes.extend(properties.duration);
-        self.mixed_nodes.extend(properties.mixed);
-        self.list_nodes.extend(properties.lists);
-        self.map_nodes.extend(properties.maps);
-        self.opaque_node_validity.extend(properties.opaque_validity);
-        self.unsupported_node_properties
-            .extend(properties.unsupported);
-        if let Some(dictionary) = properties.dictionary {
-            self.node_string_dictionary = dictionary;
-        }
-    }
-
-    /// Extends only existing homogeneous INTEGER/STRING lanes for a contiguous node append. The
-    /// caller proves schema and capacity first, so work here is proportional to appended rows and
-    /// never scans unrelated property values or rebuilds the string dictionary.
-    #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-    fn extend_reserved_node_properties(
-        &mut self,
-        backing: &mut GraphSharedBacking,
-        previous_rows: usize,
-        new_rows: usize,
-    ) -> Result<()> {
-        let appended_rows = new_rows.saturating_sub(previous_rows);
-        for (property, resident) in &mut self.integer_nodes {
-            let (appended_values, appended_validity) = {
-                let column = backing
-                    .node_properties
-                    .physical_column(*property)
-                    .ok_or_else(|| Error::internal("integer node property disappeared"))?;
-                let TypedColumn::Integer { values, .. } = column else {
-                    return Err(Error::internal(
-                        "integer node property changed physical type",
-                    ));
-                };
-                let mut values = values
-                    .iter()
-                    .rev()
-                    .take(appended_rows)
-                    .copied()
-                    .collect::<Vec<_>>();
-                values.reverse();
-                let validity = (previous_rows..new_rows)
-                    .map(|row| u8::from(column.validity().is_present(row)))
-                    .collect::<Vec<_>>();
-                (values, validity)
-            };
-            if appended_values.len() != appended_rows {
-                return Err(Error::internal(
-                    "integer node property suffix is incomplete",
-                ));
-            }
-            let values = metal_extend_reserved_shared_tensor(
-                resident
-                    .values
-                    .as_ref()
-                    .ok_or_else(|| Error::internal("integer node values are absent"))?,
-                previous_rows,
-                new_rows,
-                &appended_values,
-            )?
-            .ok_or_else(|| Error::internal("integer node value tail disappeared"))?;
-            let validity = metal_extend_reserved_shared_tensor(
-                resident
-                    .validity
-                    .as_ref()
-                    .ok_or_else(|| Error::internal("integer node validity is absent"))?,
-                previous_rows,
-                new_rows,
-                &appended_validity,
-            )?
-            .ok_or_else(|| Error::internal("integer node validity tail disappeared"))?;
-            resident.values = Some(values);
-            resident.validity = Some(validity);
-            resident.rows = new_rows;
-        }
-        for (property, resident) in &mut self.string_nodes {
-            let (appended_values, appended_validity) = {
-                let column = backing
-                    .node_properties
-                    .physical_column(*property)
-                    .ok_or_else(|| Error::internal("string node property disappeared"))?;
-                let TypedColumn::String { values, .. } = column else {
-                    return Err(Error::internal(
-                        "string node property changed physical type",
-                    ));
-                };
-                let mut values = values
-                    .iter()
-                    .rev()
-                    .take(appended_rows)
-                    .copied()
-                    .collect::<Vec<_>>();
-                values.reverse();
-                let validity = (previous_rows..new_rows)
-                    .map(|row| u8::from(column.validity().is_present(row)))
-                    .collect::<Vec<_>>();
-                (values, validity)
-            };
-            if appended_values.len() != appended_rows {
-                return Err(Error::internal("string node property suffix is incomplete"));
-            }
-            let values = metal_extend_reserved_shared_tensor(
-                resident
-                    .values
-                    .as_ref()
-                    .ok_or_else(|| Error::internal("string node values are absent"))?,
-                previous_rows,
-                new_rows,
-                &appended_values,
-            )?
-            .ok_or_else(|| Error::internal("string node value tail disappeared"))?;
-            let validity = metal_extend_reserved_shared_tensor(
-                resident
-                    .validity
-                    .as_ref()
-                    .ok_or_else(|| Error::internal("string node validity is absent"))?,
-                previous_rows,
-                new_rows,
-                &appended_validity,
-            )?
-            .ok_or_else(|| Error::internal("string node validity tail disappeared"))?;
-            resident.values = Some(values);
-            resident.validity = Some(validity);
-            resident.rows = new_rows;
-        }
-        Ok(())
-    }
-
-    fn merge_edge_property_delta(
-        &mut self,
-        selected: &BTreeSet<PropertyId>,
-        properties: UploadedPropertyColumns,
-    ) {
-        for property in selected {
-            self.integer_edges.remove(property);
-            self.boolean_edges.remove(property);
-            self.float_edges.remove(property);
-            self.string_edges.remove(property);
-            self.date_edges.remove(property);
-            self.local_time_edges.remove(property);
-            self.zoned_time_edges.remove(property);
-            self.local_datetime_edges.remove(property);
-            self.zoned_datetime_edges.remove(property);
-            self.duration_edges.remove(property);
-            self.mixed_edges.remove(property);
-            self.list_edges.remove(property);
-            self.map_edges.remove(property);
-            self.opaque_edge_validity.remove(property);
-            self.unsupported_edge_properties.remove(property);
-        }
-        self.integer_edges.extend(properties.integer);
-        self.boolean_edges.extend(properties.boolean);
-        self.float_edges.extend(properties.float);
-        self.string_edges.extend(properties.string);
-        self.date_edges.extend(properties.date);
-        self.local_time_edges.extend(properties.local_time);
-        self.zoned_time_edges.extend(properties.zoned_time);
-        self.local_datetime_edges.extend(properties.local_datetime);
-        self.zoned_datetime_edges.extend(properties.zoned_datetime);
-        self.duration_edges.extend(properties.duration);
-        self.mixed_edges.extend(properties.mixed);
-        self.list_edges.extend(properties.lists);
-        self.map_edges.extend(properties.maps);
-        self.opaque_edge_validity.extend(properties.opaque_validity);
-        self.unsupported_edge_properties
-            .extend(properties.unsupported);
-        if let Some(dictionary) = properties.dictionary {
-            self.edge_string_dictionary = dictionary;
-        }
     }
 
     fn apply_shared_temporal_deltas(
@@ -3583,101 +2274,17 @@ impl CandleResident {
         delta: &ResidentProjectDelta,
         device: &Device,
     ) -> Result<()> {
-        let mut backings = self.shared_temporal.clone();
-        let mut additions = BTreeMap::<(u8, u64, PropertyId), Vec<TemporalSample>>::new();
-        for temporal in &delta.temporal {
-            let key = (
-                temporal.entity_kind as u8,
-                temporal.target,
-                temporal.sample.property,
-            );
-            additions
-                .entry(key)
-                .or_default()
-                .push(temporal.sample.clone());
+        #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+        {
+            derived_delta::temporal(self, delta, device)
         }
-        let mut affected = BTreeSet::new();
-        for (key, samples) in additions {
-            let backing = backings
-                .iter_mut()
-                .find(|backing| {
-                    backing.entity_kind as u8 == key.0
-                        && backing.target == key.1
-                        && backing.property == key.2
-                })
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorCode::CorruptStorage,
-                        "temporal delta targets a non-resident shared column",
-                    )
-                })?;
-            backing.extend_and_sort(&samples)?;
-            affected.insert(key);
+        #[cfg(not(all(feature = "accelerator", any(target_os = "macos", target_os = "ios"))))]
+        {
+            let _ = (delta, device);
+            Err(Error::internal(
+                "shared temporal publication requires Metal",
+            ))
         }
-
-        let replaced_bytes = self
-            .shared_temporal
-            .iter()
-            .filter(|backing| {
-                affected.contains(&(backing.entity_kind as u8, backing.target, backing.property))
-            })
-            .map(shared_temporal_column_bytes)
-            .fold(0_usize, usize::saturating_add);
-        let mut upload = TensorUpload::new(device);
-        for key in affected {
-            let backing = backings
-                .iter_mut()
-                .find(|backing| {
-                    backing.entity_kind as u8 == key.0
-                        && backing.target == key.1
-                        && backing.property == key.2
-                })
-                .ok_or_else(|| Error::internal("shared temporal backing disappeared"))?;
-            let integer_value = backing.value_type == TemporalType::Integer;
-            let _raw_entity_ids =
-                metal_share_paged(&mut upload, &mut backing.entity_ids, DType::I64)?;
-            let event_times_nanos =
-                metal_share_paged(&mut upload, &mut backing.event_times_nanos, DType::I64)?;
-            let _raw_sequence =
-                metal_share_paged(&mut upload, &mut backing.sequence_indexes, DType::I64)?;
-            let uploaded = upload_properties(&mut upload, &mut backing.values, false)?;
-            let mut integers = uploaded.integer;
-            let booleans = uploaded.boolean;
-            if integer_value {
-                let column = match integers.remove(&backing.property) {
-                    Some(column) => column,
-                    None => shared_null_integer_column(&mut upload, backing.len())?,
-                };
-                self.temporal_integer.insert(
-                    key,
-                    IntegerTemporalColumn {
-                        rows: backing.len(),
-                        entity_ids: upload.u64_order_keys(backing.entity_ids.iter().copied())?,
-                        event_times_nanos,
-                        sequence_indexes: upload
-                            .u64_order_keys(backing.sequence_indexes.iter().copied())?,
-                        values: column.values,
-                        validity: column.validity,
-                    },
-                );
-            } else {
-                self.temporal_integer.remove(&key);
-            }
-            if !integers.is_empty() || !booleans.is_empty() {
-                return Err(Error::new(
-                    ErrorCode::CorruptStorage,
-                    "temporal canonical column contains an unrelated integer property",
-                ));
-            }
-        }
-        self.shared_temporal = backings;
-        self.allocated_bytes = self
-            .allocated_bytes
-            .saturating_sub(replaced_bytes)
-            .saturating_add(upload.allocated_bytes);
-        self._all_tensors.extend(upload.tensors);
-        self.drop_named_tensor_owners();
-        Ok(())
     }
 
     fn apply_shared_vector_deltas(
@@ -3687,240 +2294,15 @@ impl CandleResident {
         previous_node_rows: &PersistentMap<u32>,
         previous_edge_rows: &PersistentMap<u32>,
     ) -> Result<()> {
-        let mut backings = self.shared_vectors.clone();
-        let mut entity_rows = self
-            .vectors
-            .iter()
-            .map(|(property, column)| (*property, column.entity_rows.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let mut affected = BTreeSet::new();
-        let mut affected_rows = BTreeMap::<PropertyId, BTreeSet<u32>>::new();
-        for mutation in &delta.vectors {
-            let (property, entity) = match mutation {
-                ResolvedVectorMutation::Upsert {
-                    property,
-                    entity_id,
-                    ..
-                }
-                | ResolvedVectorMutation::Remove {
-                    property,
-                    entity_id,
-                    ..
-                } => (*property, *entity_id),
-            };
-            let backing = backings
-                .iter_mut()
-                .find(|backing| backing.property == property)
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorCode::EmbeddingProfileMismatch,
-                        "vector delta targets a non-resident shared column",
-                    )
-                })?;
-            let rows = entity_rows.get_mut(&property).ok_or_else(|| {
-                Error::new(
-                    ErrorCode::EmbeddingProfileMismatch,
-                    "vector delta targets a non-resident canonical column",
-                )
-            })?;
-            apply_shared_vector_mutation(backing, rows, mutation)?;
-            if let Some(row) = stable_id_row(rows, entity).copied() {
-                affected_rows.entry(property).or_default().insert(row);
-            }
-            affected.insert(property);
+        #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+        {
+            derived_delta::vectors(self, delta, device, previous_node_rows, previous_edge_rows)
         }
-
-        let replaced_bytes = affected.iter().try_fold(0_usize, |total, property| {
-            let column = self.vectors.get(property).ok_or_else(|| {
-                Error::new(
-                    ErrorCode::CorruptStorage,
-                    "shared vector column disappeared during replacement",
-                )
-            })?;
-            Ok::<_, Error>(
-                total.saturating_add(
-                    column
-                        .entity_ids
-                        .iter()
-                        .chain(&column.node_rows)
-                        .chain(&column.node_backed)
-                        .chain(&column.values)
-                        .chain(&column.squared_norms)
-                        .chain(&column.versions)
-                        .chain(&column.active)
-                        .map(|tensor| {
-                            tensor
-                                .elem_count()
-                                .saturating_mul(tensor.dtype().size_in_bytes())
-                        })
-                        .fold(
-                            column.rows.saturating_mul(size_of::<u64>()),
-                            usize::saturating_add,
-                        ),
-                ),
-            )
-        })?;
-        let mut upload = TensorUpload::new(device);
-        for property in affected {
-            let backing = backings
-                .iter_mut()
-                .find(|backing| backing.property == property)
-                .ok_or_else(|| Error::internal("shared vector backing disappeared"))?;
-            let current = self.vectors.get(&property).ok_or_else(|| {
-                Error::new(
-                    ErrorCode::CorruptStorage,
-                    "shared vector column disappeared during upload",
-                )
-            })?;
-            let dimension = current.dimension;
-            let similarity = current.similarity;
-            let dtype = current.dtype;
-            let rows = backing.entity_ids.len();
-            if rows != current.rows {
-                metal_share_paged(&mut upload, &mut backing.entity_ids, DType::I64)?;
-            } else {
-                upload.allocated_bytes = upload
-                    .allocated_bytes
-                    .saturating_add(rows * size_of::<u64>());
-            }
-            let owner_rows = if property == crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY {
-                &self.edge_id_rows
-            } else {
-                &self.node_id_rows
-            };
-            let remapped_rows = if property == crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY {
-                delta
-                    .graph
-                    .edges
-                    .iter()
-                    .filter_map(|edge| {
-                        (stable_id_row(previous_edge_rows, edge.id.0) != Some(&edge.dense))
-                            .then(|| stable_id_row(&current.entity_rows, edge.id.0).copied())
-                            .flatten()
-                    })
-                    .collect::<BTreeSet<_>>()
-            } else {
-                delta
-                    .graph
-                    .nodes
-                    .iter()
-                    .filter_map(|node| {
-                        (stable_id_row(previous_node_rows, node.id.0) != Some(&node.dense))
-                            .then(|| stable_id_row(&current.entity_rows, node.id.0).copied())
-                            .flatten()
-                    })
-                    .collect::<BTreeSet<_>>()
-            };
-            let (resident_entity_ids, node_rows, node_backed) = patch_shared_vector_owner_mapping(
-                current,
-                backing,
-                owner_rows,
-                &remapped_rows,
-                device,
-            )?;
-            // These allocations remain owned by the replacement, including unchanged shared
-            // mappings. Account them without reading or uploading unrelated owner rows.
-            for tensor in resident_entity_ids
-                .iter()
-                .chain(&node_rows)
-                .chain(&node_backed)
-            {
-                upload.allocated_bytes = upload
-                    .allocated_bytes
-                    .saturating_add(tensor.elem_count() * tensor.dtype().size_in_bytes());
-            }
-            let values = metal_share_paged(
-                &mut upload,
-                &mut backing.values,
-                match dtype {
-                    EmbeddingDType::F16 => DType::F16,
-                    EmbeddingDType::Bf16 => DType::BF16,
-                },
-            )?;
-            let mut squared_norms = current
-                .squared_norms
-                .as_ref()
-                .map(|tensor| tensor.copy().map_err(candle_error))
-                .transpose()?;
-            ensure_tensor_capacity(&mut squared_norms, rows.max(64), DType::F32, device)?;
-            for row in affected_rows.get(&property).into_iter().flatten() {
-                let start = (*row as usize).checked_mul(dimension).ok_or_else(|| {
-                    Error::new(
-                        ErrorCode::ResultBudgetExceeded,
-                        "vector norm offset overflow",
-                    )
-                })?;
-                let end = start.checked_add(dimension).ok_or_else(|| {
-                    Error::new(
-                        ErrorCode::ResultBudgetExceeded,
-                        "vector norm range overflow",
-                    )
-                })?;
-                let squared_norm = shared_vector_squared_norm(backing, start..end, dtype)?;
-                scatter_rows(
-                    squared_norms.as_ref().ok_or_else(|| {
-                        Error::internal("non-empty vector column has no squared norms")
-                    })?,
-                    &[*row],
-                    &Tensor::from_slice(&[squared_norm], 1, device).map_err(candle_error)?,
-                )?;
-            }
-            upload.allocated_bytes =
-                upload
-                    .allocated_bytes
-                    .saturating_add(squared_norms.as_ref().map_or(0, |tensor| {
-                        tensor
-                            .elem_count()
-                            .saturating_mul(tensor.dtype().size_in_bytes())
-                    }));
-            let versions = metal_share_paged(&mut upload, &mut backing.versions, DType::I64)?;
-            let active = metal_share_paged(&mut upload, &mut backing.active, DType::U8)?;
-            self.vectors.insert(
-                property,
-                VectorColumn {
-                    dimension,
-                    similarity,
-                    dtype,
-                    rows,
-                    entity_ids: resident_entity_ids,
-                    node_rows,
-                    node_backed,
-                    values,
-                    squared_norms,
-                    versions,
-                    active,
-                    entity_rows: entity_rows
-                        .remove(&property)
-                        .ok_or_else(|| Error::internal("shared vector row map disappeared"))?,
-                },
-            );
-            // Keep the immutable postings live and rerank changed rows from the canonical
-            // device matrix. Version filtering excludes their old postings from ANN candidates.
-            if let Some(index) = self.ann.get_mut(&property) {
-                let old_stale_bytes = index
-                    .stale_row_ids
-                    .as_ref()
-                    .map_or(0, |tensor| tensor.elem_count() * size_of::<u32>());
-                for row in affected_rows.get(&property).into_iter().flatten() {
-                    if backing.active.get(*row as usize).copied().unwrap_or(false) {
-                        index.stale_row_set.insert(*row);
-                    } else {
-                        index.stale_row_set.remove(row);
-                    }
-                }
-                index.stale_row_ids =
-                    upload.optional(&index.stale_row_set.iter().copied().collect::<Vec<_>>())?;
-                self.allocated_bytes = self.allocated_bytes.saturating_sub(old_stale_bytes);
-            }
+        #[cfg(not(all(feature = "accelerator", any(target_os = "macos", target_os = "ios"))))]
+        {
+            let _ = (delta, device, previous_node_rows, previous_edge_rows);
+            Err(Error::internal("shared vector publication requires Metal"))
         }
-        self.shared_vectors = backings;
-        self.allocated_bytes = self
-            .allocated_bytes
-            .saturating_sub(replaced_bytes)
-            .saturating_add(upload.allocated_bytes);
-        self._all_tensors.extend(upload.tensors);
-        self.drop_named_tensor_owners();
-        Ok(())
     }
 
     fn drop_named_tensor_owners(&mut self) {
@@ -4035,7 +2417,12 @@ impl CandleResident {
                 named.insert(tensor.id());
             }
         }
-        for column in self.list_nodes.values().chain(self.map_nodes.values()) {
+        for column in self
+            .list_nodes
+            .values()
+            .chain(self.map_nodes.values())
+            .chain(self.byte_nodes.values())
+        {
             named.insert(column.offsets.id());
             for tensor in column.bytes.iter().chain(&column.validity) {
                 named.insert(tensor.id());
@@ -4134,7 +2521,12 @@ impl CandleResident {
                 named.insert(tensor.id());
             }
         }
-        for column in self.list_edges.values().chain(self.map_edges.values()) {
+        for column in self
+            .list_edges
+            .values()
+            .chain(self.map_edges.values())
+            .chain(self.byte_edges.values())
+        {
             named.insert(column.offsets.id());
             for tensor in column.bytes.iter().chain(&column.validity) {
                 named.insert(tensor.id());
@@ -4189,6 +2581,21 @@ impl CandleResident {
                 .chain(&column.validity)
             {
                 named.insert(tensor.id());
+            }
+        }
+        for column in self.mixed_nodes.values().chain(self.mixed_edges.values()) {
+            named.extend(column.overrides.iter().map(Tensor::id));
+            if let Some(base) = &column.base {
+                named.extend(base.tensors().into_iter().map(Tensor::id));
+            }
+        }
+        for bundle in self.temporal_properties.values() {
+            named.extend(bundle.tensors().into_iter().map(Tensor::id));
+        }
+        #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+        for dictionary in [&self.node_string_dictionary, &self.edge_string_dictionary] {
+            if let Some(order) = &dictionary.order {
+                named.extend(order.packet.iter().map(Tensor::id));
             }
         }
         self._all_tensors
@@ -5691,13 +4098,13 @@ impl CandleResident {
         cancellation: &CancellationToken,
     ) -> Result<Vec<ResidentGroup>> {
         let row_count = rows.elem_count();
+        if key_input.is_none() && max_groups == 0 {
+            return Err(Error::new(
+                ErrorCode::ResultBudgetExceeded,
+                "resident grouping exceeded the result row budget",
+            ));
+        }
         if row_count == 0 {
-            if key_input.is_none() && max_groups == 0 {
-                return Err(Error::new(
-                    ErrorCode::ResultBudgetExceeded,
-                    "resident grouping exceeded the result row budget",
-                ));
-            }
             return Ok(if key_input.is_none() {
                 vec![ResidentGroup {
                     key: None,
@@ -7640,11 +6047,15 @@ impl CandleResident {
                 )
             })?;
             let validity = validity.index_select(rows, 0).map_err(candle_error)?;
-            let starts = column.offsets.index_select(rows, 0).map_err(candle_error)?;
+            let span_rows = (rows * 2.0).map_err(candle_error)?;
+            let starts = column
+                .offsets
+                .index_select(&span_rows, 0)
+                .map_err(candle_error)?;
             let ends = column
                 .offsets
                 .index_select(
-                    &rows
+                    &span_rows
                         .broadcast_add(&Tensor::new(1_u32, device).map_err(candle_error)?)
                         .map_err(candle_error)?,
                     0,
@@ -8213,10 +6624,11 @@ impl CandleResident {
                 .or_else(|| map.map(|column| (column, false)))
             {
                 let validity = validity_and(&column.validity)?;
-                let starts = device_index_select(&column.offsets, &safe_rows, 0)?
+                let span_rows = (&safe_rows * 2.0).map_err(candle_error)?;
+                let starts = device_index_select(&column.offsets, &span_rows, 0)?
                     .to_vec1::<u32>()
                     .map_err(candle_error)?;
-                let offset_rows = safe_rows
+                let offset_rows = span_rows
                     .broadcast_add(&Tensor::new(1_u32, device).map_err(candle_error)?)
                     .map_err(candle_error)?;
                 let ends = device_index_select(&column.offsets, &offset_rows, 0)?
@@ -14684,7 +13096,7 @@ impl CandleResident {
                                 )
                             })?
                         } else if let Some(column) = self.mixed_nodes.get(&lane.property) {
-                            if column.offsets.elem_count() != self.node_count.saturating_add(1) {
+                            if column.offsets.elem_count() != self.node_count.saturating_mul(2) {
                                 return Err(Error::new(
                                     ErrorCode::CorruptStorage,
                                     "Metal nullable mixed node-string offsets have a wrong row count",
@@ -14692,7 +13104,9 @@ impl CandleResident {
                             }
                             column
                                 .offsets
-                                .narrow(0, 0, self.node_count)
+                                .reshape((self.node_count, 2))
+                                .and_then(|values| values.narrow(1, 0, 1))
+                                .and_then(|values| values.flatten_all())
                                 .map_err(candle_error)?
                         } else {
                             Tensor::zeros(self.node_count, DType::U32, device)
@@ -14764,7 +13178,7 @@ impl CandleResident {
                                 )
                             })?
                         } else if let Some(column) = self.mixed_edges.get(&lane.property) {
-                            if column.offsets.elem_count() != self.edge_count.saturating_add(1) {
+                            if column.offsets.elem_count() != self.edge_count.saturating_mul(2) {
                                 return Err(Error::new(
                                     ErrorCode::CorruptStorage,
                                     "Metal nullable mixed relationship-string offsets have a wrong row count",
@@ -14772,7 +13186,9 @@ impl CandleResident {
                             }
                             column
                                 .offsets
-                                .narrow(0, 0, self.edge_count)
+                                .reshape((self.edge_count, 2))
+                                .and_then(|values| values.narrow(1, 0, 1))
+                                .and_then(|values| values.flatten_all())
                                 .map_err(candle_error)?
                         } else {
                             Tensor::zeros(self.edge_count, DType::U32, device)
@@ -14955,18 +13371,50 @@ impl CandleResident {
                 "relationship-string dictionary bytes",
             )?;
         }
-        for lane in &encoded.property_lanes {
+        let mixed_descriptors =
+            metal_nullable_relation_graph_property_lane_words(self, encoded, &layout)?;
+        for (index, lane) in encoded.property_lanes.iter().enumerate() {
             let Some((column, rows)) = metal_nullable_relation_mixed_string_column(self, lane)
             else {
                 continue;
             };
+            if let Some(base) = column.base.as_deref() {
+                let (shape, base_rows) = base.shape_rows();
+                let offsets_base = mixed_descriptors
+                    [index * METAL_NULLABLE_RELATION_PROPERTY_LANE_WORDS + 5]
+                    as usize;
+                let values_base = if shape == 4 {
+                    offsets_base + rows * 2
+                } else {
+                    0
+                };
+                parts.push(
+                    Tensor::from_slice(
+                        &[i64::from(shape), base_rows as i64, values_base as i64],
+                        3,
+                        device,
+                    )
+                    .map_err(candle_error)?,
+                );
+            }
             append_metal_nullable_i64(
                 &mut parts,
                 Some(&column.offsets),
-                rows.saturating_add(1),
+                rows.saturating_mul(2),
                 DType::U32,
                 "mixed-string offsets",
             )?;
+            if let Some(base) = column.base.as_deref() {
+                if base.shape_rows().0 == 4 {
+                    append_metal_nullable_i64(
+                        &mut parts,
+                        base.string_values(),
+                        base.shape_rows().1,
+                        DType::U32,
+                        "mixed base string IDs",
+                    )?;
+                }
+            }
             append_metal_nullable_i64(
                 &mut parts,
                 column.bytes.as_ref(),
@@ -16873,7 +15321,7 @@ impl CandleResident {
                 let values = if materialize_string {
                     ids.to_dtype(DType::I64).map_err(candle_error)?
                 } else {
-                    if let Some(dictionary_ranks) = &string_dictionary.ranks {
+                    if string_dictionary.has_order() {
                         let safe_ids = validity
                             .eq(1_u8)
                             .and_then(|present| {
@@ -16883,9 +15331,9 @@ impl CandleResident {
                                 )
                             })
                             .map_err(candle_error)?;
-                        dictionary_ranks
-                            .index_select(&safe_ids, 0)
-                            .and_then(|ranks| ranks.to_dtype(DType::I64))
+                        string_dictionary
+                            .ranks_for(&safe_ids, device)?
+                            .to_dtype(DType::I64)
                             .map_err(candle_error)?
                     } else {
                         Tensor::zeros(row_count, DType::I64, device).map_err(candle_error)?
@@ -16976,7 +15424,7 @@ impl CandleResident {
                 0,
             ));
         };
-        if column.offsets.elem_count() != column.rows.saturating_add(1) {
+        if column.offsets.elem_count() != column.rows.saturating_mul(2) {
             return Err(Error::new(
                 ErrorCode::CorruptStorage,
                 "resident list property offsets have an invalid row shape",
@@ -19942,6 +18390,12 @@ impl CandleResident {
         request: &ResidentNodeGroupPipelineRequest,
         cancellation: &CancellationToken,
     ) -> Result<Vec<ResidentGroup>> {
+        #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+        if let Some(groups) =
+            self.try_reduce_simple_node_aggregate(device, request, cancellation)?
+        {
+            return Ok(groups);
+        }
         let rows = self.select_node_pipeline_rows(device, &request.input, cancellation)?;
         self.reduce_node_group_pipeline_rows(device, &rows, request, cancellation)
     }
@@ -19961,6 +18415,13 @@ impl CandleResident {
                 "aligned resident reductions have different input pipelines",
             ));
         }
+        #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+        if additional.is_empty()
+            && let Some(groups) =
+                self.try_reduce_simple_node_aggregate(device, first, cancellation)?
+        {
+            return Ok(vec![groups]);
+        }
         let rows = self.select_node_pipeline_rows(device, &first.input, cancellation)?;
         std::iter::once(first)
             .chain(additional)
@@ -19968,6 +18429,115 @@ impl CandleResident {
                 self.reduce_node_group_pipeline_rows(device, &rows, request, cancellation)
             })
             .collect()
+    }
+
+    #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+    fn try_reduce_simple_node_aggregate(
+        &self,
+        device: &Device,
+        request: &ResidentNodeGroupPipelineRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Vec<ResidentGroup>>> {
+        let input = &request.input;
+        if !matches!(device, Device::Metal(_))
+            || self.node_count == 0
+            || input.project != self.project
+            || request.key.is_some()
+            || request.distinct_relationship
+            || request.max_groups == 0
+            || matches!(request.aggregate, ResidentAggregate::Dispersion { .. })
+            || input.initial_optional
+            || input.expansion.is_some()
+            || !input.continuations.is_empty()
+            || input.correlated_optional.is_some()
+            || input.relationship_null_filter.is_some()
+            || !input.predicates.is_empty()
+            || !input.property_filters.is_empty()
+            || input.value_matrix.is_some()
+            || input.mutation.is_some()
+            || !input.orders.is_empty()
+            || input.offset != 0
+            || input.limit < self.node_count
+            || input.max_output_rows < self.node_count
+            || !input.integer_projections.is_empty()
+            || !input.property_null_projections.is_empty()
+        {
+            return Ok(None);
+        }
+        let Some(projection) = request.value else {
+            return Ok(None);
+        };
+        let Some(column) = self.integer_nodes.get(&projection.property) else {
+            return Ok(None);
+        };
+        if projection.binding != ResidentNodeBinding::Start {
+            return Ok(None);
+        }
+        ensure_not_cancelled(cancellation)?;
+        let mask = self.node_selection_mask(&input.labels, input.layers)?;
+        let selected = mask
+            .to_dtype(DType::I64)
+            .and_then(|mask| mask.sum_all())
+            .and_then(|count| count.reshape(1))
+            .map_err(candle_error)?;
+        let values = column
+            .values
+            .as_ref()
+            .ok_or_else(|| Error::internal("integer column values are absent"))?;
+        let validity = column
+            .validity
+            .as_ref()
+            .ok_or_else(|| Error::internal("integer column validity is absent"))?
+            .broadcast_mul(&mask)
+            .map_err(candle_error)?;
+        let start = Tensor::zeros(1, DType::U32, device).map_err(candle_error)?;
+        let summary = values
+            .apply_op3_no_bwd(
+                &validity,
+                &start,
+                &MetalIntegerGroupSummary {
+                    row_count: self.node_count,
+                    group_count: 1,
+                },
+            )
+            .map_err(candle_error)?;
+        // Keep selection and reduction on device. Only this five-cell terminal result
+        // crosses to the host; no selected-row count readback or gathered value lane.
+        let packet = Tensor::cat(&[&selected, &summary], 0)
+            .and_then(|packet| packet.to_vec1::<i64>())
+            .map_err(candle_error)?;
+        let [rows, count, sum, minimum, maximum] = packet.as_slice() else {
+            return Err(Error::internal(
+                "global integer summary has an invalid length",
+            ));
+        };
+        if *rows < 0 || *rows as usize > self.node_count || *count < 0 || count > rows {
+            return Err(Error::internal("global integer summary has invalid counts"));
+        }
+        if matches!(
+            request.aggregate,
+            ResidentAggregate::Sum | ResidentAggregate::Average
+        ) {
+            validate_integer_accumulator_bounds(&[*count], &[*minimum], &[*maximum])?;
+        }
+        let [value] = finalize_integer_groups(
+            &[*rows],
+            &[*count],
+            &[*sum],
+            &[*minimum],
+            &[*maximum],
+            &[],
+            &[],
+            request.aggregate,
+        )?
+        .try_into()
+        .map_err(|_| Error::internal("global integer aggregate returned multiple groups"))?;
+        ensure_not_cancelled(cancellation)?;
+        Ok(Some(vec![ResidentGroup {
+            key: None,
+            rows: *rows as u64,
+            value,
+        }]))
     }
 
     fn reduce_node_group_pipeline_rows(
@@ -20102,44 +18672,68 @@ impl CandleResident {
             .as_ref()
             .ok_or_else(|| Error::internal("non-empty temporal column has no validity"))?;
 
-        let entity_low = sorted_integer_bound(
-            entity_ids,
-            column.rows,
-            &node_id_order_keys,
-            false,
-            device,
-            cancellation,
-        )?;
-        let entity_high = sorted_integer_bound(
-            entity_ids,
-            column.rows,
-            &node_id_order_keys,
-            true,
-            device,
-            cancellation,
-        )?;
-        let from = Tensor::full(request.from_nanos, node_id_order_keys.elem_count(), device)
-            .map_err(candle_error)?;
-        let to = Tensor::full(request.to_nanos, node_id_order_keys.elem_count(), device)
-            .map_err(candle_error)?;
-        let sample_low = sorted_integer_bound_ranges(
-            event_times,
-            &entity_low,
-            &entity_high,
-            &from,
-            false,
-            device,
-            cancellation,
-        )?;
-        let sample_high = sorted_integer_bound_ranges(
-            event_times,
-            &entity_low,
-            &entity_high,
-            &to,
-            false,
-            device,
-            cancellation,
-        )?;
+        #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+        let order = self
+            .temporal_properties
+            .get(&(EntityKind::Node as u8, request.target, request.property))
+            .and_then(|bundle| bundle.temporal_metadata.as_ref())
+            .and_then(|metadata| metadata.order.as_ref());
+        #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+        let native_bounds = order
+            .map(|order| {
+                order.bounds(
+                    &node_id_order_keys,
+                    request.from_nanos,
+                    request.to_nanos,
+                    device,
+                )
+            })
+            .transpose()?;
+        #[cfg(not(all(feature = "accelerator", any(target_os = "macos", target_os = "ios"))))]
+        let native_bounds: Option<(Tensor, Tensor)> = None;
+        let (sample_low, sample_high) = if let Some(bounds) = native_bounds {
+            bounds
+        } else {
+            let entity_low = sorted_integer_bound(
+                entity_ids,
+                column.rows,
+                &node_id_order_keys,
+                false,
+                device,
+                cancellation,
+            )?;
+            let entity_high = sorted_integer_bound(
+                entity_ids,
+                column.rows,
+                &node_id_order_keys,
+                true,
+                device,
+                cancellation,
+            )?;
+            let from = Tensor::full(request.from_nanos, node_id_order_keys.elem_count(), device)
+                .map_err(candle_error)?;
+            let to = Tensor::full(request.to_nanos, node_id_order_keys.elem_count(), device)
+                .map_err(candle_error)?;
+            let sample_low = sorted_integer_bound_ranges(
+                event_times,
+                &entity_low,
+                &entity_high,
+                &from,
+                false,
+                device,
+                cancellation,
+            )?;
+            let sample_high = sorted_integer_bound_ranges(
+                event_times,
+                &entity_low,
+                &entity_high,
+                &to,
+                false,
+                device,
+                cancellation,
+            )?;
+            (sample_low, sample_high)
+        };
         let counts = sample_high.sub(&sample_low).map_err(candle_error)?;
         let cap = i64::try_from(request.max_output_rows.min(i64::MAX as usize - 1))
             .unwrap_or(i64::MAX - 1)
@@ -20195,6 +18789,15 @@ impl CandleResident {
             .index_select(&source_positions, 0)
             .and_then(|rows| rows.add(&output_positions.sub(&source_output_starts)?))
             .map_err(candle_error)?;
+        #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+        let sample_rows = if let Some(order) = order {
+            order
+                .select(&sample_rows)?
+                .to_dtype(DType::I64)
+                .map_err(candle_error)?
+        } else {
+            sample_rows
+        };
         let bookmark_key = u64_order_key(request.bookmark_index);
         let visible = sequence_indexes
             .index_select(&sample_rows, 0)
@@ -21124,27 +19727,19 @@ impl CandleResident {
             ensure_graph_execution(cancellation, deadline)?;
         }
         let mut control = graph_paths::read_u32_slice(&workspace, control_offset, 2)?;
-        let Some(outgoing_neighbors) = self.outgoing_neighbors.as_ref() else {
+        if self.edge_count == 0 {
             return Ok(workspace);
-        };
-        let outgoing_edges = self.outgoing_edges.as_ref().ok_or_else(|| {
-            Error::new(
-                ErrorCode::CorruptStorage,
-                "resident outgoing adjacency has no edge-row tensor",
-            )
-        })?;
-        let incoming_neighbors = self.incoming_neighbors.as_ref().ok_or_else(|| {
-            Error::new(
-                ErrorCode::CorruptStorage,
-                "resident outgoing adjacency has no incoming counterpart",
-            )
-        })?;
-        let incoming_edges = self.incoming_edges.as_ref().ok_or_else(|| {
-            Error::new(
-                ErrorCode::CorruptStorage,
-                "resident incoming adjacency has no edge-row tensor",
-            )
-        })?;
+        }
+        let adjacency_count = self
+            .outgoing_neighbors
+            .as_ref()
+            .map_or(0, Tensor::elem_count);
+        let adjacency_dummy =
+            Tensor::zeros(1, DType::U32, visible_mask.device()).map_err(candle_error)?;
+        let outgoing_neighbors = self.outgoing_neighbors.as_ref().unwrap_or(&adjacency_dummy);
+        let outgoing_edges = self.outgoing_edges.as_ref().unwrap_or(&adjacency_dummy);
+        let incoming_neighbors = self.incoming_neighbors.as_ref().unwrap_or(&adjacency_dummy);
+        let incoming_edges = self.incoming_edges.as_ref().unwrap_or(&adjacency_dummy);
         let edge_active = self.edge_active.as_ref().ok_or_else(|| {
             Error::new(
                 ErrorCode::CorruptStorage,
@@ -21157,16 +19752,15 @@ impl CandleResident {
                 "resident adjacency has no edge-layer tensor",
             )
         })?;
-        let adjacency_count = outgoing_neighbors.elem_count();
         if adjacency_count == 0
             && self.outgoing_overlay.rows.is_empty()
             && self.incoming_overlay.rows.is_empty()
         {
             return Ok(workspace);
         }
-        if outgoing_edges.elem_count() != adjacency_count
-            || incoming_neighbors.elem_count() != adjacency_count
-            || incoming_edges.elem_count() != adjacency_count
+        if outgoing_edges.elem_count() != adjacency_count.max(1)
+            || incoming_neighbors.elem_count() != adjacency_count.max(1)
+            || incoming_edges.elem_count() != adjacency_count.max(1)
         {
             return Err(Error::new(
                 ErrorCode::CorruptStorage,
@@ -21304,6 +19898,13 @@ impl CandleResident {
                 "Dijkstra result exceeds the query row budget",
             ));
         }
+        if self.edge_count == 0 {
+            return Ok(ResidentGraphProcedureResult::Dijkstra {
+                node_rows: vec![source_dense],
+                cost: vec![0.0],
+                predecessor: vec![None],
+            });
+        }
         let workspace =
             self.metal_bfs_workspace(visible_mask, source_dense, layers, cancellation, deadline)?;
         ensure_graph_execution(cancellation, deadline)?;
@@ -21336,7 +19937,7 @@ impl CandleResident {
                 predecessor: vec![None],
             });
         }
-        if incoming_edges.elem_count() != adjacency_count {
+        if incoming_edges.elem_count() != adjacency_count.max(1) {
             return Err(Error::new(
                 ErrorCode::CorruptStorage,
                 "resident incoming CSR cardinalities differ",
@@ -22114,6 +20715,143 @@ impl CandleResident {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn selected_mixed_string_predicate(
+        &self,
+        property: PropertyId,
+        column: &MixedColumn,
+        rows: &Tensor,
+        operand: &[u8],
+        operation: super::ResidentStringPredicateOperation,
+        device: &Device,
+        cancellation: &CancellationToken,
+    ) -> Result<Tensor> {
+        let zero_rows = Tensor::zeros(rows.shape(), DType::U32, device).map_err(candle_error)?;
+        let row_validity = rows.ne(super::RESIDENT_NULL_ROW).map_err(candle_error)?;
+        let safe_rows = row_validity
+            .where_cond(rows, &zero_rows)
+            .map_err(candle_error)?;
+        let validity = self.selected_property_validity_tensor(property, rows)?;
+        let starts_at = safe_rows.affine(2.0, 0.0).map_err(candle_error)?;
+        let ends_at = starts_at.affine(1.0, 1.0).map_err(candle_error)?;
+        let starts = column
+            .offsets
+            .index_select(&starts_at, 0)
+            .map_err(candle_error)?;
+        let ends = column
+            .offsets
+            .index_select(&ends_at, 0)
+            .map_err(candle_error)?;
+        let override_rows = ends.gt(&starts).map_err(candle_error)?;
+        let evaluate = |starts: &Tensor,
+                        ends: &Tensor,
+                        validity: &Tensor,
+                        bytes: Option<&Tensor>| {
+            match operation {
+                super::ResidentStringPredicateOperation::Compare(compare) => compare_utf8_ranges(
+                    starts,
+                    ends,
+                    validity,
+                    bytes,
+                    column.maximum_string_bytes,
+                    operand,
+                    compare,
+                    device,
+                    cancellation,
+                ),
+                operation => match_utf8_ranges(
+                    starts,
+                    ends,
+                    validity,
+                    bytes,
+                    column.maximum_string_bytes,
+                    operand,
+                    operation,
+                    device,
+                    cancellation,
+                ),
+            }
+        };
+        let mut result = Tensor::zeros(rows.shape(), DType::U8, device).map_err(candle_error)?;
+        let mut string_rows = result.clone();
+        if let Some(bytes) = column
+            .bytes
+            .as_ref()
+            .filter(|bytes| bytes.elem_count() != 0)
+        {
+            let present = validity
+                .broadcast_mul(&override_rows)
+                .map_err(candle_error)?;
+            let safe_starts = present
+                .where_cond(&starts, &zero_rows)
+                .map_err(candle_error)?;
+            let tags = bytes.index_select(&safe_starts, 0).map_err(candle_error)?;
+            let strings = present
+                .broadcast_mul(&tags.eq(MIXED_STRING_TAG).map_err(candle_error)?)
+                .map_err(candle_error)?;
+            string_rows = strings.clone();
+            let content = starts.affine(1.0, 1.0).map_err(candle_error)?;
+            let string_starts = strings.where_cond(&content, &ends).map_err(candle_error)?;
+            result = evaluate(&string_starts, &ends, &strings, Some(bytes))?;
+        }
+        if let Some(MixedBaseColumn::String(base)) = column.base.as_deref() {
+            if base.rows != 0 {
+                let inherited = override_rows
+                    .eq(0_u8)
+                    .and_then(|mask| mask.broadcast_mul(&validity))
+                    .and_then(|mask| mask.broadcast_mul(&safe_rows.lt(base.rows as u32)?))
+                    .map_err(candle_error)?;
+                let inherited_rows = inherited
+                    .where_cond(&safe_rows, &zero_rows)
+                    .map_err(candle_error)?;
+                string_rows = string_rows
+                    .broadcast_add(&inherited)
+                    .map_err(candle_error)?;
+                let ids = base
+                    .values
+                    .as_ref()
+                    .ok_or_else(|| Error::internal("mixed string base values absent"))?
+                    .index_select(&inherited_rows, 0)
+                    .map_err(candle_error)?;
+                let ids = inherited
+                    .where_cond(&ids, &zero_rows)
+                    .map_err(candle_error)?;
+                let dictionary = &self.node_string_dictionary;
+                let base_starts = dictionary
+                    .offsets
+                    .index_select(&ids, 0)
+                    .map_err(candle_error)?;
+                let base_ends = dictionary
+                    .offsets
+                    .index_select(&ids.affine(1.0, 1.0).map_err(candle_error)?, 0)
+                    .map_err(candle_error)?;
+                let matches = evaluate(
+                    &base_starts,
+                    &base_ends,
+                    &inherited,
+                    dictionary.bytes.as_ref(),
+                )?;
+                result = result.broadcast_add(&matches).map_err(candle_error)?;
+            }
+        }
+        if let super::ResidentStringPredicateOperation::Compare(
+            compare @ (CompareOp::Eq | CompareOp::NotEq),
+        ) = operation
+        {
+            let non_strings = validity
+                .broadcast_mul(&string_rows.eq(0_u8).map_err(candle_error)?)
+                .map_err(candle_error)?;
+            let truth = if compare == CompareOp::Eq { 1_u8 } else { 2_u8 };
+            result = non_strings
+                .where_cond(
+                    &Tensor::full(truth, rows.shape(), device).map_err(candle_error)?,
+                    &result,
+                )
+                .map_err(candle_error)?;
+        }
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn selected_string_match(
         &self,
         property: PropertyId,
@@ -22134,55 +20872,11 @@ impl CandleResident {
                 "ordinary STRING comparison reached the match-only GPU path",
             ));
         }
-        let row_validity = rows.ne(super::RESIDENT_NULL_ROW).map_err(candle_error)?;
-        let safe_rows = row_validity
-            .where_cond(
-                rows,
-                &Tensor::zeros(rows.shape(), DType::U32, device).map_err(candle_error)?,
-            )
-            .map_err(candle_error)?;
         if let Some(column) = self.mixed_nodes.get(&property) {
-            let validity = self.selected_property_validity_tensor(property, rows)?;
-            let starts = column
-                .offsets
-                .index_select(&safe_rows, 0)
-                .map_err(candle_error)?;
-            let next_rows = safe_rows
-                .broadcast_add(&Tensor::new(1_u32, device).map_err(candle_error)?)
-                .map_err(candle_error)?;
-            let ends = column
-                .offsets
-                .index_select(&next_rows, 0)
-                .map_err(candle_error)?;
-            let bytes = column.bytes.as_ref().ok_or_else(|| {
-                Error::new(
-                    ErrorCode::CorruptStorage,
-                    "non-empty mixed property has no resident payload bytes",
-                )
-            })?;
-            let safe_starts = validity
-                .eq(1_u8)
-                .and_then(|present| {
-                    present.where_cond(&starts, &Tensor::zeros(starts.shape(), DType::U32, device)?)
-                })
-                .map_err(candle_error)?;
-            let tags = bytes.index_select(&safe_starts, 0).map_err(candle_error)?;
-            let string_validity = validity
-                .broadcast_mul(&tags.eq(MIXED_STRING_TAG).map_err(candle_error)?)
-                .map_err(candle_error)?;
-            let content_starts = starts
-                .broadcast_add(&Tensor::new(1_u32, device).map_err(candle_error)?)
-                .map_err(candle_error)?;
-            let string_starts = string_validity
-                .eq(1_u8)
-                .and_then(|present| present.where_cond(&content_starts, &ends))
-                .map_err(candle_error)?;
-            return match_utf8_ranges(
-                &string_starts,
-                &ends,
-                &string_validity,
-                Some(bytes),
-                column.maximum_string_bytes,
+            return self.selected_mixed_string_predicate(
+                property,
+                column,
+                rows,
                 operand,
                 operation,
                 device,
@@ -22281,57 +20975,13 @@ impl CandleResident {
         if rows.elem_count() == 0 {
             return Tensor::zeros(0, DType::U8, device).map_err(candle_error);
         }
-        let row_validity = rows.ne(super::RESIDENT_NULL_ROW).map_err(candle_error)?;
-        let safe_rows = row_validity
-            .where_cond(
-                rows,
-                &Tensor::zeros(rows.shape(), DType::U32, device).map_err(candle_error)?,
-            )
-            .map_err(candle_error)?;
         if let Some(column) = self.mixed_nodes.get(&property) {
-            let validity = self.selected_property_validity_tensor(property, rows)?;
-            let starts = column
-                .offsets
-                .index_select(&safe_rows, 0)
-                .map_err(candle_error)?;
-            let next_rows = safe_rows
-                .broadcast_add(&Tensor::new(1_u32, device).map_err(candle_error)?)
-                .map_err(candle_error)?;
-            let ends = column
-                .offsets
-                .index_select(&next_rows, 0)
-                .map_err(candle_error)?;
-            let bytes = column.bytes.as_ref().ok_or_else(|| {
-                Error::new(
-                    ErrorCode::CorruptStorage,
-                    "non-empty mixed property has no resident payload bytes",
-                )
-            })?;
-            let safe_starts = validity
-                .eq(1_u8)
-                .and_then(|present| {
-                    present.where_cond(&starts, &Tensor::zeros(starts.shape(), DType::U32, device)?)
-                })
-                .map_err(candle_error)?;
-            let tags = bytes.index_select(&safe_starts, 0).map_err(candle_error)?;
-            let string_validity = validity
-                .broadcast_mul(&tags.eq(MIXED_STRING_TAG).map_err(candle_error)?)
-                .map_err(candle_error)?;
-            let content_starts = starts
-                .broadcast_add(&Tensor::new(1_u32, device).map_err(candle_error)?)
-                .map_err(candle_error)?;
-            let string_starts = string_validity
-                .eq(1_u8)
-                .and_then(|present| present.where_cond(&content_starts, &ends))
-                .map_err(candle_error)?;
-            return compare_utf8_ranges(
-                &string_starts,
-                &ends,
-                &string_validity,
-                Some(bytes),
-                column.maximum_string_bytes,
+            return self.selected_mixed_string_predicate(
+                property,
+                column,
+                rows,
                 operand,
-                operation,
+                super::ResidentStringPredicateOperation::Compare(operation),
                 device,
                 cancellation,
             );
@@ -22443,7 +21093,7 @@ impl CandleResident {
         // rows, flat in the number of rows sorted, linear in the length of the longest value.
         // Building the rank table costs 66 microseconds over two megabytes, so the index this
         // avoids paying for was already there and already free.
-        if let Some(ranks) = self.node_string_dictionary.ranks.as_ref() {
+        if self.node_string_dictionary.has_order() {
             ensure_not_cancelled(cancellation)?;
             let binding_rows = rows.binding(order.binding)?;
             let (ids, validity) =
@@ -22454,9 +21104,10 @@ impl CandleResident {
                     present.where_cond(&ids, &Tensor::zeros(ids.shape(), DType::U32, device)?)
                 })
                 .map_err(candle_error)?;
-            let rank_values = ranks
-                .index_select(&safe_ids, 0)
-                .and_then(|values| values.to_dtype(DType::I64))
+            let rank_values = self
+                .node_string_dictionary
+                .ranks_for(&safe_ids, device)?
+                .to_dtype(DType::I64)
                 .map_err(candle_error)?;
             let positions = stable_nullable_integer_order(
                 &rank_values,
@@ -27830,16 +26481,8 @@ fn execute_metal_variable_path_tensor_internal(
                 })?;
                 let ranks = resident
                     .node_string_dictionary
-                    .ranks
-                    .as_ref()
-                    .ok_or_else(|| {
-                        Error::new(
-                            ErrorCode::CorruptStorage,
-                            "Metal WITH/SKIP lexical string ranks disappeared",
-                        )
-                    })?
-                    .index_select(order_values, 0)
-                    .and_then(|values| values.to_dtype(DType::I64))
+                    .ranks_for(order_values, device)?
+                    .to_dtype(DType::I64)
                     .map_err(candle_error)?;
                 let dependency_values = dependency.values.clone().ok_or_else(|| {
                     Error::new(
@@ -32752,7 +31395,7 @@ fn encode_metal_segmented_graph_aggregation(
         if column.rows != entity_rows
             || column.offsets.dtype() != DType::U32
             || column.offsets.dims().len() != 1
-            || column.offsets.elem_count() != entity_rows.saturating_add(1)
+            || column.offsets.elem_count() != entity_rows.saturating_mul(2)
             || column
                 .bytes
                 .as_ref()
@@ -44102,6 +42745,12 @@ struct MetalQuantifierEntityPropertyInput {
     bytes: Tensor,
     offset_count: usize,
     byte_count: usize,
+    base_storage_shape: u32,
+    base_rows: usize,
+    base_offsets: Tensor,
+    base_bytes: Tensor,
+    base_offset_count: usize,
+    base_byte_count: usize,
 }
 
 #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
@@ -44130,6 +42779,12 @@ fn metal_quantifier_entity_property_input(
             bytes: dummy_bytes()?,
             offset_count: 1,
             byte_count: 0,
+            base_storage_shape: 0,
+            base_rows: 0,
+            base_offsets: dummy_offsets()?,
+            base_bytes: dummy_bytes()?,
+            base_offset_count: 1,
+            base_byte_count: 0,
         });
     };
     let Some(property) = descriptor.property else {
@@ -44141,6 +42796,12 @@ fn metal_quantifier_entity_property_input(
             bytes: dummy_bytes()?,
             offset_count: 1,
             byte_count: 0,
+            base_storage_shape: 0,
+            base_rows: 0,
+            base_offsets: dummy_offsets()?,
+            base_bytes: dummy_bytes()?,
+            base_offset_count: 1,
+            base_byte_count: 0,
         });
     };
     let unsupported_physical = match source.entity_kind {
@@ -44193,7 +42854,7 @@ fn metal_quantifier_entity_property_input(
     let validity = |validity: &Option<Tensor>| -> Result<Tensor> {
         validity.as_ref().cloned().map_or_else(dummy_validity, Ok)
     };
-    let input = if let Some(column) = booleans.get(&property) {
+    let mut input = if let Some(column) = booleans.get(&property) {
         if column.rows != entity_rows {
             return Err(Error::new(
                 ErrorCode::CorruptStorage,
@@ -44211,6 +42872,12 @@ fn metal_quantifier_entity_property_input(
             bytes: dummy_bytes()?,
             offset_count: 1,
             byte_count: 0,
+            base_storage_shape: 0,
+            base_rows: 0,
+            base_offsets: dummy_offsets()?,
+            base_bytes: dummy_bytes()?,
+            base_offset_count: 1,
+            base_byte_count: 0,
         }
     } else if let Some(column) = integers.get(&property) {
         if column.rows != entity_rows {
@@ -44231,6 +42898,12 @@ fn metal_quantifier_entity_property_input(
             bytes: dummy_bytes()?,
             offset_count: 1,
             byte_count: 0,
+            base_storage_shape: 0,
+            base_rows: 0,
+            base_offsets: dummy_offsets()?,
+            base_bytes: dummy_bytes()?,
+            base_offset_count: 1,
+            base_byte_count: 0,
         }
     } else if let Some(column) = floats.get(&property) {
         if column.rows != entity_rows {
@@ -44251,6 +42924,12 @@ fn metal_quantifier_entity_property_input(
             bytes: dummy_bytes()?,
             offset_count: 1,
             byte_count: 0,
+            base_storage_shape: 0,
+            base_rows: 0,
+            base_offsets: dummy_offsets()?,
+            base_bytes: dummy_bytes()?,
+            base_offset_count: 1,
+            base_byte_count: 0,
         }
     } else if let Some(column) = strings.get(&property) {
         if column.rows != entity_rows {
@@ -44274,9 +42953,15 @@ fn metal_quantifier_entity_property_input(
                 .map_or_else(dummy_bytes, Ok)?,
             offset_count: dictionary.offsets.elem_count(),
             byte_count: dictionary.bytes.as_ref().map_or(0, Tensor::elem_count),
+            base_storage_shape: 0,
+            base_rows: 0,
+            base_offsets: dummy_offsets()?,
+            base_bytes: dummy_bytes()?,
+            base_offset_count: 1,
+            base_byte_count: 0,
         }
     } else if let Some(column) = mixed.get(&property) {
-        if column.offsets.elem_count() != entity_rows.saturating_add(1) {
+        if column.offsets.elem_count() != entity_rows.saturating_mul(2) {
             return Err(Error::new(
                 ErrorCode::CorruptStorage,
                 "resident mixed property has an invalid entity-source row count",
@@ -44294,6 +42979,12 @@ fn metal_quantifier_entity_property_input(
                 .map_or_else(dummy_bytes, Ok)?,
             offset_count: column.offsets.elem_count(),
             byte_count: column.bytes.as_ref().map_or(0, Tensor::elem_count),
+            base_storage_shape: 0,
+            base_rows: 0,
+            base_offsets: dummy_offsets()?,
+            base_bytes: dummy_bytes()?,
+            base_offset_count: 1,
+            base_byte_count: 0,
         }
     } else {
         if unsupported.contains(&property) {
@@ -44310,8 +43001,41 @@ fn metal_quantifier_entity_property_input(
             bytes: dummy_bytes()?,
             offset_count: 1,
             byte_count: 0,
+            base_storage_shape: 0,
+            base_rows: 0,
+            base_offsets: dummy_offsets()?,
+            base_bytes: dummy_bytes()?,
+            base_offset_count: 1,
+            base_byte_count: 0,
         }
     };
+    if let Some(base) = mixed
+        .get(&property)
+        .and_then(|column| column.base.as_deref())
+    {
+        let (shape, rows) = base.shape_rows();
+        input.base_storage_shape = shape;
+        input.base_rows = rows;
+        input.values = match base {
+            MixedBaseColumn::Boolean(c) => c.values.clone(),
+            MixedBaseColumn::Integer(c) => c.values.clone(),
+            MixedBaseColumn::Float(c) => c.values.clone(),
+            MixedBaseColumn::String(c) => c.values.clone(),
+            _ => {
+                return Err(Error::new(
+                    ErrorCode::GpuAdmissionFailure,
+                    "resident quantifier mixed base has an unsupported canonical Metal column",
+                ));
+            }
+        }
+        .unwrap_or(dummy_i64()?);
+        if shape == 4 {
+            input.base_offsets = dictionary.offsets.clone();
+            input.base_bytes = dictionary.bytes.clone().unwrap_or(dummy_bytes()?);
+            input.base_offset_count = dictionary.offsets.elem_count();
+            input.base_byte_count = dictionary.bytes.as_ref().map_or(0, Tensor::elem_count);
+        }
+    }
     Ok(input)
 }
 
@@ -44487,7 +43211,7 @@ fn metal_quantifier_entity_staging_bytes(
     )?;
     bytes = metal_quantifier_add(
         bytes,
-        size_of::<u32>() + size_of::<u8>() + size_of::<i64>(),
+        2 * size_of::<u32>() + 2 * size_of::<u8>() + size_of::<i64>(),
         "Metal entity path dummy staging overflow",
     )?;
     let start_labels = match &path.input {
@@ -44656,6 +43380,10 @@ struct MetalQuantifierEntityArgs {
     dependency_capacity: u32,
     group_table_capacity: u32,
     group_sort_capacity: u32,
+    property_base_storage_shape: u32,
+    property_base_rows: u32,
+    property_base_offset_count: u32,
+    property_base_byte_count: u32,
 }
 
 #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
@@ -45310,6 +44038,8 @@ struct MetalQuantifierEntityCommand {
     property_validity: Tensor,
     property_offsets: Tensor,
     property_bytes: Tensor,
+    property_base_offsets: Tensor,
+    property_base_bytes: Tensor,
 }
 
 #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
@@ -45480,6 +44210,18 @@ impl CustomOp1 for MetalQuantifierEntityCommand {
             property_bytes_layout,
             property_bytes
         );
+        metal_tensor!(
+            property_base_offsets,
+            property_base_offsets_storage,
+            property_base_offsets_layout,
+            property_base_offsets
+        );
+        metal_tensor!(
+            property_base_bytes,
+            property_base_bytes_storage,
+            property_base_bytes_layout,
+            property_base_bytes
+        );
 
         let q = self.arguments;
         let args = self.entity_arguments;
@@ -45508,16 +44250,21 @@ impl CustomOp1 for MetalQuantifierEntityCommand {
                 "Metal entity dependency domain exceeds its sealed u32 ABI".into(),
             ));
         }
-        let expected_property_dtype = match args.property_storage_shape {
-            1 => DType::U8,
-            4 => DType::U32,
-            0 | 2 | 3 | 5 => DType::I64,
-            _ => {
-                return Err(candle_core::Error::Msg(
-                    "Metal entity property storage shape is invalid".into(),
-                ));
-            }
-        };
+        let expected_property_dtype =
+            match if args.property_storage_shape == 5 && args.property_base_storage_shape != 0 {
+                args.property_base_storage_shape
+            } else {
+                args.property_storage_shape
+            } {
+                1 => DType::U8,
+                4 => DType::U32,
+                0 | 2 | 3 | 5 => DType::I64,
+                _ => {
+                    return Err(candle_core::Error::Msg(
+                        "Metal entity property storage shape is invalid".into(),
+                    ));
+                }
+            };
         let layouts = [
             program_layout,
             &input_rows_layout,
@@ -45542,6 +44289,8 @@ impl CustomOp1 for MetalQuantifierEntityCommand {
             &property_validity_layout,
             &property_offsets_layout,
             &property_bytes_layout,
+            &property_base_offsets_layout,
+            &property_base_bytes_layout,
         ];
         if layouts
             .iter()
@@ -45570,6 +44319,12 @@ impl CustomOp1 for MetalQuantifierEntityCommand {
             || self.property_validity.dtype() != DType::U8
             || self.property_offsets.dtype() != DType::U32
             || self.property_bytes.dtype() != DType::U8
+            || self.property_base_offsets.dtype() != DType::U32
+            || self.property_base_bytes.dtype() != DType::U8
+            || property_base_offsets_layout.shape().elem_count()
+                != args.property_base_offset_count as usize
+            || property_base_bytes_layout.shape().elem_count()
+                != args.property_base_byte_count.max(1) as usize
             || property_validity_layout.shape().elem_count()
                 != if args.property_storage_shape == 0 {
                     1
@@ -45594,13 +44349,9 @@ impl CustomOp1 for MetalQuantifierEntityCommand {
                     (path.segment_count as usize).saturating_mul(path.edge_count as usize)
                 }
             || outgoing_overlay_layout.shape().elem_count()
-                < (path.outgoing_overlay_count as usize)
-                    .saturating_mul(2)
-                    .saturating_add(1)
+                < (1 + usize::from(path.outgoing_overlay_count != 0))
             || incoming_overlay_layout.shape().elem_count()
-                < (path.incoming_overlay_count as usize)
-                    .saturating_mul(2)
-                    .saturating_add(1)
+                < (1 + usize::from(path.incoming_overlay_count != 0))
             || args.scalar_output_words as usize != scalar_output_words
             || args.entity_output_base != args.scalar_output_words
             || q.output_words <= args.entity_output_base
@@ -45879,6 +44630,16 @@ impl CustomOp1 for MetalQuantifierEntityCommand {
         encoder.set_output_buffer(8, Some(&entity_control), 0);
         encoder.set_bytes(9, &q);
         encoder.set_bytes(10, &args);
+        encoder.set_input_buffer(
+            11,
+            Some(property_base_offsets.buffer()),
+            property_base_offsets_layout.start_offset() * DType::U32.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            12,
+            Some(property_base_bytes.buffer()),
+            property_base_bytes_layout.start_offset(),
+        );
         dispatch(encoder, args.entity_rows as usize);
         encoder.insert_memory_barrier();
         encoder.set_compute_pipeline_state(&entity.finalize_property);
@@ -46109,6 +44870,16 @@ impl CustomOp1 for MetalQuantifierEntityCommand {
         );
         encoder.set_bytes(12, &q);
         encoder.set_bytes(13, &args);
+        encoder.set_input_buffer(
+            14,
+            Some(property_base_offsets.buffer()),
+            property_base_offsets_layout.start_offset() * DType::U32.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            15,
+            Some(property_base_bytes.buffer()),
+            property_base_bytes_layout.start_offset(),
+        );
         dispatch(encoder, q.final_row_bound as usize);
         encoder.insert_memory_barrier();
 
@@ -47355,6 +46126,16 @@ pub fn execute_metal_quantifier_program(
             )?,
             property_shape,
             property_storage_shape: property.storage_shape,
+            property_base_storage_shape: property.base_storage_shape,
+            property_base_rows: to_u32(property.base_rows, "Metal mixed base rows exceed u32")?,
+            property_base_offset_count: to_u32(
+                property.base_offset_count,
+                "Metal mixed base offsets exceed u32",
+            )?,
+            property_base_byte_count: to_u32(
+                property.base_byte_count,
+                "Metal mixed base bytes exceed u32",
+            )?,
             maximum_string_bytes,
             entity_rows: to_u32(entity_rows, "Metal entity property rows exceed u32")?,
             node_rows: to_u32(resident.node_count, "Metal entity node rows exceed u32")?,
@@ -47460,6 +46241,8 @@ pub fn execute_metal_quantifier_program(
                 property_validity: property.validity,
                 property_offsets: property.offsets,
                 property_bytes: property.bytes,
+                property_base_offsets: property.base_offsets,
+                property_base_bytes: property.base_bytes,
             })
             .and_then(|result| result.to_vec1::<i64>())
             .map_err(candle_error)?
@@ -49020,7 +47803,7 @@ fn metal_resident_row_program_scratch_breakdown(
                             )
                         })?;
                     metal_row_checked_sum([
-                        source_rows.saturating_add(1),
+                        source_rows.saturating_mul(2),
                         metal_row_checked_product(
                             source_rows,
                             maximum_row_bytes,
@@ -49287,7 +48070,7 @@ fn metal_resident_row_program_scratch_breakdown(
                         )
                     })?;
                 for elements in [
-                    source_rows.saturating_add(1),
+                    source_rows.saturating_mul(2),
                     metal_row_checked_product(
                         source_rows,
                         maximum_row_bytes,
@@ -55129,7 +53912,12 @@ fn metal_nullable_relation_graph_property_lane_words(
     for (index, lane) in encoded.property_lanes.iter().enumerate() {
         let descriptor = index * METAL_NULLABLE_RELATION_PROPERTY_LANE_WORDS;
         if let Some((column, rows)) = metal_nullable_relation_mixed_string_column(resident, lane) {
-            let offset_count = rows.checked_add(1).ok_or_else(|| {
+            if column.base.is_some() {
+                cursor = cursor
+                    .checked_add(3)
+                    .ok_or_else(|| Error::internal("mixed base header overflow"))?;
+            }
+            let offset_count = rows.checked_mul(2).ok_or_else(|| {
                 Error::new(
                     ErrorCode::ResultBudgetExceeded,
                     "Metal nullable mixed-string offset count overflow",
@@ -55142,6 +53930,13 @@ fn metal_nullable_relation_graph_property_lane_words(
                     "Metal nullable mixed-string offset layout overflow",
                 )
             })?;
+            if let Some(base) = column.base.as_deref() {
+                if base.shape_rows().0 == 4 {
+                    cursor = cursor
+                        .checked_add(base.shape_rows().1)
+                        .ok_or_else(|| Error::internal("mixed string base overflow"))?;
+                }
+            }
             let byte_base = cursor;
             let byte_count = column.bytes.as_ref().map_or(0, Tensor::elem_count);
             cursor = cursor.checked_add(byte_count).ok_or_else(|| {
@@ -55150,7 +53945,11 @@ fn metal_nullable_relation_graph_property_lane_words(
                     "Metal nullable mixed-string byte layout overflow",
                 )
             })?;
-            words[descriptor + 4] = METAL_NULLABLE_STRING_STORAGE_MIXED;
+            words[descriptor + 4] = if column.base.is_some() {
+                METAL_NULLABLE_STRING_STORAGE_MIXED_BASE
+            } else {
+                METAL_NULLABLE_STRING_STORAGE_MIXED
+            };
             words[descriptor + 5] = offsets_base as u64;
             words[descriptor + 6] = byte_base as u64;
             words[descriptor + 7] = byte_count as u64;
@@ -56411,11 +55210,17 @@ fn metal_nullable_relation_graph_layout(
         else {
             continue;
         };
-        if column.offsets.elem_count() != rows.saturating_add(1) {
+        if column.offsets.elem_count() != rows.saturating_mul(2) {
             return Err(Error::new(
                 ErrorCode::CorruptStorage,
                 "Metal nullable mixed-string offsets have a wrong row count",
             ));
+        }
+        if let Some(base) = column.base.as_deref() {
+            take(3)?;
+            if base.shape_rows().0 == 4 {
+                take(base.shape_rows().1)?;
+            }
         }
         take(column.offsets.elem_count())?;
         take(column.bytes.as_ref().map_or(0, Tensor::elem_count))?;
@@ -60033,18 +58838,12 @@ impl CustomOp1 for MetalGraphBfsChunk {
                 && (neighbors_layout.shape().elem_count() != self.adjacency_count
                     || edges_layout.shape().elem_count() != self.adjacency_count))
             || incoming_offsets_layout.shape().elem_count() != self.node_count.saturating_add(1)
-            || incoming_neighbors_layout.shape().elem_count() != self.adjacency_count
-            || incoming_edges_layout.shape().elem_count() != self.adjacency_count
+            || incoming_neighbors_layout.shape().elem_count() != self.adjacency_count.max(1)
+            || incoming_edges_layout.shape().elem_count() != self.adjacency_count.max(1)
             || outgoing_overlay_layout.shape().elem_count()
-                < self
-                    .outgoing_overlay_count
-                    .saturating_mul(2)
-                    .saturating_add(1)
+                < (1 + usize::from(self.outgoing_overlay_count != 0))
             || incoming_overlay_layout.shape().elem_count()
-                < self
-                    .incoming_overlay_count
-                    .saturating_mul(2)
-                    .saturating_add(1)
+                < (1 + usize::from(self.incoming_overlay_count != 0))
             || visible_nodes_layout.shape().elem_count() != self.node_count
             || edge_active_layout.shape().elem_count() != self.edge_count
             || edge_layers_layout.shape().elem_count() != self.edge_count
@@ -60426,10 +59225,7 @@ impl CustomOp2 for MetalGraphDijkstraUnitFinalize {
                 && (neighbors_layout.shape().elem_count() != self.adjacency_count
                     || edges_layout.shape().elem_count() != self.adjacency_count))
             || overlay_layout.shape().elem_count()
-                < self
-                    .incoming_overlay_count
-                    .saturating_mul(2)
-                    .saturating_add(1)
+                < (1 + usize::from(self.incoming_overlay_count != 0))
             || visible_layout.shape().elem_count() != self.node_count
             || edge_active_layout.shape().elem_count() != self.edge_count
             || edge_layers_layout.shape().elem_count() != self.edge_count
@@ -61170,10 +59966,7 @@ impl CustomOp1 for MetalGraphPageRankChunk {
             || neighbors_layout.shape().elem_count() != self.adjacency_count
             || edges_layout.shape().elem_count() != self.adjacency_count
             || overlay_layout.shape().elem_count()
-                < self
-                    .incoming_overlay_count
-                    .saturating_mul(2)
-                    .saturating_add(1)
+                < (1 + usize::from(self.incoming_overlay_count != 0))
             || visible_layout.shape().elem_count() != self.node_count
             || active_layout.shape().elem_count() != self.edge_count
             || layers_layout.shape().elem_count() != self.edge_count
@@ -62282,7 +61075,7 @@ impl CustomOp3 for MetalSegmentedGraphAggregationProgram {
             || self.property_value.as_ref().is_some_and(|property| {
                 property.offsets.dtype() != DType::U32
                     || property.offsets.dims().len() != 1
-                    || property.offsets.elem_count() != property.entity_rows.saturating_add(1)
+                    || property.offsets.elem_count() != property.entity_rows.saturating_mul(2)
                     || property.bytes.as_ref().is_some_and(|bytes| {
                         bytes.dtype() != DType::U8
                             || bytes.dims().len() != 1
@@ -62495,7 +61288,7 @@ impl CustomOp3 for MetalSegmentedGraphAggregationProgram {
             };
             if !offset_layout.is_contiguous()
                 || offset_layout.dims().len() != 1
-                || offset_layout.shape().elem_count() != property.entity_rows.saturating_add(1)
+                || offset_layout.shape().elem_count() != property.entity_rows.saturating_mul(2)
             {
                 return Err(candle_core::Error::Msg(
                     "PropertyValue offset tensor contract is invalid".to_owned(),
@@ -62549,7 +61342,7 @@ impl CustomOp3 for MetalSegmentedGraphAggregationProgram {
                 );
             }
             property_value_args = MetalSegmentedPropertyValueArgs {
-                offset_storage_elems: property.entity_rows.saturating_add(1) as u64,
+                offset_storage_elems: property.entity_rows.saturating_mul(2) as u64,
                 byte_storage_elems: property.byte_count as u64,
                 validity_storage_elems: property.entity_rows.max(1) as u64,
                 entity_rows: property.entity_rows as u64,
@@ -63235,6 +62028,7 @@ const METAL_NULLABLE_RELATION_FILTER_OPTIONAL_CANDIDATES: u64 = 2;
 const METAL_NULLABLE_RELATION_FILTER_OPTIONAL_GROUP: u64 = 3;
 const METAL_NULLABLE_STRING_STORAGE_DICTIONARY: u64 = 1;
 const METAL_NULLABLE_STRING_STORAGE_MIXED: u64 = 2;
+const METAL_NULLABLE_STRING_STORAGE_MIXED_BASE: u64 = 3;
 const METAL_NULLABLE_PREDICATE_NULL: u64 = 1;
 const METAL_NULLABLE_PREDICATE_BOOLEAN: u64 = 2;
 const METAL_NULLABLE_PREDICATE_INTEGER: u64 = 3;
@@ -66834,15 +65628,9 @@ impl CustomOp2 for MetalResidentVariablePath {
             || incoming_neighbors_layout.shape().elem_count()
                 != incoming_edges_layout.shape().elem_count()
             || outgoing_overlay_layout.shape().elem_count()
-                < self
-                    .outgoing_overlay_count
-                    .saturating_mul(2)
-                    .saturating_add(1)
+                < (1 + usize::from(self.outgoing_overlay_count != 0))
             || incoming_overlay_layout.shape().elem_count()
-                < self
-                    .incoming_overlay_count
-                    .saturating_mul(2)
-                    .saturating_add(1)
+                < (1 + usize::from(self.incoming_overlay_count != 0))
             || node_active_layout.shape().elem_count() != node_storage_rows
             || node_layers_layout.shape().elem_count() != node_storage_rows
             || edge_active_layout.shape().elem_count() != edge_storage_rows
@@ -67956,15 +66744,9 @@ impl CustomOp2 for MetalResidentPatternPredicate {
             || incoming_neighbors_layout.shape().elem_count()
                 != incoming_edges_layout.shape().elem_count()
             || outgoing_overlay_layout.shape().elem_count()
-                < self
-                    .outgoing_overlay_count
-                    .saturating_mul(2)
-                    .saturating_add(1)
+                < (1 + usize::from(self.outgoing_overlay_count != 0))
             || incoming_overlay_layout.shape().elem_count()
-                < self
-                    .incoming_overlay_count
-                    .saturating_mul(2)
-                    .saturating_add(1)
+                < (1 + usize::from(self.incoming_overlay_count != 0))
             || node_active_layout.shape().elem_count() != node_storage_rows
             || node_layers_layout.shape().elem_count() != node_storage_rows
             || edge_active_layout.shape().elem_count() != edge_storage_rows
@@ -72072,14 +70854,6 @@ struct MetalIntegerGroupSummaryArgs {
 }
 
 #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-struct MetalEdgeAppendArgs {
-    old_count: u64,
-    row_count: u64,
-}
-
-#[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
 #[derive(Clone, Copy, Debug)]
 struct MetalBoundedInclusiveScan {
     row_count: usize,
@@ -72711,7 +71485,6 @@ struct MetalSortPipelines {
     integer_bound: candle_metal_kernels::metal::ComputePipeline,
     integer_bound_ranges: candle_metal_kernels::metal::ComputePipeline,
     integer_group_summary: candle_metal_kernels::metal::ComputePipeline,
-    edge_append: candle_metal_kernels::metal::ComputePipeline,
     selection_local_scan: candle_metal_kernels::metal::ComputePipeline,
     selection_block_offsets: candle_metal_kernels::metal::ComputePipeline,
     selection_scatter: candle_metal_kernels::metal::ComputePipeline,
@@ -73633,7 +72406,6 @@ fn metal_sort_pipelines(
         integer_bound: pipeline("ig_integer_bound")?,
         integer_bound_ranges: pipeline("ig_integer_bound_ranges")?,
         integer_group_summary: pipeline("ig_integer_group_summary")?,
-        edge_append: pipeline("ig_edge_append")?,
         selection_local_scan: pipeline("ig_stable_selection_local_scan")?,
         selection_block_offsets: pipeline("ig_stable_selection_block_offsets")?,
         selection_scatter: pipeline("ig_stable_selection_scatter")?,
@@ -74063,6 +72835,7 @@ struct TensorUpload<'a> {
     device: &'a Device,
     tensors: Vec<Tensor>,
     allocated_bytes: usize,
+    immutable_properties: bool,
 }
 
 impl<'a> TensorUpload<'a> {
@@ -74071,12 +72844,19 @@ impl<'a> TensorUpload<'a> {
             device,
             tensors: Vec::new(),
             allocated_bytes: 0,
+            immutable_properties: false,
         }
     }
 
     fn optional<T: WithDType>(&mut self, values: &[T]) -> Result<Option<Tensor>> {
         if values.is_empty() {
             return Ok(None);
+        }
+        #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+        if self.immutable_properties && self.is_metal() {
+            return self
+                .metal_shared(values, T::DTYPE)
+                .map(|shared| shared.and_then(|(tensor, _)| tensor));
         }
         let tensor = Tensor::from_slice(values, values.len(), self.device).map_err(candle_error)?;
         self.record_tensor(tensor)
@@ -74103,12 +72883,31 @@ impl<'a> TensorUpload<'a> {
                 "shared Metal column width does not match its tensor dtype",
             ));
         }
-        let buffer = device
-            .new_buffer_builder()
-            .with_data(values)
-            .with_label("irongraph shared canonical column")
-            .build()
-            .map_err(candle_error)?;
+        let buffer = if self.immutable_properties {
+            let buffer = metal_pages::allocate(
+                device,
+                std::mem::size_of_val(values),
+                "irongraph immutable property column",
+            )?;
+            // SAFETY: this unpublished shared allocation covers the initialized source bytes.
+            #[allow(unsafe_code)]
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    values.as_ptr().cast::<u8>(),
+                    buffer.contents(),
+                    std::mem::size_of_val(values),
+                );
+            }
+            buffer
+        } else {
+            device
+                .new_buffer_builder()
+                .with_data(values)
+                .with_label("irongraph shared canonical column")
+                .build()
+                .map_err(candle_error)?
+        };
+        let allocated_bytes = buffer.length();
         let shared = shared_flat_from_metal_buffer(buffer.clone(), values.len())
             .map_err(|message| Error::new(ErrorCode::CorruptStorage, message))?;
         let storage = Storage::Metal(MetalStorage::new(
@@ -74118,10 +72917,41 @@ impl<'a> TensorUpload<'a> {
             dtype,
         ));
         let tensor = Tensor::from_storage(storage, values.len(), BackpropOp::none(), false);
-        self.allocated_bytes = self
-            .allocated_bytes
-            .saturating_add(values.len().saturating_mul(size_of::<T>()));
+        self.allocated_bytes = self.allocated_bytes.saturating_add(allocated_bytes);
         Ok(Some((Some(tensor), shared)))
+    }
+
+    #[allow(unsafe_code)]
+    fn metal_shared_csr_offsets(
+        &mut self,
+        values: &[u32],
+        capacity: usize,
+        label: &str,
+    ) -> Result<Option<(Option<Tensor>, crate::graph::SharedFlat<u32>)>> {
+        let result = self.metal_shared_reserved(values, capacity, DType::U32, label)?;
+        #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+        if let Some((Some(tensor), _)) = &result {
+            let (storage, _) = tensor.storage_and_layout();
+            let Storage::Metal(storage) = &*storage else {
+                return Err(Error::internal("CSR upload is not Metal resident"));
+            };
+            let terminal = values.last().copied().unwrap_or(0);
+            let spare_rows = (storage.buffer().length() / size_of::<u32>() - values.len())
+                .min(metal_pages::page_bytes() / size_of::<u32>());
+            // SAFETY: this allocation is new and unpublished. Only unused capacity is
+            // initialized; both views retain their original shape. Prepare one page of
+            // common append capacity without touching the unrelated reserved suffix.
+            if terminal != 0 {
+                unsafe {
+                    std::slice::from_raw_parts_mut(
+                        storage.buffer().contents().cast::<u32>().add(values.len()),
+                        spare_rows,
+                    )
+                    .fill(terminal);
+                }
+            }
+        }
+        Ok(result)
     }
 
     /// Allocates a shared column with unused tail capacity while exposing only initialized rows
@@ -74155,12 +72985,16 @@ impl<'a> TensorUpload<'a> {
                 "reserved shared Metal column capacity overflow",
             )
         })?;
-        let buffer = device
-            .new_buffer_builder()
-            .with_size(byte_capacity)
-            .with_label(label)
-            .build()
-            .map_err(candle_error)?;
+        let buffer = if self.immutable_properties {
+            metal_pages::allocate(device, byte_capacity, label)?
+        } else {
+            device
+                .new_buffer_builder()
+                .with_size(byte_capacity)
+                .with_label(label)
+                .build()
+                .map_err(candle_error)?
+        };
         // SAFETY: the shared buffer owns `byte_capacity` writable bytes, `values` is initialized,
         // non-overlapping host memory, and the checked capacity covers the copied prefix.
         unsafe {
@@ -74179,60 +73013,10 @@ impl<'a> TensorUpload<'a> {
             dtype,
         ));
         let tensor = Tensor::from_storage(storage, values.len(), BackpropOp::none(), false);
+        #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+        let byte_capacity = metal_pages::buffer_bytes(&tensor);
         self.allocated_bytes = self.allocated_bytes.saturating_add(byte_capacity);
         Ok(Some((Some(tensor), shared)))
-    }
-
-    /// Allocates a device-written shared column with geometric tail capacity while keeping both
-    /// canonical host access and the returned tensor bounded to the initialized logical prefix.
-    /// The append kernel writes only `len` rows; later generations may extend into the unreachable
-    /// tail without changing what an older pinned generation can address.
-    #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-    fn metal_shared_uninitialized_reserved<T: Send + Sync + 'static>(
-        &mut self,
-        len: usize,
-        capacity: usize,
-        dtype: DType,
-        label: &str,
-    ) -> Result<(
-        Option<Tensor>,
-        crate::graph::SharedFlat<T>,
-        Option<Arc<MetalBuffer>>,
-    )> {
-        let Device::Metal(device) = self.device else {
-            return Err(Error::internal(
-                "reserved device-generated allocation requested outside Metal",
-            ));
-        };
-        if len == 0 || capacity < len || size_of::<T>() != dtype.size_in_bytes() {
-            return Err(Error::new(
-                ErrorCode::CorruptStorage,
-                "reserved device-generated shared column shape is invalid",
-            ));
-        }
-        let byte_capacity = capacity.checked_mul(size_of::<T>()).ok_or_else(|| {
-            Error::new(
-                ErrorCode::ResultBudgetExceeded,
-                "reserved device-generated shared column capacity overflow",
-            )
-        })?;
-        let buffer = device
-            .new_buffer_builder()
-            .with_size(byte_capacity)
-            .with_label(label)
-            .build()
-            .map_err(candle_error)?;
-        let shared = shared_flat_from_metal_buffer(buffer.clone(), len)
-            .map_err(|message| Error::new(ErrorCode::CorruptStorage, message))?;
-        let storage = Storage::Metal(MetalStorage::new(
-            buffer.clone(),
-            device.clone(),
-            len,
-            dtype,
-        ));
-        let tensor = Tensor::from_storage(storage, len, BackpropOp::none(), false);
-        self.allocated_bytes = self.allocated_bytes.saturating_add(byte_capacity);
-        Ok((Some(tensor), shared, Some(buffer)))
     }
 
     #[cfg(not(all(feature = "accelerator", any(target_os = "macos", target_os = "ios"))))]
@@ -74262,6 +73046,9 @@ impl<'a> TensorUpload<'a> {
         let mut values = values.into_iter().peekable();
         if values.peek().is_none() {
             return Ok(None);
+        }
+        if self.immutable_properties && self.is_metal() {
+            return self.optional(&values.collect::<Vec<_>>());
         }
         let tensor = Tensor::from_iter(values, self.device).map_err(candle_error)?;
         self.record_tensor(tensor)
@@ -74727,6 +73514,7 @@ fn reorder_integer_temporal_column(
     Ok(())
 }
 
+#[cfg(test)]
 fn patch_shared_vector_owner_mapping(
     current: &VectorColumn,
     backing: &SharedVectorBacking,
@@ -75255,13 +74043,82 @@ fn pack_adjacency_rows(
     Ok((offsets, offset_tensor, Some(neighbors), Some(edges)))
 }
 
-fn metal_share_paged<T: Clone + Send + Sync + 'static>(
+fn metal_share_paged<T: Copy + Send + Sync + 'static>(
     upload: &mut TensorUpload<'_>,
     values: &mut crate::graph::PagedVec<T>,
     dtype: DType,
 ) -> Result<Option<Tensor>> {
-    let staged = values.iter().cloned().collect::<Vec<_>>();
-    let Some((tensor, shared)) = upload.metal_shared(&staged, dtype)? else {
+    metal_share_paged_reserved(
+        upload,
+        values,
+        values.len(),
+        dtype,
+        "irongraph shared canonical column",
+    )
+}
+
+#[allow(unsafe_code)]
+fn metal_share_paged_reserved<T: Copy + Send + Sync + 'static>(
+    upload: &mut TensorUpload<'_>,
+    values: &mut crate::graph::PagedVec<T>,
+    capacity: usize,
+    dtype: DType,
+    label: &str,
+) -> Result<Option<Tensor>> {
+    if !upload.is_metal() || values.is_empty() {
+        return Ok(None);
+    }
+    #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+    if upload.immutable_properties {
+        if capacity < values.len() || size_of::<T>() != dtype.size_in_bytes() {
+            return Err(Error::new(
+                ErrorCode::CorruptStorage,
+                "reserved shared Metal column shape is invalid",
+            ));
+        }
+        let Device::Metal(device) = upload.device else {
+            return Err(Error::internal("shared canonical column moved off Metal"));
+        };
+        let byte_capacity = capacity.checked_mul(size_of::<T>()).ok_or_else(|| {
+            Error::new(
+                ErrorCode::ResultBudgetExceeded,
+                "reserved shared Metal column capacity overflow",
+            )
+        })?;
+        let buffer = metal_pages::allocate(device, byte_capacity, label)?;
+        {
+            let destination = buffer.contents().cast::<T>();
+            for (row, value) in values.iter().enumerate() {
+                // SAFETY: the new owned shared allocation is page-aligned, has the checked
+                // capacity and element width, and cannot overlap the retained source pages.
+                // Every logical cell is initialized before exposing the immutable host view.
+                unsafe { destination.add(row).write(*value) };
+            }
+        }
+        let shared = shared_flat_from_metal_buffer(buffer.clone(), values.len())
+            .map_err(|message| Error::new(ErrorCode::CorruptStorage, message))?;
+        let tensor = Tensor::from_storage(
+            Storage::Metal(MetalStorage::new(
+                buffer,
+                device.clone(),
+                values.len(),
+                dtype,
+            )),
+            values.len(),
+            BackpropOp::none(),
+            false,
+        );
+        values
+            .rebase_shared(shared)
+            .map_err(|message| Error::new(ErrorCode::CorruptStorage, message))?;
+        upload.allocated_bytes = upload
+            .allocated_bytes
+            .saturating_add(metal_pages::buffer_bytes(&tensor));
+        return Ok(Some(tensor));
+    }
+    let staged = values.iter().copied().collect::<Vec<_>>();
+    let Some((tensor, shared)) = upload.metal_shared_reserved(&staged, capacity, dtype, label)?
+    else {
         return Ok(None);
     };
     values
@@ -75270,34 +74127,7 @@ fn metal_share_paged<T: Clone + Send + Sync + 'static>(
     Ok(tensor)
 }
 
-fn metal_share_paged_reserved<T: Copy + Send + Sync + 'static>(
-    upload: &mut TensorUpload<'_>,
-    values: &mut crate::graph::PagedVec<T>,
-    capacity: usize,
-    dtype: DType,
-    label: &str,
-) -> Result<Option<Tensor>> {
-    let staged = values.iter().copied().collect::<Vec<_>>();
-    let Some((tensor, shared)) = upload.metal_shared_reserved(&staged, capacity, dtype, label)?
-    else {
-        return metal_share_paged(upload, values, dtype);
-    };
-    values
-        .rebase_shared(shared)
-        .map_err(|message| Error::new(ErrorCode::CorruptStorage, message))?;
-    Ok(tensor)
-}
-
-#[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-fn metal_tensor_has_capacity(tensor: &Tensor, required: usize) -> bool {
-    let (storage, layout) = tensor.storage_and_layout();
-    matches!(&*storage, Storage::Metal(storage)
-        if layout.is_contiguous()
-            && layout.start_offset() == 0
-            && storage.buffer().as_ref().storageMode() == MTLStorageMode::Shared
-            && storage.buffer().length() / tensor.dtype().size_in_bytes() >= required)
-}
-
+#[cfg(test)]
 fn reserved_adjacency_empty_tail(
     old_count: usize,
     target_count: usize,
@@ -75310,81 +74140,6 @@ fn reserved_adjacency_empty_tail(
         )
     })?;
     Ok(vec![terminal; appended])
-}
-
-#[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-#[allow(unsafe_code)]
-#[track_caller]
-fn metal_extend_reserved_shared_tensor<T: Copy + Send + Sync + 'static>(
-    tensor: &Tensor,
-    old_count: usize,
-    row_count: usize,
-    appended: &[T],
-) -> Result<Option<Tensor>> {
-    let (storage, layout) = tensor.storage_and_layout();
-    let Storage::Metal(storage) = &*storage else {
-        return Err(Error::internal(
-            "reserved relationship column moved off Metal",
-        ));
-    };
-    let width = tensor.dtype().size_in_bytes();
-    if width != size_of::<T>()
-        || !layout.is_contiguous()
-        || layout.start_offset() != 0
-        || layout.shape().elem_count() != old_count
-        || old_count.checked_add(appended.len()) != Some(row_count)
-        || storage.buffer().as_ref().storageMode() != MTLStorageMode::Shared
-    {
-        let caller = std::panic::Location::caller();
-        return Err(Error::new(
-            ErrorCode::CorruptStorage,
-            format!(
-                "reserved column contract is invalid: caller={}:{} type={} dtype={:?} width={width} type_width={} contiguous={} start_offset={} tensor_count={} old_count={old_count} appended={} row_count={row_count} capacity={} shared={}",
-                caller.file(),
-                caller.line(),
-                std::any::type_name::<T>(),
-                tensor.dtype(),
-                size_of::<T>(),
-                layout.is_contiguous(),
-                layout.start_offset(),
-                layout.shape().elem_count(),
-                appended.len(),
-                storage.buffer().length() / width,
-                storage.buffer().as_ref().storageMode() == MTLStorageMode::Shared,
-            ),
-        ));
-    }
-    let capacity = storage.buffer().length() / width;
-    if row_count > capacity {
-        return Ok(None);
-    }
-    let byte_offset = old_count.checked_mul(width).ok_or_else(|| {
-        Error::new(
-            ErrorCode::ResultBudgetExceeded,
-            "reserved relationship tail offset overflow",
-        )
-    })?;
-    // SAFETY: the checked allocation capacity covers the appended tail, which lies strictly
-    // beyond the old tensor's logical shape. Existing generations cannot address these bytes.
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            appended.as_ptr().cast::<u8>(),
-            storage.buffer().contents().cast::<u8>().add(byte_offset),
-            appended.len() * width,
-        );
-    }
-    let output = Storage::Metal(MetalStorage::new(
-        Arc::new(storage.buffer().clone()),
-        storage.device().clone(),
-        row_count,
-        tensor.dtype(),
-    ));
-    Ok(Some(Tensor::from_storage(
-        output,
-        row_count,
-        BackpropOp::none(),
-        false,
-    )))
 }
 
 #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
@@ -75408,398 +74163,6 @@ fn metal_shared_tensor_prefix<T: Send + Sync + 'static>(
     }
     shared_flat_from_metal_buffer(Arc::new(storage.buffer().clone()), len)
         .map_err(|message| Error::new(ErrorCode::CorruptStorage, message))
-}
-
-#[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
-fn metal_append_shared_edge_columns(
-    upload: &mut TensorUpload<'_>,
-    backing: &mut GraphSharedBacking,
-    old_ids: Option<&Tensor>,
-    old_sources: Option<&Tensor>,
-    old_targets: Option<&Tensor>,
-    old_types: Option<&Tensor>,
-    old_layers: Option<&Tensor>,
-    old_active: Option<&Tensor>,
-    appended: &[crate::graph::EdgeDeviceDelta],
-) -> Result<(
-    Option<Tensor>,
-    Option<Tensor>,
-    Option<Tensor>,
-    Option<Tensor>,
-    Option<Tensor>,
-    Option<Tensor>,
-)> {
-    let old_count = backing.edge_ids.len().saturating_sub(appended.len());
-    let row_count = backing.edge_ids.len();
-    if appended.is_empty()
-        || appended.len() > row_count
-        || appended.iter().enumerate().any(|(offset, edge)| {
-            edge.dense as usize != old_count + offset
-                || edge.source as usize >= backing.node_ids.len()
-                || edge.target as usize >= backing.node_ids.len()
-        })
-    {
-        return Err(Error::new(
-            ErrorCode::CorruptStorage,
-            "device relationship append is not contiguous",
-        ));
-    }
-    if old_count != 0
-        && [
-            old_ids,
-            old_sources,
-            old_targets,
-            old_types,
-            old_layers,
-            old_active,
-        ]
-        .iter()
-        .any(|tensor| tensor.is_none())
-    {
-        return Err(Error::new(
-            ErrorCode::CorruptStorage,
-            "device relationship append is missing an old fixed column",
-        ));
-    }
-
-    let appended_ids = appended
-        .iter()
-        .map(|edge| edge.id.0 as i64)
-        .collect::<Vec<_>>();
-    let appended_sources = appended.iter().map(|edge| edge.source).collect::<Vec<_>>();
-    let appended_targets = appended.iter().map(|edge| edge.target).collect::<Vec<_>>();
-    let appended_types = appended
-        .iter()
-        .map(|edge| edge.relationship_type.0 as i64)
-        .collect::<Vec<_>>();
-    let appended_layers = appended
-        .iter()
-        .map(|edge| edge.layer as u8)
-        .collect::<Vec<_>>();
-    let appended_active = appended
-        .iter()
-        .map(|edge| u8::from(edge.active))
-        .collect::<Vec<_>>();
-
-    if let (
-        Some(old_ids),
-        Some(old_sources),
-        Some(old_targets),
-        Some(old_types),
-        Some(old_layers),
-        Some(old_active),
-    ) = (
-        old_ids,
-        old_sources,
-        old_targets,
-        old_types,
-        old_layers,
-        old_active,
-    ) {
-        let extended = (
-            metal_extend_reserved_shared_tensor(old_ids, old_count, row_count, &appended_ids),
-            metal_extend_reserved_shared_tensor(
-                old_sources,
-                old_count,
-                row_count,
-                &appended_sources,
-            ),
-            metal_extend_reserved_shared_tensor(
-                old_targets,
-                old_count,
-                row_count,
-                &appended_targets,
-            ),
-            metal_extend_reserved_shared_tensor(old_types, old_count, row_count, &appended_types),
-            metal_extend_reserved_shared_tensor(old_layers, old_count, row_count, &appended_layers),
-            metal_extend_reserved_shared_tensor(old_active, old_count, row_count, &appended_active),
-        );
-        if let (
-            Ok(Some(ids)),
-            Ok(Some(sources)),
-            Ok(Some(targets)),
-            Ok(Some(types)),
-            Ok(Some(layers)),
-            Ok(Some(active)),
-        ) = extended
-        {
-            return Ok((
-                Some(ids),
-                Some(sources),
-                Some(targets),
-                Some(types),
-                Some(layers),
-                Some(active),
-            ));
-        }
-    }
-    let transient_start = upload.allocated_bytes;
-    let appended_ids = upload.required(&appended_ids)?;
-    let appended_sources = upload.required(&appended_sources)?;
-    let appended_targets = upload.required(&appended_targets)?;
-    let appended_types = upload.required(&appended_types)?;
-    let appended_layers = upload.required(&appended_layers)?;
-    let appended_active = upload.required(&appended_active)?;
-    let transient_ids = [
-        appended_ids.id(),
-        appended_sources.id(),
-        appended_targets.id(),
-        appended_types.id(),
-        appended_layers.id(),
-        appended_active.id(),
-    ]
-    .into_iter()
-    .collect::<HashSet<_>>();
-    let transient_bytes = upload.allocated_bytes.saturating_sub(transient_start);
-
-    let old_ids = old_ids.unwrap_or(&appended_ids);
-    let old_sources = old_sources.unwrap_or(&appended_sources);
-    let old_targets = old_targets.unwrap_or(&appended_targets);
-    let old_types = old_types.unwrap_or(&appended_types);
-    let old_layers = old_layers.unwrap_or(&appended_layers);
-    let old_active = old_active.unwrap_or(&appended_active);
-    let (old_ids_storage, old_ids_layout) = old_ids.storage_and_layout();
-    let (old_sources_storage, old_sources_layout) = old_sources.storage_and_layout();
-    let (old_targets_storage, old_targets_layout) = old_targets.storage_and_layout();
-    let (old_types_storage, old_types_layout) = old_types.storage_and_layout();
-    let (old_layers_storage, old_layers_layout) = old_layers.storage_and_layout();
-    let (old_active_storage, old_active_layout) = old_active.storage_and_layout();
-    let (appended_ids_storage, appended_ids_layout) = appended_ids.storage_and_layout();
-    let (appended_sources_storage, appended_sources_layout) = appended_sources.storage_and_layout();
-    let (appended_targets_storage, appended_targets_layout) = appended_targets.storage_and_layout();
-    let (appended_types_storage, appended_types_layout) = appended_types.storage_and_layout();
-    let (appended_layers_storage, appended_layers_layout) = appended_layers.storage_and_layout();
-    let (appended_active_storage, appended_active_layout) = appended_active.storage_and_layout();
-    let (
-        Storage::Metal(old_ids_storage),
-        Storage::Metal(old_sources_storage),
-        Storage::Metal(old_targets_storage),
-        Storage::Metal(old_types_storage),
-        Storage::Metal(old_layers_storage),
-        Storage::Metal(old_active_storage),
-        Storage::Metal(appended_ids_storage),
-        Storage::Metal(appended_sources_storage),
-        Storage::Metal(appended_targets_storage),
-        Storage::Metal(appended_types_storage),
-        Storage::Metal(appended_layers_storage),
-        Storage::Metal(appended_active_storage),
-    ) = (
-        &*old_ids_storage,
-        &*old_sources_storage,
-        &*old_targets_storage,
-        &*old_types_storage,
-        &*old_layers_storage,
-        &*old_active_storage,
-        &*appended_ids_storage,
-        &*appended_sources_storage,
-        &*appended_targets_storage,
-        &*appended_types_storage,
-        &*appended_layers_storage,
-        &*appended_active_storage,
-    )
-    else {
-        return Err(Error::internal(
-            "device relationship append columns moved off Metal",
-        ));
-    };
-
-    let reserved_count = resident_growth_target(row_count);
-    let (output_ids, shared_ids, output_ids_buffer) = upload
-        .metal_shared_uninitialized_reserved::<crate::EdgeId>(
-            row_count,
-            reserved_count,
-            DType::I64,
-            "edge ids append",
-        )?;
-    let (output_sources, shared_sources, output_sources_buffer) = upload
-        .metal_shared_uninitialized_reserved::<u32>(
-            row_count,
-            reserved_count,
-            DType::U32,
-            "edge sources append",
-        )?;
-    let (output_targets, shared_targets, output_targets_buffer) = upload
-        .metal_shared_uninitialized_reserved::<u32>(
-            row_count,
-            reserved_count,
-            DType::U32,
-            "edge targets append",
-        )?;
-    let (output_types, shared_types, output_types_buffer) = upload
-        .metal_shared_uninitialized_reserved::<crate::types::RelationshipTypeId>(
-        row_count,
-        reserved_count,
-        DType::I64,
-        "edge types append",
-    )?;
-    let (output_layers, shared_layers, output_layers_buffer) = upload
-        .metal_shared_uninitialized_reserved::<Layer>(
-            row_count,
-            reserved_count,
-            DType::U8,
-            "edge layers append",
-        )?;
-    let (output_active, shared_active, output_active_buffer) = upload
-        .metal_shared_uninitialized_reserved::<u8>(
-            row_count,
-            reserved_count,
-            DType::U8,
-            "edge active append",
-        )?;
-    let output_buffers = [
-        output_ids_buffer.as_deref(),
-        output_sources_buffer.as_deref(),
-        output_targets_buffer.as_deref(),
-        output_types_buffer.as_deref(),
-        output_layers_buffer.as_deref(),
-        output_active_buffer.as_deref(),
-    ];
-    if output_buffers.iter().any(|buffer| buffer.is_none()) {
-        return Err(Error::internal(
-            "device relationship append output allocation is absent",
-        ));
-    }
-    let Device::Metal(device) = upload.device else {
-        return Err(Error::internal(
-            "device relationship append requested outside Metal",
-        ));
-    };
-    let pipelines = metal_sort_pipelines(device).map_err(candle_error)?;
-    {
-        let encoder = device.command_encoder().map_err(candle_error)?;
-        let encoder = encoder.as_ref();
-        encoder.set_compute_pipeline_state(&pipelines.edge_append);
-        let inputs = [
-            (old_ids_storage, &old_ids_layout, DType::I64),
-            (old_sources_storage, &old_sources_layout, DType::U32),
-            (old_targets_storage, &old_targets_layout, DType::U32),
-            (old_types_storage, &old_types_layout, DType::I64),
-            (old_layers_storage, &old_layers_layout, DType::U8),
-            (old_active_storage, &old_active_layout, DType::U8),
-            (appended_ids_storage, &appended_ids_layout, DType::I64),
-            (
-                appended_sources_storage,
-                &appended_sources_layout,
-                DType::U32,
-            ),
-            (
-                appended_targets_storage,
-                &appended_targets_layout,
-                DType::U32,
-            ),
-            (appended_types_storage, &appended_types_layout, DType::I64),
-            (appended_layers_storage, &appended_layers_layout, DType::U8),
-            (appended_active_storage, &appended_active_layout, DType::U8),
-        ];
-        for (index, (storage, layout, dtype)) in inputs.into_iter().enumerate() {
-            encoder.set_input_buffer(
-                index,
-                Some(storage.buffer()),
-                layout.start_offset() * dtype.size_in_bytes(),
-            );
-        }
-        for (offset, buffer) in output_buffers.into_iter().enumerate() {
-            encoder.set_output_buffer(12 + offset, buffer, 0);
-        }
-        encoder.set_bytes(
-            18,
-            &MetalEdgeAppendArgs {
-                old_count: old_count as u64,
-                row_count: row_count as u64,
-            },
-        );
-        encoder.dispatch_thread_groups(
-            objc2_metal::MTLSize {
-                width: row_count.div_ceil(METAL_SORT_THREADS),
-                height: 1,
-                depth: 1,
-            },
-            objc2_metal::MTLSize {
-                width: METAL_SORT_THREADS,
-                height: 1,
-                depth: 1,
-            },
-        );
-    }
-    // This branch is the O(total relationship rows) allocation fallback, not the reserved-capacity
-    // delta append above. Its newly allocated shared buffers are also the next CPU-readable
-    // canonical columns, so the command must finish before publication. Reading and comparing the
-    // full output here does not turn the incremental fast path into a full build; it protects only
-    // the fallback that already copied every unrelated row.
-    device.wait_until_completed().map_err(candle_error)?;
-    let fixed_columns_match = shared_ids
-        .as_slice()
-        .iter()
-        .copied()
-        .eq(backing.edge_ids.iter().copied())
-        && shared_sources
-            .as_slice()
-            .iter()
-            .copied()
-            .eq(backing.edge_sources.iter().copied())
-        && shared_targets
-            .as_slice()
-            .iter()
-            .copied()
-            .eq(backing.edge_targets.iter().copied())
-        && shared_types
-            .as_slice()
-            .iter()
-            .copied()
-            .eq(backing.edge_types.iter().copied())
-        && shared_layers
-            .as_slice()
-            .iter()
-            .copied()
-            .eq(backing.edge_layers.iter().copied())
-        && shared_active
-            .as_slice()
-            .iter()
-            .copied()
-            .eq(backing.edge_active.iter().copied());
-    if !fixed_columns_match {
-        return Err(Error::new(
-            ErrorCode::CorruptStorage,
-            "Metal relationship fixed-column rebuild differed from canonical host rows",
-        ));
-    }
-    upload.allocated_bytes = upload.allocated_bytes.saturating_sub(transient_bytes);
-    upload
-        .tensors
-        .retain(|tensor| !transient_ids.contains(&tensor.id()));
-    backing
-        .edge_ids
-        .rebase_shared(shared_ids)
-        .map_err(|message| Error::new(ErrorCode::CorruptStorage, message))?;
-    backing
-        .edge_sources
-        .rebase_shared(shared_sources)
-        .map_err(|message| Error::new(ErrorCode::CorruptStorage, message))?;
-    backing
-        .edge_targets
-        .rebase_shared(shared_targets)
-        .map_err(|message| Error::new(ErrorCode::CorruptStorage, message))?;
-    backing
-        .edge_types
-        .rebase_shared(shared_types)
-        .map_err(|message| Error::new(ErrorCode::CorruptStorage, message))?;
-    backing
-        .edge_layers
-        .rebase_shared(shared_layers)
-        .map_err(|message| Error::new(ErrorCode::CorruptStorage, message))?;
-    backing
-        .edge_active
-        .rebase_shared(shared_active)
-        .map_err(|message| Error::new(ErrorCode::CorruptStorage, message))?;
-    Ok((
-        output_ids,
-        output_sources,
-        output_targets,
-        output_types,
-        output_layers,
-        output_active,
-    ))
 }
 
 fn metal_shared_paged_from_slice<T: Clone + Send + Sync + 'static>(
@@ -75876,6 +74239,29 @@ fn upload_properties_selected(
     upload_dictionary: bool,
     reserve_rows: bool,
 ) -> Result<UploadedPropertyColumns> {
+    let mut property_upload = TensorUpload::new(upload.device);
+    property_upload.immutable_properties = true;
+    let result = upload_properties_selected_inner(
+        &mut property_upload,
+        columns,
+        selected,
+        upload_dictionary,
+        reserve_rows,
+    );
+    upload.allocated_bytes = upload
+        .allocated_bytes
+        .saturating_add(property_upload.allocated_bytes);
+    upload.tensors.extend(property_upload.tensors);
+    result
+}
+
+fn upload_properties_selected_inner(
+    upload: &mut TensorUpload<'_>,
+    columns: &mut PropertyColumns,
+    selected: Option<&BTreeSet<PropertyId>>,
+    upload_dictionary: bool,
+    reserve_rows: bool,
+) -> Result<UploadedPropertyColumns> {
     let row_capacity = if reserve_rows {
         resident_growth_target(columns.rows())
     } else {
@@ -75894,6 +74280,7 @@ fn upload_properties_selected(
     let mut mixed = BTreeMap::new();
     let mut lists = BTreeMap::new();
     let mut maps = BTreeMap::new();
+    let mut byte_columns = BTreeMap::new();
     let mut opaque_validity = BTreeMap::new();
     let mut unsupported = BTreeSet::new();
     let string_dictionary_offsets = columns.string_dictionary().offsets().to_vec();
@@ -75942,7 +74329,11 @@ fn upload_properties_selected(
                     "mixed property is not backed by a tagged byte column",
                 ));
             };
-            let offsets = values.offsets().to_vec();
+            let offsets = values
+                .offsets()
+                .windows(2)
+                .flat_map(|pair| pair.iter().copied())
+                .collect::<Vec<_>>();
             let bytes = values.values().to_vec();
             let maximum_string_bytes = values
                 .iter()
@@ -75960,7 +74351,7 @@ fn upload_properties_selected(
                     Some((Some(offset_tensor), shared_offsets)),
                     Some((byte_tensor, shared_bytes)),
                 ) => {
-                    values.rebase_shared(shared_offsets, shared_bytes)?;
+                    values.rebase_shared_spans(shared_offsets, shared_bytes)?;
                     (offset_tensor, byte_tensor)
                 }
                 (None, None) => (upload.required(&offsets)?, upload.optional(&bytes)?),
@@ -75977,6 +74368,9 @@ fn upload_properties_selected(
                     bytes,
                     validity,
                     maximum_string_bytes,
+                    base: None,
+                    overrides: None,
+                    allocator: variable_payload::Allocator::default(),
                 },
             );
             continue;
@@ -76096,28 +74490,46 @@ fn upload_properties_selected(
             TypedColumn::Bytes { values, .. } => {
                 unsupported.insert(property);
                 opaque_validity.insert(property, validity.clone());
-                let offsets = values.offsets().to_vec();
+                let offsets = values
+                    .offsets()
+                    .windows(2)
+                    .flat_map(|pair| pair.iter().copied())
+                    .collect::<Vec<_>>();
                 let bytes = values.values().to_vec();
-                match (
+                let maximum_bytes = offsets
+                    .chunks_exact(2)
+                    .map(|pair| pair[1].saturating_sub(pair[0]) as usize)
+                    .max()
+                    .unwrap_or(0);
+                let (offsets, bytes) = match (
                     upload.metal_shared(&offsets, DType::U32)?,
                     upload.metal_shared(&bytes, DType::U8)?,
                 ) {
                     (
-                        Some((_offset_tensor, shared_offsets)),
-                        Some((_bytes_tensor, shared_bytes)),
+                        Some((Some(offset_tensor), shared_offsets)),
+                        Some((bytes_tensor, shared_bytes)),
                     ) => {
-                        values.rebase_shared(shared_offsets, shared_bytes)?;
+                        values.rebase_shared_spans(shared_offsets, shared_bytes)?;
+                        (offset_tensor, bytes_tensor)
                     }
-                    (None, None) => {
-                        upload.required(&offsets)?;
-                        upload.optional(&bytes)?;
-                    }
+                    (None, None) => (upload.required(&offsets)?, upload.optional(&bytes)?),
                     _ => {
                         return Err(Error::internal(
                             "Metal byte-column allocation mode changed during upload",
                         ));
                     }
-                }
+                };
+                byte_columns.insert(
+                    property,
+                    DocumentColumn {
+                        offsets,
+                        bytes,
+                        validity,
+                        rows,
+                        maximum_bytes,
+                        allocator: variable_payload::Allocator::default(),
+                    },
+                );
             }
             TypedColumn::Date { values, .. } => {
                 let values = match metal_share_paged(upload, values, DType::I64)? {
@@ -76287,10 +74699,14 @@ fn upload_properties_selected(
             }
             TypedColumn::List { values, .. } | TypedColumn::Map { values, .. } => {
                 unsupported.insert(property);
-                let offsets = values.offsets().to_vec();
+                let offsets = values
+                    .offsets()
+                    .windows(2)
+                    .flat_map(|pair| pair.iter().copied())
+                    .collect::<Vec<_>>();
                 let bytes = values.values().to_vec();
                 let maximum_bytes = offsets
-                    .windows(2)
+                    .chunks_exact(2)
                     .map(|pair| pair[1].saturating_sub(pair[0]) as usize)
                     .max()
                     .unwrap_or(0);
@@ -76302,7 +74718,7 @@ fn upload_properties_selected(
                         Some((Some(offset_tensor), shared_offsets)),
                         Some((byte_tensor, shared_bytes)),
                     ) => {
-                        values.rebase_shared(shared_offsets, shared_bytes)?;
+                        values.rebase_shared_spans(shared_offsets, shared_bytes)?;
                         (offset_tensor, byte_tensor)
                     }
                     (None, None) => (upload.required(&offsets)?, upload.optional(&bytes)?),
@@ -76318,6 +74734,7 @@ fn upload_properties_selected(
                     validity,
                     rows,
                     maximum_bytes,
+                    allocator: variable_payload::Allocator::default(),
                 };
                 if document_is_list {
                     lists.insert(property, column);
@@ -76355,7 +74772,17 @@ fn upload_properties_selected(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let ranks = resident_string_dictionary_ranks(&dictionary_entries)?;
+        #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+        let order = if upload.is_metal() {
+            Some(dictionary_order::LexicalOrder::build(columns, upload)?)
+        } else {
+            None
+        };
+        let ranks = if upload.is_metal() {
+            Vec::new()
+        } else {
+            resident_string_dictionary_ranks(&dictionary_entries)?
+        };
         let (offsets, bytes) = match (
             upload.metal_shared(&offsets, DType::U32)?,
             upload.metal_shared(&bytes, DType::U8)?,
@@ -76377,6 +74804,8 @@ fn upload_properties_selected(
             offsets,
             bytes,
             ranks: upload.optional(&ranks)?,
+            #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+            order,
             maximum_bytes,
             host: None,
         })
@@ -76397,9 +74826,11 @@ fn upload_properties_selected(
         mixed,
         lists,
         maps,
+        bytes: byte_columns,
         opaque_validity,
         unsupported,
         dictionary,
+        temporal_metadata: None,
     })
 }
 
@@ -76429,6 +74860,7 @@ fn upload_shared_temporal(
 ) -> Result<(
     BTreeMap<(u8, u64, PropertyId), IntegerTemporalColumn>,
     Vec<TemporalCanonicalColumn>,
+    BTreeMap<(u8, u64, PropertyId), UploadedPropertyColumns>,
 )> {
     if image.temporal_canonical.len() != image.temporal.columns.len() {
         return Err(Error::new(
@@ -76438,6 +74870,7 @@ fn upload_shared_temporal(
     }
     let mut integer = BTreeMap::new();
     let mut shared = Vec::with_capacity(image.temporal_canonical.len());
+    let mut properties = BTreeMap::new();
     for mut canonical in image.temporal_canonical.clone() {
         let device_column = image
             .temporal
@@ -76454,37 +74887,30 @@ fn upload_shared_temporal(
                     "canonical temporal column has no device image",
                 )
             })?;
-        if canonical.len() != device_column.entity_ids.len()
-            || !canonical
-                .entity_ids
-                .iter()
-                .copied()
-                .eq(device_column.entity_ids.iter().copied())
-            || !canonical
-                .event_times_nanos
-                .iter()
-                .copied()
-                .eq(device_column.event_times_nanos.iter().copied())
-            || !canonical
-                .sequence_indexes
-                .iter()
-                .copied()
-                .eq(device_column.sequence_indexes.iter().copied())
-        {
+        if canonical.len() != device_column.entity_ids.len() {
             return Err(Error::new(
                 ErrorCode::CorruptStorage,
-                "canonical temporal order differs from its device image",
+                "canonical temporal row count differs from its device image",
             ));
         }
-        let _raw_entity_ids = metal_share_paged(upload, &mut canonical.entity_ids, DType::I64)?;
+        let raw_entity_ids = metal_share_paged(upload, &mut canonical.entity_ids, DType::I64)?;
         let event_times_nanos =
             metal_share_paged(upload, &mut canonical.event_times_nanos, DType::I64)?;
-        let _raw_sequence = metal_share_paged(upload, &mut canonical.sequence_indexes, DType::I64)?;
-        let uploaded = upload_properties(upload, &mut canonical.values, false)?;
-        let mut integers = uploaded.integer;
-        let booleans = uploaded.boolean;
+        let raw_sequence = metal_share_paged(upload, &mut canonical.sequence_indexes, DType::I64)?;
+        let mut uploaded = upload_properties(upload, &mut canonical.values, false)?;
+        uploaded.temporal_metadata = Some(TemporalMetadata {
+            entity_ids: raw_entity_ids,
+            event_times: event_times_nanos.clone(),
+            sequences: raw_sequence,
+            #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+            order: if canonical.value_type == TemporalType::Integer {
+                Some(temporal_order::TemporalOrder::build(&canonical, upload)?)
+            } else {
+                None
+            },
+        });
         if canonical.value_type == TemporalType::Integer {
-            let column = match integers.remove(&canonical.property) {
+            let column = match uploaded.integer.get(&canonical.property).cloned() {
                 Some(column) => column,
                 None => shared_null_integer_column(upload, canonical.len())?,
             };
@@ -76505,16 +74931,18 @@ fn upload_shared_temporal(
                 },
             );
         }
-        if !integers.is_empty() || !booleans.is_empty() {
-            return Err(Error::new(
-                ErrorCode::CorruptStorage,
-                "temporal canonical column contains an unrelated integer property",
-            ));
-        }
+        properties.insert(
+            (
+                canonical.entity_kind as u8,
+                canonical.target,
+                canonical.property,
+            ),
+            uploaded,
+        );
         shared.push(canonical);
     }
     upload_temporal_rollups(upload, &image.temporal.rollups)?;
-    Ok((integer, shared))
+    Ok((integer, shared, properties))
 }
 
 fn upload_temporal_rollups(
@@ -76542,6 +74970,7 @@ fn upload_temporal(
 ) -> Result<(
     BTreeMap<(u8, u64, PropertyId), IntegerTemporalColumn>,
     Vec<TemporalCanonicalColumn>,
+    BTreeMap<(u8, u64, PropertyId), UploadedPropertyColumns>,
 )> {
     if upload.is_metal() {
         return upload_shared_temporal(upload, image);
@@ -76614,7 +75043,7 @@ fn upload_temporal(
         }
     }
     upload_temporal_rollups(upload, &image.temporal.rollups)?;
-    Ok((integer, Vec::new()))
+    Ok((integer, Vec::new(), BTreeMap::new()))
 }
 
 fn upload_indexes(
@@ -76981,7 +75410,7 @@ fn upload_ann(
                 )
             })
         })
-        .collect::<Result<BTreeSet<_>>>()?;
+        .collect::<Result<derived_delta::StaleRows>>()?;
     for (position, row) in ann.rows.iter().copied().enumerate() {
         if vector.versions.get(row as usize).copied() == ann.built_versions.get(position).copied() {
             stale_row_set.remove(&row);
@@ -77044,7 +75473,7 @@ fn planned_property_bytes(
             TypedColumn::Float { values, .. } => values.len() * size_of::<i64>() * 2,
             TypedColumn::String { values, .. } => values.len() * size_of::<u32>(),
             TypedColumn::Bytes { values, .. } => {
-                (values.len() + 1) * size_of::<u32>()
+                values.len().saturating_mul(2) * size_of::<u32>()
                     + values.iter().map(|value| value.len()).sum::<usize>()
             }
             TypedColumn::Date { values, .. } => values.len() * size_of::<i64>(),
@@ -77075,7 +75504,7 @@ fn planned_property_bytes(
                     + nanos.len() * size_of::<i32>()
             }
             TypedColumn::List { values, .. } | TypedColumn::Map { values, .. } => {
-                values.offsets().len() * size_of::<u32>() + values.values().len()
+                values.rows().saturating_mul(2) * size_of::<u32>() + values.live_value_len()
             }
         });
     }
@@ -77084,8 +75513,8 @@ fn planned_property_bytes(
         bytes = bytes
             .saturating_add((dictionary.len() + 1) * size_of::<u32>())
             .saturating_add(dictionary.values().map(str::len).sum::<usize>())
-            // Exact lexicographic rank is a resident u32 lane rebuilt with the dictionary.
-            .saturating_add(dictionary.len().saturating_mul(size_of::<u32>()));
+            // A lexical tree has at most two five-word nodes per dictionary value.
+            .saturating_add(dictionary.len().saturating_mul(10 * size_of::<u32>()));
     }
     bytes
 }
@@ -77095,161 +75524,6 @@ fn metal_shared_property_bytes(columns: &PropertyColumns) -> usize {
     // property shape retains its byte-validity lane for device-side presence/keys evaluation.
     let property_ids = columns.columns().count().saturating_mul(size_of::<u64>());
     planned_property_bytes(columns, None, true).saturating_sub(property_ids)
-}
-
-fn metal_shared_selected_property_bytes(
-    columns: &PropertyColumns,
-    selected: &BTreeSet<PropertyId>,
-    include_dictionary: bool,
-) -> usize {
-    let property_ids = selected
-        .iter()
-        .filter(|property| columns.contains(**property))
-        .count()
-        .saturating_mul(size_of::<u64>());
-    planned_property_bytes(columns, Some(selected), include_dictionary).saturating_sub(property_ids)
-}
-
-fn metal_reserved_selected_node_property_spare_bytes(
-    columns: &PropertyColumns,
-    selected: &BTreeSet<PropertyId>,
-) -> usize {
-    let spare_rows = resident_growth_target(columns.rows()).saturating_sub(columns.rows());
-    selected
-        .iter()
-        .filter_map(|property| columns.physical_column(*property))
-        .map(|column| {
-            // Every node property has a reserved byte-validity lane. INTEGER and STRING also keep
-            // their fixed-width value lane reserved so contiguous appends touch only delta rows.
-            let bytes_per_spare_row = match column {
-                TypedColumn::Integer { .. } => size_of::<u8>() + size_of::<i64>(),
-                TypedColumn::String { .. } => size_of::<u8>() + size_of::<u32>(),
-                _ => size_of::<u8>(),
-            };
-            spare_rows.saturating_mul(bytes_per_spare_row)
-        })
-        .fold(0_usize, usize::saturating_add)
-}
-
-fn graph_delta_is_property_only(
-    backing: &GraphSharedBacking,
-    delta: &crate::graph::GraphDeviceDelta,
-    adjacency_changed: bool,
-) -> bool {
-    if adjacency_changed
-        || delta.node_capacity != backing.node_ids.len()
-        || delta.edge_capacity != backing.edge_ids.len()
-        || (delta.nodes.is_empty() && delta.edges.is_empty())
-    {
-        return false;
-    }
-    let nodes_are_stable = delta.nodes.iter().all(|node| {
-        let row = node.dense as usize;
-        backing.node_ids.get(row) == Some(&node.id)
-            && backing.node_layers.get(row) == Some(&node.layer)
-            && backing.node_active.get(row).copied() == Some(u8::from(node.active))
-            && backing.node_labels.get(node.dense) == Some(node.labels.as_slice())
-    });
-    let edges_are_stable = delta.edges.iter().all(|edge| {
-        let row = edge.dense as usize;
-        backing.edge_ids.get(row) == Some(&edge.id)
-            && backing.edge_sources.get(row).copied() == Some(edge.source)
-            && backing.edge_targets.get(row).copied() == Some(edge.target)
-            && backing.edge_types.get(row) == Some(&edge.relationship_type)
-            && backing.edge_layers.get(row) == Some(&edge.layer)
-            && backing.edge_active.get(row).copied() == Some(u8::from(edge.active))
-    });
-    nodes_are_stable && edges_are_stable
-}
-
-fn changed_property_ids<'a>(
-    columns: &PropertyColumns,
-    rows: impl Iterator<Item = (u32, &'a [(PropertyId, ScalarValue)])>,
-) -> BTreeSet<PropertyId> {
-    let known = columns.property_ids().collect::<Vec<_>>();
-    let mut changed = BTreeSet::new();
-    for (row, properties) in rows {
-        for property in known
-            .iter()
-            .copied()
-            .chain(properties.iter().map(|(property, _)| *property))
-        {
-            let current = columns.get(row, property);
-            let replacement = properties
-                .iter()
-                .find(|(candidate, _)| *candidate == property)
-                .map(|(_, value)| value);
-            if current.as_ref() != replacement {
-                changed.insert(property);
-            }
-        }
-    }
-    changed
-}
-
-fn shared_graph_replaced_bytes(
-    backing: &GraphSharedBacking,
-    nodes: bool,
-    edges: bool,
-    adjacency: bool,
-) -> usize {
-    let mut bytes = 0_usize;
-    if nodes {
-        let rows = backing.node_ids.len();
-        let labels = backing
-            .node_labels
-            .values()
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>()
-            .len();
-        bytes = bytes
-            .saturating_add(rows.saturating_mul(size_of::<u64>() * 3 + 2))
-            .saturating_add(
-                backing
-                    .node_labels
-                    .offsets()
-                    .len()
-                    .saturating_mul(size_of::<u32>()),
-            )
-            .saturating_add(
-                backing
-                    .node_labels
-                    .values()
-                    .len()
-                    .saturating_mul(size_of::<LabelId>()),
-            )
-            .saturating_add(labels.saturating_mul(rows))
-            .saturating_add(metal_shared_property_bytes(&backing.node_properties));
-    }
-    if edges {
-        let rows = backing.edge_ids.len();
-        bytes = bytes
-            .saturating_add(rows.saturating_mul(size_of::<u64>() * 3 + size_of::<u32>() * 2 + 2))
-            .saturating_add(metal_shared_property_bytes(&backing.edge_properties));
-    }
-    if adjacency {
-        bytes = bytes.saturating_add(
-            (backing.outgoing.offsets().len()
-                + backing.outgoing.neighbors().len()
-                + backing.outgoing.edges().len()
-                + backing.incoming.offsets().len()
-                + backing.incoming.neighbors().len()
-                + backing.incoming.edges().len())
-            .saturating_mul(size_of::<u32>()),
-        );
-    }
-    bytes
-}
-
-fn shared_vector_column_bytes(rows: usize, dimension: usize) -> usize {
-    rows.saturating_mul(
-        size_of::<u64>() * 3
-            + size_of::<u32>()
-            + size_of::<f32>()
-            + 2
-            + dimension.saturating_mul(size_of::<u16>()),
-    )
 }
 
 fn shared_temporal_column_bytes(backing: &TemporalCanonicalColumn) -> usize {
@@ -77265,6 +75539,11 @@ fn shared_temporal_column_bytes(backing: &TemporalCanonicalColumn) -> usize {
         .len()
         .saturating_mul(size_of::<u64>() * 3)
         .saturating_add(derived_order_bytes)
+        .saturating_add(
+            usize::from(integer)
+                .saturating_mul(backing.len())
+                .saturating_mul(2 * 13 * size_of::<u32>()),
+        )
         .saturating_add(null_integer_bytes)
         .saturating_add(metal_shared_property_bytes(&backing.values))
 }
@@ -78031,6 +76310,8 @@ mod tests {
             bytes: (byte_len > 0)
                 .then(|| Tensor::from_vec(bytes, byte_len, &Device::Cpu).expect("bytes tensor")),
             ranks: None,
+            #[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+            order: None,
             maximum_bytes: byte_len,
             host: None,
         }
@@ -78382,7 +76663,7 @@ mod tests {
                 value: ScalarValue::Integer(row as i64),
             })
             .collect::<Vec<_>>();
-        temporal.extend_and_sort(&additions)?;
+        temporal.append_samples(&additions)?;
         assert_eq!(temporal.len(), additions.len());
         let ordering = (0..temporal.len())
             .map(|row| {
@@ -78393,7 +76674,17 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        assert!(ordering.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(
+            ordering,
+            additions
+                .iter()
+                .map(|sample| (
+                    sample.entity_id,
+                    sample.event_time_nanos,
+                    sample.sequence_index
+                ))
+                .collect::<Vec<_>>()
+        );
         Ok(())
     }
 
@@ -80896,7 +79187,7 @@ mod tests {
             .edge_string_byte_base
             .checked_add(layout.edge_string_byte_count)
             .ok_or_else(|| Error::internal("mixed nullable test layout overflowed"))?;
-        let byte_base = mixed_base + resident.node_count + 1;
+        let byte_base = mixed_base + resident.node_count * 2;
         let byte_count = mixed.bytes.as_ref().map_or(0, Tensor::elem_count);
         assert_eq!(
             descriptors,
@@ -80928,15 +79219,15 @@ mod tests {
             .iter()
             .map(|word| *word as u64)
             .collect::<Vec<_>>();
-        assert_eq!(offsets.len(), resident.node_count + 1);
+        assert_eq!(offsets.len(), resident.node_count * 2);
         assert_eq!(offsets[0], 0);
-        assert_eq!(offsets[resident.node_count], byte_count as u64);
+        assert_eq!(offsets[resident.node_count * 2 - 1], byte_count as u64);
         assert_eq!(
             words[byte_base] as u64,
             u64::from(crate::graph::MIXED_STRING_TAG)
         );
         assert_ne!(
-            words[byte_base + offsets[1] as usize] as u64,
+            words[byte_base + offsets[2] as usize] as u64,
             u64::from(crate::graph::MIXED_STRING_TAG)
         );
         Ok(())
@@ -81963,6 +80254,57 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(all(feature = "accelerator", target_os = "macos"))]
+    #[test]
+    fn cold_paged_upload_preserves_sparse_defaults_pins_and_native_values() -> crate::Result<()> {
+        use super::{TensorUpload, candle_error, metal_pages, metal_share_paged_reserved};
+
+        let _guard = crate::metal_test_guard();
+        let device = Device::new_metal(0).map_err(candle_error)?;
+        let len = 8_000_017;
+        let mut values = PagedVec::repeat(23_i64, len);
+        for (row, value) in [(0, -11), (2049, i64::MAX), (len - 1, 44)] {
+            values.replace(row, value).map_err(Error::internal)?;
+        }
+        let pinned = values.clone();
+        let mut upload = TensorUpload::new(&device);
+        upload.immutable_properties = true;
+        assert!(
+            metal_share_paged_reserved(&mut upload, &mut values, len - 1, DType::I64, "invalid")
+                .is_err()
+        );
+        assert!(
+            metal_share_paged_reserved(&mut upload, &mut values, len, DType::U8, "invalid")
+                .is_err()
+        );
+        assert_eq!(upload.allocated_bytes, 0);
+        let tensor = metal_share_paged_reserved(
+            &mut upload,
+            &mut values,
+            len,
+            DType::I64,
+            "cold paged fixture",
+        )?
+        .ok_or_else(|| Error::internal("missing cold paged fixture"))?;
+        let selected = Tensor::from_slice(&[0_u32, 2048, 2049, (len - 1) as u32], 4, &device)
+            .map_err(candle_error)?;
+        let gather = || {
+            tensor
+                .index_select(&selected, 0)
+                .and_then(|result| result.to_vec1::<i64>())
+                .map_err(candle_error)
+        };
+        assert_eq!(gather()?, [-11, 23, i64::MAX, 44]);
+        assert_eq!(upload.allocated_bytes, metal_pages::buffer_bytes(&tensor));
+        assert_eq!(values.allocated_value_bytes(), len * size_of::<i64>());
+        assert!(pinned.allocated_value_bytes() <= 3 * 16 * 1024);
+        values.replace(0, 55).map_err(Error::internal)?;
+        assert_eq!(pinned.get(0), Some(&-11));
+        assert_eq!(values.get(0), Some(&55));
+        assert_eq!(gather()?, [-11, 23, i64::MAX, 44]);
+        Ok(())
+    }
+
     #[test]
     fn date_property_planning_uses_i64_payload_width() -> crate::Result<()> {
         const ROWS: usize = 3;
@@ -82019,7 +80361,7 @@ mod tests {
             subspace_centroid_offsets: vec![0, 3],
             codebook_vector_offsets: vec![0, 1, 2, 3],
             stale_row_ids: None,
-            stale_row_set: BTreeSet::new(),
+            stale_row_set: super::derived_delta::StaleRows::new(),
             build_generation: [1_u8; 32],
         })
     }
@@ -82792,6 +81134,129 @@ mod tests {
             &cancellation,
         )?;
         assert_eq!(count[0].value, Some(ScalarValue::Integer(4)));
+        Ok(())
+    }
+
+    #[cfg(all(feature = "accelerator", target_os = "macos"))]
+    #[test]
+    fn metal_masked_global_aggregates_keep_nulls_layers_and_dirty_owners() -> crate::Result<()> {
+        let _guard = metal_sort_test_guard();
+        let Some(device) = crate::metal_test_device() else {
+            return Ok(());
+        };
+        let mut graph = GraphStore::default();
+        let wanted = graph.catalog_mut().intern_label("Wanted")?;
+        let other = graph.catalog_mut().intern_label("Other")?;
+        let value = graph.catalog_mut().intern_property("amount")?;
+        let body = graph.catalog_mut().intern_property("body")?;
+        for row in 0..257_u64 {
+            let mut properties = Vec::new();
+            if row % 3 != 0 {
+                properties.push((value, ScalarValue::Integer(row as i64 - 128)));
+            }
+            if row == 0 {
+                properties.push((body, ScalarValue::String(Arc::from("x".repeat(256 * 1024)))));
+            }
+            graph.insert_node(NodeInput {
+                id: NodeId(row + 1),
+                layer: if row % 7 == 0 {
+                    Layer::Knowledge
+                } else {
+                    Layer::Observed
+                },
+                revision: 1,
+                labels: vec![if row % 2 == 0 { wanted } else { other }],
+                properties,
+            })?;
+        }
+        graph.delete_node(NodeId(15), false, 2)?;
+        let resident = CandleResident::upload(
+            ResidentProjectImage::graph_only(Arc::new(graph.snapshot()?)),
+            &device,
+        )?;
+        let mut request = super::ResidentNodeGroupPipelineRequest {
+            input: ResidentNodePipelineRequest {
+                project: resident.project,
+                labels: vec![wanted],
+                layers: LayerMask::ALL,
+                initial_optional: false,
+                expansion: None,
+                continuations: Vec::new(),
+                correlated_optional: None,
+                relationship_null_filter: None,
+                predicates: Vec::new(),
+                property_filters: Vec::new(),
+                value_matrix: None,
+                mutation: None,
+                orders: Vec::new(),
+                offset: 0,
+                limit: usize::MAX,
+                integer_projections: Vec::new(),
+                property_null_projections: Vec::new(),
+                max_output_rows: usize::MAX,
+            },
+            key: None,
+            value: Some(crate::ResidentI64Projection {
+                binding: crate::ResidentNodeBinding::Start,
+                property: value,
+            }),
+            aggregate: crate::ResidentAggregate::Sum,
+            distinct_relationship: false,
+            max_groups: 1,
+        };
+        let cancellation = CancellationToken::new();
+        for labels in [vec![wanted], vec![wanted, other], Vec::new()] {
+            request.input.labels = labels;
+            for layers in [LayerMask::ALL, LayerMask::OBSERVED, LayerMask::KNOWLEDGE] {
+                request.input.layers = layers;
+                for aggregate in [
+                    crate::ResidentAggregate::CountAll,
+                    crate::ResidentAggregate::CountValue,
+                    crate::ResidentAggregate::Sum,
+                    crate::ResidentAggregate::Average,
+                    crate::ResidentAggregate::Minimum,
+                    crate::ResidentAggregate::Maximum,
+                ] {
+                    request.aggregate = aggregate;
+                    let rows = resident.select_node_pipeline_rows(
+                        &device,
+                        &request.input,
+                        &cancellation,
+                    )?;
+                    let expected = resident.reduce_node_group_pipeline_rows(
+                        &device,
+                        &rows,
+                        &request,
+                        &cancellation,
+                    )?;
+                    let actual = resident
+                        .try_reduce_simple_node_aggregate(&device, &request, &cancellation)?
+                        .expect("plain global aggregates must not compact their input rows");
+                    assert_eq!(
+                        actual, expected,
+                        "labels/layers/nulls differ for {request:?}"
+                    );
+                }
+            }
+        }
+        request.input.offset = 1;
+        assert!(
+            resident
+                .try_reduce_simple_node_aggregate(&device, &request, &cancellation)?
+                .is_none()
+        );
+        request.input.offset = 0;
+        request.max_groups = 0;
+        let error = resident
+            .execute_node_group_pipeline(&device, &request, &cancellation)
+            .expect_err("even a global aggregate needs one admitted output group");
+        assert_eq!(error.code, ErrorCode::ResultBudgetExceeded);
+        request.max_groups = 1;
+        cancellation.cancel();
+        let error = resident
+            .try_reduce_simple_node_aggregate(&device, &request, &cancellation)
+            .expect_err("cancelled aggregate must not execute");
+        assert_eq!(error.code, ErrorCode::Cancelled);
         Ok(())
     }
 
@@ -83768,14 +82233,14 @@ mod tests {
         }));
         assert_eq!(
             patched.allocated_bytes,
-            appended.allocated_bytes + 66,
-            "one relationship must reuse fixed-column capacity and add only its remaining data cells plus two compact overlay rows"
+            appended.allocated_bytes + 2 * super::metal_pages::page_bytes(),
+            "one relationship reuses fixed-column capacity and adds one native page per overlay"
         );
         assert_eq!(patched.outgoing_overlay.rows.len(), 1);
         assert_eq!(patched.incoming_overlay.rows.len(), 1);
         assert_eq!(
             patched.outgoing_overlay.tensor_bytes() + patched.incoming_overlay.tensor_bytes(),
-            48
+            2 * super::metal_pages::page_bytes()
         );
         assert_eq!(
             before_topology,
@@ -83974,7 +82439,7 @@ mod tests {
 
     #[cfg(all(feature = "accelerator", target_os = "macos"))]
     #[test]
-    fn metal_sparse_graph_delta_shape_node_append_reuses_reserved_columns_and_preserves_pinned_generation()
+    fn metal_sparse_graph_delta_shape_node_append_copies_only_tail_pages_and_preserves_pinned_generation()
     -> crate::Result<()> {
         let _guard = metal_sort_test_guard();
         let mut graph = GraphStore::default();
@@ -84067,8 +82532,26 @@ mod tests {
         };
         assert_eq!(delta.graph.nodes.len(), 256);
         assert!(resident.delta_publish_is_host_complete(&delta));
+        let capture = super::metal_pages::Capture::begin()?;
         let appended = resident.stage_delta(&delta, &device)?;
-        assert_eq!(addresses(&appended)?, resident_addresses);
+        let written = capture.finish()?;
+        let appended_addresses = addresses(&appended)?;
+        assert_ne!(appended_addresses[0], resident_addresses[0]);
+        assert_eq!(
+            &appended_addresses[5..7],
+            &resident_addresses[5..7],
+            "unchanged packed label lanes stay shared"
+        );
+        assert!(written.native_retired_bytes() <= 12 * super::metal_pages::page_bytes());
+        assert_eq!(
+            resident
+                .node_entity_ids
+                .as_ref()
+                .expect("pinned IDs")
+                .to_vec1::<i64>()
+                .map_err(super::candle_error)?,
+            (1_i64..=4097).collect::<Vec<_>>()
+        );
         assert_eq!(appended.allocated_bytes, logical_bytes);
         assert_eq!(resident.node_count, 4_097);
         assert_eq!(resident.node_id_rows.len(), 4_097);
@@ -84107,11 +82590,12 @@ mod tests {
 
     #[cfg(all(feature = "accelerator", target_os = "macos"))]
     #[test]
-    fn metal_node_tail_grows_geometrically_at_capacity_boundary() -> crate::Result<()> {
+    fn metal_node_tail_crosses_native_page_boundary_without_copying_prefix() -> crate::Result<()> {
         let _guard = metal_sort_test_guard();
+        let page_rows = super::metal_pages::page_bytes() / size_of::<i64>();
         let mut graph = GraphStore::default();
         let label = graph.catalog_mut().intern_label("Vertex")?;
-        for id in 1_u64..=63 {
+        for id in 1_u64..page_rows as u64 {
             graph.insert_node(NodeInput {
                 id: NodeId(id),
                 layer: Layer::Observed,
@@ -84161,38 +82645,57 @@ mod tests {
                 invalidate_derived: false,
             })
         };
-        let fill_delta = append(&mut graph, 64, 2)?;
+        let fill_delta = append(&mut graph, page_rows as u64, 2)?;
         assert!(resident.delta_publish_is_host_complete(&fill_delta));
         let filled = resident.stage_delta(&fill_delta, &device)?;
-        assert_eq!(node_buffer(&filled)?.1, 64);
+        assert_eq!(node_buffer(&filled)?.1, page_rows);
 
-        let boundary_delta = append(&mut graph, 65, 3)?;
-        assert!(!filled.delta_publish_is_host_complete(&boundary_delta));
+        let boundary_delta = append(&mut graph, page_rows as u64 + 1, 3)?;
+        assert!(filled.delta_publish_is_host_complete(&boundary_delta));
+        let capture = super::metal_pages::Capture::begin()?;
         let grown = filled.stage_delta(&boundary_delta, &device)?;
+        assert!(capture.finish()?.native_retired_bytes() <= 8 * super::metal_pages::page_bytes());
+        assert_eq!(
+            filled
+                .node_entity_ids
+                .as_ref()
+                .expect("pinned IDs")
+                .to_vec1::<i64>()
+                .map_err(super::candle_error)?,
+            (1..=page_rows as i64).collect::<Vec<_>>()
+        );
         device.synchronize().map_err(super::candle_error)?;
         let grown_buffer = node_buffer(&grown)?;
-        assert_eq!(grown_buffer.1, 128);
+        assert_eq!(grown_buffer.1, 2 * page_rows);
 
-        let post_boundary_delta = append(&mut graph, 66, 4)?;
+        let post_boundary_delta = append(&mut graph, page_rows as u64 + 2, 4)?;
         assert!(grown.delta_publish_is_host_complete(&post_boundary_delta));
         let extended = grown.stage_delta(&post_boundary_delta, &device)?;
-        assert_eq!(node_buffer(&extended)?, grown_buffer);
-        assert_eq!(grown.node_count, 65);
-        assert_eq!(extended.node_count, 66);
-        assert_eq!(super::stable_id_row(&grown.node_id_rows, 66), None);
-        assert_eq!(super::stable_id_row(&extended.node_id_rows, 66), Some(&65));
+        assert_eq!(node_buffer(&extended)?.1, grown_buffer.1);
+        assert_ne!(node_buffer(&extended)?.0, grown_buffer.0);
+        assert_eq!(grown.node_count, page_rows + 1);
+        assert_eq!(extended.node_count, page_rows + 2);
+        assert_eq!(
+            super::stable_id_row(&grown.node_id_rows, page_rows as u64 + 2),
+            None
+        );
+        assert_eq!(
+            super::stable_id_row(&extended.node_id_rows, page_rows as u64 + 2),
+            Some(&((page_rows + 1) as u32))
+        );
         Ok(())
     }
 
     #[cfg(all(feature = "accelerator", target_os = "macos"))]
     #[test]
-    fn metal_edge_tail_grows_geometrically_across_empty_and_capacity_boundaries()
+    fn metal_edge_tail_crosses_native_page_boundary_and_preserves_pinned_topology()
     -> crate::Result<()> {
         let _guard = metal_sort_test_guard();
+        let page_rows = super::metal_pages::page_bytes() / size_of::<i64>();
         let mut graph = GraphStore::default();
         let label = graph.catalog_mut().intern_label("Vertex")?;
         let relationship = graph.catalog_mut().intern_relationship_type("LINK")?;
-        for id in 1_u64..=67 {
+        for id in 1_u64..=page_rows as u64 + 3 {
             graph.insert_node(NodeInput {
                 id: NodeId(id),
                 layer: Layer::Observed,
@@ -84255,16 +82758,16 @@ mod tests {
             properties: Vec::new(),
         })?;
         let first_delta = make_delta(&graph, 2)?;
-        assert!(!resident.delta_publish_is_host_complete(&first_delta));
+        assert!(resident.delta_publish_is_host_complete(&first_delta));
         let first = resident.stage_delta(&first_delta, &device)?;
         device.synchronize().map_err(super::candle_error)?;
         assert_eq!(
             first.edge_entity_ids.as_ref().map(Tensor::elem_count),
             Some(1)
         );
-        assert_eq!(edge_capacity(&first)?, 64);
+        assert_eq!(edge_capacity(&first)?, page_rows);
 
-        for edge in 2_u64..=64 {
+        for edge in 2_u64..=page_rows as u64 {
             graph.insert_edge(EdgeInput {
                 id: EdgeId(edge),
                 source: NodeId(1),
@@ -84280,9 +82783,9 @@ mod tests {
         let filled = first.stage_delta(&fill_delta, &device)?;
         assert_eq!(
             filled.edge_entity_ids.as_ref().map(Tensor::elem_count),
-            Some(64)
+            Some(page_rows)
         );
-        assert_eq!(edge_capacity(&filled)?, 64);
+        assert_eq!(edge_capacity(&filled)?, page_rows);
         assert_eq!(
             first.expand_out(&device, &[0], &CancellationToken::new())?,
             vec![(0, 1, 0)],
@@ -84290,29 +82793,29 @@ mod tests {
         );
 
         graph.insert_edge(EdgeInput {
-            id: EdgeId(65),
+            id: EdgeId(page_rows as u64 + 1),
             source: NodeId(1),
-            target: NodeId(66),
+            target: NodeId(page_rows as u64 + 2),
             relationship_type: relationship,
             layer: Layer::Observed,
             revision: 4,
             properties: Vec::new(),
         })?;
         let boundary_delta = make_delta(&graph, 4)?;
-        assert!(!filled.delta_publish_is_host_complete(&boundary_delta));
+        assert!(filled.delta_publish_is_host_complete(&boundary_delta));
         let grown = filled.stage_delta(&boundary_delta, &device)?;
         device.synchronize().map_err(super::candle_error)?;
         assert_eq!(
             grown.edge_entity_ids.as_ref().map(Tensor::elem_count),
-            Some(65)
+            Some(page_rows + 1)
         );
-        assert_eq!(edge_capacity(&grown)?, 128);
+        assert_eq!(edge_capacity(&grown)?, 2 * page_rows);
         let grown_buffer_address = edge_buffer_address(&grown)?;
 
         graph.insert_edge(EdgeInput {
-            id: EdgeId(66),
+            id: EdgeId(page_rows as u64 + 2),
             source: NodeId(1),
-            target: NodeId(67),
+            target: NodeId(page_rows as u64 + 3),
             relationship_type: relationship,
             layer: Layer::Observed,
             revision: 5,
@@ -84323,26 +82826,26 @@ mod tests {
         let extended = grown.stage_delta(&post_boundary_delta, &device)?;
         assert_eq!(
             extended.edge_entity_ids.as_ref().map(Tensor::elem_count),
-            Some(66)
+            Some(page_rows + 2)
         );
-        assert_eq!(edge_capacity(&extended)?, 128);
-        assert_eq!(
+        assert_eq!(edge_capacity(&extended)?, 2 * page_rows);
+        assert_ne!(
             edge_buffer_address(&extended)?,
             grown_buffer_address,
-            "the append after a boundary growth must reuse the newly reserved allocation"
+            "a changed tail must publish its own mapping while the prefix stays shared"
         );
         assert_eq!(
             grown
                 .expand_out(&device, &[0], &CancellationToken::new())?
                 .len(),
-            65,
+            page_rows + 1,
             "the pinned boundary generation must not observe the following tail append"
         );
         assert_eq!(
             extended
                 .expand_out(&device, &[0], &CancellationToken::new())?
                 .len(),
-            66
+            page_rows + 2
         );
         Ok(())
     }

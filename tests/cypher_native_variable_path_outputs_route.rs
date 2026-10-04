@@ -1881,6 +1881,54 @@ fn strict_cpu_publishes_match9_last_relationship_from_one_receipted_path_call() 
 }
 
 #[test]
+fn grouped_path_gpu_route_requires_current_generation_and_honest_receipt() -> Result<()> {
+    let fixture = with7_grouped_intermediate_fixture()?;
+    for (query, stale, expected_calls) in [
+        (WITH7_GROUPED_INTERMEDIATE_QUERY, false, 1),
+        (WITH7_GROUPED_INTERMEDIATE_QUERY, true, 0),
+        ("MATCH (n) WITH count(*) AS c RETURN count(c)", false, 0),
+    ] {
+        let backend = ObservedBackend::reporting(cpu_backend(&fixture)?, BackendKind::Metal);
+        let observations = backend.observations();
+        let mut context = context(&fixture, Some(&backend), true);
+        if stale {
+            context.bookmark.index += 1;
+        }
+        let mut emitted = Vec::<ExecutionStreamItem>::new();
+        let error = QueryEngine
+            .execute_streaming(query, &mut context, &mut |item| {
+                emitted.push(item);
+                Ok(())
+            })
+            .expect_err("CPU receipt, stale generation, and unsupported programs must not publish");
+        assert!(
+            matches!(
+                error.code,
+                ErrorCode::GpuAdmissionFailure | ErrorCode::CorruptStorage
+            ),
+            "unexpected admission failure: {error}"
+        );
+        assert!(
+            emitted.is_empty(),
+            "rejected execution emitted partial results"
+        );
+        assert_eq!(
+            observations.variable_paths.load(Ordering::SeqCst),
+            expected_calls
+        );
+        assert_eq!(observations.scans.load(Ordering::SeqCst), 0);
+        assert_eq!(observations.adjacency.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            observations
+                .unreceipted_node_pipelines
+                .load(Ordering::SeqCst),
+            0
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn cpu_completion_cannot_masquerade_as_metal_relationship_list_publication() -> Result<()> {
     let scenario = SCENARIOS[0];
     let fixture = fixture(scenario)?;

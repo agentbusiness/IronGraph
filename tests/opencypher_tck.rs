@@ -490,6 +490,10 @@ impl FixtureProcedureType {
         }
     }
 
+    #[cfg_attr(
+        not(all(feature = "accelerator", target_os = "macos")),
+        allow(dead_code)
+    )]
     const fn procedure_type(self) -> ProcedureValueType {
         match self {
             Self::Boolean => ProcedureValueType::Boolean,
@@ -501,6 +505,10 @@ impl FixtureProcedureType {
     }
 }
 
+#[cfg_attr(
+    not(all(feature = "accelerator", target_os = "macos")),
+    allow(dead_code)
+)]
 fn fixture_procedure_catalog(case: &TckCase) -> irongraph::Result<ProcedureCatalog> {
     let mut catalog = ProcedureCatalog::default();
     for fixture in &case.procedures {
@@ -553,6 +561,10 @@ struct FixtureProcedure {
 }
 
 impl FixtureProcedure {
+    #[cfg_attr(
+        not(all(feature = "accelerator", target_os = "macos")),
+        allow(dead_code)
+    )]
     fn describe(&self) -> String {
         let fields = |fields: &[FixtureProcedureField]| {
             fields
@@ -1075,6 +1087,10 @@ enum TckValue {
 }
 
 impl TckValue {
+    #[cfg_attr(
+        not(all(feature = "accelerator", target_os = "macos")),
+        allow(dead_code)
+    )]
     fn into_parameter(self) -> irongraph::Result<ResultValue> {
         match self {
             Self::Null => Ok(ResultValue::Scalar(ScalarValue::Null)),
@@ -2071,6 +2087,10 @@ fn tck_context<'a>(
     }
 }
 
+#[cfg_attr(
+    not(all(feature = "accelerator", target_os = "macos")),
+    allow(dead_code)
+)]
 fn parameter_values(case: &TckCase) -> irongraph::Result<BTreeMap<String, ResultValue>> {
     case.parameters
         .iter()
@@ -2096,6 +2116,10 @@ fn execute_setup_query(graph: &mut GraphStore, query: &str) -> irongraph::Result
     apply_mutations(graph, &output.graph_mutations)
 }
 
+#[cfg_attr(
+    not(all(feature = "accelerator", target_os = "macos")),
+    allow(dead_code)
+)]
 fn setup_graph(root: &Path, case: &TckCase) -> irongraph::Result<GraphStore> {
     let mut graph = GraphStore::default();
     if let GraphFixture::Named(name) = &case.fixture {
@@ -2210,6 +2234,10 @@ fn rows(result: &QueryResult) -> irongraph::Result<Vec<Vec<ResultValue>>> {
     Ok(rows)
 }
 
+#[cfg_attr(
+    not(all(feature = "accelerator", target_os = "macos")),
+    allow(dead_code)
+)]
 fn row_matches(expected: &[TckValue], actual: &[ResultValue], ignore_list_order: bool) -> bool {
     expected.len() == actual.len()
         && expected
@@ -2218,6 +2246,10 @@ fn row_matches(expected: &[TckValue], actual: &[ResultValue], ignore_list_order:
             .all(|(expected, actual)| expected.matches_actual(actual, ignore_list_order))
 }
 
+#[cfg_attr(
+    not(all(feature = "accelerator", target_os = "macos")),
+    allow(dead_code)
+)]
 fn result_matches(
     expectation: &ResultExpectation,
     outcome: &ObservedOutcome,
@@ -2351,6 +2383,10 @@ fn result_matches(
     }
 }
 
+#[cfg_attr(
+    not(all(feature = "accelerator", target_os = "macos")),
+    allow(dead_code)
+)]
 fn side_effects_match(
     expected: &Option<SideEffects>,
     outcome: &ObservedOutcome,
@@ -2371,6 +2407,10 @@ fn side_effects_match(
     }
 }
 
+#[cfg_attr(
+    not(all(feature = "accelerator", target_os = "macos")),
+    allow(dead_code)
+)]
 fn compare_cpu_and_gpu(cpu: &ObservedOutcome, gpu: &ObservedOutcome) -> irongraph::Result<()> {
     if cpu == gpu {
         Ok(())

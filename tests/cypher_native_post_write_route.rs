@@ -1094,17 +1094,52 @@ fn assert_native_request(
             "whole-statement request omitted the project or mutation program: {request:#?}"
         ));
     }
-    let (offset, limit) = match case.shape {
-        PostWriteShape::LimitZero => (0, 0),
-        PostWriteShape::SkipAll => (1, MAX_RESULT_ROWS + 1),
-        PostWriteShape::PageTwo => (2, 2),
-        PostWriteShape::PageAll => (0, 5),
-        _ => return Ok(()),
+    use irongraph::gpu::ResidentMutationPostStage as Stage;
+    let continuation = request
+        .mutation
+        .as_ref()
+        .and_then(|program| program.continuation.as_ref())
+        .ok_or_else(|| "post-write request omitted the complete continuation".to_owned())?;
+    if continuation.fingerprint
+        != request
+            .mutation_pipeline_fingerprint()
+            .map_err(|error| error.message)?
+        || continuation.stage_obligations.len() != continuation.stages.len()
+    {
+        return Err("post-write ordered stages are not fingerprinted and receipted".to_owned());
+    }
+    let exact = match (case.shape, continuation.stages.as_slice()) {
+        (PostWriteShape::LimitZero, [Stage::Project { .. }, Stage::Limit { rows: 0 }])
+        | (PostWriteShape::SkipAll, [Stage::Project { .. }, Stage::Skip { rows: 1 }])
+        | (
+            PostWriteShape::PageTwo,
+            [
+                Stage::Project { .. },
+                Stage::Skip { rows: 2 },
+                Stage::Limit { rows: 2 },
+            ],
+        )
+        | (
+            PostWriteShape::PageAll,
+            [
+                Stage::Project { .. },
+                Stage::Skip { rows: 0 },
+                Stage::Limit { rows: 5 },
+            ],
+        ) => true,
+        (
+            PostWriteShape::LimitZero
+            | PostWriteShape::SkipAll
+            | PostWriteShape::PageTwo
+            | PostWriteShape::PageAll,
+            _,
+        ) => false,
+        _ => true,
     };
-    if request.offset != offset || request.limit != limit {
+    if !exact || request.offset != 0 || request.limit != usize::MAX {
         return Err(format!(
-            "post-write pagination escaped the native request: expected offset/limit {offset}/{limit}, got {}/{}",
-            request.offset, request.limit
+            "post-write pagination must execute in exact ordered continuation stages after mutation: {:?}; prefix offset/limit={}/{}",
+            continuation.stages, request.offset, request.limit
         ));
     }
     Ok(())

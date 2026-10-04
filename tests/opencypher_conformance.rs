@@ -113,6 +113,10 @@ fn context<'a>(graph: &'a GraphStore, backend: &'a dyn ExecutionBackend) -> Exec
     }
 }
 
+#[cfg_attr(
+    not(all(feature = "accelerator", target_os = "macos")),
+    allow(dead_code)
+)]
 fn run_suite(
     graph: &GraphStore,
     backend: &dyn ExecutionBackend,

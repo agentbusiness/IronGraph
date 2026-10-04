@@ -81,9 +81,8 @@ fn retention_from_days(days: Option<u32>) -> Result<RetentionPolicy> {
 const MAX_OPEN_TRANSACTIONS_PER_CONNECTION: usize = 16;
 const TRANSACTION_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(50);
 const MIN_TRANSACTION_ACCOUNTED_BYTES: usize = 256;
-const OPTIMIZER_STATISTICS_MAX_REVISION_LAG: u64 = 256;
-/// Below this many canonical rows, a lazy full statistics pass is cheaper than maintenance wakeup.
-/// At and above it, the periodic `spawn_blocking` warmer owns the rebuild so request workers do not.
+/// Cold projects above this size may collect empirical cost samples in a background warmup.
+/// Ordinary writes maintain current counts and never queue a periodic full collection.
 const OPTIMIZER_STATISTICS_BACKGROUND_ROWS: usize = 100_000;
 const BROKER_RECLAIM_BATCH_SEGMENTS: usize = 256;
 const QUERY_STREAM_BATCH_ROWS: usize = 4_096;
@@ -731,6 +730,9 @@ pub(super) struct PersistedTemporalMutation {
 
 pub(super) struct DatabaseInner {
     pub(super) state: RwLock<DatabaseState>,
+    // Weak fences for older host generations held by snapshots or background readers.
+    // They own no graph bytes; dead fences are removed on the next project publication.
+    retired_project_views: Mutex<BTreeMap<ProjectId, Vec<Weak<ProjectState>>>>,
     // Serializes local sequencer writes while the mutation is applied.
     pub(super) apply: Mutex<()>,
     pub(super) admission: AdmissionController,
@@ -800,6 +802,7 @@ impl Database {
         let (broker_changes, _) = tokio::sync::watch::channel(0);
         Ok(Self(Arc::new(DatabaseInner {
             state: RwLock::new(DatabaseState::default()),
+            retired_project_views: Mutex::new(BTreeMap::new()),
             apply: Mutex::new(()),
             admission,
             transactions,
@@ -876,6 +879,7 @@ impl Database {
     }
 
     pub fn bind_execution_backend(&self, mut backend: Box<dyn ExecutionBackend>) -> Result<()> {
+        let mut current = self.0.execution.write();
         let mut state = self.0.state.write();
         let cancellation = tokio_util::sync::CancellationToken::new();
         for project in state.projects.values_mut() {
@@ -921,7 +925,6 @@ impl Database {
         self.0
             .transactions
             .set_device_limit(transaction_device_limit)?;
-        let mut current = self.0.execution.write();
         if current.is_some() {
             return Err(Error::invalid_data(
                 "database execution backend is already bound",
@@ -1367,7 +1370,6 @@ impl Database {
                 && project
                     .indexes
                     .contains(crate::graph::SEMANTIC_RELATIONSHIP_INDEX)
-                && !project.indexes.semantic_rebuild_needed()
             {
                 return Ok(());
             }
@@ -1387,18 +1389,14 @@ impl Database {
             && snapshot
                 .indexes
                 .contains(crate::graph::SEMANTIC_RELATIONSHIP_INDEX);
-        if initialized && !snapshot.indexes.semantic_rebuild_needed() {
+        if initialized {
             return Ok(());
         }
-        let vectors = if initialized {
-            Vec::new()
-        } else {
-            resolve_semantic_texts(
-                crate::graph::semantic_texts(&snapshot.graph)?,
-                embedding.as_ref(),
-                bookmark.index,
-            )?
-        };
+        let vectors = resolve_semantic_texts(
+            crate::graph::semantic_texts(&snapshot.graph)?,
+            embedding.as_ref(),
+            bookmark.index,
+        )?;
         self.commit_scoped_from(
             DatabaseMutation::Graph {
                 project,
@@ -1735,9 +1733,10 @@ impl Database {
         Bookmark,
         Option<Box<dyn ExecutionBackend>>,
     )> {
-        // Apply holds the state write lock through resident publication. Taking these locks in
-        // the same order therefore captures one exact host/device generation without blocking
+        // Acquire resident access before state, matching publication. This captures one exact
+        // host/device generation without blocking
         // execution for the lifetime of the query or transaction.
+        let execution = self.0.execution.read();
         let state = self.0.state.read();
         let snapshot = state
             .projects
@@ -1745,7 +1744,6 @@ impl Database {
             .cloned()
             .ok_or_else(|| Error::new(ErrorCode::ProjectNotFound, "project does not exist"))?;
         let bookmark = state.applied;
-        let execution = self.0.execution.read();
         let pinned = match execution.as_deref() {
             Some(backend)
                 if backend.resident_bookmark(project) == Some(bookmark)
@@ -1803,8 +1801,8 @@ impl Database {
     /// Publication is synchronous today, so this is normally empty; the catch-up worker remains a
     /// recovery guard rather than part of ordinary write behavior.
     pub(super) fn deferred_resident_projects(&self) -> Vec<(ProjectId, u64)> {
-        let state = self.0.state.read();
         let execution = self.0.execution.read();
+        let state = self.0.state.read();
         let Some(backend) = execution.as_deref() else {
             return Vec::new();
         };
@@ -1857,7 +1855,7 @@ impl Database {
         // backend out while that happens: queries deliberately route to the canonical host graph
         // and writes see no resident backend to update, so neither waits behind a supposedly
         // background cold rebuild. The short publication section below restores the backend under
-        // the normal apply -> state -> execution lock order and rechecks the captured revision.
+        // the normal apply -> execution -> state lock order and rechecks the captured revision.
         let mut backend = {
             let mut execution = self.0.execution.write();
             let Some(backend) = execution.take() else {
@@ -1877,13 +1875,13 @@ impl Database {
         }
 
         let _apply = self.0.apply.lock();
+        let mut execution = self.0.execution.write();
         let mut state = self.0.state.write();
         let unchanged = state
             .projects
             .get(&project)
             .is_some_and(|current| current.graph.revision() == expected_revision);
         let fence = state.applied;
-        let mut execution = self.0.execution.write();
         if execution.is_some() {
             return Err(Error::internal(
                 "execution backend was replaced during resident admission",
@@ -1905,10 +1903,8 @@ impl Database {
 
     /// Large projects whose optimizer-statistics cache is cold, with their current graph revision.
     ///
-    /// Statistics are invalidated on write and recomputed lazily on the next query. On a small graph
-    /// that collect is microseconds, but on a large graph it is a full O(graph) pass that lands
-    /// inline on whichever query trips the cache — a latency spike. Only large graphs are worth
-    /// pre-warming off the query path, so the scan is bounded to them.
+    /// Only cold admission or an explicit administrative rebuild can leave a cache absent.
+    /// Ordinary writes install or advance a bounded count summary and never request resampling.
     pub(super) fn cold_statistics_projects(&self) -> Vec<(ProjectId, u64)> {
         let state = self.0.state.read();
         state
@@ -1926,14 +1922,14 @@ impl Database {
             .collect()
     }
 
-    /// Pre-computes a large project's optimizer statistics off the query path, so the next query does
-    /// not pay the O(graph) collect inline.
+    /// Samples a cold project's property, index and temporal distributions off the query path.
+    /// Queries can instead initialize a bounded exact-count summary without waiting for sampling.
     ///
     /// Captures the live project `Arc` and populates its statistics cache through
     /// `OnceLock::get_or_init` — interior mutability, so no state-write lock is taken. If the project
     /// is unchanged since `expected_revision`, this warms exactly the cache the query will read
-    /// (same `Arc`, same `OnceLock`); if a concurrent write replaced the project with a fresh, empty
-    /// cache, this warmed the now-dropped old `Arc` and is harmlessly discarded. Returns whether it
+    /// (same `Arc`, same `OnceLock`); if a concurrent write published a count summary in a new
+    /// project generation, this warms only the older immutable generation. Returns whether it
     /// computed a fresh snapshot.
     pub(super) fn prewarm_optimizer_statistics(
         &self,
@@ -2286,23 +2282,72 @@ impl Database {
             self.ensure_embedding_profile_activated(project)?;
         }
         let semantic_search = matches!(&parsed.statement, Statement::Query(body) if body.clauses.iter().chain(body.unions.iter().flat_map(|branch| &branch.body)).any(|clause| matches!(clause, crate::cypher::Clause::Search(_))));
-        let (snapshot, captured_bookmark, captured_execution) = if semantic_search {
-            self.capture_semantic_execution(project)?
-        } else if writes {
-            let state = self.0.state.read();
-            let snapshot =
-                state.projects.get(&project).cloned().ok_or_else(|| {
+        if semantic_search && !writes {
+            // Complete any required admission before taking the query's read lock.
+            drop(self.capture_semantic_execution(project)?);
+        }
+        // Direct Metal scalar reads already execute on the CPU and need only the canonical
+        // state lock. Do not queue them behind a writer waiting for resident GPU readback.
+        let direct_read =
+            if !writes && self.0.selected_backend.get() == Some(&crate::gpu::BackendKind::Metal) {
+                let state = self.0.state.read();
+                let snapshot = state.projects.get(&project).ok_or_else(|| {
                     Error::new(ErrorCode::ProjectNotFound, "project does not exist")
                 })?;
-            (snapshot, state.applied, None)
-        } else {
-            self.capture_project_execution(project)?
-        };
+                QueryEngine.uses_direct_node_scan(bind(
+                    parsed.clone(),
+                    snapshot.graph.catalog(),
+                    full_capabilities(),
+                )?)?
+            } else {
+                false
+            };
+        // Publication waits for resident readers before acquiring canonical write access.
+        // Both locks remain held through the query and device readback, so no generation is pinned.
+        let read_execution = (!writes && !direct_read).then(|| self.0.execution.read());
+        let read_state = (!writes).then(|| self.0.state.read());
+        let (snapshot, captured_bookmark, captured_execution) =
+            if let Some(state) = &read_state {
+                let snapshot = state.projects.get(&project).cloned().ok_or_else(|| {
+                    Error::new(ErrorCode::ProjectNotFound, "project does not exist")
+                })?;
+                (snapshot, state.applied, None)
+            } else if semantic_search {
+                self.capture_semantic_execution(project)?
+            } else if writes {
+                let state = self.0.state.read();
+                let snapshot = state.projects.get(&project).cloned().ok_or_else(|| {
+                    Error::new(ErrorCode::ProjectNotFound, "project does not exist")
+                })?;
+                (snapshot, state.applied, None)
+            } else {
+                self.capture_project_execution(project)?
+            };
         let text_embedding = self.0.text_embedding.read().clone();
         let capabilities = full_capabilities();
         let read_only = bind(parsed, snapshot.graph.catalog(), capabilities)?.read_only;
         if read_only {
-            self.wait_for_captured_all(request.consistency, barrier_bookmark, captured_bookmark)?;
+            if read_state.is_some() {
+                // The held state lock already proves this bookmark is fully applied. Re-entering
+                // it through the barrier could deadlock behind a waiting writer.
+                self.ensure_apply_healthy()?;
+            } else {
+                self.wait_for_captured_all(
+                    request.consistency,
+                    barrier_bookmark,
+                    captured_bookmark,
+                )?;
+            }
+            let execution = read_execution
+                .as_ref()
+                .and_then(|execution| {
+                    execution.as_deref().filter(|backend| {
+                        backend.resident_bookmark(project) == Some(captured_bookmark)
+                            && backend.resident_graph_revision(project)
+                                == Some(snapshot.graph.revision())
+                    })
+                })
+                .or(captured_execution.as_deref());
             emit_catalog(
                 Some(project),
                 captured_bookmark,
@@ -2329,7 +2374,7 @@ impl Database {
                     captured_bookmark.index,
                     capabilities,
                     text_embedding.as_deref(),
-                    captured_execution.as_deref(),
+                    execution,
                     &mut stream,
                 )?
             };
@@ -2338,6 +2383,7 @@ impl Database {
             let (snapshot, planning_bookmark, planning_execution) = if semantic_search {
                 (snapshot, captured_bookmark, captured_execution)
             } else {
+                drop(snapshot);
                 let state = self.0.state.read();
                 let snapshot = state.projects.get(&project).cloned().ok_or_else(|| {
                     Error::new(ErrorCode::ProjectNotFound, "project does not exist")
@@ -2396,6 +2442,8 @@ impl Database {
                 vectors,
                 administrative,
             };
+            drop(planning_execution);
+            drop(snapshot);
             let (bookmark, _) = self.commit_from(
                 mutation,
                 MutationKind::Graph,
@@ -3058,6 +3106,7 @@ fn apply_reserved_broker_entry(
     }
     let payload_digest = *blake3::hash(entry.payload()).as_bytes();
     let _apply = database.0.apply.lock();
+    let mut execution = database.0.execution.write();
     let mut state = database.0.state.write();
     if entry.index() != state.applied.index.saturating_add(1) {
         return Ok(None);
@@ -3094,7 +3143,7 @@ fn apply_reserved_broker_entry(
         database.0.fatal_apply.store(true, Ordering::Release);
         return Err(error);
     }
-    if let Some(execution) = database.0.execution.write().as_deref_mut() {
+    if let Some(execution) = execution.as_deref_mut() {
         execution.advance_bookmark(entry.bookmark());
     }
     let committed_broker_segment = broker_publish_cursor
@@ -3369,7 +3418,41 @@ impl MutationStateBackend for Database {
         let device_impact = device_impact(&mutation, entry.bookmark(), commit_time_nanos);
         validate_database_entry(entry, &mutation)?;
         let _apply = self.0.apply.lock();
+        let mut execution = self.0.execution.write();
         let mut state = self.0.state.write();
+
+        let affected_project = match &device_impact {
+            DeviceImpact::Project { project, .. }
+            | DeviceImpact::Create(project)
+            | DeviceImpact::Rebuild(project)
+            | DeviceImpact::Drop(project) => Some(*project),
+            DeviceImpact::None => entry.project_id(),
+        };
+        let has_retained_view = affected_project.is_some_and(|project| {
+            let mut retired = self.0.retired_project_views.lock();
+            let Some(views) = retired.get_mut(&project) else {
+                return false;
+            };
+            views.retain(|view| view.strong_count() != 0);
+            if views.is_empty() {
+                retired.remove(&project);
+                false
+            } else {
+                true
+            }
+        });
+        let exclusive_project = match &device_impact {
+            DeviceImpact::Project { project, .. }
+                if !has_retained_view
+                    && state
+                        .projects
+                        .get(project)
+                        .is_some_and(|state| Arc::strong_count(state) == 1) =>
+            {
+                Some(*project)
+            }
+            _ => None,
+        };
 
         if entry.index() < state.applied.index {
             let response = match entry.request_id().and_then(|request| {
@@ -3420,7 +3503,7 @@ impl MutationStateBackend for Database {
             }
             let response = record.response.clone();
             state.applied = entry.bookmark();
-            if let Some(execution) = self.0.execution.write().as_deref_mut() {
+            if let Some(execution) = execution.as_deref_mut() {
                 execution.advance_bookmark(entry.bookmark());
             }
             state.last_payload_checksum = Some(entry.checksum());
@@ -3538,7 +3621,6 @@ impl MutationStateBackend for Database {
             }
             prune_request_results(&mut staged_state)?;
             {
-                let mut execution = self.0.execution.write();
                 populate_pending_vector_indexes(
                     &mut staged_state,
                     &device_impact,
@@ -3591,11 +3673,12 @@ impl MutationStateBackend for Database {
                     // rebuilds the whole resident image on the GPU under the apply lock, stalling the
                     // write gate at million scale. On a large graph every read is on host anyway.
                     // See `should_defer_device_publish`.
-                } else if let Err(error) = publish_execution_state(
+                } else if let Err(error) = publish_execution_state_inner(
                     &mut *execution,
                     &mut staged_state,
                     device_impact,
                     entry.bookmark(),
+                    exclusive_project,
                 ) {
                     // The resident is a derived execution image. The canonical state clone has
                     // already passed deterministic validation, and the backend publishes staged
@@ -3622,6 +3705,21 @@ impl MutationStateBackend for Database {
             // This exact staged generation is the canonical publication boundary. The dedicated
             // writer acknowledges it and persists the same ordered mutation on its background WAL
             // path afterward; no full graph build appears on that delta path.
+            if let Some(project) = affected_project
+                && let Some(previous) = state.projects.get(&project)
+                && staged_state
+                    .projects
+                    .get(&project)
+                    .is_none_or(|next| !Arc::ptr_eq(previous, next))
+                && Arc::strong_count(previous) > 1
+            {
+                self.0
+                    .retired_project_views
+                    .lock()
+                    .entry(project)
+                    .or_default()
+                    .push(Arc::downgrade(previous));
+            }
             *state = staged_state;
             Ok(MutationApplyResult {
                 response,
@@ -3767,11 +3865,22 @@ fn should_defer_device_publish(graph: &GraphStore) -> bool {
         .unwrap_or(true)
 }
 
+#[cfg(test)]
 fn publish_execution_state(
     execution: &mut Option<Box<dyn ExecutionBackend>>,
     state: &mut DatabaseState,
     impact: DeviceImpact,
     bookmark: Bookmark,
+) -> Result<()> {
+    publish_execution_state_inner(execution, state, impact, bookmark, None)
+}
+
+fn publish_execution_state_inner(
+    execution: &mut Option<Box<dyn ExecutionBackend>>,
+    state: &mut DatabaseState,
+    impact: DeviceImpact,
+    bookmark: Bookmark,
+    exclusive_project: Option<ProjectId>,
 ) -> Result<()> {
     let Some(execution) = execution.as_deref_mut() else {
         return Ok(());
@@ -3835,14 +3944,25 @@ fn publish_execution_state(
                         "device publication references a missing project",
                     )
                 })?;
-                execution.apply_project_delta(ResidentProjectDelta {
+                let delta = ResidentProjectDelta {
                     project,
                     bookmark,
                     graph: project_state.graph.device_delta(bookmark.index)?,
                     temporal,
                     vectors,
                     invalidate_derived,
-                })?;
+                };
+                if exclusive_project == Some(project) {
+                    // SAFETY: apply retains the canonical state write lock. The old project
+                    // has no external Arc owners; ordinary readers also retain this lock for
+                    // their complete execution. The backend checks its own resident pins.
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        execution.apply_project_delta_exclusive(delta)?;
+                    }
+                } else {
+                    execution.apply_project_delta(delta)?;
+                }
             }
             rebind_shared_project(state, execution, project)?;
             execution.advance_bookmark(bookmark);
@@ -3869,20 +3989,9 @@ fn rebind_shared_project(
     project.graph.rebind_shared(backing.graph)?;
     project.temporal.rebind_shared(backing.temporal)?;
     project.indexes.rebind_shared_vectors(backing.vectors)?;
-    // Through the lag-tolerant check, not an unconditional clear.
-    //
-    // This is on the device-publication path, so it runs after EVERY committed write. Clearing the
-    // snapshot outright here made `expire_optimizer_statistics_if_stale` and its
-    // `OPTIMIZER_STATISTICS_MAX_REVISION_LAG` unreachable: by the time that function was consulted
-    // there was nothing left to expire, so the tolerance it exists to provide never applied to a
-    // single write. The rebind republishes the same logical graph plus this commit's mutations, so
-    // the existing snapshot still describes it to within that lag — and the same check also catches
-    // a changed schema or index generation, which a rebind can carry.
-    //
-    // Measured on 200 000 nodes: the reset discarded a live snapshot on every commit and the next
-    // request rebuilt it at ~148 ms — including `RETURN 1`, which needs no statistics at all,
-    // because the request path collects whenever a backend exists rather than when the plan asks.
-    expire_optimizer_statistics_if_stale(project);
+    // Rebinding changes physical ownership only. Exact count generations and shared empirical
+    // cost samples remain valid without expiring a cache and deferring a graph scan to a query.
+    refresh_optimizer_statistics(project);
     Ok(())
 }
 
@@ -3947,14 +4056,10 @@ impl Database {
             execution,
             bookmark: current_bookmark,
             consistency,
-            dependencies: TransactionDependencies::default(),
-            graph_mutations: Vec::new(),
-            temporal_mutations: Vec::new(),
-            vector_mutations: Vec::new(),
+            batches: crate::graph::PagedVec::default(),
             accounted_bytes: 0,
         };
-        state.accounted_bytes =
-            transaction_retained_bytes(&state, self.0.transactions.maximum_encoded_bytes())?;
+        state.accounted_bytes = MIN_TRANSACTION_ACCOUNTED_BYTES;
         // The backend already tracks the admitted complete image. Reading that O(1) counter is
         // essential here: rebuilding a project image merely to account a BEGIN would make
         // transaction latency proportional to the entire database.
@@ -4027,6 +4132,7 @@ fn stage_transaction_project(
     now_nanos: i64,
 ) -> Result<ProjectState> {
     let mut staged = current.clone();
+    staged.graph.begin_device_delta_batch();
     for mutation in graph {
         update_next_ids(&mut staged, mutation);
         crate::graph::knowledge::validate_mutation(&staged.graph, mutation)?;
@@ -4045,7 +4151,7 @@ fn stage_transaction_project(
     for mutation in vectors {
         staged.indexes.apply_vector_mutation(mutation)?;
     }
-    staged.optimizer_statistics = OnceLock::new();
+    refresh_optimizer_statistics(&mut staged);
     Ok(staged)
 }
 
@@ -4088,17 +4194,16 @@ fn stage_transaction_execution(
     Ok(Some(next))
 }
 
-fn transaction_retained_bytes(state: &TransactionState, limit: usize) -> Result<usize> {
+fn transaction_batch_bytes(batch: &TransactionBatch, limit: usize) -> Result<usize> {
     #[derive(Serialize)]
     struct RetainedTransaction<'a> {
-        catalog: &'a crate::graph::NameCatalog,
         dependencies: &'a TransactionDependencies,
         graph: &'a [GraphMutation],
         temporal: Vec<PersistedTemporalMutation>,
         vectors: &'a [ResolvedVectorMutation],
     }
 
-    let temporal = state
+    let temporal = batch
         .temporal_mutations
         .iter()
         .map(|mutation| PersistedTemporalMutation {
@@ -4110,16 +4215,15 @@ fn transaction_retained_bytes(state: &TransactionState, limit: usize) -> Result<
         .collect();
     encode_database_value_bounded(
         &RetainedTransaction {
-            catalog: &state.catalog,
-            dependencies: &state.dependencies,
-            graph: &state.graph_mutations,
+            dependencies: &batch.dependencies,
+            graph: &batch.graph_mutations,
             temporal,
-            vectors: &state.vector_mutations,
+            vectors: &batch.vector_mutations,
         },
         "explicit transaction admission state",
         limit,
     )
-    .map(|bytes| bytes.len().max(MIN_TRANSACTION_ACCOUNTED_BYTES))
+    .map(|bytes| bytes.len().saturating_add(256))
 }
 
 impl QueryExecutor for Database {
@@ -4180,11 +4284,15 @@ struct TransactionState {
     execution: Option<Box<dyn ExecutionBackend>>,
     bookmark: Bookmark,
     consistency: CommitAcknowledgement,
+    batches: crate::graph::PagedVec<Arc<TransactionBatch>>,
+    accounted_bytes: usize,
+}
+
+struct TransactionBatch {
     dependencies: TransactionDependencies,
     graph_mutations: Vec<GraphMutation>,
     temporal_mutations: Vec<crate::cypher::PreparedTemporalMutation>,
     vector_mutations: Vec<ResolvedVectorMutation>,
-    accounted_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4342,6 +4450,24 @@ impl QueryTransaction for DatabaseTransaction {
             &output.temporal_mutations,
             &vectors,
         )?;
+        let batch = Arc::new(TransactionBatch {
+            dependencies: output.dependencies,
+            graph_mutations: output.graph_mutations,
+            temporal_mutations: output.temporal_mutations,
+            vector_mutations: vectors,
+        });
+        let next_bytes = state
+            .accounted_bytes
+            .checked_add(transaction_batch_bytes(
+                &batch,
+                self.database.0.transactions.maximum_encoded_bytes(),
+            )?)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorCode::ResultBudgetExceeded,
+                    "transaction retained bytes overflow",
+                )
+            })?;
         let mut next = TransactionState {
             catalog: working.graph.catalog().clone(),
             snapshot: Arc::clone(&state.snapshot),
@@ -4349,21 +4475,10 @@ impl QueryTransaction for DatabaseTransaction {
             execution,
             bookmark: state.bookmark,
             consistency: state.consistency,
-            dependencies: state.dependencies.clone(),
-            graph_mutations: state.graph_mutations.clone(),
-            temporal_mutations: state.temporal_mutations.clone(),
-            vector_mutations: state.vector_mutations.clone(),
-            accounted_bytes: state.accounted_bytes,
+            batches: state.batches.clone(),
+            accounted_bytes: next_bytes,
         };
-        merge_dependencies(&mut next.dependencies, output.dependencies.clone());
-        next.graph_mutations.extend(output.graph_mutations.clone());
-        next.temporal_mutations
-            .extend(output.temporal_mutations.clone());
-        next.vector_mutations.extend(vectors);
-        next.accounted_bytes = transaction_retained_bytes(
-            &next,
-            self.database.0.transactions.maximum_encoded_bytes(),
-        )?;
+        next.batches.push(batch);
         self.database
             .0
             .transactions
@@ -4441,7 +4556,11 @@ impl DatabaseTransaction {
             .get(&self.project)
             .cloned()
             .ok_or_else(|| Error::new(ErrorCode::ProjectFenced, "project was deleted"))?;
-        validate_dependencies(&state.dependencies, &current, state.bookmark.index)?;
+        let mut dependencies = TransactionDependencies::default();
+        for batch in state.batches.iter() {
+            merge_dependencies(&mut dependencies, batch.dependencies.clone());
+        }
+        validate_dependencies(&dependencies, &current, state.bookmark.index)?;
         let next_index = self
             .database
             .bookmark()
@@ -4449,13 +4568,15 @@ impl DatabaseTransaction {
             .checked_add(1)
             .ok_or_else(|| Error::internal("log index exhausted"))?;
         let graph = state
-            .graph_mutations
-            .into_iter()
+            .batches
+            .iter()
+            .flat_map(|batch| batch.graph_mutations.iter().cloned())
             .map(|mutation| retag_graph_mutation(mutation, next_index))
             .collect::<Vec<_>>();
         let temporal = state
-            .temporal_mutations
-            .into_iter()
+            .batches
+            .iter()
+            .flat_map(|batch| batch.temporal_mutations.iter().cloned())
             .map(|mut mutation| {
                 mutation.sample.sequence_index = next_index;
                 PersistedTemporalMutation {
@@ -4467,8 +4588,9 @@ impl DatabaseTransaction {
             })
             .collect::<Vec<_>>();
         let vectors = state
-            .vector_mutations
-            .into_iter()
+            .batches
+            .iter()
+            .flat_map(|batch| batch.vector_mutations.iter().cloned())
             .map(|mutation| retag_vector_mutation(mutation, next_index))
             .collect::<Vec<_>>();
         let timeout = self
@@ -4480,7 +4602,7 @@ impl DatabaseTransaction {
                 project: self.project,
                 validation: MutationValidation {
                     snapshot: state.bookmark,
-                    dependencies: state.dependencies,
+                    dependencies,
                 },
                 graph,
                 temporal,
@@ -4855,18 +4977,13 @@ fn execute_on_project_inner(
     let prior_temporal_mutations = &[][..];
     let next_node_id = project.next_node_id;
     let next_edge_id = project.next_edge_id;
-    // A canonical-host write already has a bound, point-sized mutation plan and must not pay an
-    // O(graph) statistics rebuild merely because the previous commit invalidated the cache. Device
-    // analytic reads use statistics; host writes and deliberately host-routed bookkeeping reads do
-    // not need them for correctness and remain proportional to the rows they touch.
-    let optimizer_statistics = backend.map(|_| {
-        project.optimizer_statistics.get_or_init(|| {
-            Arc::new(StatisticsSnapshot::collect_project(
-                &project.graph,
-                Some(&project.temporal),
-                Some(&project.indexes),
-            ))
-        })
+    // Every route supplies current count statistics. Omitting them makes the planner collect
+    // the whole graph on a plan-cache miss, including a host-routed point write.
+    let optimizer_statistics = project.optimizer_statistics.get_or_init(|| {
+        Arc::new(StatisticsSnapshot::count_summary(
+            &project.graph,
+            project.indexes.optimizer_generation(),
+        ))
     });
     let mut context = ExecutionContext {
         project_id: project.id,
@@ -4903,7 +5020,7 @@ fn execute_on_project_inner(
             _ => HOST_QUERY_EXECUTION_ROW_ADDRESS_SPACE,
         },
         max_batch_rows: QUERY_STREAM_BATCH_ROWS,
-        optimizer_statistics: optimizer_statistics.map(|statistics| &**statistics),
+        optimizer_statistics: Some(optimizer_statistics.as_ref()),
         backend,
         cancellation: request.cancellation.clone(),
         deadline: request.deadline,
@@ -5059,7 +5176,7 @@ fn apply_mutation_inner(
                 *version = bookmark.index;
             }
             project_state.authority_revision = bookmark.index;
-            expire_optimizer_statistics_if_stale(project_state);
+            refresh_optimizer_statistics(project_state);
             Ok(None)
         }
         DatabaseMutation::Broker { command } => {
@@ -5857,6 +5974,7 @@ fn install_database_snapshot_file(
         })
         .collect::<Result<Vec<_>>>()?;
     let _apply = database.0.apply.lock();
+    let mut execution = database.0.execution.write();
     let mut current = database.0.state.write();
     if current.applied.index > bookmark.index {
         let current_broker_segments = current
@@ -5875,7 +5993,6 @@ fn install_database_snapshot_file(
     }
     reset_ephemeral_after_snapshot_install(&database.0)?;
     {
-        let mut execution = database.0.execution.write();
         if let Some(execution) = execution.as_deref_mut() {
             execution.replace_all_projects(replacement_images)?;
             for project in state.projects.keys().copied().collect::<Vec<_>>() {
@@ -6391,25 +6508,17 @@ fn validate_request_results(state: &DatabaseState) -> Result<()> {
     Ok(())
 }
 
-fn expire_optimizer_statistics_if_stale(project: &mut ProjectState) {
-    let should_expire = project
-        .optimizer_statistics
-        .get()
-        .is_some_and(|statistics| {
-            let lag = project
-                .graph
-                .revision()
-                .saturating_sub(statistics.graph_revision);
-            // The first transition out of an empty generation must be visible immediately. Later
-            // generations may remain boundedly stale because statistics influence cost only.
-            (statistics.graph_revision == 0 && lag != 0)
-                || lag >= OPTIMIZER_STATISTICS_MAX_REVISION_LAG
-                || statistics.schema_generation != project.graph.catalog().optimizer_generation()
-                || (statistics.index_generation != [0; 32]
-                    && statistics.index_generation != project.indexes.optimizer_generation())
-        });
-    if should_expire {
-        project.optimizer_statistics = OnceLock::new();
+fn refresh_optimizer_statistics(project: &mut ProjectState) {
+    let generation = project.indexes.optimizer_generation();
+    if let Some(statistics) = project.optimizer_statistics.get_mut() {
+        Arc::make_mut(statistics).refresh_counts(&project.graph, generation);
+    } else {
+        let _ = project
+            .optimizer_statistics
+            .set(Arc::new(StatisticsSnapshot::count_summary(
+                &project.graph,
+                generation,
+            )));
     }
 }
 
@@ -8573,7 +8682,7 @@ mod project_lifecycle_tests {
         ScalarValue,
         // Tests import the private identity owner directly to construct isolated stores.
         engine::NodeIdentity,
-        graph::{DocumentItem, EdgeInput, NodeInput},
+        graph::{DocumentItem, EdgeInput, LayerMask, NodeInput},
         protocol::QueryLimits,
         storage::{SegmentFamily, SegmentRecord},
         types::DocumentList,
@@ -8924,17 +9033,9 @@ mod project_lifecycle_tests {
         graph.validate_structure()
     }
 
-    /// The device-publication path must not defeat the lag tolerance that governs everywhere else.
-    ///
-    /// `rebind_shared_project` runs after every committed write. It used to clear the snapshot
-    /// outright, which made `OPTIMIZER_STATISTICS_MAX_REVISION_LAG` unreachable — by the time
-    /// `expire_optimizer_statistics_if_stale` was consulted there was nothing left to expire, so a
-    /// tolerance measured in hundreds of commits never survived a single one. The next request then
-    /// rebuilt the snapshot by walking every node, and on a 200 000-node graph that cost ~148 ms —
-    /// paid even by `RETURN 1`, which needs no statistics, because the request path collects
-    /// whenever a backend exists rather than when the plan asks for it.
+    /// Device rebinding keeps cold samples while advancing the exact count generation.
     #[test]
-    fn a_publication_within_the_lag_tolerance_keeps_the_statistics_snapshot() {
+    fn a_publication_keeps_the_statistics_samples() {
         let mut project = ProjectState {
             id: ProjectId::random(),
             display_name: "rebind".to_owned(),
@@ -8947,20 +9048,16 @@ mod project_lifecycle_tests {
             authority_revision: 1,
             optimizer_statistics: OnceLock::new(),
         };
-        // A snapshot whose recorded revision is non-zero and close to the graph's: the ordinary
-        // steady state after a few commits. Revision 0 is deliberately excluded — the first
-        // transition out of an empty generation must still be visible immediately.
         let mut collected = StatisticsSnapshot::collect_project(&project.graph, None, None);
         collected.graph_revision = 1;
         collected.schema_generation = project.graph.catalog().optimizer_generation();
         collected.index_generation = project.indexes.optimizer_generation();
         let _ = project.optimizer_statistics.set(Arc::new(collected));
 
-        expire_optimizer_statistics_if_stale(&mut project);
+        refresh_optimizer_statistics(&mut project);
         assert!(
             project.optimizer_statistics.get().is_some(),
-            "a snapshot inside the revision lag must survive publication, or every write makes the \
-             next request walk the whole graph"
+            "publication must preserve the statistics cache"
         );
     }
 
@@ -9247,13 +9344,110 @@ mod project_lifecycle_tests {
                 execution: None,
                 bookmark,
                 consistency: CommitAcknowledgement::Published,
-                dependencies: TransactionDependencies::default(),
-                graph_mutations: Vec::new(),
-                temporal_mutations: Vec::new(),
-                vector_mutations: Vec::new(),
+                batches: crate::graph::PagedVec::default(),
                 accounted_bytes: MIN_TRANSACTION_ACCOUNTED_BYTES,
             })),
         })
+    }
+
+    #[test]
+    fn surgical_transaction_batch_append_shares_prior_payloads_and_accounts_only_new_batch()
+    -> Result<()> {
+        for batches in [4_096, 32_768] {
+            let mut log = crate::graph::PagedVec::default();
+            for revision in 0..batches {
+                log.push(Arc::new(TransactionBatch {
+                    dependencies: TransactionDependencies::default(),
+                    graph_mutations: vec![],
+                    temporal_mutations: vec![],
+                    vector_mutations: vec![ResolvedVectorMutation::Upsert {
+                        property: crate::types::PropertyId(1),
+                        entity_id: revision,
+                        coordinates: (0..384)
+                            .map(|coordinate| ((revision + coordinate * 3571) % 65521) as u16)
+                            .collect(),
+                        revision,
+                    }],
+                }));
+            }
+            let original = log.clone();
+            let batch = Arc::new(TransactionBatch {
+                dependencies: TransactionDependencies::default(),
+                graph_mutations: vec![],
+                temporal_mutations: vec![],
+                vector_mutations: vec![],
+            });
+            let added = transaction_batch_bytes(&batch, 1024)?;
+            assert!(added <= 1024);
+            log.push(batch);
+            assert!(Arc::ptr_eq(&original[0], &log[0]));
+            assert!(Arc::ptr_eq(
+                &original[batches as usize - 1],
+                &log[batches as usize - 1]
+            ));
+            assert_eq!(original.len(), batches as usize);
+            assert!(log.detached_page_bytes_from(&original) <= 16 * 1024);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn surgical_initialized_semantic_growth_never_starts_a_cold_build() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::open_backend(
+            directory.path(),
+            2 * 1024 * 1024,
+            Duration::from_secs(1),
+            NodeIdentity::generate_genesis().public(),
+        )?;
+        let profile = crate::graph::EmbeddingProfile::new(
+            [1; 32],
+            [2; 32],
+            2,
+            crate::graph::EmbeddingDType::F16,
+            true,
+            crate::graph::Similarity::Cosine,
+        )?;
+        *database.0.text_embedding.write() = Some(Arc::new(WindowEmbedding {
+            profile: profile.clone(),
+            batches: Arc::new(Mutex::new(vec![])),
+        }));
+        let project = ProjectId::random();
+        let mut state = ordered_graph_project(project, 1)?;
+        let indexes = &mut Arc::make_mut(&mut state).indexes;
+        indexes.initialize_semantic(profile.clone())?;
+        let coordinates = profile.quantize(&[1.0, 0.0])?;
+        for entity_id in 0..1024 {
+            indexes.apply_vector_mutation(&ResolvedVectorMutation::Upsert {
+                property: crate::graph::SEMANTIC_NODE_PROPERTY,
+                entity_id,
+                coordinates: coordinates.clone(),
+                revision: 1,
+            })?;
+        }
+        indexes.rebuild_vectors_with(|source, mut config| {
+            config.coarse_centroids = 2;
+            config.subquantizers = 1;
+            config.bits_per_code = 1;
+            config.probes = 1;
+            config.iterations = 1;
+            crate::graph::IvfPqIndex::build(source, config)
+        })?;
+        for entity_id in 1024..2048 {
+            indexes.apply_vector_mutation(&ResolvedVectorMutation::Upsert {
+                property: crate::graph::SEMANTIC_NODE_PROPERTY,
+                entity_id,
+                coordinates: coordinates.clone(),
+                revision: 2,
+            })?;
+        }
+        assert!(indexes.semantic_rebuild_needed());
+        database.0.state.write().projects.insert(project, state);
+        let before = database.bookmark();
+        // No runtime is bound: an attempted cold-build WAL command would fail this call.
+        database.ensure_automatic_semantic(project)?;
+        assert_eq!(database.bookmark(), before);
+        Ok(())
     }
 
     fn ordered_graph_project(id: ProjectId, revision: u64) -> Result<Arc<ProjectState>> {
@@ -9422,6 +9616,106 @@ mod project_lifecycle_tests {
         database
             .complete_command_reservation(reservation, CommandReservationOutcome::Applied)
             .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn older_host_views_remain_fenced_across_multiple_publications() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::open_backend(
+            directory.path(),
+            4 * 1024 * 1024,
+            Duration::from_secs(1),
+            NodeIdentity::generate_genesis().public(),
+        )?;
+        let project = ProjectId::random();
+        let initial = Bookmark { term: 1, index: 1 };
+        let mut initial_state = ordered_graph_project(project, 1)?;
+        let mirror = Arc::make_mut(&mut initial_state)
+            .graph
+            .catalog_mut()
+            .intern_property("mirror")?;
+        Arc::make_mut(&mut initial_state).graph.set_node_property(
+            crate::NodeId(1),
+            mirror,
+            ScalarValue::Integer(11),
+            1,
+        )?;
+        {
+            let mut state = database.0.state.write();
+            state.projects.insert(project, initial_state);
+            state.applied = initial;
+        }
+        #[cfg(all(feature = "accelerator", target_os = "macos"))]
+        database.bind_execution_backend(Box::new(crate::gpu::MetalBackend::new(
+            0,
+            64 * 1024 * 1024,
+            0,
+        )?))?;
+        let retained = database.capture_project_execution(project)?.0;
+        for index in 2..=3 {
+            let (mut command, mut mutation) = ordered_graph_command(
+                project,
+                Bookmark {
+                    term: 1,
+                    index: index - 1,
+                },
+                index as i64,
+            )?;
+            if index == 3 {
+                if let DatabaseMutation::Graph { graph, .. } = &mut mutation {
+                    if let GraphMutation::SetNodeProperty { property, .. } = &mut graph[0] {
+                        *property = mirror;
+                    }
+                }
+                command.payload = encode_database_value(&mutation, "older host view test")?;
+            }
+            let entry = MutationEntry::new(
+                1,
+                index,
+                command.kind,
+                command.project_id,
+                command.request_id,
+                command.commit_time_millis,
+                command.payload,
+            )?;
+            database.apply_mutation(&entry).await?;
+            let state = database.0.state.read();
+            assert_eq!(Arc::strong_count(&state.projects[&project]), 1);
+            assert_eq!(database.0.retired_project_views.lock()[&project].len(), 1);
+            assert!(
+                database.0.retired_project_views.lock()[&project][0]
+                    .upgrade()
+                    .is_some_and(|view| Arc::ptr_eq(&view, &retained))
+            );
+        }
+        assert_eq!(retained.graph.revision(), 1);
+        assert_eq!(
+            retained
+                .graph
+                .node(crate::NodeId(1))
+                .and_then(|node| node.property(mirror)),
+            Some(ScalarValue::Integer(11))
+        );
+        drop(retained);
+        let (command, _) = ordered_graph_command(project, Bookmark { term: 1, index: 3 }, 4)?;
+        let entry = MutationEntry::new(
+            1,
+            4,
+            command.kind,
+            command.project_id,
+            command.request_id,
+            command.commit_time_millis,
+            command.payload,
+        )?;
+        database.apply_mutation(&entry).await?;
+        assert!(
+            !database
+                .0
+                .retired_project_views
+                .lock()
+                .contains_key(&project)
+        );
         Ok(())
     }
 
@@ -10050,6 +10344,7 @@ mod project_lifecycle_tests {
             writer_start.wait();
             for index in 2_u64..=128 {
                 let bookmark = Bookmark { term: 1, index };
+                let mut execution = writer_database.0.execution.write();
                 let mut state = writer_database.0.state.write();
                 let mut staged = state.clone();
                 let project_state = Arc::make_mut(
@@ -10078,7 +10373,6 @@ mod project_lifecycle_tests {
                     .after_graph_apply(&project_state.graph, &mutation)?;
                 staged.applied = bookmark;
                 {
-                    let mut execution = writer_database.0.execution.write();
                     publish_execution_state(
                         &mut execution,
                         &mut staged,
@@ -10198,6 +10492,160 @@ mod project_lifecycle_tests {
             Some(bookmark.index)
         );
         Ok(())
+    }
+
+    #[test]
+    fn direct_scalar_read_progresses_while_resident_publication_waits() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::open_backend(
+            directory.path(),
+            4 * 1024 * 1024,
+            Duration::from_secs(1),
+            NodeIdentity::generate_genesis().public(),
+        )?;
+        let project = ProjectId::random();
+        {
+            let mut state = database.0.state.write();
+            let snapshot = ordered_graph_project(project, 1)?;
+            for (query, direct) in [
+                ("MATCH (n) RETURN n.value", true),
+                ("MATCH (n) WHERE n.value = $v RETURN n.value", true),
+                ("MATCH (n) RETURN sum(n.value)", false),
+                ("OPTIONAL MATCH (n) RETURN n.value", false),
+                ("MATCH (n)-[r]->(m) RETURN n.value", false),
+                ("MATCH (n) RETURN n.value ORDER BY n.value", false),
+            ] {
+                assert_eq!(
+                    QueryEngine.uses_direct_node_scan(bind(
+                        parse(query)?,
+                        snapshot.graph.catalog(),
+                        full_capabilities(),
+                    )?)?,
+                    direct,
+                    "{query}"
+                );
+            }
+            state.projects.insert(project, snapshot);
+            state.applied = Bookmark { term: 1, index: 1 };
+        }
+        // Exercise the Metal lock route without executing a device command. Physical Metal
+        // suites separately verify that direct reads use the canonical shared allocations.
+        let _ = database
+            .0
+            .selected_backend
+            .set(crate::gpu::BackendKind::Metal);
+        let request = QueryRequest {
+            request_id: Uuid::new_v4(),
+            project_id: Some(project),
+            query: "MATCH (n) RETURN n.value".to_owned(),
+            parameters: BTreeMap::new(),
+            consistency: CommitAcknowledgement::Published,
+            bookmark: None,
+            limits: QueryLimits::default(),
+            cancellation: Default::default(),
+            deadline: None,
+            connection_id: ConnectionId::new(),
+        };
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| -> Result<()> {
+            let execution = database.0.execution.write();
+            let reader = scope.spawn(|| -> Result<()> {
+                database.execute_autocommit(request, &mut |event| {
+                    if matches!(event, QueryStreamEvent::Batch { .. }) {
+                        assert!(database.0.state.try_write().is_none());
+                        done_tx
+                            .send(())
+                            .map_err(|e| Error::internal(e.to_string()))?;
+                    }
+                    Ok(())
+                })
+            });
+            let progressed = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+            // Release before joining even on failure, so the regression reports a failure
+            // instead of leaving a blocked test thread behind.
+            drop(execution);
+            reader
+                .join()
+                .map_err(|_| Error::internal("reader panicked"))??;
+            assert!(
+                progressed,
+                "direct read waited for resident publication access"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn ordinary_stream_holds_current_state_until_readback_finishes() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::open_backend(
+            directory.path(),
+            4 * 1024 * 1024,
+            Duration::from_secs(1),
+            NodeIdentity::generate_genesis().public(),
+        )?;
+        let project = ProjectId::random();
+        {
+            let mut state = database.0.state.write();
+            state
+                .projects
+                .insert(project, ordered_graph_project(project, 1)?);
+            state.applied = Bookmark { term: 1, index: 1 };
+        }
+        let request = QueryRequest {
+            request_id: Uuid::new_v4(),
+            project_id: Some(project),
+            query: "MATCH (n) RETURN n.value".to_owned(),
+            parameters: BTreeMap::new(),
+            consistency: CommitAcknowledgement::Published,
+            bookmark: None,
+            limits: QueryLimits::default(),
+            cancellation: Default::default(),
+            deadline: None,
+            connection_id: ConnectionId::new(),
+        };
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| -> Result<()> {
+            let read_database = &database;
+            let reader = scope.spawn(move || {
+                read_database.execute_autocommit(request, &mut |event| {
+                    if matches!(event, QueryStreamEvent::Batch { .. }) {
+                        assert!(read_database.0.state.try_write().is_none());
+                        entered_tx
+                            .send(())
+                            .map_err(|error| Error::internal(error.to_string()))?;
+                        resume_rx
+                            .recv_timeout(Duration::from_secs(5))
+                            .map_err(|error| Error::internal(error.to_string()))?;
+                    }
+                    Ok(())
+                })
+            });
+            entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|error| Error::internal(error.to_string()))?;
+            let writer = scope.spawn(|| {
+                let mut state = database.0.state.write();
+                state.applied = Bookmark { term: 1, index: 2 };
+                done_tx.send(())
+            });
+            let waited = done_rx.recv_timeout(Duration::from_millis(20)).is_err();
+            resume_tx
+                .send(())
+                .map_err(|error| Error::internal(error.to_string()))?;
+            reader
+                .join()
+                .map_err(|_| Error::internal("reader panicked"))??;
+            writer
+                .join()
+                .map_err(|_| Error::internal("writer panicked"))?
+                .map_err(|error| Error::internal(error.to_string()))?;
+            assert!(waited, "writer published while query readback was paused");
+            assert_eq!(database.bookmark().index, 2);
+            Ok(())
+        })
     }
 
     #[test]
@@ -10575,7 +11023,175 @@ mod project_lifecycle_tests {
     }
 
     #[test]
-    fn optimizer_statistics_are_boundedly_stale_not_rebuilt_per_write() -> Result<()> {
+    fn surgical_statistics_survive_hundreds_of_transaction_statements_and_preserve_results()
+    -> Result<()> {
+        let project_id = ProjectId::random();
+        let mut project = (*ordered_graph_project(project_id, 1)?).clone();
+        let value = project
+            .graph
+            .catalog()
+            .property("value")
+            .expect("value property");
+        let label = project.graph.catalog_mut().intern_label("Data")?;
+        let changed = project.graph.catalog_mut().intern_label("Changed")?;
+        let body = project.graph.catalog_mut().intern_property("body")?;
+        let payload = ScalarValue::String(Arc::from("complete unrelated document ".repeat(192)));
+        project.graph.add_node_labels(NodeId(1), vec![label], 1)?;
+        for id in 2..=4_096 {
+            project.graph.insert_node(NodeInput {
+                id: NodeId(id),
+                layer: Layer::Observed,
+                revision: 1,
+                labels: vec![label],
+                properties: vec![
+                    (value, ScalarValue::Integer(id as i64)),
+                    (body, payload.clone()),
+                ],
+            })?;
+        }
+        project.graph.set_node_property(
+            NodeId(3),
+            body,
+            ScalarValue::String(Arc::from("dirty source ".repeat(300))),
+            2,
+        )?;
+        project
+            .optimizer_statistics
+            .set(Arc::new(StatisticsSnapshot::collect(&project.graph)))
+            .map_err(|_| Error::internal("unexpected initialized statistics"))?;
+        let pinned = project.clone();
+        for revision in 3..=520 {
+            let mut mutations = vec![GraphMutation::SetNodeProperty {
+                node: NodeId(1),
+                property: value,
+                value: ScalarValue::Integer(revision as i64),
+                revision,
+            }];
+            if revision == 256 {
+                mutations.push(GraphMutation::AddNodeLabels {
+                    node: NodeId(1),
+                    labels: vec![changed],
+                    revision,
+                });
+            }
+            project = stage_transaction_project(&project, &mutations, &[], &[], 0)?;
+            let statistics = project
+                .optimizer_statistics
+                .get()
+                .expect("statement statistics stay warm");
+            assert_eq!(statistics.graph_revision, revision);
+            assert_eq!(
+                statistics.sampled_graph_revision,
+                Some(2),
+                "ordinary statement rebuilt full samples"
+            );
+            assert_eq!(statistics.node_count(LayerMask::ALL), 4_096);
+            assert_eq!(
+                statistics.label_count(changed, LayerMask::ALL),
+                u64::from(revision >= 256)
+            );
+            assert_eq!(project.graph.device_delta(revision)?.nodes.len(), 1);
+        }
+        let first_statement = project.clone();
+        project = stage_transaction_project(
+            &project,
+            &[GraphMutation::SetNodeProperty {
+                node: NodeId(2),
+                property: value,
+                value: ScalarValue::Integer(9_999_999),
+                revision: 520,
+            }],
+            &[],
+            &[],
+            0,
+        )?;
+        assert_eq!(project.graph.device_delta(520)?.nodes.len(), 1);
+        assert_eq!(project.graph.device_delta(520)?.nodes[0].dense, 1);
+        assert_eq!(first_statement.graph.device_delta(520)?.nodes[0].dense, 0);
+        assert_eq!(
+            pinned
+                .optimizer_statistics
+                .get()
+                .expect("pinned statistics")
+                .graph_revision,
+            2
+        );
+        assert_eq!(
+            pinned
+                .graph
+                .node(NodeId(1))
+                .and_then(|node| node.property(value)),
+            Some(ScalarValue::Integer(0))
+        );
+        let bookmark = Bookmark {
+            term: 1,
+            index: 520,
+        };
+        let mut backend = crate::gpu::CpuBackend::new(64 * 1024 * 1024, 0);
+        backend.admit_project(ResidentProjectImage::build(
+            project_id,
+            bookmark,
+            &project.graph,
+            &project.temporal,
+            &project.indexes,
+        )?)?;
+        for execution in [None, Some(&backend as &dyn ExecutionBackend)] {
+            for (query, expected) in [
+                (
+                    "MATCH (n:Data) WHERE n.value = 520 RETURN count(n) AS count",
+                    2,
+                ),
+                (
+                    "MATCH (n:Data) WHERE n.value > 9999998 RETURN count(n) AS count",
+                    1,
+                ),
+            ] {
+                let request = QueryRequest {
+                    request_id: Uuid::new_v4(),
+                    project_id: Some(project_id),
+                    query: query.to_owned(),
+                    parameters: BTreeMap::new(),
+                    consistency: CommitAcknowledgement::Published,
+                    bookmark: None,
+                    limits: QueryLimits::default(),
+                    cancellation: Default::default(),
+                    deadline: None,
+                    connection_id: ConnectionId::new(),
+                };
+                let output = execute_on_project(
+                    &project,
+                    &request,
+                    bookmark,
+                    521,
+                    full_capabilities(),
+                    None,
+                    execution,
+                )?;
+                let values = output
+                    .result
+                    .batches
+                    .iter()
+                    .flat_map(|batch| &batch.columns[0].values)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    values,
+                    [&ResultValue::Scalar(ScalarValue::Integer(expected))]
+                );
+                assert_eq!(
+                    project
+                        .optimizer_statistics
+                        .get()
+                        .expect("query kept statistics")
+                        .sampled_graph_revision,
+                    Some(2)
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn optimizer_statistics_advance_counts_without_rebuilding_samples() -> Result<()> {
         let project = ProjectId::random();
         let mut project_state = ProjectState {
             id: project,
@@ -10603,13 +11219,14 @@ mod project_lifecycle_tests {
                 labels: vec![label],
                 properties: Vec::new(),
             }))?;
-        expire_optimizer_statistics_if_stale(&mut project_state);
-        assert!(project_state.optimizer_statistics.get().is_none());
-
-        project_state
+        refresh_optimizer_statistics(&mut project_state);
+        let first = project_state
             .optimizer_statistics
-            .set(Arc::new(StatisticsSnapshot::collect(&project_state.graph)))
-            .map_err(|_| Error::internal("statistics cache already initialized"))?;
+            .get()
+            .expect("current statistics");
+        assert_eq!(first.node_count(LayerMask::ALL), 1);
+        assert_eq!(first.sampled_graph_revision, Some(0));
+        let pinned = Arc::clone(first);
         project_state
             .graph
             .apply(GraphMutation::InsertNode(crate::graph::NodeInput {
@@ -10619,8 +11236,15 @@ mod project_lifecycle_tests {
                 labels: vec![label],
                 properties: Vec::new(),
             }))?;
-        expire_optimizer_statistics_if_stale(&mut project_state);
-        assert!(project_state.optimizer_statistics.get().is_some());
+        refresh_optimizer_statistics(&mut project_state);
+        let current = project_state
+            .optimizer_statistics
+            .get()
+            .expect("current statistics");
+        assert_eq!(current.node_count(LayerMask::ALL), 2);
+        assert_eq!(current.graph_revision, 2);
+        assert_eq!(current.sampled_graph_revision, Some(0));
+        assert_eq!(pinned.node_count(LayerMask::ALL), 1);
         Ok(())
     }
 
@@ -10977,9 +11601,9 @@ mod project_lifecycle_tests {
         )))?;
         // Publish the initial image so the resident is fresh at revision 1 / bookmark 1.
         {
+            let mut execution = database.0.execution.write();
             let mut state = database.0.state.write();
             let mut staged = state.clone();
-            let mut execution = database.0.execution.write();
             publish_execution_state(
                 &mut execution,
                 &mut staged,

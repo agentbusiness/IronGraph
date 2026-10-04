@@ -2122,6 +2122,9 @@ fn compile_segmented_nullable_relationship_is_null_count(
         return Ok(None);
     };
     let mut nullable = nullable;
+    if !nullable.one_hop_paths.is_empty() {
+        return Ok(None);
+    }
     let complete_source_rows = nullable
         .request
         .capacities
@@ -5327,6 +5330,9 @@ fn compile_segmented_relationship_key_value_list(
     else {
         return Ok(None);
     };
+    if !nullable.one_hop_paths.is_empty() {
+        return Ok(None);
+    }
     let complete_source_rows = nullable
         .request
         .capacities
@@ -5866,6 +5872,9 @@ fn compile_segmented_property_keys_distinct(
     else {
         return Ok(None);
     };
+    if !nullable.one_hop_paths.is_empty() {
+        return Ok(None);
+    }
     let complete_source_rows = nullable
         .request
         .capacities
@@ -7543,6 +7552,9 @@ fn compile_segmented_graph_aggregation(
         return Ok(None);
     };
     let mut nullable = nullable;
+    if !nullable.one_hop_paths.is_empty() {
+        return Ok(None);
+    }
     let complete_source_rows = nullable
         .request
         .capacities

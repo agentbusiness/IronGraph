@@ -19,6 +19,8 @@ use std::{
 
 use async_trait::async_trait;
 use futures::future::join_all;
+#[cfg(all(feature = "accelerator", target_os = "macos"))]
+use irongraph::gpu::MetalBackend;
 use irongraph::{
     Bookmark, EdgeId, Layer, NodeId, ProjectId, Result, ScalarValue,
     cypher::{BindCapabilities, ExecutionContext, ExecutionOutput, QueryEngine},
@@ -30,7 +32,7 @@ use irongraph::{
     execution::{
         ResidentGraphProcedure, ResidentGraphProcedureRequest, ResidentGraphProcedureResult,
     },
-    gpu::{CpuBackend, ExecutionBackend, MetalBackend, ResidentProjectDelta, ResidentProjectImage},
+    gpu::{CpuBackend, ExecutionBackend, ResidentProjectDelta, ResidentProjectImage},
     graph::{
         EdgeInput, GraphSnapshot, GraphStore, IndexCatalog, NodeInput, PageRankConfig,
         StatisticsSnapshot, TemporalStore, bfs, clustering_coefficients, dfs, dijkstra, k_core,
@@ -784,6 +786,7 @@ fn backend(name: &str) -> Result<Box<dyn ExecutionBackend>> {
             irongraph::config::UNBOUNDED_DEVICE_MEMORY_BYTES,
             0,
         ))),
+        #[cfg(all(feature = "accelerator", target_os = "macos"))]
         "metal" => Ok(Box::new(MetalBackend::new(
             0,
             irongraph::config::UNBOUNDED_DEVICE_MEMORY_BYTES,
@@ -853,6 +856,7 @@ fn benchmark_backend(
         ));
         return;
     }
+    let admit_elapsed = admit_started.elapsed();
     let resident = execution.resident_project_bytes(PROJECT);
     output.push(distribution(
         backend_name,
@@ -873,7 +877,7 @@ fn benchmark_backend(
         edges,
         "admission",
         "admit_project",
-        vec![admit_started.elapsed()],
+        vec![admit_elapsed],
         0,
         nodes + edges,
         resident,

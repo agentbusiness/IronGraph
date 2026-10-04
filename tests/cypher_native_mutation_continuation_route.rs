@@ -1572,13 +1572,9 @@ fn assert_native_request(
                 ResidentMutationPostStage::Project { .. },
             ],
         )
-        | (TailShape::ReturnAggregate, [ResidentMutationPostStage::SumInteger { .. }])
         | (
-            TailShape::WithAggregate,
-            [
-                ResidentMutationPostStage::SumInteger { .. },
-                ResidentMutationPostStage::Project { .. },
-            ],
+            TailShape::ReturnAggregate | TailShape::WithAggregate,
+            [ResidentMutationPostStage::SumInteger { .. }],
         ) => true,
         _ => false,
     };

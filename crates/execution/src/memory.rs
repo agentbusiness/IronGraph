@@ -1,7 +1,8 @@
 //! Device memory admission for graph, model, and query allocations.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, Weak,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -69,6 +70,50 @@ struct MemoryLedger {
     shared_bytes: [usize; 5],
     scratch_bytes: usize,
     staging_bytes: usize,
+    generation: u64,
+    shared_pins: BTreeMap<u64, Weak<SharedGenerationReservation>>,
+    retired_pages: VecDeque<(u64, usize)>,
+    page_births: BTreeMap<[u64; 6], u64>,
+    allocation_births: BTreeMap<[u64; 6], u64>,
+    retained_versions: BTreeMap<u64, Vec<RetainedVersion>>,
+}
+
+#[derive(Debug)]
+struct RetainedVersion {
+    first_generation: u64,
+    last_generation: u64,
+    bytes: usize,
+}
+
+impl MemoryLedger {
+    fn retaining_pin(&self, first: u64, last: u64) -> Option<u64> {
+        if first > last {
+            return None;
+        }
+        self.shared_pins
+            .range(first..=last)
+            .rev()
+            .find(|(_, pin)| pin.strong_count() != 0)
+            .map(|(generation, _)| *generation)
+    }
+
+    fn page_birth(&self, identity: [u64; 6]) -> u64 {
+        if identity[5] != u64::MAX
+            && let Some(birth) = self.page_births.get(&identity)
+        {
+            return *birth;
+        }
+        let mut lower = identity;
+        lower[5] = 0;
+        let mut upper = identity;
+        if identity[5] == u64::MAX {
+            upper[5] = 0;
+        }
+        self.allocation_births
+            .range(lower..=upper)
+            .next_back()
+            .map_or(0, |(_, birth)| *birth)
+    }
 }
 
 /// Process-wide admission for every allocation sharing one device or Apple unified memory.
@@ -82,6 +127,7 @@ pub struct DeviceMemoryGovernor {
     reserved_bytes: usize,
     ledger: Arc<Mutex<MemoryLedger>>,
     pinned_reservation: Option<Arc<PinnedGenerationReservation>>,
+    shared_pin: Option<Arc<SharedGenerationReservation>>,
     publishes_persistent_total: bool,
     /// Reports bytes the HOST still has free, or `None` when it cannot be determined.
     ///
@@ -120,6 +166,7 @@ impl DeviceMemoryGovernor {
             reserved_bytes,
             ledger: Arc::new(Mutex::new(MemoryLedger::default())),
             pinned_reservation: None,
+            shared_pin: None,
             publishes_persistent_total: true,
             host_available_bytes: None,
         }
@@ -153,13 +200,32 @@ impl DeviceMemoryGovernor {
     }
 
     pub fn admit_persistent(&mut self, bytes: usize) -> Result<()> {
+        if self.shared_pin.is_some() {
+            let staging = self.reserve_staging(0)?;
+            return self.publish_shared_staging(staging, 0, bytes, 0, None, || Ok(()));
+        }
         let mut ledger = self.lock_ledger()?;
+        let retired = if self.publishes_persistent_total
+            && bytes != ledger.persistent_graph_bytes
+            && ledger
+                .shared_pins
+                .values()
+                .any(|pin| pin.strong_count() != 0)
+        {
+            ledger.persistent_graph_bytes
+        } else {
+            0
+        };
+        let root_pinned = ledger
+            .pinned_generation_bytes
+            .checked_add(retired)
+            .ok_or_else(memory_accounting_overflow)?;
         let (persistent, next_pinned, prior_pin) = if self.publishes_persistent_total {
             (
                 bytes
-                    .checked_add(ledger.pinned_generation_bytes)
+                    .checked_add(root_pinned)
                     .ok_or_else(memory_accounting_overflow)?,
-                ledger.pinned_generation_bytes,
+                root_pinned,
                 None,
             )
         } else {
@@ -195,6 +261,17 @@ impl DeviceMemoryGovernor {
             ));
         }
         if self.publishes_persistent_total {
+            if bytes != ledger.persistent_graph_bytes {
+                let generation = ledger.generation;
+                let next_generation = generation
+                    .checked_add(1)
+                    .ok_or_else(memory_accounting_overflow)?;
+                if retired != 0 {
+                    ledger.retired_pages.push_back((generation, retired));
+                }
+                ledger.generation = next_generation;
+                ledger.pinned_generation_bytes = root_pinned;
+            }
             ledger.persistent_graph_bytes = bytes;
             return Ok(());
         }
@@ -263,6 +340,7 @@ impl DeviceMemoryGovernor {
             reserved_bytes: self.reserved_bytes,
             ledger: Arc::clone(&self.ledger),
             pinned_reservation: None,
+            shared_pin: None,
             publishes_persistent_total: false,
             // Inherited, not dropped. A pinned view admits through the same ledger, so a view that
             // lost the probe would be a hole in the bound rather than a separate policy.
@@ -298,6 +376,297 @@ impl DeviceMemoryGovernor {
             })),
             ..pinned
         })
+    }
+
+    /// Identifier of the shared root snapshot represented by this governor.
+    pub fn current_generation(&self) -> Result<u64> {
+        Ok(self
+            .shared_pin
+            .as_ref()
+            .map_or(self.lock_ledger()?.generation, |pin| pin.generation))
+    }
+
+    #[must_use]
+    pub fn is_shared_branch(&self) -> bool {
+        self.shared_pin.is_some()
+    }
+
+    /// Older pinned generations can still share unchanged allocations with the current one.
+    pub fn has_live_shared_pins(&self) -> Result<bool> {
+        Ok(self
+            .lock_ledger()?
+            .shared_pins
+            .values()
+            .any(|pin| pin.strong_count() != 0))
+    }
+
+    /// Pins existing shared allocations without charging their complete size again. Callers
+    /// must publish subsequent changes with `publish_shared_staging`, including removed pages.
+    pub fn pin_shared_generation(&self, generation: u64) -> Result<Self> {
+        if let Some(pin) = &self.shared_pin {
+            if generation != pin.generation {
+                return Err(Error::internal(
+                    "shared branch pin changed its root generation",
+                ));
+            }
+            return Ok(self.clone());
+        }
+        let mut ledger = self.lock_ledger()?;
+        if generation > ledger.generation {
+            return Err(Error::internal("shared pin targets a future generation"));
+        }
+        let pin = match ledger.shared_pins.get(&generation).and_then(Weak::upgrade) {
+            Some(pin) => pin,
+            None => {
+                if generation != ledger.generation {
+                    return Err(Error::internal("shared generation is no longer retained"));
+                }
+                let pin = Arc::new(SharedGenerationReservation {
+                    generation,
+                    ledger: Arc::clone(&self.ledger),
+                });
+                ledger.shared_pins.insert(generation, Arc::downgrade(&pin));
+                pin
+            }
+        };
+        Ok(Self {
+            shared_pin: Some(pin),
+            pinned_reservation: Some(Arc::new(PinnedGenerationReservation {
+                bytes: AtomicUsize::new(0),
+                ledger: Arc::clone(&self.ledger),
+            })),
+            publishes_persistent_total: false,
+            ..self.clone()
+        })
+    }
+
+    /// Publishes a page-sharing generation. `retired_private_bytes` bounds old pages replaced
+    /// or removed by this write; branch bytes bound the complete current divergence from the
+    /// root snapshot. Missing branch measurements use the complete resident as a safe fallback.
+    pub fn publish_shared_staging<T>(
+        &mut self,
+        reservation: StagingReservation,
+        staged_bytes: usize,
+        persistent_bytes: usize,
+        retired_private_bytes: usize,
+        branch_private_bytes: Option<usize>,
+        publish: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.publish_shared_staging_inner(
+            reservation,
+            staged_bytes,
+            persistent_bytes,
+            retired_private_bytes,
+            branch_private_bytes,
+            None,
+            0,
+            publish,
+        )
+    }
+
+    /// Publishes stable page identities. Allocation births mark newly exposed suffixes; a zero
+    /// page charge marks a newly created page, and page u64::MAX retires a whole allocation.
+    /// Old versions are charged only while a pin can actually name that publication interval.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_shared_page_staging<T>(
+        &mut self,
+        reservation: StagingReservation,
+        staged_bytes: usize,
+        persistent_bytes: usize,
+        allocation_births: &[([u64; 5], u64)],
+        page_changes: &[([u64; 6], usize)],
+        branch_private_bytes: Option<usize>,
+        publish: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.publish_shared_staging_inner(
+            reservation,
+            staged_bytes,
+            persistent_bytes,
+            0,
+            branch_private_bytes,
+            Some((allocation_births, page_changes)),
+            0,
+            publish,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn publish_shared_staging_inner<T>(
+        &mut self,
+        mut reservation: StagingReservation,
+        staged_bytes: usize,
+        persistent_bytes: usize,
+        retired_private_bytes: usize,
+        branch_private_bytes: Option<usize>,
+        pages: Option<(&[([u64; 5], u64)], &[([u64; 6], usize)])>,
+        existing_allocation_bytes: usize,
+        publish: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.validate_staging_reservation(&reservation, staged_bytes)?;
+        let ledger_owner = Arc::clone(&self.ledger);
+        let mut ledger = ledger_owner
+            .lock()
+            .map_err(|_| Error::internal("device memory governor lock poisoned"))?;
+        let remaining_staging = ledger
+            .staging_bytes
+            .checked_sub(reservation.bytes)
+            .ok_or_else(memory_accounting_overflow)?;
+        let root = self.publishes_persistent_total;
+        let next_generation = if root {
+            ledger
+                .generation
+                .checked_add(1)
+                .ok_or_else(memory_accounting_overflow)?
+        } else {
+            ledger.generation
+        };
+        let changes = if root {
+            pages.map(|(_, changes)| {
+                changes
+                    .iter()
+                    .fold(BTreeMap::new(), |mut unique, (identity, bytes)| {
+                        let previous = unique.entry(*identity).or_insert(0_usize);
+                        *previous = (*previous).max(*bytes);
+                        unique
+                    })
+            })
+        } else {
+            None
+        };
+        let mut versions = Vec::new();
+        if let Some(changes) = &changes {
+            for (identity, bytes) in changes {
+                let birth = ledger.page_birth(*identity);
+                if *bytes != 0
+                    && let Some(pin) = ledger.retaining_pin(birth, ledger.generation)
+                {
+                    versions.push((
+                        pin,
+                        RetainedVersion {
+                            first_generation: birth,
+                            last_generation: ledger.generation,
+                            bytes: *bytes,
+                        },
+                    ));
+                }
+            }
+        }
+        let retained = if root && pages.is_some() {
+            versions.iter().try_fold(0_usize, |bytes, (_, version)| {
+                bytes
+                    .checked_add(version.bytes)
+                    .ok_or_else(memory_accounting_overflow)
+            })?
+        } else if root
+            && ledger
+                .shared_pins
+                .values()
+                .any(|pin| pin.strong_count() != 0)
+        {
+            retired_private_bytes
+        } else if root {
+            0
+        } else {
+            branch_private_bytes.unwrap_or(persistent_bytes)
+        };
+        let next_pinned = ledger
+            .pinned_generation_bytes
+            .checked_add(retained)
+            .ok_or_else(memory_accounting_overflow)?;
+        let next_persistent = if root {
+            persistent_bytes
+        } else {
+            ledger.persistent_graph_bytes
+        };
+        let next_total = self.total_with(
+            &ledger,
+            next_persistent
+                .checked_add(next_pinned)
+                .ok_or_else(memory_accounting_overflow)?,
+            ledger.scratch_bytes,
+            remaining_staging,
+        )?;
+        if next_total > self.limit_bytes() {
+            return Err(Error::new(
+                ErrorCode::GpuAdmissionFailure,
+                "shared publication exceeds admitted memory",
+            ));
+        }
+        let previous_total = self.total_with(
+            &ledger,
+            self.persistent_total(&ledger)?,
+            ledger.scratch_bytes,
+            ledger.staging_bytes,
+        )?;
+        if let Some((growth, available)) = self.host_would_be_exhausted(
+            next_total
+                .saturating_sub(previous_total)
+                .saturating_sub(existing_allocation_bytes),
+        ) {
+            return Err(Error::new(
+                ErrorCode::GpuAdmissionFailure,
+                format!(
+                    "shared publication needs {growth} more bytes with {available} host bytes available"
+                ),
+            ));
+        }
+        let published = match publish() {
+            Ok(value) => value,
+            Err(error) => {
+                // Owner swaps may already have happened. Keep the peak staging charge.
+                reservation.released = true;
+                return Err(error);
+            }
+        };
+        ledger.staging_bytes = remaining_staging;
+        ledger.pinned_generation_bytes = next_pinned;
+        let previous_pin = if root {
+            if pages.is_some() {
+                for (pin, version) in versions {
+                    ledger
+                        .retained_versions
+                        .entry(pin)
+                        .or_default()
+                        .push(version);
+                }
+                if ledger.retaining_pin(0, ledger.generation).is_some() {
+                    if let Some(changes) = changes {
+                        for identity in changes.into_keys() {
+                            ledger.page_births.insert(identity, next_generation);
+                        }
+                    }
+                    if let Some((births, _)) = pages {
+                        for (group, first_page) in births {
+                            let identity = [
+                                group[0],
+                                group[1],
+                                group[2],
+                                group[3],
+                                group[4],
+                                *first_page,
+                            ];
+                            ledger.allocation_births.insert(identity, next_generation);
+                        }
+                    }
+                }
+            } else if retained != 0 {
+                let generation = ledger.generation;
+                ledger.retired_pages.push_back((generation, retained));
+            }
+            ledger.generation = next_generation;
+            ledger.persistent_graph_bytes = persistent_bytes;
+            None
+        } else {
+            self.pinned_reservation
+                .replace(Arc::new(PinnedGenerationReservation {
+                    bytes: AtomicUsize::new(retained),
+                    ledger: Arc::clone(&self.ledger),
+                }))
+        };
+        reservation.released = true;
+        drop(ledger);
+        drop(previous_pin);
+        Ok(published)
     }
 
     fn persistent_total(&self, ledger: &MemoryLedger) -> Result<usize> {
@@ -359,6 +728,12 @@ impl DeviceMemoryGovernor {
             return Err(Error::new(
                 ErrorCode::GpuAdmissionFailure,
                 "insufficient peak memory for atomic project-image replacement beside model allocations",
+            ));
+        }
+        if let Some((growth, available)) = self.host_would_be_exhausted(bytes) {
+            return Err(Error::new(
+                ErrorCode::GpuAdmissionFailure,
+                format!("staging needs {growth} bytes with {available} host bytes available"),
             ));
         }
         ledger.staging_bytes = next;
@@ -428,10 +803,20 @@ impl DeviceMemoryGovernor {
         staged_bytes: usize,
         persistent_bytes: usize,
     ) -> Result<()> {
+        if self.shared_pin.is_some() {
+            return self.publish_shared_staging(
+                reservation,
+                staged_bytes,
+                persistent_bytes,
+                0,
+                None,
+                || Ok(()),
+            );
+        }
         self.validate_staging_reservation(&reservation, staged_bytes)?;
         let mut ledger = self.lock_ledger()?;
         let publication =
-            self.prepare_staging_publication(&ledger, reservation.bytes, persistent_bytes)?;
+            self.prepare_staging_publication(&ledger, reservation.bytes, persistent_bytes, 0)?;
         self.apply_staging_publication(&mut ledger, &publication)?;
         reservation.released = true;
         Ok(())
@@ -447,15 +832,55 @@ impl DeviceMemoryGovernor {
     /// closed instead of assuming allocator pages were released.
     pub fn publish_staging<T>(
         &mut self,
-        mut reservation: StagingReservation,
+        reservation: StagingReservation,
         staged_bytes: usize,
         persistent_bytes: usize,
         publish_and_trim: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
+        self.publish_staging_with_existing_allocations(
+            reservation,
+            staged_bytes,
+            persistent_bytes,
+            0,
+            publish_and_trim,
+        )
+    }
+
+    /// Charges all resident bytes to the device budget, while excluding allocations
+    /// already owned by the input from the check for additional physical memory.
+    pub fn publish_staging_with_existing_allocations<T>(
+        &mut self,
+        mut reservation: StagingReservation,
+        staged_bytes: usize,
+        persistent_bytes: usize,
+        existing_allocation_bytes: usize,
+        publish_and_trim: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        if existing_allocation_bytes > persistent_bytes {
+            return Err(Error::internal(
+                "existing allocation bytes exceed resident bytes",
+            ));
+        }
+        if self.shared_pin.is_some() {
+            return self.publish_shared_staging_inner(
+                reservation,
+                staged_bytes,
+                persistent_bytes,
+                0,
+                None,
+                None,
+                existing_allocation_bytes,
+                publish_and_trim,
+            );
+        }
         self.validate_staging_reservation(&reservation, staged_bytes)?;
         let mut ledger = self.lock_ledger()?;
-        let publication =
-            self.prepare_staging_publication(&ledger, reservation.bytes, persistent_bytes)?;
+        let publication = self.prepare_staging_publication(
+            &ledger,
+            reservation.bytes,
+            persistent_bytes,
+            existing_allocation_bytes,
+        )?;
         let published = match publish_and_trim() {
             Ok(published) => published,
             Err(error) => {
@@ -548,17 +973,35 @@ impl DeviceMemoryGovernor {
         ledger: &MemoryLedger,
         reservation_bytes: usize,
         persistent_bytes: usize,
+        existing_allocation_bytes: usize,
     ) -> Result<StagingPublication> {
         let remaining_staging = ledger
             .staging_bytes
             .checked_sub(reservation_bytes)
             .ok_or_else(|| Error::internal("device staging accounting underflow"))?;
         let (persistent_total, next_pinned, prior_pin) = if self.publishes_persistent_total {
+            let retained = if ledger
+                .shared_pins
+                .values()
+                .any(|pin| pin.strong_count() != 0)
+            {
+                ledger.persistent_graph_bytes
+            } else {
+                0
+            };
+            let next_pinned = ledger
+                .pinned_generation_bytes
+                .checked_add(retained)
+                .ok_or_else(memory_accounting_overflow)?;
+            ledger
+                .generation
+                .checked_add(1)
+                .ok_or_else(memory_accounting_overflow)?;
             (
                 persistent_bytes
-                    .checked_add(ledger.pinned_generation_bytes)
+                    .checked_add(next_pinned)
                     .ok_or_else(memory_accounting_overflow)?,
-                ledger.pinned_generation_bytes,
+                next_pinned,
                 None,
             )
         } else {
@@ -606,9 +1049,11 @@ impl DeviceMemoryGovernor {
             ledger.scratch_bytes,
             ledger.staging_bytes,
         )?;
-        if let Some((growth, available)) =
-            self.host_would_be_exhausted(next_total.saturating_sub(current_total))
-        {
+        if let Some((growth, available)) = self.host_would_be_exhausted(
+            next_total
+                .saturating_sub(current_total)
+                .saturating_sub(existing_allocation_bytes),
+        ) {
             return Err(Error::new(
                 ErrorCode::GpuAdmissionFailure,
                 format!(
@@ -631,6 +1076,16 @@ impl DeviceMemoryGovernor {
         publication: &StagingPublication,
     ) -> Result<()> {
         if self.publishes_persistent_total {
+            let retained = publication
+                .next_pinned
+                .saturating_sub(ledger.pinned_generation_bytes);
+            if retained != 0 {
+                ledger
+                    .retired_pages
+                    .push_back((ledger.generation, retained));
+            }
+            ledger.generation += 1;
+            ledger.pinned_generation_bytes = publication.next_pinned;
             ledger.persistent_graph_bytes = publication.persistent_bytes;
             ledger.staging_bytes = publication.remaining_staging;
             return Ok(());
@@ -694,6 +1149,70 @@ struct StagingPublication {
     remaining_staging: usize,
     next_pinned: usize,
     prior_pin: Option<(Arc<PinnedGenerationReservation>, usize)>,
+}
+
+#[derive(Debug)]
+struct SharedGenerationReservation {
+    generation: u64,
+    ledger: Arc<Mutex<MemoryLedger>>,
+}
+
+impl Drop for SharedGenerationReservation {
+    fn drop(&mut self) {
+        if let Ok(mut ledger) = self.ledger.lock() {
+            // A new pin may have replaced this expired weak entry while this Drop waited for
+            // the ledger mutex. Never remove that newer token for the same root generation.
+            if ledger
+                .shared_pins
+                .get(&self.generation)
+                .is_some_and(|pin| std::ptr::eq(pin.as_ptr(), self))
+            {
+                ledger.shared_pins.remove(&self.generation);
+            }
+            let oldest = ledger
+                .shared_pins
+                .iter()
+                .find(|(_, pin)| pin.strong_count() != 0)
+                .map(|(generation, _)| *generation);
+            // One live pin owns each interval charge. Other pins can share that same version;
+            // transfer ownership on drop instead of retaining already-freed intermediate pages.
+            if ledger
+                .shared_pins
+                .get(&self.generation)
+                .is_none_or(|pin| pin.strong_count() == 0)
+                && let Some(versions) = ledger.retained_versions.remove(&self.generation)
+            {
+                for version in versions {
+                    if let Some(pin) =
+                        ledger.retaining_pin(version.first_generation, version.last_generation)
+                    {
+                        ledger
+                            .retained_versions
+                            .entry(pin)
+                            .or_default()
+                            .push(version);
+                    } else {
+                        ledger.pinned_generation_bytes =
+                            ledger.pinned_generation_bytes.saturating_sub(version.bytes);
+                    }
+                }
+            }
+            if oldest.is_none() {
+                ledger.page_births.clear();
+                ledger.allocation_births.clear();
+            }
+            while ledger
+                .retired_pages
+                .front()
+                .is_some_and(|(generation, _)| oldest.is_none_or(|oldest| *generation < oldest))
+            {
+                if let Some((_, bytes)) = ledger.retired_pages.pop_front() {
+                    ledger.pinned_generation_bytes =
+                        ledger.pinned_generation_bytes.saturating_sub(bytes);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -939,6 +1458,58 @@ mod governor_tests {
     }
 
     #[test]
+    fn existing_input_allocations_need_no_new_host_bytes_but_keep_device_charges() -> Result<()> {
+        for branch in [false, true] {
+            let mut root = DeviceMemoryGovernor::new(10_000, 0);
+            root.admit_persistent(128)?;
+            let mut governor = if branch {
+                root.pin_shared_generation(root.current_generation()?)?
+            } else {
+                root
+            };
+            governor.set_host_available_probe(probe(Some(128)));
+            let staging = governor.reserve_staging(128)?;
+            governor.set_host_available_probe(probe(Some(0)));
+            governor.publish_staging_with_existing_allocations(
+                staging,
+                128,
+                4_224,
+                4_096,
+                || Ok(()),
+            )?;
+            let snapshot = governor.snapshot();
+            assert_eq!(
+                snapshot.persistent_graph_bytes,
+                if branch { 128 } else { 4_224 }
+            );
+            assert_eq!(
+                snapshot.pinned_generation_bytes,
+                if branch { 4_224 } else { 0 }
+            );
+            assert_eq!(snapshot.staging_bytes, 0);
+        }
+        for (limit, available, total) in [(4_000, 0, 4_224), (10_000, 255, 4_480)] {
+            let mut governor = DeviceMemoryGovernor::new(limit, 0);
+            governor.set_host_available_probe(probe(Some(128)));
+            let staging = governor.reserve_staging(128)?;
+            governor.set_host_available_probe(probe(Some(available)));
+            let mut published = false;
+            assert!(
+                governor
+                    .publish_staging_with_existing_allocations(staging, 128, total, 4_096, || {
+                        published = true;
+                        Ok(())
+                    },)
+                    .is_err()
+            );
+            assert!(!published);
+            assert_eq!(governor.snapshot().persistent_graph_bytes, 0);
+            assert_eq!(governor.snapshot().staging_bytes, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn a_pinned_view_inherits_the_probe() {
         // A pinned generation admits through the same ledger; a view that dropped the probe would be
         // a hole in the bound rather than a different policy.
@@ -1067,6 +1638,241 @@ mod governor_tests {
         drop(first_clone);
         assert_eq!(governor.snapshot().pinned_generation_bytes, 250);
         drop(second);
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn surgical_root_versions_plateau_and_transfer_between_intermediate_pins() -> Result<()> {
+        let mut governor = DeviceMemoryGovernor::new(10_000, 0);
+        governor.admit_persistent(8_000)?;
+        let oldest = governor.pin_shared_generation(governor.current_generation()?)?;
+        let a = [0, 1, 0, 0, 0, 0];
+        let b = [0, 1, 0, 0, 0, 1];
+        for _ in 0..100 {
+            let staging = governor.reserve_staging(128)?;
+            governor.publish_shared_page_staging(
+                staging,
+                128,
+                8_000,
+                &[],
+                &[(a, 64)],
+                None,
+                || Ok(()),
+            )?;
+            assert_eq!(governor.snapshot().pinned_generation_bytes, 64);
+        }
+        let middle = governor.pin_shared_generation(governor.current_generation()?)?;
+        let same_middle = governor.pin_shared_generation(governor.current_generation()?)?;
+        let staging = governor.reserve_staging(128)?;
+        governor.publish_shared_page_staging(
+            staging,
+            128,
+            8_000,
+            &[],
+            &[(a, 64), (b, 64)],
+            None,
+            || Ok(()),
+        )?;
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 192);
+        drop(middle);
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 192);
+        drop(same_middle);
+        // B's unchanged old value was also visible to the oldest reader; A's middle value was not.
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 128);
+        for _ in 0..20 {
+            let staging = governor.reserve_staging(128)?;
+            governor.publish_shared_page_staging(
+                staging,
+                128,
+                8_000,
+                &[],
+                &[(a, 64), (b, 64)],
+                None,
+                || Ok(()),
+            )?;
+            assert_eq!(governor.snapshot().pinned_generation_bytes, 128);
+        }
+        let generation = governor.current_generation()?;
+        let staging = governor.reserve_staging(128)?;
+        let mut published = false;
+        assert!(
+            governor
+                .publish_shared_page_staging(staging, 128, 9_999, &[], &[(a, 64)], None, || {
+                    published = true;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert!(!published);
+        assert_eq!(governor.current_generation()?, generation);
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 128);
+        drop(oldest);
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 0);
+        assert!(governor.lock_ledger()?.page_births.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn surgical_root_allocation_and_growth_births_exclude_older_readers() -> Result<()> {
+        let mut governor = DeviceMemoryGovernor::new(20_000, 0);
+        governor.admit_persistent(8_000)?;
+        let before_creation = governor.pin_shared_generation(governor.current_generation()?)?;
+        let group = [0, 7, 0, 0, 0];
+        let page = [0, 7, 0, 0, 0, 0];
+        let tail = [0, 7, 0, 0, 0, 100];
+        let staging = governor.reserve_staging(128)?;
+        governor.publish_shared_page_staging(
+            staging,
+            128,
+            8_000,
+            &[(group, 0)],
+            &[],
+            None,
+            || Ok(()),
+        )?;
+        let staging = governor.reserve_staging(128)?;
+        governor.publish_shared_page_staging(
+            staging,
+            128,
+            8_000,
+            &[],
+            &[(page, 64)],
+            None,
+            || Ok(()),
+        )?;
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 0);
+        let before_growth = governor.pin_shared_generation(governor.current_generation()?)?;
+        let staging = governor.reserve_staging(128)?;
+        governor.publish_shared_page_staging(
+            staging,
+            128,
+            8_000,
+            &[(group, 100)],
+            &[],
+            None,
+            || Ok(()),
+        )?;
+        let staging = governor.reserve_staging(128)?;
+        governor.publish_shared_page_staging(
+            staging,
+            128,
+            8_000,
+            &[],
+            &[(tail, 64)],
+            None,
+            || Ok(()),
+        )?;
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 0);
+        let after_growth = governor.pin_shared_generation(governor.current_generation()?)?;
+        let staging = governor.reserve_staging(128)?;
+        governor.publish_shared_page_staging(
+            staging,
+            128,
+            8_000,
+            &[],
+            &[(tail, 64)],
+            None,
+            || Ok(()),
+        )?;
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 64);
+        let staging = governor.reserve_staging(128)?;
+        governor.publish_shared_page_staging(
+            staging,
+            128,
+            7_000,
+            &[],
+            &[([0, 7, 0, 0, 0, u64::MAX], 1024)],
+            None,
+            || Ok(()),
+        )?;
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 1088);
+        drop(after_growth);
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 1024);
+        drop(before_growth);
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 0);
+        drop(before_creation);
+        Ok(())
+    }
+
+    #[test]
+    fn surgical_shared_pins_charge_retired_pages_once_and_release_after_last_reader() -> Result<()>
+    {
+        let mut governor = DeviceMemoryGovernor::new(10_000, 0);
+        governor.admit_persistent(8_000)?;
+        let generation = governor.current_generation()?;
+        let first = governor.pin_shared_generation(generation)?;
+        let second = governor.pin_shared_generation(generation)?;
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 0);
+        let staging = governor.reserve_staging(128)?;
+        governor.publish_shared_staging(staging, 128, 8_000, 64, None, || Ok(()))?;
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 64);
+        let newer = governor.pin_shared_generation(governor.current_generation()?)?;
+        let staging = governor.reserve_staging(128)?;
+        governor.publish_shared_staging(staging, 128, 7_968, 96, None, || Ok(()))?;
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 160);
+        drop(first);
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 160);
+        drop(second);
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 96);
+        drop(newer);
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn surgical_branch_private_generations_preserve_old_readers_and_failed_admission() -> Result<()>
+    {
+        let mut governor = DeviceMemoryGovernor::new(10_000, 0);
+        governor.admit_persistent(8_000)?;
+        let mut branch = governor.pin_shared_generation(governor.current_generation()?)?;
+        let stage = branch.reserve_staging(100)?;
+        branch.publish_shared_staging(stage, 100, 8_000, 100, Some(100), || Ok(()))?;
+        let reader = branch.pin_shared_generation(branch.current_generation()?)?;
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 100);
+        let stage = branch.reserve_staging(100)?;
+        branch.publish_shared_staging(stage, 100, 8_000, 100, Some(150), || Ok(()))?;
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 250);
+        drop(reader);
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 150);
+        let stage = branch.reserve_staging(100)?;
+        let mut published = false;
+        assert!(
+            branch
+                .publish_shared_staging(stage, 100, 8_000, 100, Some(3_000), || {
+                    published = true;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert!(!published);
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 150);
+        drop(branch);
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn surgical_expired_pin_drop_cannot_remove_a_concurrent_replacement_token() -> Result<()> {
+        let mut governor = DeviceMemoryGovernor::new(10_000, 0);
+        governor.admit_persistent(8_000)?;
+        let generation = governor.current_generation()?;
+        let old = governor.pin_shared_generation(generation)?;
+        // Reproduce the registry state when a final token's Drop waits behind a concurrent
+        // pin that replaced its now-unupgradeable weak entry.
+        let replacement = Arc::new(super::SharedGenerationReservation {
+            generation,
+            ledger: Arc::clone(&governor.ledger),
+        });
+        governor
+            .lock_ledger()?
+            .shared_pins
+            .insert(generation, Arc::downgrade(&replacement));
+        drop(old);
+        let staging = governor.reserve_staging(100)?;
+        governor.publish_shared_staging(staging, 100, 8_000, 64, None, || Ok(()))?;
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 64);
+        drop(replacement);
         assert_eq!(governor.snapshot().pinned_generation_bytes, 0);
         Ok(())
     }

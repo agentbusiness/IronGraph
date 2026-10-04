@@ -2,10 +2,19 @@
 
 **Rust access to a GPU-first temporal graph database with built-in streaming and queues.**
 
-Work with graph relationships, text document and vector search, temporal property history, graph
-analytics, and built-in Streams and Queues. `irongraph-sdk` provides a Rust interface to the
-native database and remote Query API/Bolt clients. IronGraph is open-source software released
-under the Apache License 2.0.
+Use Cypher to query graph structure, search text and vectors, inspect property history, and
+administer the database. Built-in Kafka-compatible Streams and AMQP-compatible Queues handle event
+and message workloads. `irongraph-sdk` provides native embedded access and remote Query API/Bolt
+clients for Rust. IronGraph is open-source software released under the Apache License 2.0.
+
+## Performance at a glance
+
+- **0.834 µs graph count** at 2 million nodes on Metal — sub-microsecond at scale.
+- **12× faster indexed range count** on Metal than CPU: 1.61 ms versus 19.38 ms.
+- **7.5× faster k-core analysis** on Metal than CPU: 326 ms versus 2,430 ms.
+
+Median results from five runs on an Apple M5 Pro with 2 million nodes and 8 million
+relationships. See [more performance results](https://irongraph.tech/).
 
 ## Database capabilities
 

@@ -1748,6 +1748,10 @@ fn run_success_case(
     Ok(output)
 }
 
+#[cfg_attr(
+    not(all(feature = "accelerator", target_os = "macos")),
+    allow(dead_code)
+)]
 fn mutation_debug(output: &ExecutionOutput) -> Vec<String> {
     output
         .graph_mutations
@@ -1756,6 +1760,10 @@ fn mutation_debug(output: &ExecutionOutput) -> Vec<String> {
         .collect()
 }
 
+#[cfg_attr(
+    not(all(feature = "accelerator", target_os = "macos")),
+    allow(dead_code)
+)]
 fn semantic_request_debug(observations: &CreateObservations) -> Vec<String> {
     observations
         .receipts

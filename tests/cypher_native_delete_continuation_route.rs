@@ -51,8 +51,64 @@ use tokio_util::sync::CancellationToken;
 use irongraph::gpu::MetalBackend;
 
 const REPORT_PATH: &str = "/tmp/irongraph-tck-full-delete-temporal-cpu-certified.json";
-const PINNED_FEATURE_ROOT: &str =
-    "/private/tmp/irongraph-opencypher-debug.6MXlLm/openCypher/tck/features";
+pub(super) fn pinned_feature_root() -> Result<std::path::PathBuf> {
+    static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    if let Some(root) = ROOT.get() {
+        return Ok(root.clone());
+    }
+    const REVISION: &str = "677cbafabb8c3c5eed458fd3b1ec0daec8d67d23";
+    let root = std::env::var_os("OPENCYPHER_TCK_DIR").ok_or_else(|| {
+        Error::invalid_data(
+            "OPENCYPHER_TCK_DIR must name the pinned openCypher tck/features directory",
+        )
+    })?;
+    let root = std::fs::canonicalize(root).map_err(|error| {
+        Error::invalid_data(format!("cannot resolve OPENCYPHER_TCK_DIR: {error}"))
+    })?;
+    let checkout = root
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| Error::invalid_data("OPENCYPHER_TCK_DIR has no checkout root"))?;
+    if checkout.join("tck/features") != root {
+        return Err(Error::invalid_data(
+            "OPENCYPHER_TCK_DIR must end in tck/features",
+        ));
+    }
+    let git = |arguments: &[&str]| -> Result<String> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(checkout)
+            .args(arguments)
+            .output()
+            .map_err(|error| {
+                Error::internal(format!("cannot verify pinned TCK source: {error}"))
+            })?;
+        if !output.status.success() {
+            return Err(Error::invalid_data(
+                "pinned TCK source must be a readable Git checkout",
+            ));
+        }
+        String::from_utf8(output.stdout)
+            .map_err(|error| Error::invalid_data(format!("invalid TCK Git output: {error}")))
+    };
+    if git(&["rev-parse", "HEAD"])?.trim() != REVISION
+        || !git(&[
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--",
+            "tck/features",
+        ])?
+        .trim()
+        .is_empty()
+    {
+        return Err(Error::invalid_data(format!(
+            "TCK features must be unchanged at pinned revision {REVISION}"
+        )));
+    }
+    let _ = ROOT.set(root.clone());
+    Ok(root)
+}
 const PROJECT: ProjectId = ProjectId(uuid::Uuid::from_u128(
     0x4445_4c45_5445_5f32_315f_5443_4b5f_3031,
 ));
@@ -251,7 +307,7 @@ fn docstrings_after(block: &str, marker: &str) -> Result<Vec<String>> {
 }
 
 fn source_scenario(case: &ManifestCase) -> Result<SourceScenario> {
-    let path = Path::new(PINNED_FEATURE_ROOT).join(&case.feature);
+    let path = pinned_feature_root()?.join(&case.feature);
     let source = fs::read_to_string(&path)
         .map_err(|error| Error::internal(format!("cannot read {}: {error}", path.display())))?;
     let block = scenario_block(&source, &case.name)?;

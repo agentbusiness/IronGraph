@@ -18,13 +18,12 @@
 //! Equality here is bit-for-bit on purpose. A tolerance would accept precisely the drift that makes
 //! the CPU reference and the GPU backend disagree about a query's result.
 
-use irongraph::{
-    Result,
-    gpu::{
-        CpuBackend, ExecutionBackend, ResidentScalarCell, ResidentScalarCellTag,
-        ResidentScalarProgramInstruction, ResidentScalarProgramOpcode,
-        ResidentScalarProgramOperand, ResidentScalarProgramRequest,
-    },
+#[cfg(all(feature = "accelerator", target_os = "macos"))]
+use irongraph::Result;
+use irongraph::gpu::{
+    CpuBackend, ExecutionBackend, ResidentScalarCell, ResidentScalarCellTag,
+    ResidentScalarProgramInstruction, ResidentScalarProgramOpcode, ResidentScalarProgramOperand,
+    ResidentScalarProgramRequest,
 };
 use tokio_util::sync::CancellationToken;
 

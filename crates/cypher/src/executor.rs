@@ -241,6 +241,19 @@ pub struct ExecutionOutput {
 pub struct QueryEngine;
 
 impl QueryEngine {
+    /// Checks the existing direct scalar read path before acquiring resident execution access.
+    pub fn uses_direct_node_scan(&self, bound: super::BoundQuery) -> Result<bool> {
+        let mut physical = plan(bound)?;
+        // Logical lowering leaves access unspecified; test the canonical scan shape before
+        // the optimizer chooses its label or property access path.
+        if let Some(PhysicalOperator::ScanPattern { access, .. }) = physical.operators.first_mut()
+            && matches!(access, ScanAccessPath::Unspecified)
+        {
+            *access = ScanAccessPath::AllNodes;
+        }
+        Ok(plan_direct_node_scan(&physical).is_some())
+    }
+
     pub fn execute(
         &self,
         source: &str,
@@ -2419,11 +2432,16 @@ fn direct_filtered_node_rows(
         {
             continue;
         }
-        if let Some(base) = context.graph.node(id) {
+        let base_revision = if context.prior_graph_mutations.is_empty() {
+            Some(node.revision())
+        } else {
+            context.graph.node(id).map(|base| base.revision())
+        };
+        if let Some(revision) = base_revision {
             state
                 .dependencies
                 .entities
-                .insert(EntityDependency::Node(id), base.revision());
+                .insert(EntityDependency::Node(id), revision);
         }
         if let Some(variable) = &pattern.start.variable {
             row.insert(variable.clone(), BindingValue::Node(dense));
@@ -3766,7 +3784,9 @@ fn render_resident_output_schema(
             "validated resident rendered projection changed its output name",
         ));
     }
-    *value_type = resident_render_column_type(&output.render);
+    if *value_type != ColumnType::Null {
+        *value_type = resident_render_column_type(&output.render);
+    }
     Ok(())
 }
 
@@ -3796,7 +3816,9 @@ fn render_resident_output_batch(
         .into_iter()
         .map(|value| render_resident_value(value, &output.render))
         .collect::<Result<Vec<_>>>()?;
-    column.value_type = resident_render_column_type(&output.render);
+    if column.value_type != ColumnType::Null {
+        column.value_type = resident_render_column_type(&output.render);
+    }
     Ok(())
 }
 
@@ -4004,13 +4026,50 @@ fn execute_resident_plan_unrendered(
     if plan_temporal_mode(plan) == 0 && plan_reads_declared_temporal_property(plan, context) {
         return Ok(None);
     }
-    // One aggregating stage per accelerated program: see `aggregating_projection_count`. The CPU
-    // resident path lowers a second stage and is left to do so; only the accelerator's segmented
-    // graph program cannot, and there the decline has to happen here rather than as an admission
-    // failure raised after the request is already built.
+    // Complete path and segmented programs can seal multiple aggregation stages. Give both
+    // compilers their generation-pinned admission opportunity before declining the plan; narrower
+    // single-stage routes must not consume only a prefix of a multistage aggregation.
     if backend.kind() != crate::execution::BackendKind::Cpu
         && aggregating_projection_count(plan) > 1
     {
+        if context.prior_graph_mutations.is_empty()
+            && context.prior_temporal_mutations.is_empty()
+            && backend.resident_bookmark(context.project_id) == Some(context.bookmark)
+            && backend.resident_graph_revision(context.project_id) == Some(context.graph.revision())
+            && backend.supports_native_variable_path()
+            && let Some(compiled) = compile_resident_variable_path(
+                plan,
+                context.project_id,
+                context.bookmark,
+                context.binding_catalog,
+                context.graph,
+                context.max_result_rows,
+            )?
+        {
+            return execute_resident_variable_path_plan(plan, &compiled, backend, context, stream)
+                .map(Some);
+        }
+        if context.prior_graph_mutations.is_empty()
+            && context.prior_temporal_mutations.is_empty()
+            && backend.resident_bookmark(context.project_id) == Some(context.bookmark)
+            && backend.resident_graph_revision(context.project_id) == Some(context.graph.revision())
+            && resident_catalog_matches_canonical(context)
+            && backend.supports_native_segmented_aggregation()
+            && let Some(compiled) = compile_resident_segmented_aggregation(
+                plan,
+                context.project_id,
+                context.graph,
+                &context.parameters,
+                context.bookmark,
+                fresh_resident_execution_id(),
+                context.max_result_rows,
+            )?
+        {
+            return execute_resident_segmented_aggregation_plan(
+                plan, &compiled, backend, context, stream,
+            )
+            .map(Some);
+        }
         return Ok(None);
     }
     if let Some(compiled) = compile_resident_pattern_count_plan(plan, context)? {
@@ -11032,6 +11091,59 @@ fn execute_resident_nullable_relation_plan(
         let value_type = result_values_type(&values);
         decoded_columns.push((output.name.clone(), value_type, values));
     }
+
+    let mut private_path_columns = BTreeSet::new();
+    for (&start, &(relationship, end)) in &compiled.one_hop_paths {
+        let columns = [start, relationship, end].map(|index| decoded_columns.get(index));
+        let [
+            Some(start_column),
+            Some(relationship_column),
+            Some(end_column),
+        ] = columns
+        else {
+            return Err(corrupt_resident_nullable_output(
+                "path projection omitted an entity column",
+            ));
+        };
+        let values = start_column
+            .2
+            .iter()
+            .zip(&relationship_column.2)
+            .zip(&end_column.2)
+            .map(
+                |((start, relationship), end)| match (start, relationship, end) {
+                    (_, ResultValue::Scalar(ScalarValue::Null), _) => {
+                        Ok(ResultValue::Scalar(ScalarValue::Null))
+                    }
+                    (
+                        ResultValue::Node(start),
+                        ResultValue::Relationship(relationship),
+                        ResultValue::Node(end),
+                    ) if (relationship.source == start.id && relationship.target == end.id)
+                        || (relationship.target == start.id && relationship.source == end.id) =>
+                    {
+                        Ok(ResultValue::Path {
+                            nodes: vec![start.clone(), end.clone()],
+                            relationships: vec![relationship.clone()],
+                        })
+                    }
+                    _ => Err(corrupt_resident_nullable_output(
+                        "path projection returned inconsistent entity identities",
+                    )),
+                },
+            )
+            .collect::<Result<Vec<_>>>()?;
+        let value_type = result_values_type(&values);
+        decoded_columns[start].1 = value_type;
+        decoded_columns[start].2 = values;
+        private_path_columns.insert(relationship);
+        private_path_columns.insert(end);
+    }
+    let decoded_columns = decoded_columns
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, column)| (!private_path_columns.contains(&index)).then_some(column))
+        .collect::<Vec<_>>();
 
     let schema = decoded_columns
         .iter()

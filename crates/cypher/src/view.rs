@@ -261,60 +261,64 @@ pub struct OverlayEdge {
 #[derive(Clone, Copy, Debug)]
 pub enum NodeReadView<'a> {
     Base(NodeView<'a>),
-    Overlay(&'a OverlayNode),
+    Overlay(&'a OverlayNode, Option<NodeView<'a>>),
 }
 
 impl<'a> NodeReadView<'a> {
     pub fn id(self) -> NodeId {
         match self {
             Self::Base(node) => node.id(),
-            Self::Overlay(node) => node.id,
+            Self::Overlay(node, _) => node.id,
         }
     }
 
     pub fn dense(self) -> u32 {
         match self {
             Self::Base(node) => node.dense(),
-            Self::Overlay(node) => node.dense,
+            Self::Overlay(node, _) => node.dense,
         }
     }
 
     pub fn layer(self) -> Layer {
         match self {
             Self::Base(node) => node.layer(),
-            Self::Overlay(node) => node.layer,
+            Self::Overlay(node, _) => node.layer,
         }
     }
 
     pub fn revision(self) -> u64 {
         match self {
             Self::Base(node) => node.revision(),
-            Self::Overlay(node) => node.revision,
+            Self::Overlay(node, _) => node.revision,
         }
     }
 
     pub fn labels(self) -> &'a [LabelId] {
         match self {
             Self::Base(node) => node.labels(),
-            Self::Overlay(node) => &node.labels,
+            Self::Overlay(node, _) => &node.labels,
         }
     }
 
     pub fn property(self, property: PropertyId) -> Option<ScalarValue> {
         match self {
             Self::Base(node) => node.property(property),
-            Self::Overlay(node) => node.properties.get(&property).cloned(),
+            Self::Overlay(node, base) => node
+                .properties
+                .get(&property)
+                .cloned()
+                .or_else(|| base.and_then(|node| node.property(property)))
+                .filter(|value| !matches!(value, ScalarValue::Null)),
         }
     }
 
     pub fn properties(self) -> Vec<(PropertyId, ScalarValue)> {
         match self {
             Self::Base(node) => node.properties(),
-            Self::Overlay(node) => node
-                .properties
-                .iter()
-                .map(|(property, value)| (*property, value.clone()))
-                .collect(),
+            Self::Overlay(node, base) => merged_properties(
+                base.map(NodeView::properties).unwrap_or_default(),
+                &node.properties,
+            ),
         }
     }
 }
@@ -322,79 +326,98 @@ impl<'a> NodeReadView<'a> {
 #[derive(Clone, Copy, Debug)]
 pub enum EdgeReadView<'a> {
     Base(EdgeView<'a>),
-    Overlay(&'a OverlayEdge),
+    Overlay(&'a OverlayEdge, Option<EdgeView<'a>>),
 }
 
 impl EdgeReadView<'_> {
     pub fn id(self) -> EdgeId {
         match self {
             Self::Base(edge) => edge.id(),
-            Self::Overlay(edge) => edge.id,
+            Self::Overlay(edge, _) => edge.id,
         }
     }
 
     pub fn dense(self) -> u32 {
         match self {
             Self::Base(edge) => edge.dense(),
-            Self::Overlay(edge) => edge.dense,
+            Self::Overlay(edge, _) => edge.dense,
         }
     }
 
     pub fn source(self) -> NodeId {
         match self {
             Self::Base(edge) => edge.source(),
-            Self::Overlay(edge) => edge.source,
+            Self::Overlay(edge, _) => edge.source,
         }
     }
 
     pub fn target(self) -> NodeId {
         match self {
             Self::Base(edge) => edge.target(),
-            Self::Overlay(edge) => edge.target,
+            Self::Overlay(edge, _) => edge.target,
         }
     }
 
     pub fn relationship_type(self) -> RelationshipTypeId {
         match self {
             Self::Base(edge) => edge.relationship_type(),
-            Self::Overlay(edge) => edge.relationship_type,
+            Self::Overlay(edge, _) => edge.relationship_type,
         }
     }
 
     pub fn layer(self) -> Layer {
         match self {
             Self::Base(edge) => edge.layer(),
-            Self::Overlay(edge) => edge.layer,
+            Self::Overlay(edge, _) => edge.layer,
         }
     }
 
     pub fn revision(self) -> u64 {
         match self {
             Self::Base(edge) => edge.revision(),
-            Self::Overlay(edge) => edge.revision,
+            Self::Overlay(edge, _) => edge.revision,
         }
     }
 
     pub fn property(self, property: PropertyId) -> Option<ScalarValue> {
         match self {
             Self::Base(edge) => edge.property(property),
-            Self::Overlay(edge) => edge.properties.get(&property).cloned(),
+            Self::Overlay(edge, base) => edge
+                .properties
+                .get(&property)
+                .cloned()
+                .or_else(|| base.and_then(|edge| edge.property(property)))
+                .filter(|value| !matches!(value, ScalarValue::Null)),
         }
     }
 
     pub fn properties(self) -> Vec<(PropertyId, ScalarValue)> {
         match self {
             Self::Base(edge) => edge.properties(),
-            Self::Overlay(edge) => edge
-                .properties
-                .iter()
-                .map(|(property, value)| (*property, value.clone()))
-                .collect(),
+            Self::Overlay(edge, base) => merged_properties(
+                base.map(EdgeView::properties).unwrap_or_default(),
+                &edge.properties,
+            ),
         }
     }
 }
 
-/// One statement reads canonical columns by reference and materializes only rows it changes.
+fn merged_properties(
+    mut base: Vec<(PropertyId, ScalarValue)>,
+    changed: &BTreeMap<PropertyId, ScalarValue>,
+) -> Vec<(PropertyId, ScalarValue)> {
+    base.retain(|(property, _)| !changed.contains_key(property));
+    base.extend(
+        changed
+            .iter()
+            .filter(|(_, value)| !matches!(value, ScalarValue::Null))
+            .map(|(property, value)| (*property, value.clone())),
+    );
+    base.sort_unstable_by_key(|(property, _)| *property);
+    base
+}
+
+/// One statement borrows canonical columns and stores only fields it changes.
 pub struct GraphReadView<'a> {
     base: &'a GraphStore,
     catalog: CatalogOverlay<'a>,
@@ -491,7 +514,8 @@ impl<'a> GraphReadView<'a> {
 
     pub fn node_dense(&self, dense: u32) -> Option<NodeReadView<'_>> {
         if let Some(node) = self.nodes.get(&dense) {
-            return (!node.deleted).then_some(NodeReadView::Overlay(node));
+            return (!node.deleted)
+                .then(|| NodeReadView::Overlay(node, self.base.node_dense(dense)));
         }
         self.base.node_dense(dense).map(NodeReadView::Base)
     }
@@ -514,7 +538,7 @@ impl<'a> GraphReadView<'a> {
             {
                 return None;
             }
-            return Some(EdgeReadView::Overlay(edge));
+            return Some(EdgeReadView::Overlay(edge, self.base.edge_dense(dense)));
         }
         let edge = self.base.edge_dense(dense)?;
         if self.node(edge.source()).is_none() || self.node(edge.target()).is_none() {
@@ -586,6 +610,13 @@ impl<'a> GraphReadView<'a> {
     }
 
     pub fn scan_node_denses(&self, label: Option<LabelId>, layers: LayerMask) -> Vec<u32> {
+        if self.nodes.is_empty() {
+            return self
+                .base
+                .scan_nodes(label, layers)
+                .map(|node| node.dense())
+                .collect();
+        }
         (0..self.node_slot_count())
             .filter_map(|row| {
                 let dense = u32::try_from(row).ok()?;
@@ -606,6 +637,20 @@ impl<'a> GraphReadView<'a> {
         layers: LayerMask,
         cap: usize,
     ) -> Vec<u32> {
+        if self.nodes.is_empty() {
+            return self
+                .base
+                .scan_nodes(labels.first().copied(), layers)
+                .filter(|node| {
+                    labels
+                        .iter()
+                        .skip(1)
+                        .all(|label| node.labels().contains(label))
+                })
+                .take(cap)
+                .map(|node| node.dense())
+                .collect();
+        }
         (0..self.node_slot_count())
             .filter_map(|row| {
                 let dense = u32::try_from(row).ok()?;
@@ -943,11 +988,7 @@ impl<'a> GraphReadView<'a> {
             .ok_or_else(|| Error::new(ErrorCode::QueryType, "node does not exist"))?
             .dense();
         let row = self.materialize_node(dense)?;
-        if matches!(value, ScalarValue::Null) {
-            row.properties.remove(&property);
-        } else {
-            row.properties.insert(property, value.clone());
-        }
+        row.properties.insert(property, value.clone());
         row.revision = revision;
         self.revision = revision;
         Ok(())
@@ -1001,11 +1042,7 @@ impl<'a> GraphReadView<'a> {
             .ok_or_else(|| Error::new(ErrorCode::QueryType, "relationship does not exist"))?
             .dense();
         let row = self.materialize_edge(dense)?;
-        if matches!(value, ScalarValue::Null) {
-            row.properties.remove(&property);
-        } else {
-            row.properties.insert(property, value.clone());
-        }
+        row.properties.insert(property, value.clone());
         row.revision = revision;
         self.revision = revision;
         Ok(())
@@ -1076,7 +1113,7 @@ impl<'a> GraphReadView<'a> {
                 layer: node.layer(),
                 revision: node.revision(),
                 labels: node.labels().to_vec(),
-                properties: node.properties().into_iter().collect(),
+                properties: BTreeMap::new(),
                 deleted: false,
             };
             self.node_ids.insert(overlay.id, dense);
@@ -1101,7 +1138,7 @@ impl<'a> GraphReadView<'a> {
                 relationship_type: edge.relationship_type(),
                 layer: edge.layer(),
                 revision: edge.revision(),
-                properties: edge.properties().into_iter().collect(),
+                properties: BTreeMap::new(),
                 deleted: false,
             };
             self.edge_ids.insert(overlay.id, dense);
@@ -1401,8 +1438,83 @@ mod tests {
     }
 
     #[test]
+    fn bounded_canonical_scan_filters_layers_labels_and_tombstones_before_cap() -> Result<()> {
+        let mut graph = GraphStore::default();
+        let first = graph.catalog_mut().intern_label("First")?;
+        let second = graph.catalog_mut().intern_label("Second")?;
+        for (row, (layer, labels)) in [
+            (Layer::Observed, vec![first]),
+            (Layer::Observed, vec![second]),
+            (Layer::Knowledge, vec![first, second]),
+            (Layer::Observed, vec![first, second]),
+            (Layer::Observed, vec![first, second]),
+            (Layer::Observed, vec![first, second]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            graph.insert_node(NodeInput {
+                id: NodeId(row as u64 + 1),
+                layer,
+                revision: 1,
+                labels,
+                properties: Vec::new(),
+            })?;
+        }
+        graph.delete_node(NodeId(5), true, 2)?;
+        let mut view = GraphReadView::new(&graph);
+        let labels = [first, second];
+        assert_eq!(
+            view.scan_node_denses_bounded(&labels, LayerMask::OBSERVED, 1),
+            vec![3]
+        );
+        assert_eq!(
+            view.scan_node_denses_bounded(&labels, LayerMask::OBSERVED, 2),
+            vec![3, 5]
+        );
+        assert!(
+            view.scan_node_denses_bounded(&labels, LayerMask::ALL, 0)
+                .is_empty()
+        );
+        assert_eq!(
+            view.scan_node_denses_bounded(&[], LayerMask::OBSERVED, 2),
+            vec![0, 1]
+        );
+        view.apply(&GraphMutation::AddNodeLabels {
+            node: NodeId(1),
+            labels: vec![second],
+            revision: 3,
+        })?;
+        view.apply(&GraphMutation::RemoveNodeLabels {
+            node: NodeId(4),
+            labels: vec![second],
+            revision: 3,
+        })?;
+        view.apply(&GraphMutation::InsertNode(NodeInput {
+            id: NodeId(7),
+            layer: Layer::Observed,
+            revision: 3,
+            labels: labels.to_vec(),
+            properties: Vec::new(),
+        }))?;
+        assert_eq!(
+            view.scan_node_denses_bounded(&labels, LayerMask::OBSERVED, 2),
+            vec![0, 5]
+        );
+        assert_eq!(
+            view.scan_node_denses_bounded(&labels, LayerMask::OBSERVED, 3),
+            vec![0, 5, 6]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn read_only_view_borrows_canonical_rows_and_write_materializes_one_row() -> Result<()> {
-        let (graph, label, property, _) = graph_fixture()?;
+        let (mut graph, label, property, _) = graph_fixture()?;
+        let body = graph.catalog_mut().intern_property("body")?;
+        let payload = ScalarValue::Bytes(vec![0x5a; 256 * 1_024].into());
+        graph.set_node_property(NodeId(1), body, payload.clone(), 1)?;
+        graph.set_edge_property(EdgeId(1), body, payload.clone(), 1)?;
         let mut view = GraphReadView::new(&graph);
 
         assert_eq!(view.overlay_row_counts(), (0, 0));
@@ -1419,6 +1531,12 @@ mod tests {
             revision: 2,
         })?;
         assert_eq!(view.overlay_row_counts(), (1, 0));
+        assert_eq!(view.nodes[&0].properties.len(), 1);
+        assert!(!view.nodes[&0].properties.contains_key(&body));
+        assert_eq!(
+            view.node(NodeId(1)).unwrap().property(body),
+            Some(payload.clone())
+        );
         assert_eq!(
             view.node(NodeId(1))
                 .and_then(|node| node.property(property)),
@@ -1435,6 +1553,45 @@ mod tests {
                 .and_then(|node| node.property(property)),
             Some(ScalarValue::Integer(20))
         );
+        view.apply(&GraphMutation::SetEdgeProperty {
+            edge: EdgeId(1),
+            property,
+            value: ScalarValue::Integer(99),
+            revision: 2,
+        })?;
+        assert_eq!(view.edges[&0].properties.len(), 1);
+        assert!(!view.edges[&0].properties.contains_key(&body));
+        assert_eq!(
+            view.edge(EdgeId(1)).unwrap().property(body),
+            Some(payload.clone())
+        );
+        view.apply(&GraphMutation::SetNodeProperty {
+            node: NodeId(1),
+            property: body,
+            value: ScalarValue::Null,
+            revision: 2,
+        })?;
+        view.apply(&GraphMutation::SetEdgeProperty {
+            edge: EdgeId(1),
+            property: body,
+            value: ScalarValue::Null,
+            revision: 2,
+        })?;
+        assert_eq!(view.node(NodeId(1)).unwrap().property(body), None);
+        assert_eq!(view.edge(EdgeId(1)).unwrap().property(body), None);
+        assert_eq!(
+            view.node(NodeId(1)).unwrap().properties(),
+            vec![(property, ScalarValue::Integer(99))]
+        );
+        assert_eq!(
+            view.edge(EdgeId(1)).unwrap().properties(),
+            vec![(property, ScalarValue::Integer(99))]
+        );
+        assert_eq!(
+            graph.node(NodeId(1)).unwrap().property(body),
+            Some(payload.clone())
+        );
+        assert_eq!(graph.edge(EdgeId(1)).unwrap().property(body), Some(payload));
         Ok(())
     }
 

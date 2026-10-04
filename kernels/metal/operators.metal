@@ -15525,6 +15525,7 @@ constant ulong IG_NULLABLE_STRING_EDGE_DICTIONARY = 3ul;
 constant ulong IG_NULLABLE_STRING_GRAPH_DIRECT = 4ul;
 constant ulong IG_NULLABLE_STRING_STORAGE_DICTIONARY = 1ul;
 constant ulong IG_NULLABLE_STRING_STORAGE_MIXED = 2ul;
+constant ulong IG_NULLABLE_STRING_STORAGE_MIXED_BASE = 3ul;
 constant ulong IG_NULLABLE_MIXED_STRING_TAG = 4ul;
 constant uint IG_NULLABLE_PREDICATE_STACK = 40u;
 constant ulong IG_NULLABLE_RELATION_NULL_ROW = 0xfffffffful;
@@ -15642,28 +15643,23 @@ struct IgNullableCsrResolvedRow {
     ulong overlay;
 };
 
-// Delta path: binary-search only the rows changed since the cold CSR build. The
-// overlay stores complete replacement rows as [ids][offsets][neighbors][edges].
+// Stable radix links address replacement rows without repacking earlier generations.
 inline IgNullableCsrResolvedRow ig_nullable_csr_resolve_row(
     device const long* graph,
     ulong offset_base,
     ulong overlay_base,
     ulong overlay_count,
     ulong row) {
-    ulong low = 0ul;
-    ulong high = overlay_count;
-    while (low < high) {
-        ulong middle = low + (high - low) / 2ul;
-        ulong candidate = ig_nullable_word(graph, overlay_base + middle);
-        if (candidate < row) low = middle + 1ul;
-        else high = middle;
+    ulong count = overlay_count == 0ul ? 0ul : ig_nullable_word(graph, overlay_base);
+    ulong link = overlay_count == 0ul ? 0ul : ig_nullable_word(graph, overlay_base + 1ul);
+    for (int shift = 31; shift >= 0 && link != 0ul; --shift) {
+        if (link >= count) { link = 0ul; break; }
+        link = ig_nullable_word(graph, overlay_base + link * 2ul + ((row >> ulong(shift)) & 1ul));
     }
-    if (low < overlay_count
-        && ig_nullable_word(graph, overlay_base + low) == row) {
-        ulong offsets = overlay_base + overlay_count;
+    if (link != 0ul && link < count) {
         return IgNullableCsrResolvedRow{
-            ig_nullable_word(graph, offsets + low),
-            ig_nullable_word(graph, offsets + low + 1ul),
+            ig_nullable_word(graph, overlay_base + link * 2ul),
+            ig_nullable_word(graph, overlay_base + link * 2ul + 1ul),
             1ul};
     }
     return IgNullableCsrResolvedRow{
@@ -15681,7 +15677,7 @@ inline ulong ig_nullable_csr_neighbor(
     ulong position) {
     if (row.overlay == 0ul) return ig_nullable_word(graph, base + position);
     return ig_nullable_word(
-        graph, overlay_base + overlay_count * 2ul + 1ul + position);
+        graph, overlay_base + position * 2ul);
 }
 
 inline ulong ig_nullable_csr_edge(
@@ -15692,10 +15688,7 @@ inline ulong ig_nullable_csr_edge(
     IgNullableCsrResolvedRow row,
     ulong position) {
     if (row.overlay == 0ul) return ig_nullable_word(graph, base + position);
-    ulong payload_count = ig_nullable_word(
-        graph, overlay_base + overlay_count * 2ul);
-    return ig_nullable_word(graph,
-        overlay_base + overlay_count * 2ul + 1ul + payload_count + position);
+    return ig_nullable_word(graph, overlay_base + position * 2ul + 1ul);
 }
 
 inline IgNullableCsrResolvedRow ig_nullable_csr_resolve_orientation(
@@ -15749,25 +15742,12 @@ inline bool ig_nullable_csr_overlay_valid(
     ulong graph_word_count) {
     if (row_count == 0ul) return word_count == 0ul;
     if (row_count > IG_NULLABLE_RELATION_MAX_DIMENSION) return false;
-    ulong prefix = row_count * 2ul + 1ul;
-    if (prefix > word_count || !ig_nullable_range(base, word_count, graph_word_count)) {
+    if (word_count < 2ul || !ig_nullable_range(base, word_count, graph_word_count)) {
         return false;
     }
-    ulong payload_count = ig_nullable_word(graph, base + row_count * 2ul);
-    if (payload_count > IG_NULLABLE_RELATION_MAX_DIMENSION
-        || prefix + payload_count * 2ul != word_count) return false;
-    ulong prior_row = 0ul;
-    ulong prior_offset = 0ul;
-    for (ulong index = 0ul; index < row_count; ++index) {
-        ulong row = ig_nullable_word(graph, base + index);
-        ulong offset = ig_nullable_word(graph, base + row_count + index);
-        if (row >= node_count || (index != 0ul && row <= prior_row)
-            || offset < prior_offset || offset > payload_count
-            || (index == 0ul && offset != 0ul)) return false;
-        prior_row = row;
-        prior_offset = offset;
-    }
-    return true;
+    ulong pairs = ig_nullable_word(graph, base);
+    ulong root = ig_nullable_word(graph, base + 1ul);
+    return pairs * 2ul == word_count && root != 0ul && root < pairs;
 }
 
 inline bool ig_nullable_product(ulong left, ulong right, thread ulong& product) {
@@ -16759,8 +16739,7 @@ kernel void ig_nullable_relation_validate_outgoing(
             graph, args.outgoing_offset_base, args.outgoing_overlay_base,
             args.outgoing_overlay_row_count, source);
         ulong bound = row.overlay == 0ul ? args.outgoing_count
-            : ig_nullable_word(graph, args.outgoing_overlay_base
-                + args.outgoing_overlay_row_count * 2ul);
+            : ig_nullable_word(graph, args.outgoing_overlay_base);
         if (row.begin > row.end || row.end > bound) {
             output[1] = 2ul;
             return;
@@ -16814,8 +16793,7 @@ kernel void ig_nullable_relation_validate_incoming(
             graph, args.incoming_offset_base, args.incoming_overlay_base,
             args.incoming_overlay_row_count, target);
         ulong bound = row.overlay == 0ul ? args.incoming_count
-            : ig_nullable_word(graph, args.incoming_overlay_base
-                + args.incoming_overlay_row_count * 2ul);
+            : ig_nullable_word(graph, args.incoming_overlay_base);
         if (row.begin > row.end || row.end > bound) {
             output[1] = 2ul;
             return;
@@ -17004,33 +16982,30 @@ kernel void ig_nullable_relation_validate_properties(
             }
             continue;
         }
-        if (storage != IG_NULLABLE_STRING_STORAGE_MIXED) {
+        bool has_base = storage == IG_NULLABLE_STRING_STORAGE_MIXED_BASE;
+        if (storage != IG_NULLABLE_STRING_STORAGE_MIXED && !has_base) {
             output[1] = 2ul;
             return;
         }
         ulong offset_base = ig_nullable_word(graph, graph_base + 5ul);
         ulong byte_base = ig_nullable_word(graph, graph_base + 6ul);
         ulong byte_count = ig_nullable_word(graph, graph_base + 7ul);
-        ulong offset_count = rows + 1ul;
-        if (offset_count <= rows || offset_base != mixed_cursor
-            || byte_base != offset_base + offset_count
+        ulong offset_count = rows * 2ul;
+        if (offset_count < rows || offset_base != mixed_cursor + (has_base ? 3ul : 0ul)
             || !ig_nullable_range(offset_base, offset_count, args.graph_word_count)
             || !ig_nullable_range(byte_base, byte_count, args.graph_word_count)
             || byte_base + byte_count > args.property_descriptor_base) {
             output[1] = 2ul;
             return;
         }
-        ulong prior = 0ul;
-        for (ulong index = 0ul; index < offset_count; ++index) {
-            ulong offset = ig_nullable_word(graph, offset_base + index);
-            if (offset < prior || offset > byte_count
-                || (index == 0ul && offset != 0ul)) {
-                output[1] = 2ul;
-                return;
-            }
-            prior = offset;
-        }
-        if (prior != byte_count) {
+        ulong base_shape = has_base ? ig_nullable_word(graph, offset_base - 3ul) : 0ul;
+        ulong base_rows = has_base ? ig_nullable_word(graph, offset_base - 2ul) : 0ul;
+        ulong base_values = has_base ? ig_nullable_word(graph, offset_base - 1ul) : 0ul;
+        ulong base_value_count = base_shape == 4ul ? base_rows : 0ul;
+        if ((has_base && (base_shape == 0ul || base_shape > 6ul || base_rows > rows))
+            || (base_shape == 4ul && base_values != offset_base + offset_count)
+            || (base_shape != 4ul && base_values != 0ul)
+            || byte_base != offset_base + offset_count + base_value_count) {
             output[1] = 2ul;
             return;
         }
@@ -17043,13 +17018,22 @@ kernel void ig_nullable_relation_validate_properties(
         for (ulong row = 0ul; row < rows; ++row) {
             ulong present = ig_nullable_word(
                 graph, validity + category * rows + row);
-            ulong start = ig_nullable_word(graph, offset_base + row);
-            ulong end = ig_nullable_word(graph, offset_base + row + 1ul);
+            ulong start = ig_nullable_word(graph, offset_base + row * 2ul);
+            ulong end = ig_nullable_word(graph, offset_base + row * 2ul + 1ul);
             ulong value = ig_nullable_word(graph, values + category * rows + row);
-            if (present > 1ul || value != start
-                || (present == 1ul && start >= end)) {
+            if (present > 1ul || value != start || start > end || end > byte_count
+                || (present == 1ul && start == end && (!has_base || row >= base_rows))) {
                 output[1] = 2ul;
                 return;
+            }
+            if (present == 1ul && start == end && base_shape == 4ul) {
+                ulong dictionary_id = ig_nullable_word(graph, base_values + row);
+                ulong dictionary_offsets = kind == 1ul
+                    ? args.node_string_offset_count : args.edge_string_offset_count;
+                if (dictionary_offsets < 2ul || dictionary_id >= dictionary_offsets - 1ul) {
+                    output[1] = 2ul;
+                    return;
+                }
             }
         }
         mixed_cursor = byte_base + byte_count;
@@ -18558,15 +18542,32 @@ inline bool ig_nullable_string_property_value(
             dictionary_id, 0ul);
         return true;
     }
-    if (storage != IG_NULLABLE_STRING_STORAGE_MIXED) return false;
+    bool has_base = storage == IG_NULLABLE_STRING_STORAGE_MIXED_BASE;
+    if (storage != IG_NULLABLE_STRING_STORAGE_MIXED && !has_base) return false;
     ulong offset_base = ig_nullable_word(graph, descriptor + 5ul);
     ulong byte_base = ig_nullable_word(graph, descriptor + 6ul);
     ulong byte_count = ig_nullable_word(graph, descriptor + 7ul);
-    if (!ig_nullable_range(offset_base, rows + 1ul, args.graph_word_count)
+    if (!ig_nullable_range(offset_base, rows * 2ul, args.graph_word_count)
         || !ig_nullable_range(byte_base, byte_count, args.graph_word_count)) return false;
-    ulong start = ig_nullable_word(graph, offset_base + dense);
-    ulong end = ig_nullable_word(graph, offset_base + dense + 1ul);
-    if (start >= end || end > byte_count) return false;
+    ulong start = ig_nullable_word(graph, offset_base + dense * 2ul);
+    ulong end = ig_nullable_word(graph, offset_base + dense * 2ul + 1ul);
+    if (start > end || end > byte_count) return false;
+    if (start == end) {
+        if (!has_base || offset_base < 3ul) return false;
+        ulong base_shape = ig_nullable_word(graph, offset_base - 3ul);
+        ulong base_rows = ig_nullable_word(graph, offset_base - 2ul);
+        if (dense >= base_rows || base_shape == 0ul || base_shape > 6ul) return false;
+        if (base_shape != 4ul) {
+            value = ulong4(IG_NULLABLE_VALUE_PRESENT_NON_STRING, 0ul, 0ul, 0ul);
+            return true;
+        }
+        ulong base_values = ig_nullable_word(graph, offset_base - 1ul);
+        if (!ig_nullable_range(base_values, base_rows, args.graph_word_count)) return false;
+        value = ulong4(IG_NULLABLE_VALUE_STRING,
+            kind == 1ul ? IG_NULLABLE_STRING_NODE_DICTIONARY : IG_NULLABLE_STRING_EDGE_DICTIONARY,
+            ig_nullable_word(graph, base_values + dense), 0ul);
+        return true;
+    }
     ulong tag = ig_nullable_word(graph, byte_base + start);
     if (tag != IG_NULLABLE_MIXED_STRING_TAG) {
         value = ulong4(IG_NULLABLE_VALUE_PRESENT_NON_STRING, 0ul, 0ul, 0ul);
@@ -18929,6 +18930,14 @@ inline uint ig_nullable_evaluate_predicate(
                     if (left.x == IG_NULLABLE_VALUE_NULL
                         || right.x == IG_NULLABLE_VALUE_NULL) {
                         value = ulong4(IG_NULLABLE_VALUE_NULL, 0ul, 0ul, 0ul);
+                    } else if (operation <= 5ul
+                        && ((left.x == IG_NULLABLE_VALUE_PRESENT_NON_STRING
+                                && right.x == IG_NULLABLE_VALUE_STRING)
+                            || (right.x == IG_NULLABLE_VALUE_PRESENT_NON_STRING
+                                && left.x == IG_NULLABLE_VALUE_STRING))) {
+                        value = operation <= 1ul
+                            ? ulong4(IG_NULLABLE_VALUE_BOOLEAN, operation, 0ul, 0ul)
+                            : ulong4(IG_NULLABLE_VALUE_NULL, 0ul, 0ul, 0ul);
                     } else if (operation <= 5ul) {
                         bool valid = false;
                         int ordering = ig_nullable_string_order(
@@ -19712,9 +19721,7 @@ struct IgCsrResolvedRow {
     uint overlay;
 };
 
-// Resolve a complete replacement row before the immutable cold CSR. One compact packet stores
-// [row ids K][offsets K+1][neighbors M][edge ids M]. Binary search makes lookup logarithmic in
-// changed rows while an empty overlay takes the original two offset loads.
+// Resolve a complete replacement row through stable 32-bit radix links before the cold CSR.
 inline bool ig_csr_resolve_row(
     device const uint* base_offsets,
     ulong base_entry_count,
@@ -19723,18 +19730,16 @@ inline bool ig_csr_resolve_row(
     uint row,
     thread IgCsrResolvedRow& resolved) {
     if (overlay_count != 0u) {
-        uint low = 0u;
-        uint high = overlay_count;
-        while (low < high) {
-            uint middle = low + ((high - low) >> 1u);
-            if (overlay[middle] < row) low = middle + 1u;
-            else high = middle;
+        uint link = overlay[1];
+        for (int shift = 31; shift >= 0 && link != 0u; --shift) {
+            if (link >= overlay[0]) return false;
+            link = overlay[link * 2u + ((row >> uint(shift)) & 1u)];
         }
-        if (low < overlay_count && overlay[low] == row) {
-            uint payload_count = overlay[2u * overlay_count];
-            uint begin = overlay[overlay_count + low];
-            uint end = overlay[overlay_count + low + 1u];
-            if (begin > end || ulong(end) > ulong(payload_count)) return false;
+        if (link != 0u) {
+            if (link >= overlay[0]) return false;
+            uint begin = overlay[link * 2u];
+            uint end = overlay[link * 2u + 1u];
+            if (begin > end || end > overlay[0]) return false;
             resolved = IgCsrResolvedRow{begin, end, 1u};
             return true;
         }
@@ -19753,7 +19758,7 @@ inline uint ig_csr_resolved_neighbor(
     IgCsrResolvedRow row,
     uint position) {
     if (row.overlay == 0u) return base_neighbors[position];
-    return overlay[2u * overlay_count + 1u + position];
+    return overlay[position * 2u];
 }
 
 inline uint ig_csr_resolved_edge(
@@ -19763,8 +19768,7 @@ inline uint ig_csr_resolved_edge(
     IgCsrResolvedRow row,
     uint position) {
     if (row.overlay == 0u) return base_edges[position];
-    uint payload_count = overlay[2u * overlay_count];
-    return overlay[2u * overlay_count + 1u + payload_count + position];
+    return overlay[position * 2u + 1u];
 }
 
 kernel void ig_nullable_relation_publish(
@@ -21881,8 +21885,14 @@ kernel void ig_graph_bfs_top_down_step(
     }
     uint begin = row.begin;
     uint end = row.end;
-    begin = max(begin, args.edge_begin);
-    end = min(end, args.edge_end);
+    if (row.overlay != 0u) {
+        uint degree = end - begin;
+        end = begin + min(degree, args.edge_end);
+        begin += min(degree, args.edge_begin);
+    } else {
+        begin = max(begin, args.edge_begin);
+        end = min(end, args.edge_end);
+    }
     for (uint position = begin; position < end; ++position) {
         uint edge = ig_csr_resolved_edge(
             outgoing_edges, outgoing_overlay, args.overlay_count, row, position);
@@ -21949,8 +21959,14 @@ kernel void ig_graph_bfs_bottom_up_step(
     }
     uint begin = row.begin;
     uint end = row.end;
-    begin = max(begin, args.edge_begin);
-    end = min(end, args.edge_end);
+    if (row.overlay != 0u) {
+        uint degree = end - begin;
+        end = begin + min(degree, args.edge_end);
+        begin += min(degree, args.edge_begin);
+    } else {
+        begin = max(begin, args.edge_begin);
+        end = min(end, args.edge_end);
+    }
     for (uint position = begin; position < end; ++position) {
         uint edge = ig_csr_resolved_edge(
             incoming_edges, incoming_overlay, args.overlay_count, row, position);
@@ -22069,8 +22085,14 @@ kernel void ig_graph_dijkstra_unit_finalize(
     }
     uint begin = row.begin;
     uint end = row.end;
-    begin = max(begin, args.edge_begin);
-    end = min(end, args.edge_end);
+    if (row.overlay != 0u) {
+        uint degree = end - begin;
+        end = begin + min(degree, args.edge_end);
+        begin += min(degree, args.edge_begin);
+    } else {
+        begin = max(begin, args.edge_begin);
+        end = min(end, args.edge_end);
+    }
     uint required_source_distance = target_distance - 1u;
     uint best = predecessors[target];
     for (uint position = begin; position < end; ++position) {
@@ -24043,7 +24065,7 @@ kernel void ig_resident_row_evaluate(
                 && validity_offset < args.property_storage_words
                 && sixth % ulong(IG_ROW_LIST_ELEMENT_BYTES) == 0ul
                 && ig_row_range_is_valid(
-                    second, ulong(source_rows) + 1ul, args.property_storage_words)
+                    second, ulong(source_rows) * 2ul, args.property_storage_words)
                 && ig_row_range_is_valid(
                     third, ulong(byte_count), args.property_storage_words)
                 && ig_row_string_slot(args, fifth, sixth, row, slot_offset);
@@ -24063,8 +24085,8 @@ kernel void ig_resident_row_evaluate(
                     valid = 0L;
                 } else if (valid != 0L) {
                     ulong source = as_type<ulong>(source_word);
-                    long start_word = property_inputs[second + source];
-                    long end_word = property_inputs[second + source + 1ul];
+                    long start_word = property_inputs[second + source * 2ul];
+                    long end_word = property_inputs[second + source * 2ul + 1ul];
                     bool range_valid = start_word >= 0L && end_word >= start_word
                         && as_type<ulong>(end_word) <= ulong(byte_count);
                     ulong length = range_valid
@@ -26225,55 +26247,6 @@ kernel void ig_integer_group_summary(
     output[groups + group] = as_type<long>(sums[0]);
     output[2ul * groups + group] = counts[0] == 0ul ? 0L : minimums[0];
     output[3ul * groups + group] = counts[0] == 0ul ? 0L : maximums[0];
-}
-
-struct EdgeAppendArgs {
-    ulong old_count;
-    ulong row_count;
-};
-
-// Publishes the six query-visible fixed relationship columns in one dispatch. Appended rows are
-// already canonical, so copying them through six complete host vectors only adds bandwidth and a
-// second full-size allocation. Revisions remain in the canonical paged host backing because no
-// resident query kernel reads them.
-kernel void ig_edge_append(
-    device const long* old_ids [[buffer(0)]],
-    device const uint* old_sources [[buffer(1)]],
-    device const uint* old_targets [[buffer(2)]],
-    device const long* old_types [[buffer(3)]],
-    device const uchar* old_layers [[buffer(4)]],
-    device const uchar* old_active [[buffer(5)]],
-    device const long* appended_ids [[buffer(6)]],
-    device const uint* appended_sources [[buffer(7)]],
-    device const uint* appended_targets [[buffer(8)]],
-    device const long* appended_types [[buffer(9)]],
-    device const uchar* appended_layers [[buffer(10)]],
-    device const uchar* appended_active [[buffer(11)]],
-    device long* output_ids [[buffer(12)]],
-    device uint* output_sources [[buffer(13)]],
-    device uint* output_targets [[buffer(14)]],
-    device long* output_types [[buffer(15)]],
-    device uchar* output_layers [[buffer(16)]],
-    device uchar* output_active [[buffer(17)]],
-    constant EdgeAppendArgs& args [[buffer(18)]],
-    uint row [[thread_position_in_grid]]) {
-    if (ulong(row) >= args.row_count) return;
-    if (ulong(row) < args.old_count) {
-        output_ids[row] = old_ids[row];
-        output_sources[row] = old_sources[row];
-        output_targets[row] = old_targets[row];
-        output_types[row] = old_types[row];
-        output_layers[row] = old_layers[row];
-        output_active[row] = old_active[row];
-        return;
-    }
-    ulong appended = ulong(row) - args.old_count;
-    output_ids[row] = appended_ids[appended];
-    output_sources[row] = appended_sources[appended];
-    output_targets[row] = appended_targets[appended];
-    output_types[row] = appended_types[appended];
-    output_layers[row] = appended_layers[appended];
-    output_active[row] = appended_active[appended];
 }
 
 // Stable mask compaction in three bounded passes. The prior host composition implemented the
@@ -32399,7 +32372,7 @@ kernel void ig_segmented_graph_source_program(
     if (property_value_source) {
         ulong property_kind = program[property_value_base + 3ul];
         ulong expected_rows = property_kind == 1ul ? program[29] : program[30];
-        if (property_args.offset_storage_elems != expected_rows + 1ul
+        if (property_args.offset_storage_elems != expected_rows * 2ul
                 || property_args.validity_storage_elems != max(expected_rows, 1ul)
                 || property_args.entity_rows != expected_rows
                 || property_args.maximum_bytes != program[property_value_base + 11ul]
@@ -32780,8 +32753,8 @@ kernel void ig_segmented_graph_source_program(
                     return;
                 }
                 uchar valid = property_validity[dense];
-                start = ulong(property_offsets[dense]);
-                ulong end = ulong(property_offsets[ulong(dense) + 1ul]);
+                start = ulong(property_offsets[ulong(dense) * 2ul]);
+                ulong end = ulong(property_offsets[ulong(dense) * 2ul + 1ul]);
                 if (valid > 1u || end < start
                         || end > property_args.byte_storage_elems
                         || end - start > property_args.maximum_bytes
@@ -35457,18 +35430,15 @@ inline IgVariablePathCsrRow ig_variable_path_csr_row(
     device const uint* overlay,
     uint overlay_count,
     uint source) {
-    uint low = 0u;
-    uint high = overlay_count;
-    while (low < high) {
-        uint middle = low + (high - low) / 2u;
-        uint candidate = overlay[middle];
-        if (candidate < source) low = middle + 1u;
-        else high = middle;
+    uint link = overlay_count == 0u ? 0u : overlay[1];
+    for (int shift = 31; shift >= 0 && link != 0u; --shift) {
+        if (link >= overlay[0]) { link = 0u; break; }
+        link = overlay[link * 2u + ((source >> uint(shift)) & 1u)];
     }
-    if (low < overlay_count && overlay[low] == source) {
+    if (link != 0u && link < overlay[0]) {
         return IgVariablePathCsrRow{
-            overlay[overlay_count + low],
-            overlay[overlay_count + low + 1u],
+            overlay[link * 2u],
+            overlay[link * 2u + 1u],
             1u};
     }
     return IgVariablePathCsrRow{offsets[source], offsets[source + 1u], 0u};
@@ -35481,7 +35451,7 @@ inline uint ig_variable_path_csr_neighbor(
     IgVariablePathCsrRow row,
     uint position) {
     return row.overlay == 0u ? neighbors[position]
-        : overlay[overlay_count * 2u + 1u + position];
+        : overlay[position * 2u];
 }
 
 inline uint ig_variable_path_csr_edge(
@@ -35491,8 +35461,7 @@ inline uint ig_variable_path_csr_edge(
     IgVariablePathCsrRow row,
     uint position) {
     if (row.overlay == 0u) return edges[position];
-    uint payload_count = overlay[overlay_count * 2u];
-    return overlay[overlay_count * 2u + 1u + payload_count + position];
+    return overlay[position * 2u + 1u];
 }
 
 // The effective maximum is clamped to the resident edge domain. `minimum > maximum` therefore
@@ -36027,7 +35996,7 @@ inline uint ig_variable_path_count_orientation(
     thread bool& corrupt) {
     IgVariablePathCsrRow row = ig_variable_path_csr_row(
         offsets, overlay, overlay_count, source);
-    uint bound = row.overlay == 0u ? args.edge_count : overlay[overlay_count * 2u];
+    uint bound = row.overlay == 0u ? args.edge_count : overlay[0];
     if (row.begin > row.end || row.end > bound) {
         corrupt = true;
         return 0u;
@@ -36075,7 +36044,7 @@ inline uint ig_variable_path_scatter_orientation(
     thread bool& corrupt) {
     IgVariablePathCsrRow row = ig_variable_path_csr_row(
         offsets, overlay, overlay_count, source);
-    uint bound = row.overlay == 0u ? args.edge_count : overlay[overlay_count * 2u];
+    uint bound = row.overlay == 0u ? args.edge_count : overlay[0];
     if (row.begin > row.end || row.end > bound) {
         corrupt = true;
         return write;
@@ -37373,7 +37342,7 @@ kernel void ig_variable_path_publish(
                     outgoing_offsets, outgoing_overlay,
                     args.outgoing_overlay_count, source);
                 uint adjacency_bound = adjacency.overlay == 0u ? args.edge_count
-                    : outgoing_overlay[args.outgoing_overlay_count * 2u];
+                    : outgoing_overlay[0];
                 if (adjacency.begin > adjacency.end || adjacency.end > adjacency_bound) {
                     output[1] = as_type<long>(ulong(IG_VARIABLE_PATH_STATUS_CORRUPT)
                         | (ulong(IG_VARIABLE_PATH_PHASE_COMPLETE) << 32u));
@@ -37499,7 +37468,7 @@ kernel void ig_variable_path_publish(
                 incoming_offsets, incoming_overlay,
                 args.incoming_overlay_count, start);
             uint adjacency_bound = adjacency.overlay == 0u ? args.edge_count
-                : incoming_overlay[args.incoming_overlay_count * 2u];
+                : incoming_overlay[0];
             if (adjacency.begin > adjacency.end || adjacency.end > adjacency_bound) {
                 output[1] = as_type<long>(ulong(IG_VARIABLE_PATH_STATUS_CORRUPT)
                     | (ulong(IG_VARIABLE_PATH_PHASE_COMPLETE) << 32u));
@@ -37627,7 +37596,7 @@ kernel void ig_variable_path_publish(
                             outgoing_offsets, outgoing_overlay,
                             args.outgoing_overlay_count, source);
                         uint adjacency_bound = adjacency.overlay == 0u ? args.edge_count
-                            : outgoing_overlay[args.outgoing_overlay_count * 2u];
+                            : outgoing_overlay[0];
                         if (adjacency.begin > adjacency.end
                                 || adjacency.end > adjacency_bound) {
                             output[1] = as_type<long>(ulong(IG_VARIABLE_PATH_STATUS_CORRUPT)
@@ -37740,20 +37709,21 @@ kernel void ig_variable_path_publish(
                 && final_property_values[start] == as_type<long>(args.final_projection_operand_0)
                 && final_property_values[second] == as_type<long>(args.final_projection_operand_1);
             for (uint orientation = 0u; orientation < 2u; ++orientation) {
-                uint begin = orientation == 0u ? outgoing_offsets[first] : incoming_offsets[first];
-                uint end = orientation == 0u ? outgoing_offsets[first + 1u] : incoming_offsets[first + 1u];
-                if (begin > end || end > args.edge_count) {
+                device const uint* offsets = orientation == 0u ? outgoing_offsets : incoming_offsets;
+                device const uint* neighbors = orientation == 0u ? outgoing_neighbors : incoming_neighbors;
+                device const uint* edges = orientation == 0u ? outgoing_edges : incoming_edges;
+                device const uint* overlay = orientation == 0u ? outgoing_overlay : incoming_overlay;
+                uint count = orientation == 0u ? args.outgoing_overlay_count : args.incoming_overlay_count;
+                IgVariablePathCsrRow resolved = ig_variable_path_csr_row(offsets, overlay, count, first);
+                uint bound = resolved.overlay == 0u ? args.edge_count : overlay[0];
+                if (resolved.begin > resolved.end || resolved.end > bound) {
                     output[1] = as_type<long>(ulong(IG_VARIABLE_PATH_STATUS_CORRUPT)
                         | (ulong(IG_VARIABLE_PATH_PHASE_COMPLETE) << 32u));
                     return;
                 }
-                for (uint position = begin; position < end; ++position) {
-                    uint neighbor = orientation == 0u
-                        ? outgoing_neighbors[position]
-                        : incoming_neighbors[position];
-                    uint edge = orientation == 0u
-                        ? outgoing_edges[position]
-                        : incoming_edges[position];
+                for (uint position = resolved.begin; position < resolved.end; ++position) {
+                    uint neighbor = ig_variable_path_csr_neighbor(neighbors, overlay, count, resolved, position);
+                    uint edge = ig_variable_path_csr_edge(edges, overlay, count, resolved, position);
                     if (orientation != 0u && neighbor == first) continue;
                     uint visible = ig_variable_path_final_adjacency_selected(
                         neighbor, edge, false, final_node_mask,
@@ -37806,16 +37776,20 @@ kernel void ig_variable_path_publish(
             }
             if (selected_start == 0u) continue;
             ++selected_starts;
-            uint begin = outgoing_offsets[start];
-            uint end = outgoing_offsets[start + 1u];
-            if (begin > end || end > args.edge_count) {
+            IgVariablePathCsrRow resolved = ig_variable_path_csr_row(
+                outgoing_offsets, outgoing_overlay, args.outgoing_overlay_count, start);
+            uint bound = resolved.overlay == 0u ? args.edge_count : outgoing_overlay[0];
+            if (resolved.begin > resolved.end || resolved.end > bound) {
                 output[1] = as_type<long>(ulong(IG_VARIABLE_PATH_STATUS_CORRUPT)
                     | (ulong(IG_VARIABLE_PATH_PHASE_COMPLETE) << 32u));
                 return;
             }
-            for (uint position = begin; position < end; ++position) {
+            for (uint position = resolved.begin; position < resolved.end; ++position) {
                 uint visible = ig_variable_path_final_adjacency_selected(
-                    outgoing_neighbors[position], outgoing_edges[position], false,
+                    ig_variable_path_csr_neighbor(outgoing_neighbors, outgoing_overlay,
+                        args.outgoing_overlay_count, resolved, position),
+                    ig_variable_path_csr_edge(outgoing_edges, outgoing_overlay,
+                        args.outgoing_overlay_count, resolved, position), false,
                     final_node_mask, node_active, node_layers, edge_active, edge_layers, args);
                 if (visible == 2u) {
                     output[1] = as_type<long>(ulong(IG_VARIABLE_PATH_STATUS_CORRUPT)
@@ -41814,6 +41788,10 @@ struct MetalQuantifierEntityArgs {
     uint dependency_capacity;
     uint group_table_capacity;
     uint group_sort_capacity;
+    uint property_base_storage_shape;
+    uint property_base_rows;
+    uint property_base_offset_count;
+    uint property_base_byte_count;
 };
 
 inline void ig_q_entity_fail(device atomic_uint* control, uint status) {
@@ -42030,6 +42008,8 @@ kernel void ig_quantifier_entity_validate_property(
     device atomic_uint* control [[buffer(8)]],
     constant MetalQuantifierArgs& q [[buffer(9)]],
     constant MetalQuantifierEntityArgs& args [[buffer(10)]],
+    device const uint* base_offsets [[buffer(11)]],
+    device const uchar* base_bytes [[buffer(12)]],
     uint row [[thread_position_in_grid]]) {
     if (row >= args.entity_rows
             || atomic_load_explicit(&control[IG_Q_ENTITY_CONTROL_STATUS], memory_order_relaxed)
@@ -42080,27 +42060,61 @@ kernel void ig_quantifier_entity_validate_property(
         kind = 8u;
         string_bytes = end - begin;
     } else if (args.property_storage_shape == 5u) {
-        if (row + 1u >= args.property_offset_count) {
+        if (ulong(row) * 2ul + 1ul >= ulong(args.property_offset_count)) {
             ig_q_entity_fail(control, IG_Q_ENTITY_STATUS_CORRUPT);
             return;
         }
-        uint begin = offsets[row];
-        uint end = offsets[row + 1u];
-        if (begin >= end || end > args.property_byte_count) {
+        uint begin = offsets[ulong(row) * 2ul];
+        uint end = offsets[ulong(row) * 2ul + 1ul];
+        if (begin > end || end > args.property_byte_count) {
             ig_q_entity_fail(control, IG_Q_ENTITY_STATUS_CORRUPT);
             return;
         }
-        uchar tag = bytes[begin];
-        uint payload = end - begin - 1u;
-        if (tag == 1u && payload == 1u && bytes[begin + 1u] <= 1u) kind = 1u;
-        else if (tag == 2u && payload == 8u) kind = 2u;
-        else if (tag == 3u && payload == 8u) kind = 4u;
-        else if (tag == 4u) {
-            kind = 8u;
-            string_bytes = payload;
+        if (begin == end) {
+            if (args.property_base_storage_shape == 0u || row >= args.property_base_rows) {
+                ig_q_entity_fail(control, IG_Q_ENTITY_STATUS_CORRUPT);
+                return;
+            }
+            uint shape = args.property_base_storage_shape;
+            if (shape == 1u) {
+                if (property_u8[row] > 1u) {
+                    ig_q_entity_fail(control, IG_Q_ENTITY_STATUS_CORRUPT);
+                    return;
+                }
+                kind = 1u;
+            } else if (shape == 2u) kind = 2u;
+            else if (shape == 3u) kind = 4u;
+            else if (shape == 4u) {
+                uint id = property_u32[row];
+                if (ulong(id) + 1ul >= ulong(args.property_base_offset_count)) {
+                    ig_q_entity_fail(control, IG_Q_ENTITY_STATUS_CORRUPT);
+                    return;
+                }
+                uint start = base_offsets[id];
+                uint finish = base_offsets[id + 1u];
+                if (start > finish || finish > args.property_base_byte_count) {
+                    ig_q_entity_fail(control, IG_Q_ENTITY_STATUS_CORRUPT);
+                    return;
+                }
+                kind = 8u;
+                string_bytes = finish - start;
+            } else {
+                ig_q_entity_fail(control, IG_Q_ENTITY_STATUS_ADMISSION);
+                return;
+            }
         } else {
-            ig_q_entity_fail(control, IG_Q_ENTITY_STATUS_ADMISSION);
-            return;
+            uchar tag = bytes[begin];
+            uint payload = end - begin - 1u;
+            if (tag == 1u && payload == 1u && bytes[begin + 1u] <= 1u) kind = 1u;
+            else if (tag == 2u && payload == 8u) kind = 2u;
+            else if (tag == 3u && payload == 8u) kind = 4u;
+            else if (tag == 4u) {
+                kind = 8u;
+                string_bytes = payload;
+            } else {
+                ig_q_entity_fail(control, IG_Q_ENTITY_STATUS_ADMISSION);
+                return;
+            }
         }
     } else {
         ig_q_entity_fail(control, IG_Q_ENTITY_STATUS_CORRUPT);
@@ -42503,6 +42517,7 @@ struct IgQuantifierEntityScalar {
     ulong bits;
     uint offset;
     uint length;
+    uint base;
 };
 
 inline IgQuantifierEntityScalar ig_q_entity_property_scalar(
@@ -42513,8 +42528,9 @@ inline IgQuantifierEntityScalar ig_q_entity_property_scalar(
     device const uchar* validity,
     device const uint* offsets,
     device const uchar* bytes,
+    device const uint* base_offsets,
     constant MetalQuantifierEntityArgs& args) {
-    IgQuantifierEntityScalar value { 0u, 0ul, 0u, 0u };
+    IgQuantifierEntityScalar value { 0u, 0ul, 0u, 0u, 0u };
     if (args.property_storage_shape == 0u || validity[row] == 0u) return value;
     if (args.property_storage_shape == 1u) {
         value.tag = 1u;
@@ -42531,8 +42547,22 @@ inline IgQuantifierEntityScalar ig_q_entity_property_scalar(
         value.offset = offsets[id];
         value.length = offsets[id + 1u] - value.offset;
     } else {
-        uint begin = offsets[row];
-        uint end = offsets[row + 1u];
+        uint begin = offsets[ulong(row) * 2ul];
+        uint end = offsets[ulong(row) * 2ul + 1ul];
+        if (begin == end && args.property_base_storage_shape != 0u
+                && row < args.property_base_rows) {
+            uint shape = args.property_base_storage_shape;
+            value.tag = shape;
+            if (shape == 1u) value.bits = ulong(property_u8[row]);
+            else if (shape == 2u || shape == 3u) value.bits = as_type<ulong>(property_i64[row]);
+            else if (shape == 4u) {
+                uint id = property_u32[row];
+                value.offset = base_offsets[id];
+                value.length = base_offsets[id + 1u] - value.offset;
+                value.base = 1u;
+            }
+            return value;
+        }
         uchar tag = bytes[begin];
         value.tag = uint(tag);
         if (tag == 1u) value.bits = ulong(bytes[begin + 1u]);
@@ -42576,10 +42606,12 @@ inline long ig_q_entity_compare_property(
     device const uchar* validity,
     device const uint* offsets,
     device const uchar* bytes,
+    device const uint* base_offsets,
+    device const uchar* base_bytes,
     constant MetalQuantifierArgs& q,
     constant MetalQuantifierEntityArgs& args) {
     IgQuantifierEntityScalar property = ig_q_entity_property_scalar(
-        row, property_u8, property_i64, property_u32, validity, offsets, bytes, args);
+        row, property_u8, property_i64, property_u32, validity, offsets, bytes, base_offsets, args);
     device const ulong* literal = ig_q_cell(program, scratch, q, literal_handle);
     if (property.tag == 0u || literal[0] == IG_Q_TAG_NULL) return -1L;
     bool equal = false;
@@ -42605,7 +42637,8 @@ inline long ig_q_entity_compare_property(
         order = property.bits < literal[1] ? -1 : (property.bits > literal[1] ? 1 : 0);
         equal = property.bits == literal[1];
     } else if (property.tag == 4u && literal[0] == IG_Q_TAG_STRING) {
-        order = ig_q_entity_string_order(bytes, property, program, scratch, q, literal);
+        order = ig_q_entity_string_order(
+            property.base == 0u ? bytes : base_bytes, property, program, scratch, q, literal);
         equal = order == 0;
     } else {
         comparable = false;
@@ -42637,6 +42670,8 @@ kernel void ig_quantifier_entity_project(
     device const uchar* bytes [[buffer(11)]],
     constant MetalQuantifierArgs& q [[buffer(12)]],
     constant MetalQuantifierEntityArgs& args [[buffer(13)]],
+    device const uint* base_offsets [[buffer(14)]],
+    device const uchar* base_bytes [[buffer(15)]],
     uint row [[thread_position_in_grid]]) {
     if (atomic_load_explicit(&control[IG_Q_ENTITY_CONTROL_STATUS], memory_order_relaxed)
             != IG_Q_ENTITY_STATUS_OK) return;
@@ -42684,7 +42719,7 @@ kernel void ig_quantifier_entity_project(
                 long predicate = ig_q_entity_compare_property(
                     dense, descriptor[5], descriptor[7] != 0ul, descriptor[6],
                     program, scratch, property_u8, property_i64, property_u32,
-                    validity, offsets, bytes, q, args);
+                    validity, offsets, bytes, base_offsets, base_bytes, q, args);
                 if (predicate < 0L) unknown = true;
                 else if (predicate == 0L) ++false_count;
                 else ++true_count;

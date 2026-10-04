@@ -109,15 +109,18 @@ use super::{
 };
 
 /// Explicit degraded CPU backend; never advertised as GPU execution.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CpuBackend {
-    governor: DeviceMemoryGovernor,
     resident: BTreeMap<ProjectId, Arc<CpuResident>>,
+    // Drop the physical owners before releasing their retained-generation token.
+    governor: DeviceMemoryGovernor,
 }
 
 #[derive(Clone, Debug)]
 struct CpuResident {
-    image: ResidentProjectImage,
+    image: Arc<ResidentProjectImage>,
+    cold_bytes: usize,
+    vectors: BTreeMap<crate::types::PropertyId, CpuVectorColumn>,
     node_id_rows: PersistentMap<u32>,
     edge_id_rows: PersistentMap<u32>,
     bookmark: Bookmark,
@@ -127,12 +130,93 @@ struct CpuResident {
     edge_capacity: usize,
     // Sparse publication copies only the radix path for each changed dense row. These maps are
     // the delta overlay and must never be rebuilt or cloned in proportion to the cold image.
-    nodes: PersistentMap<crate::graph::NodeDeviceDelta>,
-    edges: PersistentMap<crate::graph::EdgeDeviceDelta>,
-    outgoing: PersistentMap<crate::graph::AdjacencyRowDeviceDelta>,
-    incoming: PersistentMap<crate::graph::AdjacencyRowDeviceDelta>,
-    temporal: Vec<super::ResidentTemporalDelta>,
+    nodes: PersistentMap<Arc<crate::graph::NodeDeviceDelta>>,
+    edges: PersistentMap<Arc<crate::graph::EdgeDeviceDelta>>,
+    outgoing: PersistentMap<Arc<crate::graph::AdjacencyRowDeviceDelta>>,
+    incoming: PersistentMap<Arc<crate::graph::AdjacencyRowDeviceDelta>>,
+    temporal: crate::graph::PagedVec<super::ResidentTemporalDelta>,
     delta_bytes: usize,
+    branch_rows: PersistentMap<usize>,
+    branch_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+struct CpuVectorColumn {
+    dimension: usize,
+    similarity: Similarity,
+    dtype: EmbeddingDType,
+    entity_ids: crate::graph::PagedVec<u64>,
+    values: crate::graph::PagedVec<u16>,
+    versions: crate::graph::PagedVec<u64>,
+    active: crate::graph::PagedVec<u8>,
+    rows: PersistentMap<usize>,
+    changed_rows: PersistentMap<()>,
+}
+
+impl CpuVectorColumn {
+    fn from_image(image: crate::graph::VectorDeviceImage) -> Self {
+        fn paged<T: Clone>(values: Vec<T>) -> crate::graph::PagedVec<T> {
+            let mut result = crate::graph::PagedVec::default();
+            for value in values {
+                result.push(value);
+            }
+            result
+        }
+        let mut rows = PersistentMap::default();
+        for (row, entity) in image.entity_ids.iter().enumerate() {
+            rows.insert_cow(stable_id_key(*entity), row);
+        }
+        Self {
+            dimension: image.dimension,
+            similarity: image.similarity,
+            dtype: image.dtype,
+            entity_ids: paged(image.entity_ids),
+            values: paged(image.values),
+            versions: paged(image.versions),
+            active: paged(image.active),
+            rows,
+            changed_rows: PersistentMap::default(),
+        }
+    }
+
+    fn resident_bytes(&self) -> usize {
+        cpu_vector_shape_bytes(self.entity_ids.len(), self.dimension)
+    }
+
+    fn private_bytes(&self) -> usize {
+        self.changed_rows
+            .len()
+            .saturating_mul(128 * 1024 + self.dimension * 2)
+    }
+}
+
+fn cpu_vector_shape_bytes(rows: usize, dimension: usize) -> usize {
+    let page = 16 * 1024;
+    [
+        rows.saturating_mul(8),
+        rows.saturating_mul(dimension).saturating_mul(2),
+        rows.saturating_mul(8),
+        rows,
+    ]
+    .into_iter()
+    .fold(
+        rows.saturating_mul(512).saturating_add(page),
+        |total, bytes| total.saturating_add(bytes.div_ceil(page).saturating_mul(page + 512)),
+    )
+}
+
+fn cpu_image_staging_bytes(image: &ResidentProjectImage) -> usize {
+    image.indexes.vectors.iter().fold(
+        image
+            .resident_bytes()
+            .saturating_add(image.staging_only_bytes()),
+        |total, vector| {
+            total.saturating_add(cpu_vector_shape_bytes(
+                vector.entity_ids.len(),
+                vector.dimension,
+            ))
+        },
+    )
 }
 
 #[inline]
@@ -140,6 +224,61 @@ const fn cpu_dense_key(row: u32) -> u128 {
     // PersistentMap branches from the most-significant nibble. Dense ordinals occupy the high
     // word so sparse overlays do not traverse 24 leading-zero radix levels per lookup.
     (row as u128) << 96
+}
+
+fn merge_property_patch(
+    patch: &mut Vec<(PropertyId, ScalarValue)>,
+    previous: &[(PropertyId, ScalarValue)],
+) {
+    for (property, value) in previous {
+        if !patch.iter().any(|(candidate, _)| candidate == property) {
+            patch.push((*property, value.clone()));
+        }
+    }
+}
+
+fn cpu_node_bytes(row: &crate::graph::NodeDeviceDelta) -> usize {
+    row.properties.iter().fold(
+        4096 + row.labels.capacity() * size_of::<LabelId>()
+            + row.properties.capacity() * size_of::<(PropertyId, ScalarValue)>(),
+        |bytes, (_, value)| bytes.saturating_add(super::image::scalar_resident_bytes(value)),
+    )
+}
+
+fn cpu_edge_bytes(row: &crate::graph::EdgeDeviceDelta) -> usize {
+    row.properties.iter().fold(
+        4096 + row.properties.capacity() * size_of::<(PropertyId, ScalarValue)>(),
+        |bytes, (_, value)| bytes.saturating_add(super::image::scalar_resident_bytes(value)),
+    )
+}
+
+fn cpu_adjacency_bytes(row: &crate::graph::AdjacencyRowDeviceDelta) -> usize {
+    4096_usize.saturating_add((row.neighbors.capacity() + row.edges.capacity()) * size_of::<u32>())
+}
+
+fn cpu_map_path_changes<V>(
+    previous: Option<&PersistentMap<V>>,
+    next: Option<&PersistentMap<V>>,
+    group: [u64; 4],
+    changes: &mut Vec<([u64; 6], usize)>,
+) {
+    let empty = PersistentMap::default();
+    let paths = next
+        .unwrap_or(&empty)
+        .changed_path_nodes(previous.unwrap_or(&empty));
+    changes.extend(paths.into_iter().map(|(prefix, depth, bytes, _)| {
+        (
+            [
+                group[0] | (u64::from(depth) << 16),
+                group[1],
+                group[2],
+                group[3],
+                (prefix >> 64) as u64,
+                prefix as u64,
+            ],
+            bytes,
+        )
+    }));
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -195,6 +334,10 @@ impl CpuResident {
         // This staging-only canonical view exists for unified-memory rebinding. The semantic CPU
         // backend executes the already-flat device image and must not retain a duplicate copy.
         image.temporal_canonical.clear();
+        let vectors = std::mem::take(&mut image.indexes.vectors)
+            .into_iter()
+            .map(|column| (column.property, CpuVectorColumn::from_image(column)))
+            .collect();
         let mut node_id_rows = std::mem::take(&mut image.node_id_rows);
         if node_id_rows.len() != image.graph.node_ids.len() {
             node_id_rows = PersistentMap::default();
@@ -213,26 +356,59 @@ impl CpuResident {
                 }
             }
         }
+        let cold_bytes = image.resident_bytes();
         Self {
             bookmark: image.bookmark,
             graph_revision: image.graph.revision,
             layout_version: image.graph.layout_version,
             node_capacity: image.graph.node_ids.len(),
             edge_capacity: image.graph.edge_ids.len(),
-            image,
+            image: Arc::new(image),
+            cold_bytes,
+            vectors,
             node_id_rows,
             edge_id_rows,
             nodes: PersistentMap::default(),
             edges: PersistentMap::default(),
             outgoing: PersistentMap::default(),
             incoming: PersistentMap::default(),
-            temporal: Vec::new(),
+            temporal: crate::graph::PagedVec::default(),
             delta_bytes: 0,
+            branch_rows: PersistentMap::default(),
+            branch_bytes: 0,
         }
     }
 
     fn resident_bytes(&self) -> usize {
-        self.image.resident_bytes().saturating_add(self.delta_bytes)
+        self.vectors.values().fold(
+            self.cold_bytes
+                .saturating_add(self.delta_bytes)
+                // Per-sample accounting covers full pages amortized over their values. The
+                // first/last partial page and its radix path need an explicit tail allowance.
+                .saturating_add(usize::from(!self.temporal.is_empty()) * 64 * 1024),
+            |total, column| total.saturating_add(column.resident_bytes()),
+        )
+    }
+
+    fn private_bytes(&self) -> usize {
+        self.vectors
+            .values()
+            .fold(self.branch_bytes, |bytes, vector| {
+                bytes.saturating_add(vector.private_bytes())
+            })
+    }
+
+    fn record_branch_row(&mut self, key: u128, bytes: usize) {
+        let previous = self
+            .branch_rows
+            // The low nibble names the row domain. Put it first in the radix tree so a
+            // relationship append does not copy a node-only branch's shared dense-row path.
+            .insert_cow(key.reverse_bits(), bytes)
+            .unwrap_or(0);
+        self.branch_bytes = self
+            .branch_bytes
+            .saturating_sub(previous)
+            .saturating_add(bytes);
     }
 
     fn property_value(&self, row: u32, property: PropertyId) -> Result<Option<ScalarValue>> {
@@ -246,13 +422,16 @@ impl CpuResident {
             ));
         }
         let value = match self.nodes.get(cpu_dense_key(row)) {
-            // A device delta carries the complete replacement row. Absence in that row means the
-            // property was removed; falling through to the immutable base would resurrect it.
             Some(node) => node
                 .properties
                 .iter()
                 .find(|(candidate, _)| *candidate == property)
-                .map(|(_, value)| value.clone()),
+                .map(|(_, value)| value.clone())
+                .or_else(|| {
+                    (!node.properties_complete)
+                        .then(|| self.image.graph.node_properties.get(row, property))
+                        .flatten()
+                }),
             None => self.image.graph.node_properties.get(row, property),
         };
         Ok(value.filter(|value| !matches!(value, ScalarValue::Null)))
@@ -280,7 +459,12 @@ impl CpuResident {
                         .properties
                         .iter()
                         .find(|(candidate, _)| *candidate == property)
-                        .map(|(_, value)| value.clone()),
+                        .map(|(_, value)| value.clone())
+                        .or_else(|| {
+                            (!node.properties_complete)
+                                .then(|| self.image.graph.node_properties.get(row, property))
+                                .flatten()
+                        }),
                     None => self.image.graph.node_properties.get(row, property),
                 }
             }
@@ -296,7 +480,12 @@ impl CpuResident {
                         .properties
                         .iter()
                         .find(|(candidate, _)| *candidate == property)
-                        .map(|(_, value)| value.clone()),
+                        .map(|(_, value)| value.clone())
+                        .or_else(|| {
+                            (!edge.properties_complete)
+                                .then(|| self.image.graph.edge_properties.get(row, property))
+                                .flatten()
+                        }),
                     None => self.image.graph.edge_properties.get(row, property),
                 }
             }
@@ -460,39 +649,16 @@ impl CpuResident {
             }
             None => None,
         };
-        if self.nodes.len() == 0 {
-            return rows
-                .iter()
-                .copied()
-                .enumerate()
-                .map(|(position, row)| {
-                    if position & 4095 == 0 {
-                        ensure_not_cancelled(cancellation)?;
-                    }
-                    if row == super::RESIDENT_NULL_ROW {
-                        return Ok(None);
-                    }
-                    if row as usize >= self.node_capacity {
-                        return Err(Error::new(
-                            ErrorCode::QueryType,
-                            "resident integer operator row is out of bounds",
-                        ));
-                    }
-                    let Some((values, validity)) = base else {
-                        return Ok(None);
-                    };
-                    if !validity.is_present(row as usize) {
-                        return Ok(None);
-                    }
-                    values.get(row as usize).copied().map(Some).ok_or_else(|| {
-                        Error::new(
-                            ErrorCode::CorruptStorage,
-                            "resident integer property row has no backing value",
-                        )
-                    })
-                })
-                .collect();
-        }
+        let dense_prefix = rows
+            .iter()
+            .enumerate()
+            .all(|(position, row)| *row as usize == position);
+        // Sequential reads visit the page directory once per page and the bitmap
+        // once per word. Arbitrary row selections keep their direct lookups.
+        let mut sequential = base
+            .filter(|_| dense_prefix)
+            .map(|(values, validity)| (values.iter(), validity.words(), 0_u64));
+        let mut output = Vec::with_capacity(rows.len());
         rows.iter()
             .copied()
             .enumerate()
@@ -509,35 +675,56 @@ impl CpuResident {
                         "resident integer operator row is out of bounds",
                     ));
                 }
+                let sequential_value = sequential.as_mut().map(|(values, words, word)| {
+                    if position % 64 == 0 {
+                        *word = words.next().unwrap_or(0);
+                    }
+                    (
+                        values.next().copied(),
+                        *word & (1_u64 << (position % 64)) != 0,
+                    )
+                });
                 if let Some(node) = self.nodes.get(cpu_dense_key(row)) {
-                    return match node
+                    let value = node
                         .properties
                         .iter()
                         .find(|(candidate, _)| *candidate == property)
-                        .map(|(_, value)| value)
-                    {
-                        Some(crate::ScalarValue::Integer(value)) => Ok(Some(*value)),
-                        Some(crate::ScalarValue::Null) | None => Ok(None),
-                        Some(_) => Err(Error::new(
-                            ErrorCode::QueryType,
-                            "resident property is not an integer column",
-                        )),
-                    };
+                        .map(|(_, value)| value);
+                    if value.is_some() || node.properties_complete {
+                        return match value {
+                            Some(crate::ScalarValue::Integer(value)) => Ok(Some(*value)),
+                            Some(crate::ScalarValue::Null) | None => Ok(None),
+                            Some(_) => Err(Error::new(
+                                ErrorCode::QueryType,
+                                "resident property is not an integer column",
+                            )),
+                        };
+                    }
                 }
                 let Some((values, validity)) = base else {
                     return Ok(None);
                 };
-                if !validity.is_present(row as usize) {
+                let (value, present) = sequential_value.unwrap_or_else(|| {
+                    (
+                        values.get(row as usize).copied(),
+                        validity.is_present(row as usize),
+                    )
+                });
+                if !present || row as usize >= validity.len() {
                     return Ok(None);
                 }
-                values.get(row as usize).copied().map(Some).ok_or_else(|| {
+                value.map(Some).ok_or_else(|| {
                     Error::new(
                         ErrorCode::CorruptStorage,
                         "resident integer property row has no backing value",
                     )
                 })
             })
-            .collect()
+            .try_for_each(|value| -> Result<()> {
+                output.push(value?);
+                Ok(())
+            })?;
+        Ok(output)
     }
 
     fn integer_value(&self, row: u32, property: PropertyId) -> Result<Option<i64>> {
@@ -551,19 +738,21 @@ impl CpuResident {
             ));
         }
         if let Some(node) = self.nodes.get(cpu_dense_key(row)) {
-            return match node
+            let value = node
                 .properties
                 .iter()
                 .find(|(candidate, _)| *candidate == property)
-                .map(|(_, value)| value)
-            {
-                Some(crate::ScalarValue::Integer(value)) => Ok(Some(*value)),
-                Some(crate::ScalarValue::Null) | None => Ok(None),
-                Some(_) => Err(Error::new(
-                    ErrorCode::QueryType,
-                    "resident property is not an integer column",
-                )),
-            };
+                .map(|(_, value)| value);
+            if value.is_some() || node.properties_complete {
+                return match value {
+                    Some(crate::ScalarValue::Integer(value)) => Ok(Some(*value)),
+                    Some(crate::ScalarValue::Null) | None => Ok(None),
+                    Some(_) => Err(Error::new(
+                        ErrorCode::QueryType,
+                        "resident property is not an integer column",
+                    )),
+                };
+            }
         }
         match self.image.graph.node_properties.column(property) {
             Some(TypedColumn::Integer { values, validity }) => {
@@ -619,16 +808,7 @@ impl CpuResident {
                         "resident Boolean operator row is out of bounds",
                     ));
                 }
-                let value = self
-                    .nodes
-                    .get(cpu_dense_key(row))
-                    .and_then(|node| {
-                        node.properties
-                            .iter()
-                            .find(|(candidate, _)| *candidate == property)
-                            .map(|(_, value)| value.clone())
-                    })
-                    .or_else(|| self.image.graph.node_properties.get(row, property));
+                let value = self.property_value(row, property)?;
                 match value {
                     Some(crate::ScalarValue::Boolean(value)) => Ok(Some(value)),
                     Some(crate::ScalarValue::Null) | None => Ok(None),
@@ -675,16 +855,7 @@ impl CpuResident {
                         "resident string operator row is out of bounds",
                     ));
                 }
-                let value = self
-                    .nodes
-                    .get(cpu_dense_key(row))
-                    .and_then(|node| {
-                        node.properties
-                            .iter()
-                            .find(|(candidate, _)| *candidate == property)
-                            .map(|(_, value)| value.clone())
-                    })
-                    .or_else(|| self.image.graph.node_properties.get(row, property));
+                let value = self.property_value(row, property)?;
                 match value {
                     Some(crate::ScalarValue::String(value)) => Ok(Some(value)),
                     Some(crate::ScalarValue::Null) | None => Ok(None),
@@ -731,16 +902,7 @@ impl CpuResident {
                         "resident float operator row is out of bounds",
                     ));
                 }
-                let value = self
-                    .nodes
-                    .get(cpu_dense_key(row))
-                    .and_then(|node| {
-                        node.properties
-                            .iter()
-                            .find(|(candidate, _)| *candidate == property)
-                            .map(|(_, value)| value.clone())
-                    })
-                    .or_else(|| self.image.graph.node_properties.get(row, property));
+                let value = self.property_value(row, property)?;
                 match value {
                     Some(crate::ScalarValue::Float(value)) => Ok(Some(value)),
                     Some(crate::ScalarValue::Null) | None => Ok(None),
@@ -3287,19 +3449,16 @@ impl CpuBackend {
 
     #[must_use]
     pub fn resident(&self, project: ProjectId) -> Option<&ResidentProjectImage> {
-        self.resident.get(&project).map(|resident| &resident.image)
+        self.resident
+            .get(&project)
+            .map(|resident| resident.image.as_ref())
     }
 
     fn total_after(&self, project: ProjectId, replacement_bytes: usize) -> usize {
         self.resident
             .iter()
             .filter(|(id, _)| **id != project)
-            .map(|(_, resident)| {
-                resident
-                    .image
-                    .resident_bytes()
-                    .saturating_add(resident.delta_bytes)
-            })
+            .map(|(_, resident)| resident.resident_bytes())
             .fold(replacement_bytes, usize::saturating_add)
     }
 }
@@ -12861,12 +13020,22 @@ impl ExecutionBackend for CpuBackend {
     }
 
     fn pin_project(&self, project: ProjectId) -> Result<Box<dyn ExecutionBackend>> {
-        let resident = self
+        let mut resident = self
             .resident
             .get(&project)
             .cloned()
             .ok_or_else(|| project_not_resident(project))?;
-        let governor = self.governor.pin_generation(resident.resident_bytes())?;
+        if !self.governor.is_shared_branch() {
+            let resident = Arc::make_mut(&mut resident);
+            resident.branch_rows = PersistentMap::default();
+            resident.branch_bytes = 0;
+            for vector in resident.vectors.values_mut() {
+                vector.changed_rows = PersistentMap::default();
+            }
+        }
+        let governor = self
+            .governor
+            .pin_shared_generation(self.governor.current_generation()?)?;
         Ok(Box::new(Self {
             governor,
             resident: BTreeMap::from([(project, resident)]),
@@ -12874,13 +13043,11 @@ impl ExecutionBackend for CpuBackend {
     }
 
     fn admit_project(&mut self, image: ResidentProjectImage) -> Result<()> {
-        let replacement_bytes = image.resident_bytes();
+        let replacement_bytes = cpu_image_staging_bytes(&image);
         // The staging reservation has to cover everything the image holds right now, not just what
         // survives intake: the canonical temporal columns are still live here and are only released
         // by `CpuResident::from_image` below.
-        let staging = self
-            .governor
-            .reserve_staging(replacement_bytes.saturating_add(image.staging_only_bytes()))?;
+        let staging = self.governor.reserve_staging(replacement_bytes)?;
         let project = image.project;
         let replacement = CpuResident::from_image(image);
         let total = self.total_after(project, replacement.resident_bytes());
@@ -12893,8 +13060,7 @@ impl ExecutionBackend for CpuBackend {
     fn replace_all_projects(&mut self, images: Vec<ResidentProjectImage>) -> Result<()> {
         let planned = images.iter().try_fold(0_usize, |total, image| {
             total
-                .checked_add(image.resident_bytes())
-                .and_then(|total| total.checked_add(image.staging_only_bytes()))
+                .checked_add(cpu_image_staging_bytes(image))
                 .ok_or_else(|| {
                     Error::new(
                         ErrorCode::GpuAdmissionFailure,
@@ -12942,9 +13108,21 @@ impl ExecutionBackend for CpuBackend {
                 "resident CPU delta bookmark did not advance",
             ));
         }
-        let staged_bytes = resident
-            .resident_bytes()
-            .checked_add(delta_bytes)
+        let changed_rows = delta.graph.nodes.len()
+            + delta.graph.edges.len()
+            + delta.graph.outgoing.len()
+            + delta.graph.incoming.len()
+            + delta.temporal.len()
+            + delta.vectors.len();
+        // Bound path-copy metadata and private value pages before staging, independently of
+        // untouched cold data. Large changed payloads are charged through their explicit size.
+        let staged_bytes = changed_rows
+            .checked_mul(128 * 1024)
+            .and_then(|bytes| {
+                delta_bytes
+                    .checked_mul(4)
+                    .and_then(|delta| bytes.checked_add(delta))
+            })
             .ok_or_else(|| {
                 Error::new(
                     ErrorCode::GpuAdmissionFailure,
@@ -12952,8 +13130,183 @@ impl ExecutionBackend for CpuBackend {
                 )
             })?;
         let reservation = self.governor.reserve_staging(staged_bytes)?;
+        let mut changes = Vec::new();
+        let mut map_keys = Vec::new();
+        let project_key = project.0.as_u128();
+        // Branch admission charges its complete private divergence below. Only the
+        // publishing root uses retirement identities to account for older readers.
+        if !self.governor.is_shared_branch() && self.governor.has_live_shared_pins()? {
+            let identity = |domain, lane, row| {
+                [
+                    domain,
+                    (project_key >> 64) as u64,
+                    project_key as u64,
+                    lane,
+                    0,
+                    row,
+                ]
+            };
+            for (domain, ids) in [
+                (
+                    22,
+                    delta
+                        .graph
+                        .nodes
+                        .iter()
+                        .filter(|row| stable_id_row(&resident.node_id_rows, row.id.0).is_none())
+                        .map(|row| row.id.0)
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    23,
+                    delta
+                        .graph
+                        .edges
+                        .iter()
+                        .filter(|row| stable_id_row(&resident.edge_id_rows, row.id.0).is_none())
+                        .map(|row| row.id.0)
+                        .collect(),
+                ),
+            ] {
+                for id in ids {
+                    map_keys.push((domain, PropertyId(0), stable_id_key(id)));
+                }
+            }
+            for (domain, rows) in [
+                (
+                    16,
+                    delta
+                        .graph
+                        .nodes
+                        .iter()
+                        .map(|row| {
+                            (
+                                row.dense,
+                                resident
+                                    .nodes
+                                    .get(cpu_dense_key(row.dense))
+                                    .map_or(0, |row| cpu_node_bytes(row)),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    17,
+                    delta
+                        .graph
+                        .edges
+                        .iter()
+                        .map(|row| {
+                            (
+                                row.dense,
+                                resident
+                                    .edges
+                                    .get(cpu_dense_key(row.dense))
+                                    .map_or(0, |row| cpu_edge_bytes(row)),
+                            )
+                        })
+                        .collect(),
+                ),
+                (
+                    18,
+                    delta
+                        .graph
+                        .outgoing
+                        .iter()
+                        .map(|row| {
+                            (
+                                row.dense,
+                                resident
+                                    .outgoing
+                                    .get(cpu_dense_key(row.dense))
+                                    .map_or(0, |row| cpu_adjacency_bytes(row)),
+                            )
+                        })
+                        .collect(),
+                ),
+                (
+                    19,
+                    delta
+                        .graph
+                        .incoming
+                        .iter()
+                        .map(|row| {
+                            (
+                                row.dense,
+                                resident
+                                    .incoming
+                                    .get(cpu_dense_key(row.dense))
+                                    .map_or(0, |row| cpu_adjacency_bytes(row)),
+                            )
+                        })
+                        .collect(),
+                ),
+            ] {
+                for (row, bytes) in rows {
+                    changes.push((identity(domain, 0, u64::from(row)), bytes));
+                    map_keys.push((domain, PropertyId(0), cpu_dense_key(row)));
+                }
+            }
+            for mutation in &delta.vectors {
+                let (property, entity) = match mutation {
+                    crate::graph::ResolvedVectorMutation::Upsert {
+                        property,
+                        entity_id,
+                        ..
+                    }
+                    | crate::graph::ResolvedVectorMutation::Remove {
+                        property,
+                        entity_id,
+                        ..
+                    } => (*property, *entity_id),
+                };
+                if resident
+                    .vectors
+                    .get(&property)
+                    .is_none_or(|vector| vector.rows.get(stable_id_key(entity)).is_none())
+                {
+                    map_keys.push((24, property, stable_id_key(entity)));
+                }
+                if let Some(vector) = resident.vectors.get(&property) {
+                    let row = vector
+                        .rows
+                        .get(stable_id_key(entity))
+                        .copied()
+                        .unwrap_or(vector.entity_ids.len());
+                    for (lane, start, end, width, old_len) in [
+                        (0, row, row + 1, 2048, vector.entity_ids.len()),
+                        (1, row, row + 1, 2048, vector.versions.len()),
+                        (2, row, row + 1, 4096, vector.active.len()),
+                        (
+                            3,
+                            row * vector.dimension,
+                            (row + 1) * vector.dimension,
+                            4096,
+                            vector.values.len(),
+                        ),
+                    ] {
+                        for page in start / width..end.div_ceil(width) {
+                            changes.push((
+                                identity(20 | (lane << 8), property.0, page as u64),
+                                if page * width < old_len { 64 * 1024 } else { 0 },
+                            ));
+                        }
+                    }
+                }
+            }
+            if !delta.temporal.is_empty() {
+                let width = (16 * 1024 / size_of::<super::ResidentTemporalDelta>()).clamp(1, 4096);
+                let before = resident.temporal.len();
+                for page in before / width..(before + delta.temporal.len()).div_ceil(width) {
+                    changes.push((
+                        identity(21, 0, page as u64),
+                        if page * width < before { 64 * 1024 } else { 0 },
+                    ));
+                }
+            }
+        }
         let mut replacement = resident.as_ref().clone();
-        for node in delta.graph.nodes {
+        for mut node in delta.graph.nodes {
             match stable_id_row(&replacement.node_id_rows, node.id.0) {
                 Some(existing) if *existing != node.dense => {
                     return Err(Error::new(
@@ -12964,13 +13317,27 @@ impl ExecutionBackend for CpuBackend {
                 None => {
                     replacement
                         .node_id_rows
-                        .insert(stable_id_key(node.id.0), node.dense);
+                        .insert_cow(stable_id_key(node.id.0), node.dense);
                 }
                 Some(_) => {}
             }
-            replacement.nodes.insert(cpu_dense_key(node.dense), node);
+            if !node.properties_complete {
+                if let Some(previous) = replacement.nodes.get(cpu_dense_key(node.dense)) {
+                    merge_property_patch(&mut node.properties, &previous.properties);
+                    node.properties_complete = previous.properties_complete;
+                }
+            }
+            let bytes = cpu_node_bytes(&node);
+            replacement.record_branch_row((u128::from(node.dense) << 4) | 1, bytes);
+            let previous = replacement
+                .nodes
+                .insert_cow(cpu_dense_key(node.dense), Arc::new(node));
+            replacement.delta_bytes = replacement
+                .delta_bytes
+                .saturating_sub(previous.as_ref().map_or(0, |row| cpu_node_bytes(row)))
+                .saturating_add(bytes);
         }
-        for edge in delta.graph.edges {
+        for mut edge in delta.graph.edges {
             match stable_id_row(&replacement.edge_id_rows, edge.id.0) {
                 Some(existing) if *existing != edge.dense => {
                     return Err(Error::new(
@@ -12981,62 +13348,152 @@ impl ExecutionBackend for CpuBackend {
                 None => {
                     replacement
                         .edge_id_rows
-                        .insert(stable_id_key(edge.id.0), edge.dense);
+                        .insert_cow(stable_id_key(edge.id.0), edge.dense);
                 }
                 Some(_) => {}
             }
-            replacement.edges.insert(cpu_dense_key(edge.dense), edge);
+            if !edge.properties_complete {
+                if let Some(previous) = replacement.edges.get(cpu_dense_key(edge.dense)) {
+                    merge_property_patch(&mut edge.properties, &previous.properties);
+                    edge.properties_complete = previous.properties_complete;
+                }
+            }
+            let bytes = cpu_edge_bytes(&edge);
+            replacement.record_branch_row((u128::from(edge.dense) << 4) | 2, bytes);
+            let previous = replacement
+                .edges
+                .insert_cow(cpu_dense_key(edge.dense), Arc::new(edge));
+            replacement.delta_bytes = replacement
+                .delta_bytes
+                .saturating_sub(previous.as_ref().map_or(0, |row| cpu_edge_bytes(row)))
+                .saturating_add(bytes);
         }
         for row in delta.graph.outgoing {
-            replacement.outgoing.insert(cpu_dense_key(row.dense), row);
+            let bytes = cpu_adjacency_bytes(&row);
+            replacement.record_branch_row((u128::from(row.dense) << 4) | 3, bytes);
+            let previous = replacement
+                .outgoing
+                .insert_cow(cpu_dense_key(row.dense), Arc::new(row));
+            replacement.delta_bytes = replacement
+                .delta_bytes
+                .saturating_sub(previous.as_ref().map_or(0, |row| cpu_adjacency_bytes(row)))
+                .saturating_add(bytes);
         }
         for row in delta.graph.incoming {
-            replacement.incoming.insert(cpu_dense_key(row.dense), row);
+            let bytes = cpu_adjacency_bytes(&row);
+            replacement.record_branch_row((u128::from(row.dense) << 4) | 4, bytes);
+            let previous = replacement
+                .incoming
+                .insert_cow(cpu_dense_key(row.dense), Arc::new(row));
+            replacement.delta_bytes = replacement
+                .delta_bytes
+                .saturating_sub(previous.as_ref().map_or(0, |row| cpu_adjacency_bytes(row)))
+                .saturating_add(bytes);
         }
         for mutation in delta.vectors {
-            apply_cpu_vector_delta(&mut replacement.image, mutation)?;
+            apply_cpu_vector_delta(&mut replacement.vectors, mutation)?;
         }
-        replacement.temporal.extend(delta.temporal);
+        for sample in delta.temporal {
+            // A branch can append to a shared partial page even when the new sample is tiny.
+            // Charge the private tail once per branch, independently of history length.
+            replacement.record_branch_row(u128::MAX, 64 * 1024);
+            replacement.branch_bytes = replacement
+                .branch_bytes
+                .saturating_add(256 + super::image::scalar_resident_bytes(&sample.sample.value));
+            replacement.delta_bytes = replacement
+                .delta_bytes
+                .saturating_add(256 + super::image::scalar_resident_bytes(&sample.sample.value));
+            replacement.temporal.push(sample);
+        }
         replacement.node_capacity = delta.graph.node_capacity;
         replacement.edge_capacity = delta.graph.edge_capacity;
         replacement.graph_revision = delta.graph.revision;
         replacement.bookmark = delta.bookmark;
-        replacement.delta_bytes = replacement
-            .delta_bytes
-            .checked_add(delta_bytes)
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorCode::GpuAdmissionFailure,
-                    "CPU resident delta byte accounting overflow",
-                )
-            })?;
+        for (domain, property) in map_keys
+            .into_iter()
+            .map(|(domain, property, _)| (domain, property))
+            .collect::<BTreeSet<_>>()
+        {
+            let group = [
+                32 | (domain << 8),
+                (project_key >> 64) as u64,
+                project_key as u64,
+                property.0,
+            ];
+            match domain {
+                16 => cpu_map_path_changes(
+                    Some(&resident.nodes),
+                    Some(&replacement.nodes),
+                    group,
+                    &mut changes,
+                ),
+                17 => cpu_map_path_changes(
+                    Some(&resident.edges),
+                    Some(&replacement.edges),
+                    group,
+                    &mut changes,
+                ),
+                18 => cpu_map_path_changes(
+                    Some(&resident.outgoing),
+                    Some(&replacement.outgoing),
+                    group,
+                    &mut changes,
+                ),
+                19 => cpu_map_path_changes(
+                    Some(&resident.incoming),
+                    Some(&replacement.incoming),
+                    group,
+                    &mut changes,
+                ),
+                22 => cpu_map_path_changes(
+                    Some(&resident.node_id_rows),
+                    Some(&replacement.node_id_rows),
+                    group,
+                    &mut changes,
+                ),
+                23 => cpu_map_path_changes(
+                    Some(&resident.edge_id_rows),
+                    Some(&replacement.edge_id_rows),
+                    group,
+                    &mut changes,
+                ),
+                24 => cpu_map_path_changes(
+                    resident.vectors.get(&property).map(|vector| &vector.rows),
+                    replacement
+                        .vectors
+                        .get(&property)
+                        .map(|vector| &vector.rows),
+                    group,
+                    &mut changes,
+                ),
+                _ => unreachable!("CPU persistent map identity domain"),
+            }
+        }
         let total = self.total_after(project, replacement.resident_bytes());
-        self.governor
-            .commit_staging(reservation, staged_bytes, total)?;
+        self.governor.publish_shared_page_staging(
+            reservation,
+            staged_bytes,
+            total,
+            &[],
+            &changes,
+            Some(replacement.private_bytes()),
+            || Ok(()),
+        )?;
         self.resident.insert(project, Arc::new(replacement));
         Ok(())
     }
 
     fn evict_project(&mut self, project: ProjectId) -> Result<()> {
+        let bytes = self.total_after(project, 0);
+        self.governor.admit_persistent(bytes)?;
         self.resident.remove(&project);
-        let bytes = self
-            .resident
-            .values()
-            .map(|resident| {
-                resident
-                    .image
-                    .resident_bytes()
-                    .saturating_add(resident.delta_bytes)
-            })
-            .fold(0_usize, usize::saturating_add);
-        self.governor.admit_persistent(bytes)
+        Ok(())
     }
 
     fn advance_bookmark(&mut self, bookmark: Bookmark) {
         for resident in self.resident.values_mut() {
             let resident = Arc::make_mut(resident);
             resident.bookmark = bookmark;
-            resident.image.bookmark = bookmark;
         }
     }
 
@@ -13152,15 +13609,16 @@ impl ExecutionBackend for CpuBackend {
             let Some((values, validity)) = base else {
                 return Ok(selected);
             };
-            for row in 0..resident.node_capacity {
+            let mut words = validity.words();
+            let mut present = 0_u64;
+            for (row, value) in values.iter().take(resident.node_capacity).enumerate() {
                 if row & 4095 == 0 {
                     ensure_not_cancelled(cancellation)?;
                 }
-                if validity.is_present(row)
-                    && values
-                        .get(row)
-                        .is_some_and(|value| compare_i64(*value, operation, operand))
-                {
+                if row & 63 == 0 {
+                    present = words.next().unwrap_or(0);
+                }
+                if present & (1_u64 << (row & 63)) != 0 && compare_i64(*value, operation, operand) {
                     selected.push(row as u32);
                 }
             }
@@ -13170,18 +13628,16 @@ impl ExecutionBackend for CpuBackend {
             if row & 4095 == 0 {
                 ensure_not_cancelled(cancellation)?;
             }
-            let value = resident
-                .nodes
-                .get(cpu_dense_key(row as u32))
-                .and_then(|node| {
-                    node.properties
-                        .iter()
-                        .find_map(|(candidate, value)| (*candidate == property).then_some(value))
-                });
+            let node = resident.nodes.get(cpu_dense_key(row as u32));
+            let value = node.and_then(|node| {
+                node.properties
+                    .iter()
+                    .find_map(|(candidate, value)| (*candidate == property).then_some(value))
+            });
             let value = match value {
                 Some(crate::ScalarValue::Integer(value)) => Some(*value),
                 Some(_) => None,
-                None if resident.nodes.contains_key(cpu_dense_key(row as u32)) => None,
+                None if node.is_some_and(|node| node.properties_complete) => None,
                 None => base.and_then(|(values, validity)| {
                     validity
                         .is_present(row)
@@ -13314,15 +13770,9 @@ impl ExecutionBackend for CpuBackend {
             .resident
             .get(&request.project)
             .ok_or_else(|| project_not_resident(request.project))?;
-        let vector = resident
-            .image
-            .indexes
-            .vectors
-            .iter()
-            .find(|column| column.property == request.property)
-            .ok_or_else(|| {
-                Error::new(ErrorCode::IndexUnavailable, "vector column is not resident")
-            })?;
+        let vector = resident.vectors.get(&request.property).ok_or_else(|| {
+            Error::new(ErrorCode::IndexUnavailable, "vector column is not resident")
+        })?;
         let profile = resident.image.indexes.profile.clone().ok_or_else(|| {
             Error::new(
                 ErrorCode::EmbeddingProfileMismatch,
@@ -13339,7 +13789,14 @@ impl ExecutionBackend for CpuBackend {
             ));
         }
         validate_vector_queries(request, vector.dimension)?;
-        let matrix = decode_vectors(vector);
+        let matrix = vector
+            .values
+            .iter()
+            .map(|bits| match vector.dtype {
+                EmbeddingDType::F16 => f16::from_bits(*bits).to_f32(),
+                EmbeddingDType::Bf16 => bf16::from_bits(*bits).to_f32(),
+            })
+            .collect::<Vec<_>>();
         let relationship_owned = request.property == crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY;
         if relationship_owned && request.selection.is_some() {
             return Err(Error::new(
@@ -13411,7 +13868,7 @@ impl ExecutionBackend for CpuBackend {
             let start = query_row * vector.dimension;
             let mut query = request.queries[start..start + vector.dimension].to_vec();
             prepare_vector_query(vector.similarity, &mut query)?;
-            hits.push(score_vectors(
+            hits.push(score_vector_rows(
                 &matrix,
                 vector,
                 &query,
@@ -13657,23 +14114,13 @@ impl ExecutionBackend for CpuBackend {
         let mut initial_rows = if push_start_predicates && !start_predicates.is_empty() {
             let predicate = start_predicates[0];
             consumed_start_predicates = 1;
-            let mut rows = self.filter_node_i64(
+            self.filter_node_i64(
                 request.project,
                 predicate.property,
                 predicate.operation,
                 predicate.operand,
                 cancellation,
-            )?;
-            let mut retained = 0_usize;
-            for position in 0..rows.len() {
-                let row = rows[position];
-                if resident.node_is_visible(row, &request.labels, request.layers) {
-                    rows[retained] = row;
-                    retained += 1;
-                }
-            }
-            rows.truncate(retained);
-            rows
+            )?
         } else {
             let first_label = request.labels.first().copied();
             let rows =
@@ -13694,8 +14141,15 @@ impl ExecutionBackend for CpuBackend {
                     ensure_not_cancelled(cancellation)?;
                 }
                 let row = initial_rows[position];
-                if resident
-                    .integer_value(row, predicate.property)?
+                let value = match resident.integer_value(row, predicate.property) {
+                    // An invisible row was skipped before predicate pushdown. Preserve that
+                    // behavior if its stale property representation cannot be read as an integer.
+                    Err(_) if !resident.node_is_visible(row, &request.labels, request.layers) => {
+                        None
+                    }
+                    result => result?,
+                };
+                if value
                     .is_some_and(|value| compare_i64(value, predicate.operation, predicate.operand))
                 {
                     initial_rows[retained] = row;
@@ -13703,6 +14157,10 @@ impl ExecutionBackend for CpuBackend {
                 }
             }
             initial_rows.truncate(retained);
+        }
+        if consumed_start_predicates != 0 {
+            initial_rows
+                .retain(|row| resident.node_is_visible(*row, &request.labels, request.layers));
         }
         if request.initial_optional && expansion_count == 0 && initial_rows.is_empty() {
             initial_rows.push(super::RESIDENT_NULL_ROW);
@@ -18708,11 +19166,16 @@ fn cpu_segmented_property_keys(
             resident.nodes.get(cpu_dense_key(row)).map_or_else(
                 || resident.image.graph.node_property_is_present(row, property),
                 |node| {
-                    // A delta row is a complete canonical replacement. Cypher NULL removes a
-                    // property, so only a non-NULL value is canonically present.
-                    node.properties.iter().any(|(candidate, value)| {
-                        *candidate == property && !matches!(value, ScalarValue::Null)
-                    })
+                    node.properties
+                        .iter()
+                        .find(|(candidate, _)| *candidate == property)
+                        .map_or_else(
+                            || {
+                                !node.properties_complete
+                                    && resident.image.graph.node_property_is_present(row, property)
+                            },
+                            |(_, value)| !matches!(value, ScalarValue::Null),
+                        )
                 },
             )
         }
@@ -18720,9 +19183,16 @@ fn cpu_segmented_property_keys(
             resident.edges.get(cpu_dense_key(row)).map_or_else(
                 || resident.image.graph.edge_property_is_present(row, property),
                 |edge| {
-                    edge.properties.iter().any(|(candidate, value)| {
-                        *candidate == property && !matches!(value, ScalarValue::Null)
-                    })
+                    edge.properties
+                        .iter()
+                        .find(|(candidate, _)| *candidate == property)
+                        .map_or_else(
+                            || {
+                                !edge.properties_complete
+                                    && resident.image.graph.edge_property_is_present(row, property)
+                            },
+                            |(_, value)| !matches!(value, ScalarValue::Null),
+                        )
                 },
             )
         }
@@ -26671,62 +27141,38 @@ fn cpu_mutation_continuation_property_count(
     let Some((kind, target_id)) = resident.mutation_target_id(binding, dense)? else {
         return Ok(None);
     };
-    let mut canonical = match binding {
-        ResidentEntityBinding::Node(_) => resident.nodes.get(cpu_dense_key(dense)).map_or_else(
-            || {
-                resident
-                    .image
-                    .graph
-                    .node_properties
-                    .property_ids()
-                    .filter(|property| {
-                        resident
-                            .image
-                            .graph
-                            .node_properties
-                            .get(dense, *property)
-                            .is_some()
-                    })
-                    .collect::<BTreeSet<_>>()
-            },
-            |node| {
-                node.properties
-                    .iter()
-                    .filter_map(|(property, value)| {
-                        (!matches!(value, ScalarValue::Null)).then_some(*property)
-                    })
-                    .collect::<BTreeSet<_>>()
-            },
-        ),
+    let (base, complete, changed) = match binding {
+        ResidentEntityBinding::Node(_) => {
+            let node = resident.nodes.get(cpu_dense_key(dense));
+            (
+                &resident.image.graph.node_properties,
+                node.is_some_and(|node| node.properties_complete),
+                node.map(|node| node.properties.as_slice()).unwrap_or(&[]),
+            )
+        }
         ResidentEntityBinding::Relationship(_) => {
-            resident.edges.get(cpu_dense_key(dense)).map_or_else(
-                || {
-                    resident
-                        .image
-                        .graph
-                        .edge_properties
-                        .property_ids()
-                        .filter(|property| {
-                            resident
-                                .image
-                                .graph
-                                .edge_properties
-                                .get(dense, *property)
-                                .is_some()
-                        })
-                        .collect::<BTreeSet<_>>()
-                },
-                |edge| {
-                    edge.properties
-                        .iter()
-                        .filter_map(|(property, value)| {
-                            (!matches!(value, ScalarValue::Null)).then_some(*property)
-                        })
-                        .collect::<BTreeSet<_>>()
-                },
+            let edge = resident.edges.get(cpu_dense_key(dense));
+            (
+                &resident.image.graph.edge_properties,
+                edge.is_some_and(|edge| edge.properties_complete),
+                edge.map(|edge| edge.properties.as_slice()).unwrap_or(&[]),
             )
         }
     };
+    let mut canonical = BTreeSet::new();
+    if !complete {
+        canonical.extend(base.property_ids().filter(|property| {
+            base.physical_column(*property)
+                .is_some_and(|column| column.validity().is_present(dense as usize))
+        }));
+    }
+    for (property, value) in changed {
+        if matches!(value, ScalarValue::Null) {
+            canonical.remove(property);
+        } else {
+            canonical.insert(*property);
+        }
+    }
     let mut statement_local = BTreeSet::new();
     if let Some(entity) = overlay.get(&cpu_mutation_entity_key(kind, target_id)) {
         if entity.replaced {
@@ -27653,7 +28099,7 @@ fn append_cpu_temporal_row(
 }
 
 fn apply_cpu_vector_delta(
-    image: &mut ResidentProjectImage,
+    columns: &mut BTreeMap<crate::types::PropertyId, CpuVectorColumn>,
     mutation: crate::graph::ResolvedVectorMutation,
 ) -> Result<()> {
     let (property, entity, revision) = match &mutation {
@@ -27669,21 +28115,20 @@ fn apply_cpu_vector_delta(
             revision,
         } => (*property, *entity_id, *revision),
     };
-    let vector = image
-        .indexes
-        .vectors
-        .iter_mut()
-        .find(|vector| vector.property == property)
-        .ok_or_else(|| {
-            Error::new(
-                ErrorCode::EmbeddingProfileMismatch,
-                "vector delta targets a non-resident canonical column",
-            )
-        })?;
-    let row = vector
-        .entity_ids
-        .iter()
-        .position(|candidate| *candidate == entity);
+    let vector = columns.get_mut(&property).ok_or_else(|| {
+        Error::new(
+            ErrorCode::EmbeddingProfileMismatch,
+            "vector delta targets a non-resident canonical column",
+        )
+    })?;
+    let row = vector.rows.get(stable_id_key(entity)).copied();
+    if !matches!(
+        mutation,
+        crate::graph::ResolvedVectorMutation::Remove { .. }
+    ) || row.is_some()
+    {
+        vector.changed_rows.insert_cow(stable_id_key(entity), ());
+    }
     match mutation {
         crate::graph::ResolvedVectorMutation::Remove { .. } => {
             if let Some(row) = row {
@@ -27700,12 +28145,19 @@ fn apply_cpu_vector_delta(
             }
             if let Some(row) = row {
                 let start = row.saturating_mul(vector.dimension);
-                vector.values[start..start + vector.dimension].copy_from_slice(&coordinates);
+                for (offset, value) in coordinates.into_iter().enumerate() {
+                    vector.values[start + offset] = value;
+                }
                 vector.versions[row] = revision;
                 vector.active[row] = 1;
             } else {
+                vector
+                    .rows
+                    .insert_cow(stable_id_key(entity), vector.entity_ids.len());
                 vector.entity_ids.push(entity);
-                vector.values.extend_from_slice(&coordinates);
+                for value in coordinates {
+                    vector.values.push(value);
+                }
                 vector.versions.push(revision);
                 vector.active.push(1);
             }
@@ -27815,26 +28267,67 @@ pub fn score_vectors(
     allowed: Option<&[u8]>,
     cancellation: &CancellationToken,
 ) -> Result<Vec<VectorHit>> {
-    if allowed.is_some_and(|allowed| allowed.len() != vector.entity_ids.len()) {
+    score_vector_rows(matrix, vector, query, limit, allowed, cancellation)
+}
+
+trait VectorRows {
+    fn row_count(&self) -> usize;
+    fn dimension(&self) -> usize;
+    fn similarity(&self) -> Similarity;
+    fn entity(&self, row: usize) -> u64;
+    fn active(&self, row: usize) -> bool;
+}
+
+macro_rules! vector_rows {
+    ($column:ty) => {
+        impl VectorRows for $column {
+            fn row_count(&self) -> usize {
+                self.entity_ids.len()
+            }
+            fn dimension(&self) -> usize {
+                self.dimension
+            }
+            fn similarity(&self) -> Similarity {
+                self.similarity
+            }
+            fn entity(&self, row: usize) -> u64 {
+                self.entity_ids[row]
+            }
+            fn active(&self, row: usize) -> bool {
+                self.active.get(row).copied() == Some(1)
+            }
+        }
+    };
+}
+vector_rows!(crate::graph::VectorDeviceImage);
+vector_rows!(CpuVectorColumn);
+
+fn score_vector_rows(
+    matrix: &[f32],
+    vector: &impl VectorRows,
+    query: &[f32],
+    limit: usize,
+    allowed: Option<&[u8]>,
+    cancellation: &CancellationToken,
+) -> Result<Vec<VectorHit>> {
+    if allowed.is_some_and(|allowed| allowed.len() != vector.row_count()) {
         return Err(Error::new(
             ErrorCode::CorruptStorage,
             "vector visibility mask has an invalid row count",
         ));
     }
     let mut hits = Vec::new();
-    for row in 0..vector.entity_ids.len() {
+    for row in 0..vector.row_count() {
         if row & 1023 == 0 {
             ensure_not_cancelled(cancellation)?;
         }
-        if vector.active.get(row).copied() != Some(1)
-            || allowed.is_some_and(|allowed| allowed[row] != 1)
-        {
+        if !vector.active(row) || allowed.is_some_and(|allowed| allowed[row] != 1) {
             continue;
         }
-        let start = row * vector.dimension;
-        let values = &matrix[start..start + vector.dimension];
+        let start = row * vector.dimension();
+        let values = &matrix[start..start + vector.dimension()];
         let dot = values.iter().zip(query).map(|(a, b)| a * b).sum::<f32>();
-        let score = match vector.similarity {
+        let score = match vector.similarity() {
             Similarity::Cosine | Similarity::Dot => dot,
             Similarity::Euclidean => values
                 .iter()
@@ -27847,12 +28340,12 @@ pub fn score_vectors(
                 .sqrt(),
         };
         hits.push(VectorHit {
-            entity_id: vector.entity_ids[row],
+            entity_id: vector.entity(row),
             score,
         });
     }
     hits.sort_by(|left, right| {
-        let score = match vector.similarity {
+        let score = match vector.similarity() {
             Similarity::Euclidean => left.score.total_cmp(&right.score),
             Similarity::Cosine | Similarity::Dot => right.score.total_cmp(&left.score),
         };
@@ -27873,6 +28366,625 @@ mod node_pipeline_cpu_tests {
     };
 
     const PROJECT: ProjectId = ProjectId(uuid::Uuid::nil());
+
+    fn surgical_fixture(rows: usize) -> Result<CpuBackend> {
+        let mut graph = GraphStore::default();
+        for property in ["unused", "scalar", "vector", "history"] {
+            graph.catalog_mut().intern_property(property)?;
+        }
+        graph.insert_node(NodeInput {
+            id: NodeId(1),
+            layer: Layer::Observed,
+            revision: 1,
+            labels: vec![],
+            properties: vec![(PropertyId(1), ScalarValue::Integer(7))],
+        })?;
+        let mut image = ResidentProjectImage::graph_only(Arc::new(graph.snapshot()?));
+        image.indexes.profile = Some(crate::graph::EmbeddingProfile::new(
+            [1; 32],
+            [2; 32],
+            384,
+            EmbeddingDType::F16,
+            false,
+            Similarity::Dot,
+        )?);
+        image.indexes.vectors.push(crate::graph::VectorDeviceImage {
+            property: PropertyId(2),
+            dimension: 384,
+            similarity: Similarity::Dot,
+            dtype: EmbeddingDType::F16,
+            entity_ids: (1..=rows as u64).collect(),
+            values: (0..rows * 384)
+                .map(|index| {
+                    f16::from_f32(((index * 3571 % 65521) as f32 + 1.0) / 65521.0).to_bits()
+                })
+                .collect(),
+            versions: vec![1; rows],
+            active: vec![1; rows],
+        });
+        image
+            .temporal
+            .columns
+            .push(crate::graph::TemporalDeviceColumn {
+                entity_kind: EntityKind::Node,
+                target: 1,
+                property: PropertyId(3),
+                value_type: crate::graph::TemporalType::Integer,
+                entity_ids: vec![1; rows],
+                event_times_nanos: (0..rows as i64).collect(),
+                sequence_indexes: (1..=rows as u64).collect(),
+                validity: vec![1; rows],
+                values: TemporalDeviceValues::Integer(
+                    (0..rows as i64).map(|row| row * 3571).collect(),
+                ),
+                current_entity_ids: vec![1],
+                current_rows: vec![(rows - 1) as u32],
+            });
+        let mut cpu = CpuBackend::new(512 * 1024 * 1024, 0);
+        cpu.admit_project(image)?;
+        let resident = Arc::make_mut(cpu.resident.get_mut(&PROJECT).expect("fixture admitted"));
+        for row in 0..rows {
+            resident.temporal.push(super::super::ResidentTemporalDelta {
+                entity_kind: EntityKind::Node,
+                target: 1,
+                sample: crate::graph::TemporalSample {
+                    entity_id: 1,
+                    property: PropertyId(3),
+                    event_time_nanos: -(row as i64) - 2,
+                    sequence_index: 1,
+                    value: ScalarValue::Integer((row as i64) * 3571),
+                },
+            });
+        }
+        resident.delta_bytes = rows * 256;
+        let total = resident.resident_bytes();
+        cpu.governor.admit_persistent(total)?;
+        Ok(cpu)
+    }
+
+    fn surgical_delta(revision: u64) -> ResidentProjectDelta {
+        ResidentProjectDelta {
+            project: PROJECT,
+            bookmark: Bookmark {
+                term: 0,
+                index: revision,
+            },
+            graph: crate::graph::GraphDeviceDelta {
+                revision,
+                node_capacity: 1,
+                edge_capacity: 0,
+                nodes: vec![crate::graph::NodeDeviceDelta {
+                    dense: 0,
+                    id: NodeId(1),
+                    layer: Layer::Observed,
+                    revision,
+                    active: true,
+                    labels: vec![],
+                    properties_complete: true,
+                    properties: vec![(PropertyId(1), ScalarValue::Integer(revision as i64))],
+                }],
+                edges: vec![],
+                outgoing: vec![],
+                incoming: vec![],
+            },
+            temporal: vec![],
+            vectors: vec![],
+            invalidate_derived: true,
+        }
+    }
+
+    #[test]
+    fn surgical_cpu_dirty_images_share_scalar_writes_and_copy_only_changed_vector_pages()
+    -> Result<()> {
+        for rows in [4_096, 32_768] {
+            let mut cpu = surgical_fixture(rows)?;
+            let reader = cpu.pin_project(PROJECT)?;
+            let old = cpu.resident[&PROJECT].clone();
+            let fingerprint = old.vectors[&PropertyId(2)]
+                .values
+                .iter()
+                .fold(0_u64, |hash, value| {
+                    hash.wrapping_mul(31).wrapping_add(u64::from(*value))
+                });
+            cpu.apply_project_delta(surgical_delta(2))?;
+            let scalar = cpu.resident[&PROJECT].clone();
+            assert!(
+                Arc::ptr_eq(&old.image, &scalar.image),
+                "cold vector/history/index image must stay shared"
+            );
+            assert_eq!(
+                scalar.vectors[&PropertyId(2)]
+                    .values
+                    .detached_page_bytes_from(&old.vectors[&PropertyId(2)].values),
+                0
+            );
+            assert_eq!(
+                old.property_value(0, PropertyId(1))?,
+                Some(ScalarValue::Integer(7))
+            );
+            assert_eq!(
+                scalar.property_value(0, PropertyId(1))?,
+                Some(ScalarValue::Integer(2))
+            );
+            let mut delta = surgical_delta(3);
+            delta
+                .vectors
+                .push(crate::graph::ResolvedVectorMutation::Upsert {
+                    property: PropertyId(2),
+                    entity_id: 1,
+                    revision: 3,
+                    coordinates: vec![f16::from_f32(2.0).to_bits(); 384],
+                });
+            delta.temporal.push(super::super::ResidentTemporalDelta {
+                entity_kind: EntityKind::Node,
+                target: 1,
+                sample: crate::graph::TemporalSample {
+                    entity_id: 1,
+                    property: PropertyId(3),
+                    event_time_nanos: -1,
+                    sequence_index: 3,
+                    value: ScalarValue::Integer(-777),
+                },
+            });
+            cpu.apply_project_delta(delta)?;
+            let changed = cpu.resident[&PROJECT].clone();
+            let vector = &changed.vectors[&PropertyId(2)];
+            let copied = vector
+                .values
+                .detached_page_bytes_from(&old.vectors[&PropertyId(2)].values)
+                + vector
+                    .versions
+                    .detached_page_bytes_from(&old.vectors[&PropertyId(2)].versions)
+                + vector
+                    .active
+                    .detached_page_bytes_from(&old.vectors[&PropertyId(2)].active);
+            assert!(
+                copied <= 48 * 1024,
+                "{rows} dirty vectors copied {copied} bytes"
+            );
+            assert!(Arc::ptr_eq(&old.image, &changed.image));
+            assert_eq!(old.temporal.len(), rows);
+            assert_eq!(changed.temporal.len(), rows + 1);
+            assert!(changed.temporal.detached_page_bytes_from(&old.temporal) <= 16 * 1024);
+            for (row, sample) in old.temporal.iter().enumerate() {
+                assert_eq!(
+                    sample.sample.value,
+                    ScalarValue::Integer((row as i64) * 3571)
+                );
+            }
+            assert_eq!(
+                fingerprint,
+                old.vectors[&PropertyId(2)]
+                    .values
+                    .iter()
+                    .fold(0_u64, |hash, value| hash
+                        .wrapping_mul(31)
+                        .wrapping_add(u64::from(*value)))
+            );
+            assert_eq!(reader.resident_bookmark(PROJECT), Some(old.bookmark));
+            let mut rejected = surgical_delta(4);
+            rejected
+                .vectors
+                .push(crate::graph::ResolvedVectorMutation::Upsert {
+                    property: PropertyId(2),
+                    entity_id: 1,
+                    revision: 4,
+                    coordinates: vec![0],
+                });
+            assert!(cpu.apply_project_delta(rejected).is_err());
+            assert!(Arc::ptr_eq(&changed, &cpu.resident[&PROJECT]));
+            eprintln!(
+                "surgical CPU rows={rows} copied_vector_bytes={copied} shared_history_rows={rows}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dense_integer_reads_keep_nulls_overrides_page_boundaries_and_old_views() -> Result<()> {
+        let mut graph = GraphStore::default();
+        let property = graph.catalog_mut().intern_property("value")?;
+        let body = graph.catalog_mut().intern_property("body")?;
+        for row in 0..4_097_u64 {
+            let mut properties = Vec::new();
+            if row % 3 != 0 {
+                properties.push((property, ScalarValue::Integer(row as i64)));
+            }
+            if row == 0 {
+                properties.push((body, ScalarValue::Bytes(vec![0x5a; 256 * 1_024].into())));
+            }
+            graph.insert_node(NodeInput {
+                id: NodeId(row),
+                layer: Layer::Observed,
+                revision: 1,
+                labels: vec![],
+                properties,
+            })?;
+        }
+        let mut cpu = CpuBackend::new(64 * 1_024 * 1_024, 0);
+        cpu.admit_project(ResidentProjectImage::graph_only(Arc::new(
+            graph.snapshot()?,
+        )))?;
+        let original = cpu.resident[&PROJECT].clone();
+        graph.begin_device_delta_batch();
+        for (row, value) in [
+            (0, ScalarValue::Integer(-1)),
+            (63, ScalarValue::Integer(-63)),
+            (64, ScalarValue::Null),
+            (2_048, ScalarValue::Integer(-2_048)),
+        ] {
+            graph.set_node_property(NodeId(row), property, value, 2)?;
+        }
+        cpu.apply_project_delta(ResidentProjectDelta {
+            project: PROJECT,
+            bookmark: Bookmark { term: 0, index: 2 },
+            graph: graph.device_delta(2)?,
+            temporal: vec![],
+            vectors: vec![],
+            invalidate_derived: false,
+        })?;
+        for resident in [&original, &cpu.resident[&PROJECT]] {
+            for rows in [
+                (0..4_097).collect::<Vec<_>>(),
+                vec![2_048, 64, 63, 0, 2_048, super::super::RESIDENT_NULL_ROW],
+            ] {
+                let expected = rows
+                    .iter()
+                    .map(|row| resident.integer_value(*row, property))
+                    .collect::<Result<Vec<_>>>()?;
+                assert_eq!(
+                    resident.integer_values(&rows, property, &CancellationToken::new())?,
+                    expected
+                );
+            }
+            assert!(
+                resident
+                    .integer_values(&[4_097], property, &CancellationToken::new())
+                    .is_err()
+            );
+            let cancelled = CancellationToken::new();
+            cancelled.cancel();
+            assert!(
+                resident
+                    .integer_values(&[0, 1], property, &cancelled)
+                    .is_err()
+            );
+        }
+        assert_eq!(original.integer_value(0, property)?, None);
+        assert_eq!(cpu.resident[&PROJECT].integer_value(0, property)?, Some(-1));
+        Ok(())
+    }
+
+    #[test]
+    fn surgical_cpu_property_patches_keep_large_base_payloads_and_removals() -> Result<()> {
+        let mut graph = GraphStore::default();
+        let value = graph.catalog_mut().intern_property("value")?;
+        let other = graph.catalog_mut().intern_property("other")?;
+        let body = graph.catalog_mut().intern_property("body")?;
+        let kind = graph.catalog_mut().intern_relationship_type("LINK")?;
+        let payload = ScalarValue::Bytes(vec![0x5a; 256 * 1_024].into());
+        for id in [1, 2] {
+            graph.insert_node(NodeInput {
+                id: NodeId(id),
+                layer: Layer::Observed,
+                revision: 1,
+                labels: vec![],
+                properties: vec![
+                    (value, ScalarValue::Integer(7)),
+                    (other, ScalarValue::Integer(9)),
+                    (body, payload.clone()),
+                ],
+            })?;
+        }
+        graph.insert_edge(EdgeInput {
+            id: EdgeId(10),
+            source: NodeId(1),
+            target: NodeId(2),
+            relationship_type: kind,
+            layer: Layer::Observed,
+            revision: 1,
+            properties: vec![(value, ScalarValue::Integer(7)), (body, payload.clone())],
+        })?;
+        let mut cpu = CpuBackend::new(64 * 1024 * 1024, 0);
+        cpu.admit_project(ResidentProjectImage::graph_only(Arc::new(
+            graph.snapshot()?,
+        )))?;
+        let pinned = cpu.resident[&PROJECT].clone();
+        let descriptors =
+            [(value, "value"), (other, "other"), (body, "body")].map(|(property, name)| {
+                super::super::ResidentSegmentedPropertyKeyDescriptor {
+                    property,
+                    name: name.into(),
+                }
+            });
+        for revision in 2..5 {
+            graph.begin_device_delta_batch();
+            graph.set_node_property(
+                NodeId(1),
+                value,
+                ScalarValue::Integer(revision as i64),
+                revision,
+            )?;
+            graph.set_edge_property(
+                EdgeId(10),
+                value,
+                ScalarValue::Integer(revision as i64),
+                revision,
+            )?;
+            if revision == 3 {
+                graph.set_node_property(NodeId(1), other, ScalarValue::Null, revision)?;
+                graph.set_edge_property(EdgeId(10), value, ScalarValue::Null, revision)?;
+            }
+            let mut delta = surgical_delta(revision);
+            delta.graph = graph.device_delta(revision)?;
+            assert!(
+                delta.graph.nodes[0]
+                    .properties
+                    .iter()
+                    .all(|(property, _)| *property != body)
+            );
+            assert!(
+                delta.graph.edges[0]
+                    .properties
+                    .iter()
+                    .all(|(property, _)| *property != body)
+            );
+            cpu.apply_project_delta(delta)?;
+            let current = &cpu.resident[&PROJECT];
+            assert!(Arc::ptr_eq(&pinned.image, &current.image));
+            assert!(
+                current
+                    .nodes
+                    .get(cpu_dense_key(0))
+                    .unwrap()
+                    .properties
+                    .iter()
+                    .all(|(property, _)| *property != body)
+            );
+            assert_eq!(current.property_value(0, body)?, Some(payload.clone()));
+            assert_eq!(
+                current.mutation_property_value(ResidentEntityBinding::Relationship(0), 0, body)?,
+                payload
+            );
+            assert_eq!(current.integer_value(0, value)?, Some(revision as i64));
+            assert_eq!(
+                cpu.filter_node_i64(PROJECT, other, CompareOp::Eq, 9, &CancellationToken::new())?,
+                if revision == 2 { vec![0, 1] } else { vec![1] }
+            );
+            assert_eq!(
+                current.mutation_property_value(
+                    ResidentEntityBinding::Relationship(0),
+                    0,
+                    value
+                )?,
+                if revision == 3 {
+                    ScalarValue::Null
+                } else {
+                    ScalarValue::Integer(revision as i64)
+                }
+            );
+            let keys = cpu_segmented_property_keys(
+                current,
+                &CpuSegmentedProgramValue::Node(1),
+                ResidentNullableRelationBindingKind::Node,
+                &descriptors,
+            )?;
+            let CpuSegmentedProgramValue::List(keys) = keys else {
+                return Err(Error::internal("keys lost list shape"));
+            };
+            let keys = keys
+                .into_iter()
+                .map(|key| match key {
+                    CpuSegmentedProgramValue::String(name) => Ok(name),
+                    _ => Err(Error::internal("keys lost string shape")),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            assert_eq!(
+                keys,
+                if revision == 2 {
+                    vec!["value", "other", "body"]
+                } else {
+                    vec!["value", "body"]
+                }
+            );
+            assert_eq!(
+                current.integer_values(&[0], other, &CancellationToken::new())?,
+                vec![if revision == 2 { Some(9) } else { None }]
+            );
+            assert_eq!(
+                pinned.property_value(0, value)?,
+                Some(ScalarValue::Integer(7))
+            );
+            assert_eq!(
+                pinned.property_value(0, other)?,
+                Some(ScalarValue::Integer(9))
+            );
+        }
+        // A complete replacement still removes omitted properties rather than falling back.
+        let mut replacement = surgical_delta(5);
+        replacement.graph.node_capacity = 2;
+        replacement.graph.edge_capacity = 1;
+        replacement.graph.nodes[0].properties = vec![(value, ScalarValue::Integer(5))];
+        cpu.apply_project_delta(replacement)?;
+        let current = &cpu.resident[&PROJECT];
+        assert_eq!(current.property_value(0, body)?, None);
+        assert_eq!(current.integer_value(0, other)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn surgical_cpu_replacement_churn_has_bounded_retained_accounting() -> Result<()> {
+        let mut cpu = surgical_fixture(4_096)?;
+        cpu.apply_project_delta(surgical_delta(2))?;
+        let retained = cpu.resident[&PROJECT].resident_bytes();
+        for revision in 3..1_003 {
+            cpu.apply_project_delta(surgical_delta(revision))?;
+            assert_eq!(cpu.resident[&PROJECT].resident_bytes(), retained);
+            assert_eq!(cpu.governor.snapshot().pinned_generation_bytes, 0);
+        }
+        assert_eq!(
+            cpu.resident[&PROJECT].property_value(0, PropertyId(1))?,
+            Some(ScalarValue::Integer(1_002))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn surgical_cpu_radix_leaf_keeps_large_neighbor_records_shared() -> Result<()> {
+        let mut cpu = surgical_fixture(4096)?;
+        let mut delta = surgical_delta(2);
+        delta.graph.node_capacity = 2;
+        delta.graph.nodes.push(crate::graph::NodeDeviceDelta {
+            dense: 1,
+            id: NodeId(2),
+            layer: Layer::Observed,
+            revision: 2,
+            active: true,
+            labels: vec![],
+            properties_complete: true,
+            properties: (1..8193)
+                .map(|property| {
+                    (
+                        PropertyId(property),
+                        ScalarValue::Integer(property as i64 * 7919),
+                    )
+                })
+                .collect(),
+        });
+        cpu.apply_project_delta(delta)?;
+        let original = cpu.resident[&PROJECT].clone();
+        let mut delta = surgical_delta(3);
+        delta.graph.node_capacity = 2;
+        cpu.apply_project_delta(delta)?;
+        let updated = &cpu.resident[&PROJECT];
+        assert!(
+            Arc::ptr_eq(
+                original.nodes.get(cpu_dense_key(1)).unwrap(),
+                updated.nodes.get(cpu_dense_key(1)).unwrap()
+            ),
+            "a changed radix leaf must not clone a neighboring owner's8192-property Vec"
+        );
+        assert!(!Arc::ptr_eq(
+            original.nodes.get(cpu_dense_key(0)).unwrap(),
+            updated.nodes.get(cpu_dense_key(0)).unwrap()
+        ));
+        assert_eq!(
+            original.property_value(0, PropertyId(1))?,
+            Some(ScalarValue::Integer(2))
+        );
+        assert_eq!(
+            updated.property_value(0, PropertyId(1))?,
+            Some(ScalarValue::Integer(3))
+        );
+        assert_eq!(
+            updated.property_value(1, PropertyId(8192))?,
+            Some(ScalarValue::Integer(8192 * 7919))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn surgical_cpu_root_churn_preserves_only_pinned_versions() -> Result<()> {
+        let mut cpu = surgical_fixture(4096)?;
+        let delta = |revision| {
+            let mut delta = surgical_delta(revision);
+            delta
+                .vectors
+                .push(crate::graph::ResolvedVectorMutation::Upsert {
+                    property: PropertyId(2),
+                    entity_id: 1,
+                    revision,
+                    coordinates: vec![f16::from_f32(revision as f32).to_bits(); 384],
+                });
+            delta.temporal.push(super::super::ResidentTemporalDelta {
+                entity_kind: EntityKind::Node,
+                target: 1,
+                sample: crate::graph::TemporalSample {
+                    entity_id: 1,
+                    property: PropertyId(3),
+                    event_time_nanos: -(revision as i64),
+                    sequence_index: revision,
+                    value: ScalarValue::Integer(revision as i64),
+                },
+            });
+            delta
+        };
+        cpu.apply_project_delta(surgical_delta(2))?;
+        let oldest = cpu.pin_project(PROJECT)?;
+        cpu.apply_project_delta(delta(3))?;
+        let retained = cpu.governor.snapshot().pinned_generation_bytes;
+        assert!(retained > 0);
+        for revision in 4..40 {
+            cpu.apply_project_delta(delta(revision))?;
+            assert_eq!(cpu.governor.snapshot().pinned_generation_bytes, retained);
+        }
+        let middle = cpu.pin_project(PROJECT)?;
+        cpu.apply_project_delta(delta(40))?;
+        let two = cpu.governor.snapshot().pinned_generation_bytes;
+        assert!(two > retained);
+        for revision in 41..80 {
+            cpu.apply_project_delta(delta(revision))?;
+            assert_eq!(cpu.governor.snapshot().pinned_generation_bytes, two);
+        }
+        assert_eq!(
+            oldest.resident_bookmark(PROJECT),
+            Some(Bookmark { term: 0, index: 2 })
+        );
+        assert_eq!(
+            middle.resident_bookmark(PROJECT),
+            Some(Bookmark { term: 0, index: 39 })
+        );
+        let cancellation = CancellationToken::new();
+        assert_eq!(
+            oldest.filter_node_i64(PROJECT, PropertyId(1), CompareOp::Eq, 2, &cancellation)?,
+            vec![0]
+        );
+        assert_eq!(
+            middle.filter_node_i64(PROJECT, PropertyId(1), CompareOp::Eq, 39, &cancellation)?,
+            vec![0]
+        );
+        drop(middle);
+        assert_eq!(cpu.governor.snapshot().pinned_generation_bytes, retained);
+        drop(oldest);
+        assert_eq!(cpu.governor.snapshot().pinned_generation_bytes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn surgical_cpu_branches_need_only_delta_headroom_and_release_private_pages() -> Result<()> {
+        let mut cpu = surgical_fixture(4_096)?;
+        for revision in 2..12 {
+            cpu.apply_project_delta(surgical_delta(revision))?;
+        }
+        let resident = cpu.governor.snapshot().admitted_bytes();
+        cpu.governor.cap_limit(resident + 512 * 1024)?;
+        let reader = cpu.pin_project(PROJECT)?;
+        let mut branch = cpu.pin_project(PROJECT)?;
+        assert_eq!(cpu.governor.snapshot().pinned_generation_bytes, 0);
+        branch.apply_project_delta(surgical_delta(12))?;
+        let retained = cpu.governor.snapshot().pinned_generation_bytes;
+        assert!(retained > 0 && retained < 32 * 1024);
+        let old_branch = branch.pin_project(PROJECT)?;
+        branch.apply_project_delta(surgical_delta(13))?;
+        assert_eq!(
+            old_branch.resident_bookmark(PROJECT),
+            Some(Bookmark { term: 0, index: 12 })
+        );
+        assert_eq!(
+            reader.resident_bookmark(PROJECT),
+            Some(Bookmark { term: 0, index: 11 })
+        );
+        assert_eq!(
+            cpu.resident[&PROJECT].property_value(0, PropertyId(1))?,
+            Some(ScalarValue::Integer(11))
+        );
+        drop(old_branch);
+        assert_eq!(cpu.governor.snapshot().pinned_generation_bytes, retained);
+        drop(branch);
+        drop(reader);
+        assert_eq!(cpu.governor.snapshot().pinned_generation_bytes, 0);
+        Ok(())
+    }
 
     #[test]
     #[allow(clippy::too_many_lines)]
@@ -28093,6 +29205,86 @@ mod node_pipeline_cpu_tests {
                 .expect_err("outside resident capacity")
                 .code,
             ErrorCode::QueryType
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pushed_start_predicates_skip_invalid_properties_on_deleted_rows() -> Result<()> {
+        let mut graph = GraphStore::default();
+        let first = graph.catalog_mut().intern_property("first")?;
+        let second = graph.catalog_mut().intern_property("second")?;
+        for id in [1, 2] {
+            graph.insert_node(NodeInput {
+                id: NodeId(id),
+                layer: Layer::Observed,
+                revision: 1,
+                labels: vec![],
+                properties: vec![
+                    (first, ScalarValue::Integer(1)),
+                    (second, ScalarValue::Integer(2)),
+                ],
+            })?;
+        }
+        let mut cpu = CpuBackend::new(32 * 1024 * 1024, 0);
+        cpu.admit_project(ResidentProjectImage::build(
+            PROJECT,
+            Bookmark { term: 1, index: 1 },
+            &graph,
+            &TemporalStore::default(),
+            &IndexCatalog::default(),
+        )?)?;
+        graph.set_node_property(NodeId(2), second, ScalarValue::String("removed".into()), 2)?;
+        graph.apply(crate::graph::GraphMutation::DeleteNode {
+            node: NodeId(2),
+            detach: false,
+            revision: 2,
+        })?;
+        cpu.apply_project_delta(ResidentProjectDelta {
+            project: PROJECT,
+            bookmark: Bookmark { term: 1, index: 2 },
+            graph: graph.device_delta(2)?,
+            temporal: vec![],
+            vectors: vec![],
+            invalidate_derived: true,
+        })?;
+        let request = ResidentNodePipelineRequest {
+            project: PROJECT,
+            labels: vec![],
+            layers: LayerMask::ALL,
+            initial_optional: false,
+            expansion: None,
+            continuations: vec![],
+            correlated_optional: None,
+            relationship_null_filter: None,
+            predicates: vec![
+                ResidentI64Predicate {
+                    binding: ResidentNodeBinding::Start,
+                    property: first,
+                    operation: CompareOp::Eq,
+                    operand: 1,
+                },
+                ResidentI64Predicate {
+                    binding: ResidentNodeBinding::Start,
+                    property: second,
+                    operation: CompareOp::Eq,
+                    operand: 2,
+                },
+            ],
+            property_filters: vec![],
+            value_matrix: None,
+            mutation: None,
+            orders: vec![],
+            offset: 0,
+            limit: 8,
+            integer_projections: vec![],
+            property_null_projections: vec![],
+            max_output_rows: 8,
+        };
+        assert_eq!(
+            cpu.execute_node_pipeline(&request, &CancellationToken::new())?
+                .start_rows,
+            vec![0]
         );
         Ok(())
     }

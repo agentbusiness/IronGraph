@@ -27,7 +27,9 @@
 //!   *1..3 total                         = 6
 //! ```
 
-use std::{collections::BTreeMap, sync::Arc, time::Instant};
+#[cfg(all(feature = "accelerator", target_os = "macos"))]
+use std::sync::Arc;
+use std::{collections::BTreeMap, time::Instant};
 
 use irongraph::{
     Bookmark, EdgeId, Layer, NodeId, ProjectId,
@@ -40,11 +42,27 @@ use tokio_util::sync::CancellationToken;
 #[cfg(all(feature = "accelerator", target_os = "macos"))]
 use irongraph::gpu::MetalBackend;
 
+#[cfg_attr(
+    not(all(feature = "accelerator", target_os = "macos")),
+    allow(dead_code)
+)]
 const PROJECT: ProjectId = ProjectId(uuid::Uuid::nil());
+#[cfg_attr(
+    not(all(feature = "accelerator", target_os = "macos")),
+    allow(dead_code)
+)]
 const MEMORY_LIMIT: usize = 256 * 1024 * 1024;
+#[cfg_attr(
+    not(all(feature = "accelerator", target_os = "macos")),
+    allow(dead_code)
+)]
 const RESERVED_MEMORY: usize = 4 * 1024 * 1024;
 
 /// `n1 -> n2 -> n3 -> n4`, all `:N` joined by `:R`.
+#[cfg_attr(
+    not(all(feature = "accelerator", target_os = "macos")),
+    allow(dead_code)
+)]
 fn chain_graph() -> irongraph::Result<GraphStore> {
     let mut graph = GraphStore::default();
     let node = graph.catalog_mut().intern_label("N")?;
@@ -72,6 +90,10 @@ fn chain_graph() -> irongraph::Result<GraphStore> {
     Ok(graph)
 }
 
+#[cfg_attr(
+    not(all(feature = "accelerator", target_os = "macos")),
+    allow(dead_code)
+)]
 fn context<'a>(graph: &'a GraphStore, backend: &'a dyn ExecutionBackend) -> ExecutionContext<'a> {
     ExecutionContext {
         project_id: PROJECT,
@@ -102,6 +124,10 @@ fn context<'a>(graph: &'a GraphStore, backend: &'a dyn ExecutionBackend) -> Exec
 }
 
 /// Runs `query` and returns the single scalar it projects.
+#[cfg_attr(
+    not(all(feature = "accelerator", target_os = "macos")),
+    allow(dead_code)
+)]
 fn scalar(
     graph: &GraphStore,
     backend: &dyn ExecutionBackend,
@@ -132,6 +158,10 @@ fn scalar(
     Ok(value.clone())
 }
 
+#[cfg_attr(
+    not(all(feature = "accelerator", target_os = "macos")),
+    allow(dead_code)
+)]
 fn integer(value: &ResultValue) -> Option<i64> {
     match value {
         ResultValue::Scalar(irongraph::ScalarValue::Integer(number)) => Some(*number),

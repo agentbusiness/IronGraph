@@ -344,6 +344,30 @@ impl Csr {
         Ok(())
     }
 
+    /// Rebinds an immutable COW copy whose only writes extend the empty row domain. The publisher
+    /// guarantees the old prefix is unchanged; validation reads just its boundary and new tail.
+    pub fn rebase_cow_offsets_extension(&mut self, offsets: SharedFlat<u32>) -> Result<()> {
+        let old = self.offsets.as_slice();
+        let next = offsets.as_slice();
+        let terminal = old.last().copied().ok_or_else(|| {
+            Error::new(
+                ErrorCode::CorruptStorage,
+                "cold adjacency offsets are empty",
+            )
+        })?;
+        if next.len() < old.len()
+            || next.get(old.len() - 1).copied() != Some(terminal)
+            || next[old.len()..].iter().any(|value| *value != terminal)
+        {
+            return Err(Error::new(
+                ErrorCode::CorruptStorage,
+                "COW adjacency extension changes the empty row boundary",
+            ));
+        }
+        self.offsets = FlatColumn::from_shared(offsets);
+        Ok(())
+    }
+
     #[must_use]
     pub fn row(
         &self,
@@ -471,13 +495,37 @@ pub enum AdjacencyDelta {
 }
 
 /// Bidirectional immutable adjacency plus a bounded append-only change buffer.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Adjacency {
     outgoing: Csr,
     incoming: Csr,
     deltas: PagedVec<AdjacencyDelta>,
     #[serde(skip)]
     delta_rows: OnceLock<Arc<DeltaRows>>,
+}
+
+impl<'de> Deserialize<'de> for Adjacency {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct StoredAdjacency {
+            outgoing: Csr,
+            incoming: Csr,
+            deltas: PagedVec<AdjacencyDelta>,
+        }
+        let stored = StoredAdjacency::deserialize(deserializer)?;
+        let delta_rows = OnceLock::new();
+        // Deserialization is the cold boundary. The first later edit must never pay to rebuild
+        // endpoint indexes from unrelated historical deltas.
+        let _ = delta_rows.set(Arc::new(Self::build_delta_rows(&stored.deltas)));
+        Ok(Self {
+            outgoing: stored.outgoing,
+            incoming: stored.incoming,
+            deltas: stored.deltas,
+            delta_rows,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -978,6 +1026,29 @@ mod tests {
         assert_eq!(replaced.offsets(), expected.offsets());
         assert_eq!(replaced.neighbors(), expected.neighbors());
         assert_eq!(replaced.edges(), expected.edges());
+        Ok(())
+    }
+
+    #[test]
+    fn surgical_restart_builds_endpoint_indexes_before_the_first_edit() -> Result<()> {
+        let mut adjacency = Adjacency::default();
+        for row in 0..4_096 {
+            adjacency.insert(row, row + 1, row);
+        }
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&adjacency, &mut bytes)
+            .map_err(|error| Error::internal(error.to_string()))?;
+        let mut restored: Adjacency = ciborium::de::from_reader(bytes.as_slice())
+            .map_err(|error| Error::internal(error.to_string()))?;
+        assert!(restored.delta_rows.get().is_some());
+        let pinned = restored.clone();
+        restored.delete(0, 1, 0);
+        let mut old = Vec::new();
+        let mut current = Vec::new();
+        pinned.expand_out(0, &mut old);
+        restored.expand_out(0, &mut current);
+        assert_eq!(old, vec![(1, 0)]);
+        assert!(current.is_empty());
         Ok(())
     }
 

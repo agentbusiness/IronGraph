@@ -34626,6 +34626,16 @@ pub trait ExecutionBackend: Send + Sync {
         ))
     }
 
+    /// Publishes a delta while the caller excludes access to canonical shared allocations.
+    ///
+    /// # Safety
+    /// The caller must hold the canonical state write lock and must ensure no retained host
+    /// snapshot or CPU view can access this project's resident bytes until publication finishes.
+    #[allow(unsafe_code)]
+    unsafe fn apply_project_delta_exclusive(&mut self, delta: ResidentProjectDelta) -> Result<()> {
+        self.apply_project_delta(delta)
+    }
+
     /// Applies an uncommitted explicit-transaction delta to an already pinned singleton
     /// generation while preserving its externally visible snapshot bookmark. The temporary
     /// monotonic fence exists only to reuse the canonical bounded delta path.

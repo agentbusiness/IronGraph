@@ -84,12 +84,12 @@ impl TryFrom<&ScalarValue> for IndexKey {
 pub struct EqualityIndex {
     postings: Arc<BTreeMap<IndexKey, RoaringBitmap>>,
     #[serde(default)]
-    deltas: PersistentMap<Vec<PostingDelta>>,
+    deltas: PersistentMap<Arc<Vec<PostingDelta>>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PostingDelta {
-    key: IndexKey,
+    key: Arc<IndexKey>,
     changes: PersistentMap<bool>,
 }
 
@@ -163,31 +163,35 @@ fn index_key_hash(key: &IndexKey) -> u128 {
 }
 
 fn append_posting_delta(
-    deltas: &mut PersistentMap<Vec<PostingDelta>>,
+    deltas: &mut PersistentMap<Arc<Vec<PostingDelta>>>,
     key: IndexKey,
     row: u32,
     present: bool,
 ) {
     let hash = index_key_hash(&key);
     let mut bucket = deltas.get(hash).cloned().unwrap_or_default();
-    if let Some(delta) = bucket.iter_mut().find(|delta| delta.key == key) {
+    let values = Arc::make_mut(&mut bucket);
+    if let Some(delta) = values.iter_mut().find(|delta| delta.key.as_ref() == &key) {
         delta.changes.insert(u128::from(row), present);
     } else {
         let mut changes = PersistentMap::default();
         changes.insert(u128::from(row), present);
-        bucket.push(PostingDelta { key, changes });
+        values.push(PostingDelta {
+            key: Arc::new(key),
+            changes,
+        });
     }
     deltas.insert(hash, bucket);
 }
 
 fn materialize_postings(
     base: &BTreeMap<IndexKey, RoaringBitmap>,
-    deltas: &PersistentMap<Vec<PostingDelta>>,
+    deltas: &PersistentMap<Arc<Vec<PostingDelta>>>,
 ) -> BTreeMap<IndexKey, RoaringBitmap> {
     let mut postings = base.clone();
     for (_, bucket) in deltas.iter() {
-        for delta in bucket {
-            let rows = postings.entry(delta.key.clone()).or_default();
+        for delta in bucket.iter() {
+            let rows = postings.entry(delta.key.as_ref().clone()).or_default();
             for (row, present) in delta.changes.iter() {
                 let Ok(row) = u32::try_from(row) else {
                     continue;
@@ -199,7 +203,7 @@ fn materialize_postings(
                 }
             }
             if rows.is_empty() {
-                postings.remove(&delta.key);
+                postings.remove(delta.key.as_ref());
             }
         }
     }
@@ -234,7 +238,7 @@ impl EqualityIndex {
     pub fn get(&self, key: &IndexKey) -> Option<RoaringBitmap> {
         let mut rows = self.postings.get(key).cloned().unwrap_or_default();
         if let Some(bucket) = self.deltas.get(index_key_hash(key))
-            && let Some(delta) = bucket.iter().find(|delta| &delta.key == key)
+            && let Some(delta) = bucket.iter().find(|delta| delta.key.as_ref() == key)
         {
             apply_changes(&mut rows, &delta.changes);
         }
@@ -245,7 +249,7 @@ impl EqualityIndex {
         let changes = self
             .deltas
             .get(index_key_hash(key))
-            .and_then(|bucket| bucket.iter().find(|delta| &delta.key == key))
+            .and_then(|bucket| bucket.iter().find(|delta| delta.key.as_ref() == key))
             .map(|delta| &delta.changes);
         bounded_bitmap_with_changes(self.postings.get(key), changes, limit)
     }
@@ -265,7 +269,7 @@ impl EqualityIndex {
         let mut bytes = self.deltas.detached_node_bytes_from(&previous.deltas);
         for (hash, bucket) in self.deltas.iter() {
             let old_bucket = previous.deltas.get(hash);
-            for delta in bucket {
+            for delta in bucket.iter() {
                 let old = old_bucket
                     .and_then(|bucket| bucket.iter().find(|old| old.key == delta.key))
                     .map_or(&empty, |old| &old.changes);
@@ -281,7 +285,7 @@ impl EqualityIndex {
 pub struct RangeIndex {
     postings: Arc<BTreeMap<IndexKey, RoaringBitmap>>,
     #[serde(default)]
-    deltas: PersistentMap<Vec<PostingDelta>>,
+    deltas: PersistentMap<Arc<Vec<PostingDelta>>>,
 }
 
 impl RangeIndex {
@@ -304,7 +308,7 @@ impl RangeIndex {
         let changes = self
             .deltas
             .get(index_key_hash(key))
-            .and_then(|bucket| bucket.iter().find(|delta| &delta.key == key))
+            .and_then(|bucket| bucket.iter().find(|delta| delta.key.as_ref() == key))
             .map(|delta| &delta.changes);
         bounded_bitmap_with_changes(self.postings.get(key), changes, limit)
     }
@@ -341,8 +345,10 @@ impl RangeIndex {
             }
         }
         for (_, bucket) in self.deltas.iter() {
-            for delta in bucket {
-                if !self.postings.contains_key(&delta.key) && in_bounds(&delta.key, lower, upper) {
+            for delta in bucket.iter() {
+                if !self.postings.contains_key(delta.key.as_ref())
+                    && in_bounds(&delta.key, lower, upper)
+                {
                     let mut rows = RoaringBitmap::new();
                     apply_changes(&mut rows, &delta.changes);
                     result |= rows;
@@ -421,11 +427,11 @@ fn bounded_bitmap_with_changes(
 
 fn apply_posting_delta(
     rows: &mut RoaringBitmap,
-    deltas: &PersistentMap<Vec<PostingDelta>>,
+    deltas: &PersistentMap<Arc<Vec<PostingDelta>>>,
     key: &IndexKey,
 ) {
     if let Some(bucket) = deltas.get(index_key_hash(key))
-        && let Some(delta) = bucket.iter().find(|delta| &delta.key == key)
+        && let Some(delta) = bucket.iter().find(|delta| delta.key.as_ref() == key)
     {
         apply_changes(rows, &delta.changes);
     }
@@ -437,14 +443,14 @@ pub struct TextIndex {
     postings: Arc<BTreeMap<String, RoaringBitmap>>,
     rows: Arc<BTreeMap<u32, BTreeSet<String>>>,
     #[serde(default)]
-    posting_deltas: PersistentMap<Vec<TextPostingDelta>>,
+    posting_deltas: PersistentMap<Arc<Vec<TextPostingDelta>>>,
     #[serde(default)]
-    row_overrides: PersistentMap<Option<BTreeSet<String>>>,
+    row_overrides: PersistentMap<Option<Arc<BTreeSet<String>>>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct TextPostingDelta {
-    term: String,
+    term: Arc<str>,
     changes: PersistentMap<bool>,
 }
 
@@ -459,19 +465,26 @@ fn text_term_hash(term: &str) -> u128 {
 }
 
 fn append_text_delta(
-    deltas: &mut PersistentMap<Vec<TextPostingDelta>>,
+    deltas: &mut PersistentMap<Arc<Vec<TextPostingDelta>>>,
     term: String,
     row: u32,
     present: bool,
 ) {
     let hash = text_term_hash(&term);
     let mut bucket = deltas.get(hash).cloned().unwrap_or_default();
-    if let Some(delta) = bucket.iter_mut().find(|delta| delta.term == term) {
+    let values = Arc::make_mut(&mut bucket);
+    if let Some(delta) = values
+        .iter_mut()
+        .find(|delta| delta.term.as_ref() == term.as_str())
+    {
         delta.changes.insert(u128::from(row), present);
     } else {
         let mut changes = PersistentMap::default();
         changes.insert(u128::from(row), present);
-        bucket.push(TextPostingDelta { term, changes });
+        values.push(TextPostingDelta {
+            term: Arc::from(term),
+            changes,
+        });
     }
     deltas.insert(hash, bucket);
 }
@@ -483,19 +496,20 @@ impl TextIndex {
         for term in &terms {
             append_text_delta(&mut self.posting_deltas, term.clone(), row, true);
         }
-        self.row_overrides.insert(u128::from(row), Some(terms));
+        self.row_overrides
+            .insert(u128::from(row), Some(Arc::new(terms)));
     }
 
     pub fn remove(&mut self, row: u32) {
         let terms = match self.row_overrides.get(u128::from(row)) {
             Some(terms) => terms.clone(),
-            None => self.rows.get(&row).cloned(),
+            None => self.rows.get(&row).cloned().map(Arc::new),
         };
         let Some(terms) = terms else {
             return;
         };
-        for term in terms {
-            append_text_delta(&mut self.posting_deltas, term, row, false);
+        for term in terms.iter() {
+            append_text_delta(&mut self.posting_deltas, term.clone(), row, false);
         }
         self.row_overrides.insert(u128::from(row), None);
     }
@@ -548,7 +562,7 @@ impl TextIndex {
         let changes = self
             .posting_deltas
             .get(text_term_hash(term))
-            .and_then(|bucket| bucket.iter().find(|delta| delta.term == term))
+            .and_then(|bucket| bucket.iter().find(|delta| delta.term.as_ref() == term))
             .map(|delta| &delta.changes);
         bounded_bitmap_with_changes(self.postings.get(term), changes, limit)
     }
@@ -556,7 +570,7 @@ impl TextIndex {
     fn posting(&self, term: &str) -> Option<RoaringBitmap> {
         let mut rows = self.postings.get(term).cloned().unwrap_or_default();
         if let Some(bucket) = self.posting_deltas.get(text_term_hash(term))
-            && let Some(delta) = bucket.iter().find(|delta| delta.term == term)
+            && let Some(delta) = bucket.iter().find(|delta| delta.term.as_ref() == term)
         {
             apply_changes(&mut rows, &delta.changes);
         }
@@ -566,11 +580,11 @@ impl TextIndex {
     fn materialized_postings(&self) -> BTreeMap<String, RoaringBitmap> {
         let mut postings = self.postings.as_ref().clone();
         for (_, bucket) in self.posting_deltas.iter() {
-            for delta in bucket {
-                let rows = postings.entry(delta.term.clone()).or_default();
+            for delta in bucket.iter() {
+                let rows = postings.entry(delta.term.to_string()).or_default();
                 apply_changes(rows, &delta.changes);
                 if rows.is_empty() {
-                    postings.remove(&delta.term);
+                    postings.remove(delta.term.as_ref());
                 }
             }
         }
@@ -585,7 +599,7 @@ impl TextIndex {
             };
             match terms {
                 Some(terms) => {
-                    rows.insert(row, terms.clone());
+                    rows.insert(row, terms.as_ref().clone());
                 }
                 None => {
                     rows.remove(&row);
@@ -614,7 +628,7 @@ impl TextIndex {
             );
         for (hash, bucket) in self.posting_deltas.iter() {
             let old_bucket = previous.posting_deltas.get(hash);
-            for delta in bucket {
+            for delta in bucket.iter() {
                 let old = old_bucket
                     .and_then(|bucket| bucket.iter().find(|old| old.term == delta.term))
                     .map_or(&empty, |old| &old.changes);
@@ -3979,13 +3993,13 @@ fn scalar_lookup_key(
 }
 
 fn posting_changes<'a>(
-    deltas: &'a PersistentMap<Vec<PostingDelta>>,
+    deltas: &'a PersistentMap<Arc<Vec<PostingDelta>>>,
     key: &IndexKey,
 ) -> Option<&'a PersistentMap<bool>> {
     deltas
         .get(index_key_hash(key))?
         .iter()
-        .find(|delta| &delta.key == key)
+        .find(|delta| delta.key.as_ref() == key)
         .map(|delta| &delta.changes)
 }
 
@@ -4009,12 +4023,12 @@ fn posting_cardinality(base: Option<&RoaringBitmap>, changes: Option<&Persistent
 
 fn scalar_posting_shape(
     base: &BTreeMap<IndexKey, RoaringBitmap>,
-    deltas: &PersistentMap<Vec<PostingDelta>>,
+    deltas: &PersistentMap<Arc<Vec<PostingDelta>>>,
 ) -> (u64, u64, u64, u64) {
     let mut keys = BTreeSet::<&IndexKey>::new();
     keys.extend(base.keys());
     for (_, bucket) in deltas.iter() {
-        keys.extend(bucket.iter().map(|delta| &delta.key));
+        keys.extend(bucket.iter().map(|delta| delta.key.as_ref()));
     }
     let mut distinct = 0_u64;
     let mut total = 0_u64;
@@ -4042,7 +4056,7 @@ fn text_posting_shape(index: &TextIndex) -> (u64, u64, u64, u64) {
     let mut terms = BTreeSet::<&str>::new();
     terms.extend(index.postings.keys().map(String::as_str));
     for (_, bucket) in index.posting_deltas.iter() {
-        terms.extend(bucket.iter().map(|delta| delta.term.as_str()));
+        terms.extend(bucket.iter().map(|delta| delta.term.as_ref()));
     }
     let mut distinct = 0_u64;
     let mut total = 0_u64;
@@ -4052,7 +4066,7 @@ fn text_posting_shape(index: &TextIndex) -> (u64, u64, u64, u64) {
         let changes = index
             .posting_deltas
             .get(text_term_hash(term))
-            .and_then(|bucket| bucket.iter().find(|delta| delta.term == term))
+            .and_then(|bucket| bucket.iter().find(|delta| delta.term.as_ref() == term))
             .map(|delta| &delta.changes);
         let rows = posting_cardinality(index.postings.get(term), changes);
         if rows == 0 {
@@ -4393,6 +4407,227 @@ mod tests {
 
     use super::*;
     use crate::{Layer, NodeId, NodeInput};
+
+    #[test]
+    fn surgical_dirty_scalar_neighbors_share_large_keys_and_preserve_postings() -> Result<()> {
+        let mut detached = Vec::new();
+        for size in [64 * 1_024, 2 * 1_024 * 1_024] {
+            let neighbors = [
+                IndexKey::String("s".repeat(size)),
+                IndexKey::Bytes(vec![71; size]),
+                IndexKey::Composite(vec![
+                    IndexKey::String("c".repeat(size)),
+                    IndexKey::Integer(7),
+                ]),
+            ];
+            let changed = IndexKey::String("changed".to_owned());
+            let mut equality = EqualityIndex::default();
+            let mut range = RangeIndex::default();
+            for (row, key) in neighbors
+                .iter()
+                .chain(std::iter::once(&changed))
+                .enumerate()
+            {
+                equality.insert_key(key.clone(), row as u32);
+                range.insert_key(key.clone(), row as u32);
+            }
+            let pinned_equality = equality.clone();
+            let pinned_range = range.clone();
+            equality.remove_key(&changed, 3);
+            equality.insert_key(changed.clone(), 9);
+            range.remove_key(&changed, 3);
+            range.insert_key(changed.clone(), 9);
+            for (row, key) in neighbors.iter().enumerate() {
+                let hash = index_key_hash(key);
+                let original = pinned_equality
+                    .deltas
+                    .get(hash)
+                    .expect("pinned scalar bucket");
+                let current = equality.deltas.get(hash).expect("current scalar bucket");
+                assert!(Arc::ptr_eq(original, current));
+                assert!(Arc::ptr_eq(&original[0].key, &current[0].key));
+                assert!(Arc::ptr_eq(
+                    pinned_range.deltas.get(hash).expect("pinned range bucket"),
+                    range.deltas.get(hash).expect("range bucket")
+                ));
+                assert_eq!(equality.get_bounded(key, 2), vec![row as u32]);
+                assert_eq!(
+                    range
+                        .between(Some((key, true)), Some((key, true)))
+                        .iter()
+                        .collect::<Vec<_>>(),
+                    vec![row as u32]
+                );
+            }
+            assert_eq!(pinned_equality.get_bounded(&changed, 4), vec![3]);
+            assert_eq!(equality.get_bounded(&changed, 4), vec![9]);
+            assert_eq!(pinned_range.exact_bounded(&changed, 4), vec![3]);
+            assert_eq!(range.exact_bounded(&changed, 4), vec![9]);
+            // Copying a collision bucket must also share each key's heap payload, rather than
+            // merely sharing buckets in neighboring radix leaves.
+            let original = Arc::new(
+                neighbors
+                    .iter()
+                    .map(|key| PostingDelta {
+                        key: Arc::new(key.clone()),
+                        changes: PersistentMap::default(),
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let mut collision = Arc::clone(&original);
+            Arc::make_mut(&mut collision)[0].changes.insert(99, true);
+            for (before, after) in original.iter().zip(collision.iter()) {
+                assert!(Arc::ptr_eq(&before.key, &after.key));
+            }
+            assert!(original[0].changes.get(99).is_none());
+            detached.push(equality.detached_storage_bytes_from(&pinned_equality));
+        }
+        assert_eq!(detached[0], detached[1]);
+        eprintln!(
+            "scalar neighbor payloads: 64KiB/2MiB keys remain shared; detached radix bytes {detached:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn surgical_dirty_text_neighbors_share_large_terms_and_token_sets() {
+        let huge_term = "x".repeat(1_024 * 1_024);
+        let token_text = (0..4_096)
+            .map(|row| format!("token{row}{}", "z".repeat(256)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut index = TextIndex::default();
+        index.upsert(0, "alpha beta");
+        index.upsert(1, &huge_term);
+        index.upsert(2, &token_text);
+        let pinned = index.clone();
+        index.upsert(0, "beta replacement");
+        for row in [1, 2] {
+            let original = pinned
+                .row_overrides
+                .get(row)
+                .and_then(Option::as_ref)
+                .expect("pinned terms");
+            let current = index
+                .row_overrides
+                .get(row)
+                .and_then(Option::as_ref)
+                .expect("current terms");
+            assert!(Arc::ptr_eq(original, current));
+            for (before, after) in original.iter().zip(current.iter()) {
+                assert_eq!(before.as_ptr(), after.as_ptr());
+            }
+        }
+        let hash = text_term_hash(&huge_term);
+        let before = pinned.posting_deltas.get(hash).expect("pinned huge term");
+        let after = index.posting_deltas.get(hash).expect("huge term");
+        assert!(Arc::ptr_eq(before, after));
+        assert!(Arc::ptr_eq(&before[0].term, &after[0].term));
+        assert_eq!(pinned.search("alpha").iter().collect::<Vec<_>>(), vec![0]);
+        assert!(index.search("alpha").is_empty());
+        assert_eq!(
+            index.search("replacement").iter().collect::<Vec<_>>(),
+            vec![0]
+        );
+        assert_eq!(index.search(&huge_term).iter().collect::<Vec<_>>(), vec![1]);
+        let token = format!("token2048{}", "z".repeat(256));
+        assert_eq!(index.search(&token).iter().collect::<Vec<_>>(), vec![2]);
+        let mut collision = Arc::clone(before);
+        Arc::make_mut(&mut collision)[0].changes.insert(99, true);
+        assert!(Arc::ptr_eq(&before[0].term, &collision[0].term));
+        assert!(before[0].changes.get(99).is_none());
+    }
+
+    #[test]
+    fn surgical_index_payload_ownership_preserves_checkpoint_wire_shapes() -> Result<()> {
+        #[derive(Clone, Serialize)]
+        struct OldPosting {
+            key: IndexKey,
+            changes: PersistentMap<bool>,
+        }
+        #[derive(Serialize)]
+        struct OldScalar {
+            postings: Arc<BTreeMap<IndexKey, RoaringBitmap>>,
+            deltas: PersistentMap<Vec<OldPosting>>,
+        }
+        #[derive(Clone, Serialize)]
+        struct OldTextPosting {
+            term: String,
+            changes: PersistentMap<bool>,
+        }
+        #[derive(Serialize)]
+        struct OldText {
+            postings: Arc<BTreeMap<String, RoaringBitmap>>,
+            rows: Arc<BTreeMap<u32, BTreeSet<String>>>,
+            posting_deltas: PersistentMap<Vec<OldTextPosting>>,
+            row_overrides: PersistentMap<Option<BTreeSet<String>>>,
+        }
+        let key = IndexKey::String("large indexed value ".repeat(4_096));
+        let mut scalar = EqualityIndex::default();
+        scalar.insert_key(key.clone(), 7);
+        let mut old_deltas = PersistentMap::default();
+        old_deltas.insert(
+            index_key_hash(&key),
+            vec![OldPosting {
+                key: key.clone(),
+                changes: scalar.deltas.get(index_key_hash(&key)).expect("delta")[0]
+                    .changes
+                    .clone(),
+            }],
+        );
+        let old = OldScalar {
+            postings: scalar.postings.clone(),
+            deltas: old_deltas,
+        };
+        let old_bytes =
+            postcard::to_stdvec(&old).map_err(|error| Error::internal(error.to_string()))?;
+        assert_eq!(
+            old_bytes,
+            postcard::to_stdvec(&scalar).map_err(|error| Error::internal(error.to_string()))?
+        );
+        let recovered: EqualityIndex =
+            postcard::from_bytes(&old_bytes).map_err(|error| Error::internal(error.to_string()))?;
+        let recovered_range: RangeIndex =
+            postcard::from_bytes(&old_bytes).map_err(|error| Error::internal(error.to_string()))?;
+        assert_eq!(recovered.get_bounded(&key, 2), vec![7]);
+        assert_eq!(recovered_range.exact_bounded(&key, 2), vec![7]);
+        let mut text = TextIndex::default();
+        text.upsert(8, "alpha beta");
+        let mut posting_deltas = PersistentMap::default();
+        for (hash, bucket) in text.posting_deltas.iter() {
+            posting_deltas.insert(
+                hash,
+                bucket
+                    .iter()
+                    .map(|delta| OldTextPosting {
+                        term: delta.term.to_string(),
+                        changes: delta.changes.clone(),
+                    })
+                    .collect(),
+            );
+        }
+        let mut row_overrides = PersistentMap::default();
+        row_overrides.insert(8, Some(tokenize("alpha beta")));
+        let old_text = OldText {
+            postings: text.postings.clone(),
+            rows: text.rows.clone(),
+            posting_deltas,
+            row_overrides,
+        };
+        let old_bytes =
+            postcard::to_stdvec(&old_text).map_err(|error| Error::internal(error.to_string()))?;
+        assert_eq!(
+            old_bytes,
+            postcard::to_stdvec(&text).map_err(|error| Error::internal(error.to_string()))?
+        );
+        let recovered: TextIndex =
+            postcard::from_bytes(&old_bytes).map_err(|error| Error::internal(error.to_string()))?;
+        assert_eq!(
+            recovered.search("alpha beta").iter().collect::<Vec<_>>(),
+            vec![8]
+        );
+        Ok(())
+    }
 
     #[test]
     fn scalar_index_key_preserves_wide_date_days() -> Result<()> {

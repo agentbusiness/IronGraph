@@ -37,8 +37,10 @@ use irongraph::{
         ResidentNullableRelationPredicate, ResidentNullableRelationPredicateValue,
         ResidentNullableRelationReceipt, ResidentNullableRelationRequest,
         ResidentNullableRelationResult, ResidentNullableRelationStage,
-        ResidentNullableRelationshipEndpoint, ResidentProjectImage, ResidentSortRequest,
-        ResidentSortResult, ResidentVectorQuery, ResidentVectorResult, ScratchReservation,
+        ResidentNullableRelationshipEndpoint, ResidentProjectImage,
+        ResidentSegmentedAggregationRequest, ResidentSegmentedAggregationResult,
+        ResidentSortRequest, ResidentSortResult, ResidentVectorQuery, ResidentVectorResult,
+        ScratchReservation,
     },
     graph::{GraphMutation, GraphStore, IndexCatalog, LayerMask, TemporalStore},
     types::{LabelId, PropertyId},
@@ -50,8 +52,6 @@ use tokio_util::sync::CancellationToken;
 use irongraph::gpu::MetalBackend;
 
 const REPORT_PATH: &str = "/tmp/irongraph-tck-full-delete-temporal-cpu-certified.json";
-const PINNED_FEATURE_ROOT: &str =
-    "/private/tmp/irongraph-opencypher-debug.6MXlLm/openCypher/tck/features";
 const PROJECT: ProjectId = ProjectId(uuid::Uuid::from_u128(
     0x4f50_5449_4f4e_414c_5f35_325f_5443_4b,
 ));
@@ -307,7 +307,8 @@ fn docstring_after(block: &str, marker: &str) -> Result<String> {
 }
 
 fn source_scenario(case: &ManifestCase) -> Result<SourceScenario> {
-    let path = Path::new(PINNED_FEATURE_ROOT).join(&case.feature);
+    let path =
+        super::cypher_native_delete_continuation_route::pinned_feature_root()?.join(&case.feature);
     let source = fs::read_to_string(&path)
         .map_err(|error| Error::internal(format!("cannot read {}: {error}", path.display())))?;
     let block = scenario_block(&source, &case.name)?;
@@ -462,8 +463,14 @@ fn assert_matches_oracle(
         || oracle.result.truncated != actual.result.truncated
     {
         return Err(Error::internal(format!(
-            "{} native result metadata differs from the generic CPU oracle",
-            case.name
+            "{} native result metadata differs from the generic CPU oracle: expected schema={:?}, statistics={:?}, truncated={}; actual schema={:?}, statistics={:?}, truncated={}",
+            case.name,
+            oracle.result.schema,
+            oracle.result.statistics,
+            oracle.result.truncated,
+            actual.result.schema,
+            actual.result.statistics,
+            actual.result.truncated
         )));
     }
     let mut expected = result_rows(oracle)?
@@ -505,15 +512,17 @@ struct RouteObservations {
     forbidden_calls: AtomicUsize,
     requests: Mutex<Vec<ResidentNullableRelationRequest>>,
     receipts: Mutex<Vec<Vec<ResidentNullableRelationReceipt>>>,
+    segmented_requests: Mutex<Vec<ResidentSegmentedAggregationRequest>>,
+    validated_segmented: AtomicUsize,
 }
 
-/// A fail-closed test boundary around the sealed nullable-relation command.
+/// A fail-closed test boundary around complete nullable-relation and segmented commands.
 ///
 /// The root advertises Metal so `require_native_execution` cannot fall through to generic rows.
 /// The pinned CPU-reference object reports CPU honestly; a separate fault mode deliberately lies
 /// to prove that a CPU result cannot be accepted as Metal. Every host-visible scan, traversal,
 /// filter, join, grouping, sort, and legacy node-pipeline entrypoint is rejected. The nullable
-/// command may run only on the one immutable generation returned by `pin_project`.
+/// commands may run only on the one immutable generation returned by `pin_project`.
 struct StrictOptionalBackend {
     inner: Box<dyn ExecutionBackend>,
     actual_kind: BackendKind,
@@ -876,6 +885,55 @@ impl ExecutionBackend for StrictOptionalBackend {
         }
     }
 
+    fn supports_native_segmented_aggregation(&self) -> bool {
+        self.inner.supports_native_segmented_aggregation()
+    }
+
+    fn execute_segmented_aggregation(
+        &self,
+        request: &ResidentSegmentedAggregationRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ResidentSegmentedAggregationResult> {
+        if !self.pinned {
+            return self.reject("segmented_aggregation_on_root");
+        }
+        if !matches!(self.fault, Fault::None | Fault::CpuMasqueradesAsMetal) {
+            return self.reject("nullable_fault_on_segmented_command");
+        }
+        if request.project != PROJECT
+            || request.expected_bookmark != self.expected_bookmark
+            || request.expected_graph_revision != self.expected_revision
+            || self.inner.resident_bookmark(PROJECT) != Some(self.expected_bookmark)
+            || self.inner.resident_graph_revision(PROJECT) != Some(self.expected_revision)
+            || request.program.is_none()
+            || request.input.row_count != 0
+            || request.input.column_count != 0
+            || !request.input.cells.is_empty()
+            || !request.input.arena.is_empty()
+        {
+            return self.reject("unsealed_or_host_shaped_segmented_aggregation");
+        }
+        request.validate()?;
+        self.observations
+            .complete_calls
+            .fetch_add(1, Ordering::SeqCst);
+        self.observations
+            .segmented_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(request.clone());
+        let result = self
+            .inner
+            .execute_segmented_aggregation(request, cancellation)?;
+        result
+            .clone()
+            .validate_for_publication(request, self.kind())?;
+        self.observations
+            .validated_segmented
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(result)
+    }
+
     fn filter_i64(
         &self,
         _values: &[i64],
@@ -928,6 +986,22 @@ fn assert_route(case: &ManifestCase, observations: &RouteObservations) -> Result
         .requests
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let segmented = observations
+        .segmented_requests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !segmented.is_empty() {
+        if !requests.is_empty()
+            || segmented.len() != 1
+            || observations.validated_segmented.load(Ordering::SeqCst) != 1
+        {
+            return Err(Error::internal(
+                "OPTIONAL aggregate omitted its unique validated native completion",
+            ));
+        }
+        segmented[0].validate()?;
+        return Ok(());
+    }
     let expected_proof_actions = requests.first().map_or(0, |request| {
         request
             .program
@@ -967,7 +1041,18 @@ fn assert_predicate_program(case: &ManifestCase, observations: &RouteObservation
     Ok(())
 }
 
+#[cfg(all(feature = "accelerator", target_os = "macos"))]
 fn assert_metal_receipts(case: &ManifestCase, observations: &RouteObservations) -> Result<()> {
+    if observations
+        .segmented_requests
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .len()
+        == 1
+        && observations.validated_segmented.load(Ordering::SeqCst) == 1
+    {
+        return Ok(());
+    }
     let requests = observations
         .requests
         .lock()
@@ -2269,8 +2354,9 @@ fn native_cpu_reference_matches_the_generic_oracle_for_all_52() -> Result<()> {
 
 #[cfg(all(feature = "accelerator", target_os = "macos"))]
 #[test]
-#[ignore = "red acceptance gate: all 52 OPTIONAL scenarios require one complete real-Metal command"]
+#[ignore = "hardware acceptance: all 52 OPTIONAL scenarios require one complete real-Metal command"]
 fn real_metal_matches_the_generic_oracle_for_all_52() -> Result<()> {
+    let mut failures = Vec::new();
     for case in manifest()? {
         let source = source_scenario(&case)?;
         let graph = fixture_graph(&source)?;
@@ -2279,12 +2365,74 @@ fn real_metal_matches_the_generic_oracle_for_all_52() -> Result<()> {
         let mut metal = MetalBackend::with_governor(0, governor)?;
         metal.admit_project(resident_image(&graph)?)?;
         let backend = StrictOptionalBackend::metal(metal)?;
-        execute_strict(&case, &source, &graph, &backend).map_err(|error| {
-            Error::internal(format!(
-                "real-Metal failure at report {} / {}: {}",
+        if let Err(error) = execute_strict(&case, &source, &graph, &backend) {
+            failures.push(format!(
+                "report {} / {}: {}",
                 case.report_id, case.name, error.message
-            ))
-        })?;
+            ));
+        }
+    }
+    if !failures.is_empty() {
+        return Err(Error::internal(format!(
+            "real-Metal OPTIONAL failures ({} of 52): {}",
+            failures.len(),
+            failures.join(" | ")
+        )));
+    }
+    Ok(())
+}
+
+fn named_optional_path_sources() -> Vec<SourceScenario> {
+    [
+        "MATCH (a {name: 'A'}), (x) WHERE x.name IN ['B', 'C', null] OPTIONAL MATCH p=(a)-->(x) RETURN x, p, p AS alias",
+        "MATCH (a {name: 'A'}), (x) WHERE x.name IN [] OPTIONAL MATCH p=(a)-->(x) RETURN x, p",
+        "MATCH (a {name: 'A'}), (x) WHERE x.name IN ['B', 'C'] OPTIONAL MATCH p=(a)<--(x) RETURN x, p",
+        "MATCH (a {name: 'A'}), (x) WHERE x.name IN ['B', 'C'] OPTIONAL MATCH p=(a)--(x) RETURN p",
+        "MATCH (a {name: 'A'}) OPTIONAL MATCH p=(a)-->(x) WITH x AS p RETURN p",
+    ].into_iter().map(|query| SourceScenario {
+            setup_queries: vec!["CREATE (a {name:'A'}), (b {name:'B'}), ({name:'C'}), ({marker:1}) CREATE (a)-[:X]->(b)".to_owned()],
+            query: query.to_owned(),
+    }).collect()
+}
+
+#[test]
+fn strict_cpu_named_optional_paths_preserve_membership_nulls_and_scope() -> Result<()> {
+    for source in named_optional_path_sources() {
+        let graph = fixture_graph(&source)?;
+        let mut cpu = CpuBackend::new(MEMORY_LIMIT_BYTES, RESERVED_BYTES);
+        cpu.admit_project(resident_image(&graph)?)?;
+        execute_strict(
+            &ManifestCase {
+                report_id: usize::MAX,
+                feature: "adversarial/named-optional".to_owned(),
+                name: source.query.clone(),
+            },
+            &source,
+            &graph,
+            &StrictOptionalBackend::cpu_reference(cpu)?,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[test]
+#[ignore = "hardware acceptance: selected native path rows and membership null semantics"]
+fn real_metal_named_optional_paths_preserve_membership_nulls_and_scope() -> Result<()> {
+    for source in named_optional_path_sources() {
+        let graph = fixture_graph(&source)?;
+        let governor =
+            irongraph::gpu::DeviceMemoryGovernor::new(MEMORY_LIMIT_BYTES, RESERVED_BYTES);
+        let mut metal = MetalBackend::with_governor(0, governor)?;
+        metal.admit_project(resident_image(&graph)?)?;
+        let backend = StrictOptionalBackend::metal(metal)?;
+        let case = ManifestCase {
+            report_id: usize::MAX,
+            feature: "adversarial/named-optional".to_owned(),
+            name: source.query.clone(),
+        };
+        execute_strict(&case, &source, &graph, &backend)?;
+        assert_metal_receipts(&case, &backend.observations())?;
     }
     Ok(())
 }

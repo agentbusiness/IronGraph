@@ -471,14 +471,14 @@ impl CustomOp1 for DfsChunk {
                 &self.outgoing_neighbors,
                 &outgoing_neighbors_layout,
                 DType::U32,
-                self.adjacency_count,
+                self.adjacency_count.max(1),
                 "DFS neighbors",
             ),
             (
                 &self.outgoing_edges,
                 &outgoing_edges_layout,
                 DType::U32,
-                self.adjacency_count,
+                self.adjacency_count.max(1),
                 "DFS edge rows",
             ),
             (
@@ -763,7 +763,7 @@ impl CustomOp1 for ShortestChunk {
         );
         let nodes = self.args.node_count as usize;
         let edges_count = self.args.edge_count as usize;
-        let adjacency = self.args.adjacency_count as usize;
+        let adjacency = (self.args.adjacency_count as usize).max(1);
         validate_vector(
             workspace,
             workspace_layout,
@@ -1081,7 +1081,7 @@ impl CustomOp1 for PersistentBfsChunk {
         metal_input!(self, edge_layers, layers_guard, layers_layout, layers);
         let nodes = self.args.node_count as usize;
         let edge_count = self.args.edge_count as usize;
-        let adjacency = self.args.adjacency_count as usize;
+        let adjacency = (self.args.adjacency_count as usize).max(1);
         let adjacency_storage = adjacency.max(1);
         validate_vector(
             workspace,
@@ -1196,6 +1196,8 @@ struct DijkstraArgs {
     quantum: u32,
     outgoing_overlay_count: u32,
     incoming_overlay_count: u32,
+    weight_base_kind: u32,
+    weight_base_rows: u32,
 }
 
 impl DijkstraArgs {
@@ -1230,6 +1232,8 @@ impl DijkstraArgs {
                 incoming_overlay_count,
                 "Dijkstra incoming overlay row count",
             )?,
+            weight_base_kind: weight.base_kind,
+            weight_base_rows: checked_candle_u32(weight.base_rows, "Dijkstra base weight rows")?,
         })
     }
 }
@@ -1237,10 +1241,32 @@ impl DijkstraArgs {
 #[derive(Clone, Debug)]
 struct PathWeight {
     kind: u32,
+    base_kind: u32,
+    base_rows: usize,
     homogeneous_values: Tensor,
     validity: Tensor,
     mixed_offsets: Tensor,
     mixed_bytes: Tensor,
+}
+
+impl PathWeight {
+    fn validate_base(&self, layout: &Layout, edge_count: usize) -> candle_core::Result<()> {
+        if self.base_kind == 0 {
+            return Ok(());
+        }
+        if self.kind != 3 || self.base_kind > 2 || self.base_rows > edge_count {
+            return Err(candle_core::Error::Msg(
+                "Metal Dijkstra base weight contract is invalid".into(),
+            ));
+        }
+        validate_bound_vector(
+            &self.homogeneous_values,
+            layout,
+            DType::I64,
+            self.base_rows,
+            "Dijkstra retained base weights",
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1442,7 +1468,7 @@ impl CustomOp1 for DijkstraChunk {
         };
         let nodes = self.args.node_count as usize;
         let edge_count = self.args.edge_count as usize;
-        let adjacency = self.args.adjacency_count as usize;
+        let adjacency = (self.args.adjacency_count as usize).max(1);
         validate_vector(
             workspace,
             workspace_layout,
@@ -1509,6 +1535,7 @@ impl CustomOp1 for DijkstraChunk {
             self.args.incoming_overlay_count as usize,
             "Dijkstra incoming overlay",
         )?;
+        self.weight.validate_base(values_layout, edge_count)?;
         if self.weight.kind == 1 || self.weight.kind == 2 {
             validate_bound_vector(
                 &self.weight.homogeneous_values,
@@ -1522,7 +1549,7 @@ impl CustomOp1 for DijkstraChunk {
                 &self.weight.mixed_offsets,
                 mixed_offsets_layout,
                 DType::U32,
-                edge_count + 1,
+                edge_count * 2,
                 "Dijkstra mixed offsets",
             )?;
             validate_bound_vector(
@@ -1736,7 +1763,7 @@ impl CustomOp1 for DijkstraHeapChunk {
         };
         let nodes = self.args.node_count as usize;
         let edge_count = self.args.edge_count as usize;
-        let adjacency = self.args.adjacency_count as usize;
+        let adjacency = (self.args.adjacency_count as usize).max(1);
         validate_vector(
             workspace,
             workspace_layout,
@@ -1803,6 +1830,7 @@ impl CustomOp1 for DijkstraHeapChunk {
             self.args.outgoing_overlay_count as usize,
             "heap Dijkstra outgoing overlay",
         )?;
+        self.weight.validate_base(values_layout, edge_count)?;
         if self.weight.kind == 1 || self.weight.kind == 2 {
             validate_bound_vector(
                 &self.weight.homogeneous_values,
@@ -1816,7 +1844,7 @@ impl CustomOp1 for DijkstraHeapChunk {
                 &self.weight.mixed_offsets,
                 mixed_offsets_layout,
                 DType::U32,
-                edge_count + 1,
+                edge_count * 2,
                 "heap Dijkstra mixed offsets",
             )?;
             validate_bound_vector(
@@ -1980,7 +2008,7 @@ impl CustomOp2 for DijkstraFinalize {
         };
         let nodes = self.args.node_count as usize;
         let edge_count = self.args.edge_count as usize;
-        let adjacency = self.args.adjacency_count as usize;
+        let adjacency = (self.args.adjacency_count as usize).max(1);
         validate_vector(
             workspace,
             workspace_layout,
@@ -2054,6 +2082,7 @@ impl CustomOp2 for DijkstraFinalize {
             self.args.incoming_overlay_count as usize,
             "Dijkstra finalizer incoming overlay",
         )?;
+        self.weight.validate_base(values_layout, edge_count)?;
         if self.weight.kind == 1 || self.weight.kind == 2 {
             validate_bound_vector(
                 &self.weight.homogeneous_values,
@@ -2067,7 +2096,7 @@ impl CustomOp2 for DijkstraFinalize {
                 &self.weight.mixed_offsets,
                 mixed_offsets_layout,
                 DType::U32,
-                edge_count + 1,
+                edge_count * 2,
                 "Dijkstra mixed offsets",
             )?;
         } else if self.weight.kind != 4 {
@@ -2385,7 +2414,7 @@ impl CandleResident {
         ensure_graph_execution(cancellation, deadline)?;
         validate_u32_workspace_words(self.node_count, 4, PATH_CONTROL_WORDS, "DFS")
             .map_err(candle_error)?;
-        let Some(neighbors) = self.outgoing_neighbors.as_ref() else {
+        if self.edge_count == 0 {
             if max_output_rows == 0 {
                 return Err(path_budget("DFS"));
             }
@@ -2393,8 +2422,8 @@ impl CandleResident {
                 node_rows: vec![source_dense],
                 order: vec![0],
             });
-        };
-        let edges = self.path_outgoing_edges(neighbors.elem_count())?;
+        }
+        let (neighbors, edges, adjacency_count) = self.path_cold_adjacency(false)?;
         let (edge_active, edge_layers) = self.path_edge_visibility()?;
         let control_offset = self.node_count * 4;
         let words = control_offset + PATH_CONTROL_WORDS;
@@ -2477,7 +2506,7 @@ impl CandleResident {
                     edge_layers: edge_layers.clone(),
                     node_count: self.node_count,
                     edge_count: self.edge_count,
-                    adjacency_count: neighbors.elem_count(),
+                    adjacency_count,
                     outgoing_overlay_count: self.outgoing_overlay.rows.len(),
                     source: source_dense,
                     layer_mask: u32::from(layers.bits()),
@@ -2557,19 +2586,13 @@ impl CandleResident {
                 "Metal shortest-path forward and reverse labels disagree",
             ));
         }
-        let neighbors = self.outgoing_neighbors.as_ref().ok_or_else(|| {
-            Error::new(
-                ErrorCode::CorruptStorage,
-                "reachable shortest path has no outgoing adjacency",
-            )
-        })?;
-        let edges = self.path_outgoing_edges(neighbors.elem_count())?;
+        let (neighbors, edges, adjacency_count) = self.path_cold_adjacency(false)?;
         let (edge_active, edge_layers) = self.path_edge_visibility()?;
         let words = self.node_count * 2 + PATH_CONTROL_WORDS;
         let args = ShortestArgs::new(
             self.node_count,
             self.edge_count,
-            neighbors.elem_count(),
+            adjacency_count,
             source_dense,
             target_dense,
             u32::from(layers.bits()),
@@ -2691,28 +2714,10 @@ impl CandleResident {
                 predecessor: vec![None],
             });
         }
-        let neighbors = self.outgoing_neighbors.as_ref().ok_or_else(|| {
-            Error::new(
-                ErrorCode::CorruptStorage,
-                "resident weighted graph has no outgoing-neighbor tensor",
-            )
-        })?;
-        let outgoing_edges = self.path_outgoing_edges(neighbors.elem_count())?;
-        let incoming_neighbors = self.incoming_neighbors.as_ref().ok_or_else(|| {
-            Error::new(
-                ErrorCode::CorruptStorage,
-                "resident weighted graph has no incoming-neighbor tensor",
-            )
-        })?;
-        let incoming_edges = self.incoming_edges.as_ref().ok_or_else(|| {
-            Error::new(
-                ErrorCode::CorruptStorage,
-                "resident weighted graph has no incoming-edge tensor",
-            )
-        })?;
-        if incoming_neighbors.elem_count() != neighbors.elem_count()
-            || incoming_edges.elem_count() != neighbors.elem_count()
-        {
+        let (neighbors, outgoing_edges, adjacency_count) = self.path_cold_adjacency(false)?;
+        let (incoming_neighbors, incoming_edges, incoming_count) =
+            self.path_cold_adjacency(true)?;
+        if incoming_count != adjacency_count {
             return Err(Error::new(
                 ErrorCode::CorruptStorage,
                 "resident weighted incoming and outgoing CSR cardinalities differ",
@@ -2723,7 +2728,7 @@ impl CandleResident {
         let args = DijkstraArgs::new(
             self.node_count,
             self.edge_count,
-            neighbors.elem_count(),
+            adjacency_count,
             source_dense,
             u32::from(layers.bits()),
             &weight,
@@ -2820,7 +2825,7 @@ impl CandleResident {
             }
             if weighted_dijkstra_should_switch_to_heap(
                 self.node_count,
-                neighbors.elem_count(),
+                adjacency_count,
                 rounds,
                 active_count,
             ) {
@@ -2838,7 +2843,7 @@ impl CandleResident {
                     "exact weighted Dijkstra did not converge within the simple-path bound",
                 ));
             }
-            let adjacency_tile_domain = neighbors.elem_count().max(self.edge_count);
+            let adjacency_tile_domain = adjacency_count.max(self.edge_count);
             let tile_count = adjacency_tile_domain
                 .max(1)
                 .div_ceil(super::METAL_GRAPH_EDGE_TILE);
@@ -2919,7 +2924,7 @@ impl CandleResident {
             packet_words,
             "irongraph Metal weighted Dijkstra result packet",
         )?;
-        let adjacency_tile_domain = neighbors.elem_count().max(self.edge_count);
+        let adjacency_tile_domain = adjacency_count.max(self.edge_count);
         let tile_count = adjacency_tile_domain
             .max(1)
             .div_ceil(super::METAL_GRAPH_EDGE_TILE);
@@ -3060,20 +3065,35 @@ impl CandleResident {
         Ok(())
     }
 
-    fn path_outgoing_edges(&self, adjacency_count: usize) -> Result<&Tensor> {
-        let edges = self.outgoing_edges.as_ref().ok_or_else(|| {
-            Error::new(
+    /// Bind cold CSR lanes independently of rows replaced by the persistent overlay.
+    fn path_cold_adjacency(&self, incoming: bool) -> Result<(Tensor, Tensor, usize)> {
+        let (neighbors, edges) = if incoming {
+            (&self.incoming_neighbors, &self.incoming_edges)
+        } else {
+            (&self.outgoing_neighbors, &self.outgoing_edges)
+        };
+        match (neighbors, edges) {
+            (Some(neighbors), Some(edges))
+                if neighbors.elem_count() == edges.elem_count() && neighbors.elem_count() != 0 =>
+            {
+                Ok((neighbors.clone(), edges.clone(), neighbors.elem_count()))
+            }
+            (None, None) => {
+                // The zero-length cold lane is never indexed. Reuse its first offset word so
+                // the mandatory Metal binding needs no extra scratch allocation.
+                let offsets = if incoming {
+                    &self.incoming_offsets
+                } else {
+                    &self.outgoing_offsets
+                };
+                let dummy = offsets.narrow(0, 0, 1).map_err(candle_error)?;
+                Ok((dummy.clone(), dummy, 0))
+            }
+            _ => Err(Error::new(
                 ErrorCode::CorruptStorage,
-                "resident outgoing adjacency has no edge-row tensor",
-            )
-        })?;
-        if edges.elem_count() != adjacency_count {
-            return Err(Error::new(
-                ErrorCode::CorruptStorage,
-                "resident outgoing CSR cardinalities differ",
-            ));
+                "resident cold CSR neighbor and edge cardinalities differ",
+            )),
         }
-        Ok(edges)
     }
 
     fn path_edge_visibility(&self) -> Result<(&Tensor, &Tensor)> {
@@ -3104,6 +3124,8 @@ impl CandleResident {
             }
             return Ok(PathWeight {
                 kind: 1,
+                base_kind: 0,
+                base_rows: 0,
                 homogeneous_values: values.clone(),
                 validity: validity.clone(),
                 mixed_offsets: self.outgoing_offsets.clone(),
@@ -3121,6 +3143,8 @@ impl CandleResident {
             }
             return Ok(PathWeight {
                 kind: 2,
+                base_kind: 0,
+                base_rows: 0,
                 homogeneous_values: values.clone(),
                 validity: validity.clone(),
                 mixed_offsets: self.outgoing_offsets.clone(),
@@ -3129,15 +3153,35 @@ impl CandleResident {
         }
         if let Some(column) = self.mixed_edges.get(&property) {
             let validity = column.validity.as_ref().ok_or_else(weight_type_error)?;
-            let bytes = column.bytes.as_ref().ok_or_else(weight_type_error)?;
-            let homogeneous_values =
-                Tensor::zeros(1, DType::I64, dummy_bytes.device()).map_err(candle_error)?;
+            let (base_kind, base_rows, homogeneous_values) = match column.base.as_deref() {
+                Some(super::MixedBaseColumn::Integer(base)) => (
+                    1,
+                    base.rows,
+                    base.values.as_ref().ok_or_else(weight_type_error)?.clone(),
+                ),
+                Some(super::MixedBaseColumn::Float(base)) => (
+                    2,
+                    base.rows,
+                    base.values.as_ref().ok_or_else(weight_type_error)?.clone(),
+                ),
+                _ => (
+                    0,
+                    0,
+                    Tensor::zeros(1, DType::I64, dummy_bytes.device()).map_err(candle_error)?,
+                ),
+            };
+            let bytes = match &column.bytes {
+                Some(bytes) => bytes.clone(),
+                None => Tensor::zeros(1, DType::U8, dummy_bytes.device()).map_err(candle_error)?,
+            };
             return Ok(PathWeight {
                 kind: 3,
+                base_kind,
+                base_rows,
                 homogeneous_values,
                 validity: validity.clone(),
                 mixed_offsets: column.offsets.clone(),
-                mixed_bytes: bytes.clone(),
+                mixed_bytes: bytes,
             });
         }
         let validity = self.edge_active.as_ref().ok_or_else(|| {
@@ -3150,6 +3194,8 @@ impl CandleResident {
             // Unsupported scalar shape. The kernel reports QueryType only when a reachable edge
             // is examined, matching the CPU reference's lazy weight callback semantics.
             kind: 4,
+            base_kind: 0,
+            base_rows: 0,
             homogeneous_values: Tensor::zeros(1, DType::I64, dummy_bytes.device())
                 .map_err(candle_error)?,
             validity: validity.clone(),
@@ -3228,39 +3274,16 @@ impl CandleResident {
             }
             ensure_graph_execution(cancellation, deadline)?;
         }
-        let Some(reverse_neighbors) = self.incoming_neighbors.as_ref() else {
-            return Ok(workspace);
-        };
-        let reverse_edges = self.incoming_edges.as_ref().ok_or_else(|| {
-            Error::new(
-                ErrorCode::CorruptStorage,
-                "resident incoming adjacency has no edge-row tensor",
-            )
-        })?;
-        let pull_neighbors = self.outgoing_neighbors.as_ref().ok_or_else(|| {
-            Error::new(
-                ErrorCode::CorruptStorage,
-                "resident incoming adjacency has no outgoing counterpart",
-            )
-        })?;
-        let pull_edges = self.outgoing_edges.as_ref().ok_or_else(|| {
-            Error::new(
-                ErrorCode::CorruptStorage,
-                "resident outgoing adjacency has no edge-row tensor",
-            )
-        })?;
-        let (edge_active, edge_layers) = self.path_edge_visibility()?;
-        let adjacency_count = reverse_neighbors.elem_count();
+        let (reverse_neighbors, reverse_edges, adjacency_count) = self.path_cold_adjacency(true)?;
+        let (pull_neighbors, pull_edges, pull_count) = self.path_cold_adjacency(false)?;
         if adjacency_count == 0
             && self.outgoing_overlay.rows.is_empty()
             && self.incoming_overlay.rows.is_empty()
         {
             return Ok(workspace);
         }
-        if reverse_edges.elem_count() != adjacency_count
-            || pull_neighbors.elem_count() != adjacency_count
-            || pull_edges.elem_count() != adjacency_count
-        {
+        let (edge_active, edge_layers) = self.path_edge_visibility()?;
+        if pull_count != adjacency_count {
             return Err(Error::new(
                 ErrorCode::CorruptStorage,
                 "resident incoming and outgoing CSR cardinalities differ",
@@ -3986,7 +4009,7 @@ fn validate_csr_overlay(
     row_count: usize,
     name: &str,
 ) -> candle_core::Result<()> {
-    let minimum_words = row_count.saturating_mul(2).saturating_add(1);
+    let minimum_words = if row_count == 0 { 1 } else { 2 };
     if tensor.dtype() != DType::U32
         || !layout.is_contiguous()
         || layout.dims().len() != 1
@@ -4137,6 +4160,143 @@ mod tests {
         validate_u32_workspace_words, weighted_dijkstra_scratch_bytes,
         weighted_dijkstra_should_switch_to_heap,
     };
+
+    #[test]
+    fn surgical_dijkstra_reads_retained_numeric_base_and_appended_mixed_weights() -> Result<()> {
+        use crate::{
+            Bookmark, EdgeId, Layer, NodeId, ProjectId, ResidentGraphProcedure,
+            ResidentGraphProcedureRequest, ResidentGraphProcedureResult, ResidentProjectDelta,
+            ResidentProjectImage, ScalarValue,
+            graph::{EdgeInput, GraphStore, LayerMask, NodeInput},
+        };
+        use std::sync::Arc;
+        let _guard = crate::metal_test_guard();
+        let Some(device) = crate::metal_test_device() else {
+            return Ok(());
+        };
+        for (float_base, overlay_only) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let mut graph = GraphStore::default();
+            let weight = graph.catalog_mut().intern_property("weight")?;
+            let kind = graph.catalog_mut().intern_relationship_type("LINK")?;
+            let empty = super::CandleResident::upload(
+                ResidentProjectImage::graph_only(Arc::new(graph.snapshot()?)),
+                &device,
+            )?;
+            for id in 1..=3 {
+                graph.insert_node(NodeInput {
+                    id: NodeId(id),
+                    layer: Layer::Observed,
+                    revision: 1,
+                    labels: Vec::new(),
+                    properties: Vec::new(),
+                })?;
+            }
+            for id in 1..=2 {
+                let value = if float_base {
+                    ScalarValue::Float(((id + 1) as f64).into())
+                } else {
+                    ScalarValue::Integer((id + 1) as i64)
+                };
+                graph.insert_edge(EdgeInput {
+                    id: EdgeId(id),
+                    source: NodeId(id),
+                    target: NodeId(id + 1),
+                    relationship_type: kind,
+                    layer: Layer::Observed,
+                    revision: 1,
+                    properties: vec![(weight, value)],
+                })?;
+            }
+            let pinned = if overlay_only {
+                empty.stage_delta(
+                    &ResidentProjectDelta {
+                        project: ProjectId(uuid::Uuid::nil()),
+                        bookmark: Bookmark { term: 1, index: 1 },
+                        graph: graph.device_delta(1)?,
+                        temporal: Vec::new(),
+                        vectors: Vec::new(),
+                        invalidate_derived: false,
+                    },
+                    &device,
+                )?
+            } else {
+                super::CandleResident::upload(
+                    ResidentProjectImage::graph_only(Arc::new(graph.snapshot()?)),
+                    &device,
+                )?
+            };
+            let value = if float_base {
+                ScalarValue::Integer(4)
+            } else {
+                ScalarValue::Float(4.5.into())
+            };
+            graph.set_edge_property(EdgeId(2), weight, value, 2)?;
+            graph.insert_node(NodeInput {
+                id: NodeId(4),
+                layer: Layer::Observed,
+                revision: 2,
+                labels: Vec::new(),
+                properties: Vec::new(),
+            })?;
+            graph.insert_edge(EdgeInput {
+                id: EdgeId(3),
+                source: NodeId(3),
+                target: NodeId(4),
+                relationship_type: kind,
+                layer: Layer::Observed,
+                revision: 2,
+                properties: vec![(
+                    weight,
+                    if float_base {
+                        ScalarValue::Integer(1)
+                    } else {
+                        ScalarValue::Float(1.25.into())
+                    },
+                )],
+            })?;
+            let delta = ResidentProjectDelta {
+                project: ProjectId(uuid::Uuid::nil()),
+                bookmark: Bookmark { term: 1, index: 2 },
+                graph: graph.device_delta(2)?,
+                temporal: Vec::new(),
+                vectors: Vec::new(),
+                invalidate_derived: false,
+            };
+            let staged = pinned.stage_delta(&delta, &device)?;
+            let request = ResidentGraphProcedureRequest {
+                project: delta.project,
+                layers: LayerMask::ALL,
+                procedure: ResidentGraphProcedure::DijkstraWeighted {
+                    source_dense: 0,
+                    weight_property: weight,
+                },
+                max_output_rows: 4,
+                deadline: None,
+            };
+            let query = |resident: &super::CandleResident| -> Result<Vec<f64>> {
+                match resident.execute_graph_procedure(
+                    &device,
+                    &request,
+                    &tokio_util::sync::CancellationToken::new(),
+                )? {
+                    ResidentGraphProcedureResult::Dijkstra { cost, .. } => Ok(cost),
+                    _ => Err(crate::Error::internal("unexpected Dijkstra result")),
+                }
+            };
+            assert_eq!(query(&pinned)?, vec![0.0, 2.0, 5.0]);
+            assert_eq!(
+                query(&staged)?,
+                if float_base {
+                    vec![0.0, 2.0, 6.0, 7.0]
+                } else {
+                    vec![0.0, 2.0, 6.5, 7.75]
+                }
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn path_library_contains_all_exact_procedure_kernels() {

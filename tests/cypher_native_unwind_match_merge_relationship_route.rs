@@ -454,6 +454,10 @@ enum CaseKind {
     WrongDirectionAndType,
 }
 
+#[cfg_attr(
+    not(all(feature = "accelerator", target_os = "macos")),
+    allow(dead_code)
+)]
 const ALL_CASES: [CaseKind; 11] = [
     CaseKind::ExactTck,
     CaseKind::DuplicateIdenticalRows,

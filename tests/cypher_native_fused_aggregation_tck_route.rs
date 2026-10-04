@@ -15,7 +15,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs,
+    fs,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -284,9 +284,7 @@ fn certified_report() -> Result<CertifiedReport> {
 }
 
 fn feature_root() -> Result<PathBuf> {
-    env::var_os("OPENCYPHER_TCK_DIR")
-        .map(PathBuf::from)
-        .ok_or_else(|| Error::invalid_data("OPENCYPHER_TCK_DIR is required for this gate"))
+    super::cypher_native_delete_continuation_route::pinned_feature_root()
 }
 
 fn table_row(line: &str) -> Option<Vec<String>> {
@@ -3841,6 +3839,17 @@ fn strict_cpu_proves_return6_6_empty_document_tail_in_one_command() -> Result<()
 
 #[test]
 fn strict_cpu_proves_return6_16_two_aggregate_boundaries_in_one_graph_command() -> Result<()> {
+    execute_return6_16_two_aggregate_boundaries(&mut ObservedBackend::strict_cpu())
+}
+
+#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[test]
+#[ignore = "requires a physical Metal device; run alone"]
+fn real_metal_proves_return6_16_two_aggregate_boundaries_in_one_graph_command() -> Result<()> {
+    execute_return6_16_two_aggregate_boundaries(&mut ObservedBackend::real_metal()?)
+}
+
+fn execute_return6_16_two_aggregate_boundaries(backend: &mut ObservedBackend) -> Result<()> {
     let case = ManifestCase {
         report_id: 748,
         feature: "clauses/return/Return6.feature".to_owned(),
@@ -3895,12 +3904,11 @@ fn strict_cpu_proves_return6_16_two_aggregate_boundaries_in_one_graph_command() 
         ],
         result_order: ResultOrder::Any,
     };
-    let mut backend = ObservedBackend::strict_cpu();
     let calls = backend.calls();
     let before = calls.snapshot();
     let stages_before = calls.graph_relation_stage_sequences()?.len();
 
-    execute_strict_case(&case, &source, &mut backend)?;
+    execute_strict_case(&case, &source, backend)?;
 
     assert_eq!(
         call_delta(before, calls.snapshot()),

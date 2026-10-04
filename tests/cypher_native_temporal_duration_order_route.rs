@@ -1881,6 +1881,10 @@ fn assert_result(
     Ok(())
 }
 
+#[cfg_attr(
+    not(all(feature = "accelerator", target_os = "macos")),
+    allow(dead_code)
+)]
 struct NativeRun {
     rows: Vec<ObservedRow>,
     request: ResidentRowProgramRequest,

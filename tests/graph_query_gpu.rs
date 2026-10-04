@@ -19,8 +19,7 @@ use irongraph::{
         ResidentExpansion, ResidentGroupRequest, ResidentI64Predicate, ResidentI64Projection,
         ResidentJoinPair, ResidentJoinRequest, ResidentNodeBinding, ResidentNodeOrder,
         ResidentNodePipelineRequest, ResidentProjectDelta, ResidentProjectImage, ResidentSortKey,
-        ResidentSortRequest, ResidentSortSource, ResidentTemporalDelta,
-        ResidentTemporalPipelineRequest, ResidentValueMatrixProgram, ResidentValueMatrixValue,
+        ResidentSortRequest, ResidentSortSource,
     },
     graph::{
         EdgeInput, EqualityIndex, GraphIndexDefinition, GraphIndexKind, GraphMutation, GraphStore,
@@ -36,7 +35,10 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(all(feature = "accelerator", target_os = "macos"))]
 use irongraph::{
-    gpu::{DeviceMemoryGovernor, MetalBackend, ResidentVectorQuery},
+    gpu::{
+        DeviceMemoryGovernor, MetalBackend, ResidentTemporalDelta, ResidentTemporalPipelineRequest,
+        ResidentValueMatrixProgram, ResidentValueMatrixValue, ResidentVectorQuery,
+    },
     graph::{EmbeddingDType, EmbeddingIndexDefinition, EmbeddingProfile},
 };
 

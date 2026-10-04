@@ -119,7 +119,7 @@ impl ResidentProjectDelta {
     }
 }
 
-fn scalar_resident_bytes(value: &ScalarValue) -> usize {
+pub(crate) fn scalar_resident_bytes(value: &ScalarValue) -> usize {
     match value {
         ScalarValue::Null => 0,
         ScalarValue::Boolean(_) => size_of::<u8>(),

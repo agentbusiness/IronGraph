@@ -625,7 +625,10 @@ fn source_catalog_at_root(
 }
 
 fn source_catalog(cases: &[ManifestCase]) -> Result<BTreeMap<(String, String), SourceCase>> {
-    source_catalog_at_root(cases, Path::new(PINNED_FEATURE_ROOT))
+    source_catalog_at_root(
+        cases,
+        &super::cypher_native_delete_continuation_route::pinned_feature_root()?,
+    )
 }
 
 fn report_manifest_case(
@@ -651,7 +654,7 @@ fn report_manifest_case(
     })
 }
 
-fn float_unary_minus_regression_catalog()
+fn float_unary_minus_certified_report_catalog()
 -> Result<(Vec<ManifestCase>, BTreeMap<(String, String), SourceCase>)> {
     const FAILURE: &str = "Metal unary minus does not yet admit a possible FLOAT operand";
     let report = read_certified_report(FLOAT_UNARY_MINUS_REPORT_PATH)?;
@@ -756,7 +759,7 @@ fn float_unary_minus_regression_catalog()
             family_cases.len()
         )));
     }
-    let family_sources = source_catalog_at_root(&family_cases, feature_root)?;
+    let family_sources = source_catalog(&family_cases)?;
     let mut sources = BTreeMap::new();
     for ((_, _, _, expected_query), case) in FLOAT_UNARY_MINUS_REGRESSIONS.iter().zip(&selected) {
         let key = (case.feature.clone(), case.name.clone());
@@ -774,6 +777,60 @@ fn float_unary_minus_regression_catalog()
             )));
         }
         sources.insert(key, source.clone());
+    }
+    Ok((selected, sources))
+}
+
+#[test]
+#[ignore = "external certification: requires both original reports and the pinned TCK source"]
+fn float_unary_minus_report_identities_match_the_certified_baseline() -> Result<()> {
+    float_unary_minus_certified_report_catalog().map(|_| ())
+}
+
+#[cfg(all(feature = "accelerator", target_os = "macos"))]
+fn float_unary_minus_regression_catalog()
+-> Result<(Vec<ManifestCase>, BTreeMap<(String, String), SourceCase>)> {
+    let root = super::cypher_native_delete_continuation_route::pinned_feature_root()?;
+    let mut selected = Vec::new();
+    let mut sources = BTreeMap::new();
+    for (report_id, feature, name, query) in FLOAT_UNARY_MINUS_REGRESSIONS {
+        let mut matching = Vec::new();
+        for scenario in parse_feature(&root.join(feature))? {
+            if scenario.name != source_base_name(name) {
+                continue;
+            }
+            for table in &scenario.examples {
+                let (headers, rows) = table
+                    .split_first()
+                    .ok_or_else(|| Error::internal("empty FLOAT quantifier Examples table"))?;
+                for row in rows {
+                    if row.len() != headers.len() {
+                        return Err(Error::internal("malformed FLOAT quantifier example"));
+                    }
+                    let steps = scenario
+                        .steps
+                        .iter()
+                        .map(|step| substitute_step(step, headers, row))
+                        .collect::<Vec<_>>();
+                    let source = source_case_from_steps(name, &steps)?;
+                    if normalize_query(&source.query) == query {
+                        matching.push(source);
+                    }
+                }
+            }
+        }
+        if matching.len() != 1 {
+            return Err(Error::internal(format!(
+                "pinned source resolved {} exact FLOAT cases for {name}",
+                matching.len()
+            )));
+        }
+        selected.push(ManifestCase {
+            report_id,
+            feature: feature.into(),
+            name: name.into(),
+        });
+        sources.insert((feature.into(), name.into()), matching.remove(0));
     }
     Ok((selected, sources))
 }
@@ -1410,6 +1467,7 @@ fn run_entity_list_suite(backend: &mut ObservedBackend) -> Result<()> {
     run_strict_cases(backend, cases, "entity-list quantifier")
 }
 
+#[cfg(all(feature = "accelerator", target_os = "macos"))]
 fn run_float_unary_minus_regressions(backend: &mut ObservedBackend) -> Result<()> {
     let (cases, sources) = float_unary_minus_regression_catalog()?;
     if cases.len() != FLOAT_UNARY_MINUS_REGRESSIONS.len() || sources.len() != cases.len() {
@@ -1548,7 +1606,7 @@ fn cpu_node_identity_equality_and_inequality_cross_match_and_with_natively() -> 
 #[cfg(all(feature = "accelerator", target_os = "macos"))]
 #[test]
 #[ignore = "requires a real Metal device"]
-fn real_metal_matchwhere6_3_uses_the_certified_node_pipeline_route() -> Result<()> {
+fn real_metal_matchwhere6_3_uses_one_complete_nullable_route() -> Result<()> {
     let source = SourceCase {
         setup_queries: vec![
             "CREATE (s:Single), (a:A {num: 42}), (b:B {num: 46}), (c:C) \
@@ -1564,7 +1622,7 @@ fn real_metal_matchwhere6_3_uses_the_certified_node_pipeline_route() -> Result<(
         &source,
         &mut ObservedBackend::real_metal()?,
         CallSnapshot {
-            node_pipeline: 1,
+            nullable: 1,
             ..CallSnapshot::default()
         },
     )
@@ -1779,7 +1837,7 @@ fn strict_cpu_reference_executes_all_72_without_generic_or_legacy_fallback() -> 
 
 #[cfg(all(feature = "accelerator", target_os = "macos"))]
 #[test]
-#[ignore = "external regression gate: requires both full reports and their pinned TCK checkout"]
+#[ignore = "native regression gate: requires the pinned TCK checkout and a real Metal device"]
 fn real_metal_executes_exact_four_float_unary_minus_report_regressions() -> Result<()> {
     run_float_unary_minus_regressions(&mut ObservedBackend::real_metal()?)
 }

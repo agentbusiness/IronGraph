@@ -1,6 +1,10 @@
 //! Metal-first complete-residency backend using Candle's production Metal kernels.
 
-use std::{collections::BTreeMap, mem, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    mem,
+    sync::Arc,
+};
 
 use candle_core::{Device, Tensor};
 use parking_lot::ReentrantMutexGuard;
@@ -8,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     Bookmark, Error, ErrorCode, ProjectId, Result,
-    graph::{IvfPqBuildPlan, IvfPqConfig, IvfPqIndex, LayerMask, VectorIndex},
-    types::{LabelId, PropertyId},
+    graph::{IvfPqBuildPlan, IvfPqConfig, IvfPqIndex, LayerMask, PersistentMap, VectorIndex},
+    types::{LabelId, PropertyId, ScalarValue},
 };
 
 use super::{
@@ -46,6 +50,7 @@ use super::{
         metal_breadth_first_scratch_bytes, metal_degree_scratch_bytes,
         metal_depth_first_scratch_bytes, metal_graph_metrics_scratch_bytes,
         metal_kcore_scratch_bytes, metal_louvain_scratch_bytes, metal_pagerank_scratch_bytes,
+        metal_pages::{BranchPages, Capture, ExclusiveWrite},
         metal_quantifier_program_scratch_bytes, metal_resident_row_program_scratch_bytes,
         metal_scc_scratch_bytes, metal_shortest_path_scratch_bytes,
         metal_temporal_arithmetic_scratch_bytes, metal_unit_dijkstra_scratch_bytes,
@@ -66,14 +71,523 @@ pub struct MetalBackend {
     /// without a covering lock, so two threads on one device is undefined behaviour — and
     /// `pin_project` hands this exact device to every concurrent read.
     gate: &'static parking_lot::ReentrantMutex<()>,
-    governor: DeviceMemoryGovernor,
     resident: BTreeMap<ProjectId, Arc<CandleResident>>,
     /// The device's maximum single-buffer length, used as the native command-buffer scratch ceiling
     /// so a high-memory GPU is allowed the largest command it can physically hold.
     max_buffer_length: usize,
+    /// Native allocations/pages private to this pinned branch. None uses the conservative
+    /// complete-footprint fallback after explicit cold replacement of an existing branch.
+    private_pages: Option<BranchPages>,
+    host: BTreeMap<ProjectId, HostFootprint>,
+    private_host: HostFootprint,
+    // Release retained data before its accounting token.
+    governor: DeviceMemoryGovernor,
 }
 
-const METAL_KERNEL_SOURCES: [(&str, &str); 4] = [
+#[derive(Clone, Default)]
+struct HostFootprint {
+    cold_bytes: usize,
+    owners: PersistentMap<HostOwner>,
+    cold_temporal_owners: PersistentMap<()>,
+    private_bytes: usize,
+    history_entries: u64,
+    dictionary_base: [(usize, usize); 2],
+    dictionary_bytes: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+struct HostOwner {
+    fixed: usize,
+    payload: usize,
+}
+
+impl HostOwner {
+    fn bytes(self) -> usize {
+        self.fixed.saturating_add(self.payload)
+    }
+}
+
+fn scalar_host_bytes(value: &ScalarValue) -> usize {
+    match value {
+        ScalarValue::String(value) => value.len(),
+        ScalarValue::Bytes(value) => value.len(),
+        ScalarValue::List(value) => value.as_bytes().len(),
+        ScalarValue::Map(value) => value.as_bytes().len(),
+        ScalarValue::ZonedDateTime { timezone, .. } => 32 + timezone.len(),
+        _ => 32,
+    }
+}
+
+impl HostFootprint {
+    fn dictionary_stats(columns: &crate::graph::PropertyColumns) -> (usize, usize) {
+        let dictionary = columns.string_dictionary();
+        (dictionary.len(), dictionary.byte_len())
+    }
+
+    fn branch(resident: &CandleResident) -> Self {
+        Self {
+            dictionary_base: resident
+                .shared_graph_backing()
+                .map_or([(0, 0); 2], |backing| {
+                    [
+                        Self::dictionary_stats(&backing.node_properties),
+                        Self::dictionary_stats(&backing.edge_properties),
+                    ]
+                }),
+            ..Self::default()
+        }
+    }
+
+    fn update_dictionaries(&mut self, resident: &CandleResident) {
+        let Some(backing) = resident.shared_graph_backing() else {
+            return;
+        };
+        self.dictionary_bytes = [
+            Self::dictionary_stats(&backing.node_properties),
+            Self::dictionary_stats(&backing.edge_properties),
+        ]
+        .into_iter()
+        .zip(self.dictionary_base)
+        .fold(
+            0_usize,
+            |bytes, ((entries, payload), (base_entries, base_payload))| {
+                let added = entries.saturating_sub(base_entries);
+                bytes
+                    .saturating_add(added.saturating_mul(512))
+                    .saturating_add(payload.saturating_sub(base_payload))
+                    .saturating_add(usize::from(added != 0) * 64 * 1024)
+            },
+        );
+    }
+
+    fn cold(image: &ResidentProjectImage) -> Self {
+        let mut cold_temporal_owners = PersistentMap::default();
+        for column in &image.temporal_canonical {
+            let key = (7_u128 << 120)
+                | ((column.entity_kind as u128) << 112)
+                | (u128::from(column.property.0) << 64)
+                | u128::from(column.target);
+            cold_temporal_owners.insert_cow(key, ());
+            cold_temporal_owners.insert_cow(Self::group_key(key, column.target), ());
+        }
+        let dictionary_base = [
+            Self::dictionary_stats(&image.graph.node_properties),
+            Self::dictionary_stats(&image.graph.edge_properties),
+        ];
+        let rows = image
+            .graph
+            .node_ids
+            .len()
+            .saturating_add(image.graph.edge_ids.len())
+            .saturating_add(
+                image
+                    .indexes
+                    .vectors
+                    .iter()
+                    .map(|column| column.entity_ids.len())
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                image
+                    .temporal
+                    .columns
+                    .iter()
+                    .map(|column| column.entity_ids.len())
+                    .sum::<usize>(),
+            );
+        // Canonical value bytes share native allocations after rebind. Identity radix nodes,
+        // page directories and container roots remain independently retained host allocations.
+        Self {
+            cold_bytes: rows
+                .saturating_mul(512)
+                .saturating_add(
+                    image
+                        .resident_bytes()
+                        .div_ceil(16 * 1024)
+                        .saturating_mul(512),
+                )
+                .saturating_add(64 * 1024)
+                .saturating_add(
+                    dictionary_base
+                        .iter()
+                        .map(|(entries, _)| entries.saturating_mul(512))
+                        .sum::<usize>(),
+                ),
+            dictionary_base,
+            cold_temporal_owners,
+            ..Self::default()
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        self.cold_bytes
+            .saturating_add(self.private_bytes)
+            .saturating_add(self.dictionary_bytes)
+    }
+
+    fn cold_staging_bytes(&self, image: &ResidentProjectImage) -> usize {
+        // Upload retains these already allocated persistent identity maps by cloning their
+        // roots. Keep them in total resident accounting, but reserve only new allocations
+        // against the host's currently available physical memory. Missing maps are rebuilt
+        // during upload and therefore still need their complete staging allowance.
+        let shared_nodes = if image.node_id_rows.len() == image.graph.node_ids.len() {
+            image.node_id_rows.len()
+        } else {
+            0
+        };
+        let shared_edges = if image.edge_id_rows.len() == image.graph.edge_ids.len() {
+            image.edge_id_rows.len()
+        } else {
+            0
+        };
+        self.bytes().saturating_sub(
+            shared_nodes
+                .saturating_add(shared_edges)
+                .saturating_mul(512),
+        )
+    }
+
+    fn set(&mut self, key: u128, fixed: usize, payload: usize) {
+        // Removing a value does not remove its column's null/validity pages. Keep the
+        // affected lane allowance while releasing the previous variable payload estimate.
+        // Dense row bits branch first; the logical owner domains remain in retirement events.
+        let key = key.reverse_bits();
+        let previous = self.owners.get(key).copied().unwrap_or_default();
+        let next = HostOwner {
+            fixed: fixed.max(previous.fixed),
+            payload,
+        };
+        self.owners.insert_cow(key, next);
+        self.private_bytes = self
+            .private_bytes
+            .saturating_sub(previous.bytes())
+            .saturating_add(next.bytes());
+    }
+
+    fn group_key(key: u128, dense: u64) -> u128 {
+        (key & !u128::from(u64::MAX)) | (1_u128 << 119) | u128::from(dense / 256)
+    }
+
+    fn apply(
+        &mut self,
+        delta: &ResidentProjectDelta,
+        schema: (usize, usize),
+        previous: &CandleResident,
+        resident: &CandleResident,
+        retain_history: bool,
+    ) -> Vec<(u128, usize)> {
+        let mut changed = Vec::new();
+        // Every retirement event describes the pre-publication generation, including when
+        // several rows in this batch create the same new group.
+        let prior_owners = retain_history.then(|| self.owners.clone());
+        // Appending dense value pages can still replace existing page-directory ancestors.
+        // These bounded directory paths are separate from the exact identity-map changes.
+        for (domain, changed_rows, old_rows, lanes) in [
+            (
+                1_u128,
+                delta.graph.nodes.len(),
+                previous.node_count(),
+                schema.0 + 1,
+            ),
+            (
+                2,
+                delta.graph.edges.len(),
+                previous.edge_count(),
+                schema.1 + 1,
+            ),
+            (3, delta.graph.outgoing.len(), previous.node_count(), 1),
+            (4, delta.graph.incoming.len(), previous.node_count(), 1),
+        ] {
+            if retain_history && changed_rows != 0 {
+                changed.push((
+                    (domain << 120) | (1_u128 << 118),
+                    if old_rows != 0 { lanes * 64 * 1024 } else { 0 },
+                ));
+            }
+        }
+        for vector in delta.vectors.iter().filter(|_| retain_history) {
+            let property = match vector {
+                crate::graph::ResolvedVectorMutation::Upsert { property, .. }
+                | crate::graph::ResolvedVectorMutation::Remove { property, .. } => *property,
+            };
+            changed.push((
+                (5_u128 << 120) | (1_u128 << 118) | (u128::from(property.0) << 64),
+                if previous.vector_row_count(property) == 0 {
+                    0
+                } else {
+                    64 * 1024
+                },
+            ));
+        }
+        let mut changed_groups = BTreeMap::<u128, usize>::new();
+        let mut set = |this: &mut Self,
+                       key: u128,
+                       dense: u64,
+                       fixed: usize,
+                       payload: usize,
+                       existing: (bool, bool)| {
+            // A 256-row group shares its column-page/path allowance. Payload and owner
+            // metadata remain individually replaceable; ingest must not allocate one
+            // full host-page allowance for every row.
+            let group = Self::group_key(key, dense);
+            match changed_groups.entry(group) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    if let Some(prior_owners) = &prior_owners {
+                        let prior_group = prior_owners
+                            .get(group.reverse_bits())
+                            .copied()
+                            .unwrap_or(HostOwner {
+                                fixed: if existing.1 { fixed } else { 0 },
+                                payload: 0,
+                            });
+                        changed.push((group, prior_group.bytes()));
+                    }
+                    this.set(group, fixed, 0);
+                    entry.insert(fixed);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) if fixed > *entry.get() => {
+                    entry.insert(fixed);
+                    this.set(group, fixed, 0);
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+            if let Some(prior_owners) = &prior_owners {
+                changed.push((
+                    key,
+                    prior_owners
+                        .get(key.reverse_bits())
+                        .copied()
+                        .map_or(if existing.0 { 512 } else { 0 }, HostOwner::bytes),
+                ));
+            }
+            this.set(key, 512, payload);
+        };
+        for node in &delta.graph.nodes {
+            let bytes = node
+                .properties
+                .iter()
+                .fold(node.labels.len() * 8, |bytes, (_, value)| {
+                    bytes.saturating_add(scalar_host_bytes(value))
+                });
+            set(
+                self,
+                (1_u128 << 120) | u128::from(node.dense),
+                u64::from(node.dense),
+                (schema.0.max(node.properties.len()) + 1) * 64 * 1024,
+                bytes,
+                (
+                    (node.dense as usize) < previous.node_count(),
+                    (node.dense as usize / 256) * 256 < previous.node_count(),
+                ),
+            );
+        }
+        for edge in &delta.graph.edges {
+            let bytes = edge.properties.iter().fold(0_usize, |bytes, (_, value)| {
+                bytes.saturating_add(scalar_host_bytes(value))
+            });
+            set(
+                self,
+                (2_u128 << 120) | u128::from(edge.dense),
+                u64::from(edge.dense),
+                (schema.1.max(edge.properties.len()) + 1) * 64 * 1024,
+                bytes,
+                (
+                    (edge.dense as usize) < previous.edge_count(),
+                    (edge.dense as usize / 256) * 256 < previous.edge_count(),
+                ),
+            );
+        }
+        for (domain, rows) in [
+            (3_u128, &delta.graph.outgoing),
+            (4_u128, &delta.graph.incoming),
+        ] {
+            for row in rows {
+                set(
+                    self,
+                    (domain << 120) | u128::from(row.dense),
+                    u64::from(row.dense),
+                    64 * 1024,
+                    (row.neighbors.len() + row.edges.len()) * 4,
+                    (
+                        (row.dense as usize) < previous.node_count(),
+                        (row.dense as usize / 256) * 256 < previous.node_count(),
+                    ),
+                );
+            }
+        }
+        for vector in &delta.vectors {
+            let (property, entity, payload) = match vector {
+                crate::graph::ResolvedVectorMutation::Upsert {
+                    property,
+                    entity_id,
+                    coordinates,
+                    ..
+                } => (*property, *entity_id, coordinates.len() * 2),
+                crate::graph::ResolvedVectorMutation::Remove {
+                    property,
+                    entity_id,
+                    ..
+                } => (*property, *entity_id, 0),
+            };
+            let dense = u64::from(resident.vector_dense_row(property, entity).unwrap_or(0));
+            set(
+                self,
+                (5_u128 << 120) | (u128::from(property.0) << 64) | u128::from(entity),
+                dense,
+                128 * 1024,
+                payload,
+                (
+                    previous.vector_dense_row(property, entity).is_some(),
+                    (dense as usize / 256) * 256 < previous.vector_row_count(property),
+                ),
+            );
+        }
+        for sample in &delta.temporal {
+            let key = (7_u128 << 120)
+                | ((sample.entity_kind as u128) << 112)
+                | (u128::from(sample.sample.property.0) << 64)
+                | u128::from(sample.target);
+            let existing = (
+                self.cold_temporal_owners.get(key).is_some(),
+                self.cold_temporal_owners
+                    .get(Self::group_key(key, sample.target))
+                    .is_some(),
+            );
+            set(self, key, sample.target, 64 * 1024, 0, existing);
+            self.set(
+                (6_u128 << 120) | u128::from(self.history_entries),
+                1024,
+                scalar_host_bytes(&sample.sample.value),
+            );
+            self.history_entries += 1;
+        }
+        changed
+    }
+}
+
+fn host_delta_retirement(
+    current: &CandleResident,
+    host: Option<&HostFootprint>,
+    delta: &ResidentProjectDelta,
+) -> usize {
+    let mut bytes = delta.staging_bytes().saturating_mul(2);
+    if let Some(backing) = current.shared_graph_backing() {
+        for (domain, rows, adjacency) in [
+            (3_u128, &delta.graph.outgoing, &backing.outgoing),
+            (4_u128, &delta.graph.incoming, &backing.incoming),
+        ] {
+            for row in rows {
+                let cold = adjacency.row(row.dense).map_or(0, |row| row.len() * 8);
+                let prior = host
+                    .and_then(|host| {
+                        host.owners
+                            .get(((domain << 120) | u128::from(row.dense)).reverse_bits())
+                    })
+                    .copied()
+                    .map_or(0, HostOwner::bytes);
+                bytes = bytes.saturating_add(cold.max(prior));
+            }
+        }
+        for (rows, columns) in [
+            (
+                delta
+                    .graph
+                    .nodes
+                    .iter()
+                    .map(|node| node.dense)
+                    .collect::<Vec<_>>(),
+                &backing.node_properties,
+            ),
+            (
+                delta
+                    .graph
+                    .edges
+                    .iter()
+                    .map(|edge| edge.dense)
+                    .collect::<Vec<_>>(),
+                &backing.edge_properties,
+            ),
+        ] {
+            for row in rows {
+                bytes = bytes.saturating_add(64 * 1024);
+                for property in columns.property_ids() {
+                    if let Some(value) = columns.get(row, property) {
+                        bytes = bytes.saturating_add(64 * 1024 + scalar_host_bytes(&value));
+                    }
+                }
+            }
+        }
+    }
+    bytes.saturating_add(
+        (delta.graph.outgoing.len()
+            + delta.graph.incoming.len()
+            + delta.vectors.len()
+            + delta.temporal.len())
+        .saturating_mul(128 * 1024),
+    )
+}
+
+fn identity_path_changes(
+    previous: &CandleResident,
+    staged: &CandleResident,
+    delta: &ResidentProjectDelta,
+) -> Vec<([u64; 6], usize)> {
+    let project = delta.project.0.as_u128();
+    let mut changes = Vec::new();
+    let mut maps = BTreeSet::new();
+    for node in &delta.graph.nodes {
+        if node.dense as usize >= previous.node_count() {
+            maps.insert((0_u8, PropertyId(0)));
+        }
+    }
+    for edge in &delta.graph.edges {
+        if edge.dense as usize >= previous.edge_count() {
+            maps.insert((1, PropertyId(0)));
+        }
+    }
+    for mutation in &delta.vectors {
+        let (property, entity) = match mutation {
+            crate::graph::ResolvedVectorMutation::Upsert {
+                property,
+                entity_id,
+                ..
+            }
+            | crate::graph::ResolvedVectorMutation::Remove {
+                property,
+                entity_id,
+                ..
+            } => (*property, *entity_id),
+        };
+        if previous.vector_dense_row(property, entity).is_none()
+            && staged.vector_dense_row(property, entity).is_some()
+        {
+            maps.insert((2, property));
+        }
+    }
+    for (domain, property) in maps {
+        changes.extend(
+            staged
+                .identity_map_changes(previous, domain, property)
+                .into_iter()
+                .map(|(prefix, depth, bytes, _)| {
+                    (
+                        [
+                            3 | (u64::from(domain) << 8) | (u64::from(depth) << 16),
+                            (project >> 64) as u64,
+                            project as u64,
+                            property.0,
+                            (prefix >> 64) as u64,
+                            prefix as u64,
+                        ],
+                        bytes,
+                    )
+                }),
+        );
+    }
+    changes
+}
+
+const METAL_KERNEL_SOURCES: [(&str, &str); 6] = [
     (
         "operators.metal",
         include_str!("../../../kernels/metal/operators.metal"),
@@ -89,6 +603,14 @@ const METAL_KERNEL_SOURCES: [(&str, &str); 4] = [
     (
         "graph_louvain.metal",
         include_str!("../../../kernels/metal/graph_louvain.metal"),
+    ),
+    (
+        "dictionary_order.rs",
+        include_str!("accelerator/dictionary_order.rs"),
+    ),
+    (
+        "temporal_order.rs",
+        include_str!("accelerator/temporal_order.rs"),
     ),
 ];
 
@@ -240,6 +762,9 @@ impl MetalBackend {
             governor,
             resident: BTreeMap::new(),
             max_buffer_length,
+            private_pages: None,
+            host: BTreeMap::new(),
+            private_host: HostFootprint::default(),
         })
     }
 
@@ -309,7 +834,11 @@ impl MetalBackend {
         self.resident
             .iter()
             .filter(|(id, _)| **id != project)
-            .map(|(_, resident)| resident.allocated_bytes)
+            .map(|(id, resident)| {
+                resident
+                    .allocated_bytes
+                    .saturating_add(self.host.get(id).map_or(0, HostFootprint::bytes))
+            })
             .fold(replacement_bytes, usize::saturating_add)
     }
 }
@@ -337,6 +866,8 @@ impl ExecutionBackend for MetalBackend {
     }
 
     fn resident_project_bytes(&self, project: ProjectId) -> Option<usize> {
+        // This interface reports the device image. Independent host allocations are
+        // still included in governor admission and retained-generation accounting.
         self.resident
             .get(&project)
             .map(|resident| resident.allocated_bytes)
@@ -358,29 +889,63 @@ impl ExecutionBackend for MetalBackend {
                 format!("project {project} has no complete Metal-resident image"),
             )
         })?;
-        let governor = self.governor.pin_generation(resident.allocated_bytes)?;
+        let private_pages = if self.governor.is_shared_branch() {
+            self.private_pages.clone()
+        } else {
+            Some(BranchPages::default())
+        };
+        let governor = self
+            .governor
+            .pin_shared_generation(self.governor.current_generation()?)?;
+        let private_host = if self.governor.is_shared_branch() {
+            self.private_host.clone()
+        } else {
+            HostFootprint::branch(&resident)
+        };
         Ok(Box::new(Self {
             device: self.device.clone(),
             gate: self.gate,
             governor,
             resident: BTreeMap::from([(project, resident)]),
             max_buffer_length: self.max_buffer_length,
+            private_pages,
+            host: self
+                .host
+                .get(&project)
+                .cloned()
+                .map(|host| BTreeMap::from([(project, host)]))
+                .unwrap_or_default(),
+            private_host,
         }))
     }
 
     fn admit_project(&mut self, image: ResidentProjectImage) -> Result<()> {
         let _gate = self.gate();
-        let planned = CandleResident::planned_bytes(&image);
+        let host = HostFootprint::cold(&image);
+        let existing_host_bytes = host.bytes().saturating_sub(host.cold_staging_bytes(&image));
+        let planned =
+            CandleResident::planned_bytes(&image).saturating_add(host.cold_staging_bytes(&image));
         let staging = self.governor.reserve_staging(planned)?;
         let project = image.project;
         let staged = CandleResident::upload(image, &self.device)?;
-        let total = self.total_after(project, staged.allocated_bytes);
+        let total = self.total_after(project, staged.allocated_bytes.saturating_add(host.bytes()));
+        self.device.synchronize().map_err(candle_error)?;
         let mut governor = self.governor.clone();
-        governor.publish_staging(staging, staged.allocated_bytes, total, || {
-            let old = self.resident.insert(project, Arc::new(staged));
-            drop(old);
-            self.device.synchronize().map_err(candle_error)
-        })?;
+        governor.publish_staging_with_existing_allocations(
+            staging,
+            staged.allocated_bytes,
+            total,
+            existing_host_bytes,
+            || {
+                let old = self.resident.insert(project, Arc::new(staged));
+                drop(old);
+                Ok(())
+            },
+        )?;
+        self.governor = governor;
+        self.private_pages = None;
+        self.private_host = HostFootprint::default();
+        self.host.insert(project, host);
         Ok(())
     }
 
@@ -388,7 +953,10 @@ impl ExecutionBackend for MetalBackend {
         let _gate = self.gate();
         let planned = images.iter().try_fold(0_usize, |total, image| {
             total
-                .checked_add(CandleResident::planned_bytes(image))
+                .checked_add(
+                    CandleResident::planned_bytes(image)
+                        .saturating_add(HostFootprint::cold(image).cold_staging_bytes(image)),
+                )
                 .ok_or_else(|| {
                     Error::new(
                         ErrorCode::GpuAdmissionFailure,
@@ -398,8 +966,17 @@ impl ExecutionBackend for MetalBackend {
         })?;
         let staging = self.governor.reserve_staging(planned)?;
         let mut replacement = BTreeMap::new();
+        let mut host = BTreeMap::new();
+        let mut shared_host_bytes = 0_usize;
         for image in images {
             let project = image.project;
+            let footprint = HostFootprint::cold(&image);
+            shared_host_bytes = shared_host_bytes.saturating_add(
+                footprint
+                    .bytes()
+                    .saturating_sub(footprint.cold_staging_bytes(&image)),
+            );
+            host.insert(project, footprint);
             let resident = CandleResident::upload(image, &self.device)?;
             if replacement.insert(project, Arc::new(resident)).is_some() {
                 return Err(Error::new(
@@ -408,20 +985,39 @@ impl ExecutionBackend for MetalBackend {
                 ));
             }
         }
-        let actual = replacement.values().try_fold(0_usize, |total, resident| {
-            total.checked_add(resident.allocated_bytes).ok_or_else(|| {
-                Error::new(
-                    ErrorCode::GpuAdmissionFailure,
-                    "replacement Metal project bytes overflow",
-                )
-            })
-        })?;
+        let actual = replacement
+            .iter()
+            .try_fold(0_usize, |total, (project, resident)| {
+                total
+                    .checked_add(
+                        resident
+                            .allocated_bytes
+                            .saturating_add(host[project].bytes()),
+                    )
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorCode::GpuAdmissionFailure,
+                            "replacement Metal project bytes overflow",
+                        )
+                    })
+            })?;
         let mut governor = self.governor.clone();
-        governor.publish_staging(staging, actual, actual, || {
-            let old = mem::replace(&mut self.resident, replacement);
-            drop(old);
-            self.device.synchronize().map_err(candle_error)
-        })?;
+        self.device.synchronize().map_err(candle_error)?;
+        governor.publish_staging_with_existing_allocations(
+            staging,
+            actual.saturating_sub(shared_host_bytes),
+            actual,
+            shared_host_bytes,
+            || {
+                let old = mem::replace(&mut self.resident, replacement);
+                drop(old);
+                Ok(())
+            },
+        )?;
+        self.governor = governor;
+        self.private_pages = None;
+        self.private_host = HostFootprint::default();
+        self.host = host;
         Ok(())
     }
 
@@ -434,22 +1030,131 @@ impl ExecutionBackend for MetalBackend {
                 format!("project {project} has no complete Metal-resident image"),
             )
         })?;
+        let retain_history =
+            !self.governor.is_shared_branch() && self.governor.has_live_shared_pins()?;
         let host_complete = current.delta_publish_is_host_complete(&delta);
-        let staged_bytes = current.planned_delta_staging_bytes(&delta)?;
+        let retired_host = host_delta_retirement(current, self.host.get(&project), &delta);
+        let (planned_bytes, plan) = current.prepare_delta_staging(&delta)?;
+        let staged_bytes = planned_bytes.saturating_add(retired_host);
         let reservation = self.governor.reserve_staging(staged_bytes)?;
-        let staged = current.stage_delta(&delta, &self.device)?;
-        let total = self.total_after(project, staged.allocated_bytes);
-        let mut governor = self.governor.clone();
-        governor.publish_staging(reservation, staged_bytes, total, || {
-            let old = self.resident.insert(project, Arc::new(staged));
-            drop(old);
-            if host_complete {
-                Ok(())
+        let mut host = self.host.get(&project).cloned().unwrap_or_default();
+        let mut private_host = self.private_host.clone();
+        let capture = Capture::begin()?;
+        let staged = current.stage_delta_prepared(&delta, &self.device, Some(plan))?;
+        let mut pages = capture.finish()?;
+        let schema = staged.shared_graph_backing().map_or((0, 0), |backing| {
+            (
+                backing.node_properties.property_ids().count(),
+                backing.edge_properties.property_ids().count(),
+            )
+        });
+        let shared_host_owners = private_host.owners.shared_with(&host.owners)
+            && private_host.private_bytes == host.private_bytes
+            && private_host.history_entries == host.history_entries;
+        let host_changes = host.apply(&delta, schema, current, &staged, retain_history);
+        host.update_dictionaries(&staged);
+        if self.governor.is_shared_branch() {
+            if shared_host_owners {
+                // The owner delta is identical. Share its immutable index root while
+                // retaining this branch's separate cold and dictionary allowances.
+                private_host.owners = host.owners.clone();
+                private_host.private_bytes = host.private_bytes;
+                private_host.history_entries = host.history_entries;
             } else {
-                self.device.synchronize().map_err(candle_error)
+                private_host.apply(&delta, schema, current, &staged, false);
             }
-        })?;
+            private_host.update_dictionaries(&staged);
+        }
+        let mut private_pages = self.private_pages.clone();
+        if let Some(branch) = &mut private_pages {
+            branch.apply(&pages);
+        }
+        let total = self.total_after(project, staged.allocated_bytes.saturating_add(host.bytes()));
+        if !host_complete {
+            self.device.synchronize().map_err(candle_error)?;
+        }
+        let mut governor = self.governor.clone();
+        // Branches charge private_pages/private_host, so retirement records are
+        // needed only when the root publishes a new generation for pinned readers.
+        let (births, mut changes) = if retain_history {
+            pages.retirement_events()
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        if retain_history {
+            changes.extend(identity_path_changes(current, &staged, &delta));
+            let project_key = project.0.as_u128();
+            if let Some(previous_host) = self.host.get(&project) {
+                changes.extend(
+                    host.owners
+                        .changed_path_nodes(&previous_host.owners)
+                        .into_iter()
+                        .map(|(prefix, depth, old_bytes, _)| {
+                            (
+                                [
+                                    4,
+                                    (project_key >> 64) as u64,
+                                    project_key as u64,
+                                    u64::from(depth),
+                                    (prefix >> 64) as u64,
+                                    prefix as u64,
+                                ],
+                                old_bytes,
+                            )
+                        }),
+                );
+            }
+            changes.extend(host_changes.into_iter().map(|(key, bytes)| {
+                (
+                    [
+                        2,
+                        (project_key >> 64) as u64,
+                        project_key as u64,
+                        (key >> 64) as u64,
+                        0,
+                        key as u64,
+                    ],
+                    bytes,
+                )
+            }));
+        }
+        governor.publish_shared_page_staging(
+            reservation,
+            staged_bytes,
+            total,
+            &births,
+            &changes,
+            private_pages
+                .as_ref()
+                .map(|pages| pages.bytes().saturating_add(private_host.bytes())),
+            || {
+                let old = self.resident.insert(project, Arc::new(staged));
+                drop(old);
+                Ok(())
+            },
+        )?;
+        pages.commit();
+        self.governor = governor;
+        self.private_pages = private_pages;
+        self.private_host = private_host;
+        self.host.insert(project, host);
         Ok(())
+    }
+
+    #[allow(unsafe_code)]
+    unsafe fn apply_project_delta_exclusive(&mut self, delta: ResidentProjectDelta) -> Result<()> {
+        let _gate = self.gate();
+        if self.governor.has_live_shared_pins()?
+            || self
+                .resident
+                .get(&delta.project)
+                .is_none_or(|resident| Arc::strong_count(resident) != 1)
+        {
+            return self.apply_project_delta(delta);
+        }
+        self.device.synchronize().map_err(candle_error)?;
+        let _exclusive = ExclusiveWrite::begin();
+        self.apply_project_delta(delta)
     }
 
     fn evict_project(&mut self, project: ProjectId) -> Result<()> {
@@ -458,16 +1163,24 @@ impl ExecutionBackend for MetalBackend {
             .resident
             .iter()
             .filter(|(resident_project, _)| **resident_project != project)
-            .map(|(_, resident)| resident)
-            .map(|resident| resident.allocated_bytes)
+            .map(|(id, resident)| {
+                resident
+                    .allocated_bytes
+                    .saturating_add(self.host.get(id).map_or(0, HostFootprint::bytes))
+            })
             .fold(0_usize, usize::saturating_add);
         let staging = self.governor.reserve_staging(0)?;
         let mut governor = self.governor.clone();
+        self.device.synchronize().map_err(candle_error)?;
         governor.publish_staging(staging, 0, total, || {
             let old = self.resident.remove(&project);
             drop(old);
-            self.device.synchronize().map_err(candle_error)
+            Ok(())
         })?;
+        self.governor = governor;
+        self.private_pages = None;
+        self.private_host = HostFootprint::default();
+        self.host.remove(&project);
         Ok(())
     }
 
@@ -1373,8 +2086,532 @@ mod tests {
     use super::*;
 
     #[test]
+    fn host_batch_groups_charge_once_and_keep_retained_accounting() -> Result<()> {
+        use crate::graph::{GraphStore, NodeInput};
+        use crate::{Layer, NodeId};
+        let _guard = crate::metal_test_guard();
+        let device = Device::new_metal(0).map_err(candle_error)?;
+        let mut graph = GraphStore::default();
+        let value = graph.catalog_mut().intern_property("value")?;
+        let body = graph.catalog_mut().intern_property("body")?;
+        let dirty: Arc<str> = "dirty body ".repeat(32_768).into();
+        for row in 0..64_u64 {
+            graph.insert_node(NodeInput {
+                id: NodeId(row + 1),
+                layer: Layer::Observed,
+                revision: 1,
+                labels: vec![],
+                properties: vec![
+                    (value, ScalarValue::Integer(row as i64)),
+                    (body, ScalarValue::String(dirty.clone())),
+                ],
+            })?;
+        }
+        let image = ResidentProjectImage::graph_only(Arc::new(graph.snapshot()?));
+        let mut host = HostFootprint::cold(&image);
+        let pinned = host.clone();
+        let original = CandleResident::upload(image, &device)?;
+        for row in 64..320_u64 {
+            graph.insert_node(NodeInput {
+                id: NodeId(row + 1),
+                layer: Layer::Observed,
+                revision: 2,
+                labels: vec![],
+                properties: vec![
+                    (value, ScalarValue::Integer(row as i64)),
+                    (body, ScalarValue::String(dirty.clone())),
+                ],
+            })?;
+        }
+        let delta = ResidentProjectDelta {
+            project: original.project,
+            bookmark: Bookmark { term: 1, index: 2 },
+            graph: graph.device_delta(2)?,
+            temporal: vec![],
+            vectors: vec![],
+            invalidate_derived: false,
+        };
+        let (_, plan) = original.prepare_delta_staging(&delta)?;
+        let staged = original.stage_delta_prepared(&delta, &device, Some(plan))?;
+        let mut without_history = host.clone();
+        assert!(
+            without_history
+                .apply(&delta, (2, 0), &original, &staged, false)
+                .is_empty()
+        );
+        let events = host.apply(&delta, (2, 0), &original, &staged, true);
+        assert_eq!(without_history.private_bytes, host.private_bytes);
+        assert_eq!(
+            without_history
+                .owners
+                .iter()
+                .map(|(key, value)| (key, value.fixed, value.payload))
+                .collect::<Vec<_>>(),
+            host.owners
+                .iter()
+                .map(|(key, value)| (key, value.fixed, value.payload))
+                .collect::<Vec<_>>()
+        );
+        let groups = events
+            .iter()
+            .filter(|(key, _)| key & (1_u128 << 119) != 0)
+            .collect::<Vec<_>>();
+        assert_eq!(groups.len(), 2, "one retirement record per changed group");
+        let expected = 2 * 3 * 64 * 1024 + 256 * (512 + 32 + dirty.len());
+        assert_eq!(host.private_bytes, expected);
+        assert_eq!(pinned.private_bytes, 0);
+        assert_eq!(pinned.owners.len(), 0);
+        let events = host.apply(&delta, (2, 0), &original, &staged, true);
+        assert_eq!(
+            host.private_bytes, expected,
+            "repeated replacement cannot grow its charge"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(key, bytes)| key & (1_u128 << 119) != 0 && *bytes == 3 * 64 * 1024)
+                .count(),
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn exclusive_publication_preserves_older_pins_and_updates_unpinned_cells() -> Result<()> {
+        use crate::graph::{GraphStore, NodeInput, TypedColumn};
+        use crate::{Layer, NodeId};
+        let _guard = crate::metal_test_guard();
+        let mut graph = GraphStore::default();
+        let value = graph.catalog_mut().intern_property("value")?;
+        let mirror = graph.catalog_mut().intern_property("mirror")?;
+        graph.insert_node(NodeInput {
+            id: NodeId(1),
+            layer: Layer::Observed,
+            revision: 1,
+            labels: vec![],
+            properties: vec![
+                (value, ScalarValue::Integer(7)),
+                (mirror, ScalarValue::Integer(11)),
+            ],
+        })?;
+        let image = ResidentProjectImage::graph_only(Arc::new(graph.snapshot()?));
+        let project = image.project;
+        let host = HostFootprint::cold(&image);
+        assert_eq!(host.bytes() - host.cold_staging_bytes(&image), 512);
+        let mut missing = image.clone();
+        missing.node_id_rows = PersistentMap::default();
+        assert_eq!(host.cold_staging_bytes(&missing), host.bytes());
+        let mut backend = MetalBackend::new(0, 64 * 1024 * 1024, 0)?;
+        backend.admit_project(image)?;
+        let original = backend.pin_project(project)?;
+        graph.set_node_property(NodeId(1), value, ScalarValue::Integer(19), 2)?;
+        backend.apply_project_delta(ResidentProjectDelta {
+            project,
+            bookmark: Bookmark { term: 1, index: 2 },
+            graph: graph.device_delta(2)?,
+            vectors: vec![],
+            temporal: vec![],
+            invalidate_derived: true,
+        })?;
+        assert_eq!(Arc::strong_count(&backend.resident[&project]), 1);
+        graph.set_node_property(NodeId(1), mirror, ScalarValue::Integer(23), 3)?;
+        // SAFETY: this fixture has no concurrent host accesses. The backend must still reject
+        // in-place writes when an older execution generation owns unchanged native lanes.
+        unsafe {
+            backend.apply_project_delta_exclusive(ResidentProjectDelta {
+                project,
+                bookmark: Bookmark { term: 1, index: 3 },
+                graph: graph.device_delta(3)?,
+                vectors: vec![],
+                temporal: vec![],
+                invalidate_derived: true,
+            })?;
+        }
+        let original_backing = original
+            .shared_project_backing(project)
+            .ok_or_else(|| Error::internal("missing pinned backing"))?;
+        let read = |backing: &crate::graph::GraphSharedBacking, property| {
+            let Some(TypedColumn::Integer { values, .. }) =
+                backing.node_properties.column(property)
+            else {
+                panic!("integer fixture")
+            };
+            values[0]
+        };
+        assert_eq!(read(&original_backing.graph, value), 7);
+        assert_eq!(read(&original_backing.graph, mirror), 11);
+        drop(original_backing);
+        drop(original);
+        assert!(!backend.governor.has_live_shared_pins()?);
+        graph.set_node_property(NodeId(1), mirror, ScalarValue::Integer(31), 4)?;
+        // SAFETY: every external host view and execution pin was dropped above.
+        unsafe {
+            backend.apply_project_delta_exclusive(ResidentProjectDelta {
+                project,
+                bookmark: Bookmark { term: 1, index: 4 },
+                graph: graph.device_delta(4)?,
+                vectors: vec![],
+                temporal: vec![],
+                invalidate_derived: true,
+            })?;
+        }
+        let after = backend
+            .shared_project_backing(project)
+            .ok_or_else(|| Error::internal("missing published backing"))?;
+        assert_eq!(read(&after.graph, mirror), 31);
+        drop(after);
+        // A reader born after an unpinned publication retains that new value,
+        // even though the earlier write needed no retirement history.
+        let later = backend.pin_project(project)?;
+        graph.set_node_property(NodeId(1), mirror, ScalarValue::Integer(47), 5)?;
+        // SAFETY: the older execution pin forces the safe staged publication path.
+        unsafe {
+            backend.apply_project_delta_exclusive(ResidentProjectDelta {
+                project,
+                bookmark: Bookmark { term: 1, index: 5 },
+                graph: graph.device_delta(5)?,
+                vectors: vec![],
+                temporal: vec![],
+                invalidate_derived: true,
+            })?;
+        }
+        let later_backing = later.shared_project_backing(project).unwrap();
+        assert_eq!(read(&later_backing.graph, mirror), 31);
+        assert!(backend.governor.snapshot().pinned_generation_bytes > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn surgical_host_births_exclude_pre_ingest_readers() -> Result<()> {
+        use crate::graph::{GraphStore, NodeInput};
+        use crate::{Layer, NodeId};
+        let _guard = crate::metal_test_guard();
+        let mut graph = GraphStore::default();
+        let property = graph.catalog_mut().intern_property("value")?;
+        let id = |row: u64| {
+            NodeId(
+                row.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    .wrapping_add(1_u64 << 63),
+            )
+        };
+        for row in 0..255_u64 {
+            graph.insert_node(NodeInput {
+                id: id(row),
+                layer: Layer::Observed,
+                revision: 1,
+                labels: vec![],
+                properties: vec![(property, ScalarValue::Integer(row as i64))],
+            })?;
+        }
+        let project = ProjectId(uuid::Uuid::nil());
+        let mut backend = MetalBackend::new(0, 256 * 1024 * 1024, 0)?;
+        backend.admit_project(ResidentProjectImage::graph_only(Arc::new(
+            graph.snapshot()?,
+        )))?;
+        let previous = backend.resident[&project].clone();
+        let mut host = backend.host[&project].clone();
+        for row in 255..768_u64 {
+            graph.insert_node(NodeInput {
+                id: id(row),
+                layer: Layer::Observed,
+                revision: 2,
+                labels: vec![],
+                properties: vec![(property, ScalarValue::Integer(row as i64))],
+            })?;
+        }
+        let mut delta = ResidentProjectDelta {
+            project,
+            bookmark: Bookmark { term: 1, index: 2 },
+            graph: graph.device_delta(2)?,
+            vectors: vec![],
+            temporal: vec![],
+            invalidate_derived: true,
+        };
+        backend.apply_project_delta(delta.clone())?;
+        let grown = backend.resident[&project].clone();
+        let paths = grown.identity_map_changes(&previous, 0, PropertyId(0));
+        assert!(
+            paths.iter().filter(|(_, _, old, _)| *old > 0).count() > 8,
+            "random high IDs retire multiple old lookup leaves"
+        );
+        let path_events = identity_path_changes(&previous, &grown, &delta);
+        assert_eq!(path_events.len(), paths.len());
+        let expected_old = paths.iter().map(|(_, _, old, _)| old).sum::<usize>();
+        let mut lookup_governor = DeviceMemoryGovernor::new(16 * 1024 * 1024, 0);
+        let before_lookup_birth = lookup_governor.pin_shared_generation(0)?;
+        let reservation = lookup_governor.reserve_staging(0)?;
+        lookup_governor.publish_shared_page_staging(
+            reservation,
+            0,
+            0,
+            &[],
+            &path_events,
+            None,
+            || Ok(()),
+        )?;
+        assert_eq!(
+            lookup_governor.snapshot().pinned_generation_bytes,
+            expected_old
+        );
+        let born_paths = paths
+            .iter()
+            .filter(|(_, _, old, new)| *old == 0 && *new != 0)
+            .map(|(prefix, depth, _, new)| {
+                (
+                    [
+                        3 | (u64::from(*depth) << 16),
+                        0,
+                        0,
+                        0,
+                        (prefix >> 64) as u64,
+                        *prefix as u64,
+                    ],
+                    *new,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !born_paths.is_empty(),
+            "split sibling births must be recorded"
+        );
+        let reservation = lookup_governor.reserve_staging(0)?;
+        lookup_governor.publish_shared_page_staging(
+            reservation,
+            0,
+            0,
+            &[],
+            &born_paths,
+            None,
+            || Ok(()),
+        )?;
+        assert_eq!(
+            lookup_governor.snapshot().pinned_generation_bytes,
+            expected_old
+        );
+        let after_lookup_birth =
+            lookup_governor.pin_shared_generation(lookup_governor.current_generation()?)?;
+        let reservation = lookup_governor.reserve_staging(0)?;
+        lookup_governor.publish_shared_page_staging(
+            reservation,
+            0,
+            0,
+            &[],
+            &born_paths,
+            None,
+            || Ok(()),
+        )?;
+        assert_eq!(
+            lookup_governor.snapshot().pinned_generation_bytes,
+            expected_old + born_paths.iter().map(|(_, bytes)| bytes).sum::<usize>()
+        );
+        drop(after_lookup_birth);
+        assert_eq!(
+            lookup_governor.snapshot().pinned_generation_bytes,
+            expected_old
+        );
+        drop(before_lookup_birth);
+        assert_eq!(lookup_governor.snapshot().pinned_generation_bytes, 0);
+        let changes = host.apply(&delta, (1, 0), &previous, &grown, true);
+        let new_node_changes = |changes: Vec<(u128, usize)>| {
+            changes
+                .into_iter()
+                .filter(|(key, _)| key >> 120 == 1 && key & (1_u128 << 118) == 0)
+                .map(|(key, bytes)| ([2, 0, 0, (key >> 64) as u64, 0, key as u64], bytes))
+                .collect::<Vec<_>>()
+        };
+        let changes = new_node_changes(changes);
+        let old_group = [
+            2,
+            0,
+            0,
+            ((1_u128 << 120 | 1_u128 << 119) >> 64) as u64,
+            0,
+            0,
+        ];
+        assert!(
+            changes
+                .iter()
+                .any(|(key, bytes)| *key == old_group && *bytes > 0),
+            "a partially filled cold page keeps its old metadata bound"
+        );
+        let births = changes
+            .into_iter()
+            .filter(|(key, _)| *key != old_group)
+            .collect::<Vec<_>>();
+        assert_eq!(births.len(), 513 + 2, "one birth per row and new group");
+        assert_eq!(
+            births
+                .iter()
+                .map(|(key, _)| key)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            births.len()
+        );
+        assert!(
+            births.iter().all(|(_, bytes)| *bytes == 0),
+            "every row and both new page groups are born in this batch"
+        );
+        let mut governor = DeviceMemoryGovernor::new(16 * 1024 * 1024, 0);
+        let oldest = governor.pin_shared_generation(0)?;
+        let reservation = governor.reserve_staging(0)?;
+        governor.publish_shared_page_staging(reservation, 0, 0, &[], &births, None, || Ok(()))?;
+        graph.set_node_property(id(256), property, ScalarValue::Integer(-3), 3)?;
+        delta.graph = graph.device_delta(3)?;
+        delta.bookmark.index = 3;
+        let replaced = new_node_changes(host.apply(&delta, (1, 0), &grown, &grown, true));
+        assert!(replaced.iter().all(|(_, bytes)| *bytes > 0));
+        let reservation = governor.reserve_staging(0)?;
+        governor.publish_shared_page_staging(reservation, 0, 0, &[], &replaced, None, || Ok(()))?;
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 0);
+        let later = governor.pin_shared_generation(governor.current_generation()?)?;
+        let reservation = governor.reserve_staging(0)?;
+        governor.publish_shared_page_staging(reservation, 0, 0, &[], &replaced, None, || Ok(()))?;
+        assert!(governor.snapshot().pinned_generation_bytes > 0);
+        drop(later);
+        assert_eq!(governor.snapshot().pinned_generation_bytes, 0);
+        drop(oldest);
+        Ok(())
+    }
+
+    #[test]
+    fn surgical_metal_pins_share_pages_and_branch_churn_plateaus() -> Result<()> {
+        use crate::graph::{GraphStore, NodeInput};
+        use crate::{Layer, NodeId};
+
+        let _guard = crate::metal_test_guard();
+        let mut graph = GraphStore::default();
+        let property = graph.catalog_mut().intern_property("value")?;
+        for row in 0_u64..8192 {
+            graph.insert_node(NodeInput {
+                id: NodeId(row + 1),
+                layer: Layer::Observed,
+                revision: 1,
+                labels: vec![],
+                properties: vec![(
+                    property,
+                    ScalarValue::Integer((row as i64).wrapping_mul(7919)),
+                )],
+            })?;
+        }
+        let project = ProjectId(uuid::Uuid::nil());
+        let mut backend = MetalBackend::new(0, 256 * 1024 * 1024, 0)?;
+        backend.admit_project(ResidentProjectImage::graph_only(Arc::new(
+            graph.snapshot()?,
+        )))?;
+        let observer = backend.governor.clone();
+        let reader = backend.pin_project(project)?;
+        let mut branch = backend.pin_project(project)?;
+        assert_eq!(observer.snapshot().pinned_generation_bytes, 0);
+        let delta = |graph: &mut GraphStore, revision| -> Result<ResidentProjectDelta> {
+            graph.set_node_property(
+                NodeId(1),
+                property,
+                ScalarValue::Integer(-(revision as i64)),
+                revision,
+            )?;
+            Ok(ResidentProjectDelta {
+                project,
+                bookmark: Bookmark {
+                    term: 1,
+                    index: revision,
+                },
+                graph: graph.device_delta(revision)?,
+                temporal: vec![],
+                vectors: vec![],
+                invalidate_derived: true,
+            })
+        };
+        branch.apply_project_delta(delta(&mut graph, 2)?)?;
+        let private = observer.snapshot().pinned_generation_bytes;
+        assert!(
+            private > 0 && private < 1024 * 1024,
+            "branch unexpectedly retained {private} bytes"
+        );
+        let old_branch = branch.pin_project(project)?;
+        for revision in 3..35 {
+            branch.apply_project_delta(delta(&mut graph, revision)?)?;
+            assert_eq!(observer.snapshot().pinned_generation_bytes, 2 * private);
+        }
+        let cancellation = CancellationToken::new();
+        assert_eq!(
+            reader.filter_node_i64(project, property, CompareOp::Eq, 0, &cancellation)?,
+            vec![0]
+        );
+        assert_eq!(
+            old_branch.filter_node_i64(project, property, CompareOp::Eq, -2, &cancellation)?,
+            vec![0]
+        );
+        assert_eq!(
+            branch.filter_node_i64(project, property, CompareOp::Eq, -34, &cancellation)?,
+            vec![0]
+        );
+        drop(old_branch);
+        assert_eq!(observer.snapshot().pinned_generation_bytes, private);
+        let root_delta = delta(&mut graph, 35)?;
+        backend.apply_project_delta(root_delta)?;
+        assert!(observer.snapshot().pinned_generation_bytes > private);
+        let root_retained = observer.snapshot().pinned_generation_bytes;
+        // A branch pinned after root writes has a different private-owner baseline.
+        // It must charge its own delta rather than inherit the root's private allowance.
+        let mut late_branch = backend.pin_project(project)?;
+        late_branch.apply_project_delta(delta(&mut graph, 36)?)?;
+        assert_eq!(
+            late_branch.filter_node_i64(project, property, CompareOp::Eq, -36, &cancellation)?,
+            vec![0]
+        );
+        assert_eq!(
+            backend.filter_node_i64(project, property, CompareOp::Eq, -35, &cancellation)?,
+            vec![0]
+        );
+        assert!(observer.snapshot().pinned_generation_bytes > root_retained);
+        drop(late_branch);
+        assert_eq!(observer.snapshot().pinned_generation_bytes, root_retained);
+        for revision in 36..68 {
+            backend.apply_project_delta(delta(&mut graph, revision)?)?;
+            assert_eq!(observer.snapshot().pinned_generation_bytes, root_retained);
+        }
+        let intermediate = backend.pin_project(project)?;
+        backend.apply_project_delta(delta(&mut graph, 68)?)?;
+        let with_intermediate = observer.snapshot().pinned_generation_bytes;
+        assert!(with_intermediate > root_retained);
+        for revision in 69..85 {
+            backend.apply_project_delta(delta(&mut graph, revision)?)?;
+            assert_eq!(
+                observer.snapshot().pinned_generation_bytes,
+                with_intermediate
+            );
+        }
+        assert_eq!(
+            intermediate.filter_node_i64(project, property, CompareOp::Eq, -67, &cancellation)?,
+            vec![0]
+        );
+        drop(intermediate);
+        assert_eq!(observer.snapshot().pinned_generation_bytes, root_retained);
+        assert_eq!(
+            reader.filter_node_i64(project, property, CompareOp::Eq, 0, &cancellation)?,
+            vec![0]
+        );
+        let prior = branch.resident_bookmark(project);
+        observer.cap_limit(observer.snapshot().admitted_bytes())?;
+        assert!(branch.apply_project_delta(delta(&mut graph, 85)?).is_err());
+        assert_eq!(branch.resident_bookmark(project), prior);
+        assert_eq!(
+            branch.filter_node_i64(project, property, CompareOp::Eq, -34, &cancellation)?,
+            vec![0]
+        );
+        drop(branch);
+        drop(reader);
+        assert_eq!(observer.snapshot().pinned_generation_bytes, 0);
+        eprintln!(
+            "surgical Metal: dirty_rows=8192 branch_private_bytes={private}; repeated writes plateau"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn production_kernel_fingerprint_covers_every_metal_library() {
-        assert_eq!(METAL_KERNEL_SOURCES.len(), 4);
+        assert_eq!(METAL_KERNEL_SOURCES.len(), 6);
         assert_eq!(
             MetalBackend::kernel_source_hash(),
             metal_kernel_sources_hash(&METAL_KERNEL_SOURCES)
@@ -1431,40 +2668,35 @@ mod tests {
 /// `None` on any failure. The caller treats that as "no opinion" and admits as it would without a
 /// probe: a memory check that cannot read memory must not become a new way to refuse work.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
+#[allow(unsafe_code)]
 fn host_available_bytes() -> Option<usize> {
-    use std::process::Command;
-
-    let page_size = Command::new("/usr/sbin/sysctl")
-        .args(["-n", "vm.pagesize"])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .and_then(|text| text.trim().parse::<usize>().ok())?;
-    let output = Command::new("/usr/bin/vm_stat").output().ok()?;
-    if !output.status.success() {
-        return None;
+    unsafe extern "C" {
+        static mach_task_self_: libc::mach_port_t;
+        fn mach_host_self() -> libc::mach_port_t;
+        fn mach_port_deallocate(task: libc::mach_port_t, name: libc::mach_port_t) -> i32;
     }
-    let text = String::from_utf8(output.stdout).ok()?;
-    let mut pages = 0_usize;
-    let mut seen = 0_usize;
-    for line in text.lines() {
-        let Some((label, value)) = line.split_once(':') else {
-            continue;
-        };
-        let label = label.trim().trim_matches('"');
-        if !matches!(label, "Pages free" | "Pages inactive" | "Pages speculative") {
-            continue;
-        }
-        let Ok(count) = value.trim().trim_end_matches('.').parse::<usize>() else {
-            continue;
-        };
-        pages = pages.saturating_add(count);
-        seen += 1;
-    }
-    // All three or nothing: a partial parse would silently understate availability, which is the
-    // failure mode that refuses work that would have fit.
-    (seen == 3).then(|| pages.saturating_mul(page_size))
+    // SAFETY: the kernel writes at most `count` integer words into this initialized
+    // ABI-sized structure. Each acquired host send right is released before returning.
+    let (status, count, stats, page_size) = unsafe {
+        let mut stats: libc::vm_statistics64 = std::mem::zeroed();
+        let mut count = libc::HOST_VM_INFO64_COUNT;
+        let host = mach_host_self();
+        let status = libc::host_statistics64(
+            host,
+            libc::HOST_VM_INFO64,
+            (&mut stats as *mut libc::vm_statistics64).cast(),
+            &mut count,
+        );
+        mach_port_deallocate(mach_task_self_, host);
+        (status, count, stats, libc::vm_page_size)
+    };
+    // Mach's free_count already includes speculative pages; vm_stat subtracts them
+    // from its "Pages free" display. Require the three leading counters we use.
+    (status == libc::KERN_SUCCESS && count >= 3 && page_size > 0).then(|| {
+        (stats.free_count as usize)
+            .saturating_add(stats.inactive_count as usize)
+            .saturating_mul(page_size)
+    })
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]

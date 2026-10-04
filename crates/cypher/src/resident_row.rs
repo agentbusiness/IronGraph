@@ -102,6 +102,9 @@ pub struct CompiledResidentNullableRelationOutput {
 pub struct CompiledResidentNullableRelationPlan {
     pub request: ResidentNullableRelationRequest,
     pub outputs: Vec<CompiledResidentNullableRelationOutput>,
+    /// Start output -> relationship/end outputs, all selected and validated by the device.
+    /// The latter two columns are private publication inputs, not additional query outputs.
+    pub one_hop_paths: BTreeMap<usize, (usize, usize)>,
 }
 
 /// Client-side rendering applied only after one complete native command has returned a validated
@@ -4197,14 +4200,20 @@ pub fn compile_nullable_relation_with_parameters(
         stages: builder.stages,
     };
     let predicate_program = builder.predicate_program;
-    let visible_node_rows = graph
-        .nodes()
-        .filter(|node| plan.read_layers.contains_layer(node.layer()))
-        .count();
-    let visible_relationship_rows = graph
-        .edges()
-        .filter(|edge| plan.read_layers.contains_layer(edge.layer()))
-        .count();
+    let visible_node_rows =
+        usize::try_from(graph.node_count_in_layers(plan.read_layers)).map_err(|_| {
+            Error::new(
+                ErrorCode::ResultBudgetExceeded,
+                "visible node count exceeds host addressability",
+            )
+        })?;
+    let visible_relationship_rows = usize::try_from(graph.edge_count_in_layers(plan.read_layers))
+        .map_err(|_| {
+        Error::new(
+            ErrorCode::ResultBudgetExceeded,
+            "visible relationship count exceeds host addressability",
+        )
+    })?;
     let capacities = ResidentNullableRelationCapacities::derive(
         &program,
         graph.node_slot_count(),
@@ -4231,6 +4240,7 @@ pub fn compile_nullable_relation_with_parameters(
     Ok(Some(CompiledResidentNullableRelationPlan {
         request,
         outputs,
+        one_hop_paths: builder.path_outputs,
     }))
 }
 
@@ -5736,6 +5746,8 @@ struct NullableRelationBuilder<'a> {
     uniqueness_group: Option<MatchGroupId>,
     uniqueness_relationships: BTreeSet<ResidentNullableRelationSlot>,
     fixed_path_lengths: BTreeMap<String, i64>,
+    one_hop_paths: BTreeMap<String, [NullableRelationBinding; 3]>,
+    path_outputs: BTreeMap<usize, (usize, usize)>,
     /// Named OPTIONAL paths whose required start binding is proven to be always null by the
     /// sealed staged program. The path value and every graph-list function over it are therefore
     /// exactly Cypher null without materializing a path on either backend.
@@ -5764,6 +5776,8 @@ impl<'a> NullableRelationBuilder<'a> {
             uniqueness_group: None,
             uniqueness_relationships: BTreeSet::new(),
             fixed_path_lengths: BTreeMap::new(),
+            one_hop_paths: BTreeMap::new(),
+            path_outputs: BTreeMap::new(),
             statically_null_paths: BTreeMap::new(),
             static_null_node_seeded: false,
             unmaterialized_scope_values: BTreeSet::new(),
@@ -6240,6 +6254,7 @@ impl<'a> NullableRelationBuilder<'a> {
         }
         let mut fixed_path = None;
         let mut statically_null_path = None;
+        let mut empty_type_path = None;
         if let Some(variable) = pattern.variable.as_ref() {
             let Some(step) = pattern.steps.first() else {
                 return Ok(false);
@@ -6259,34 +6274,56 @@ impl<'a> NullableRelationBuilder<'a> {
                 return Ok(false);
             }
             if optional {
-                // Path1 [1] and Path2 [3] are the one safe named-OPTIONAL erasure: a literal-null
-                // node seed is proven Always by the same sealed program validator, so the path
-                // cannot exist and nodes(path)/relationships(path) are exactly null. Keep every
-                // reachable, typed, labelled, property-constrained, reverse, undirected, or
-                // multi-hop named OPTIONAL outside this narrow adapter.
-                let Some(start_variable) = pattern.start.variable.as_ref() else {
-                    return Ok(false);
-                };
-                let Some(start) = self.scope.get(start_variable).copied() else {
-                    return Ok(false);
-                };
-                if start.kind != ResidentNullableRelationBindingKind::Node
-                    || !self.binding_is_statically_always_null(start)?
-                    || pattern.start.property_predicate_present
-                    || !pattern.start.labels.is_empty()
-                    || !pattern.start.properties.is_empty()
-                    || step.relationship.variable.is_none()
-                    || !step.relationship.types.is_empty()
-                    || !step.relationship.properties.is_empty()
-                    || step.relationship.direction != Direction::Outgoing
-                    || step.node.variable.is_some()
-                    || step.node.property_predicate_present
-                    || !step.node.labels.is_empty()
-                    || !step.node.properties.is_empty()
+                // An absent relationship type is sealed in this catalog generation. Its
+                // OPTIONAL expansion introduces a null endpoint, which can also carry the
+                // path's null value without materializing a path or reading graph rows.
+                if nullable_relationship_domain(&step.relationship.types, self.catalog)
+                    .is_known_empty()
+                    && pattern.start.variable.as_ref().is_some_and(|name| {
+                        self.scope.get(name).is_some_and(|binding| {
+                            binding.kind == ResidentNullableRelationBindingKind::Node
+                        })
+                    })
+                    && step
+                        .node
+                        .variable
+                        .as_ref()
+                        .is_none_or(|name| !self.scope.contains_key(name))
                 {
-                    return Ok(false);
+                    empty_type_path = Some(variable.clone());
+                } else {
+                    // Path1 [1] and Path2 [3] are the one safe named-OPTIONAL erasure: a literal-null
+                    // node seed is proven Always by the same sealed program validator, so the path
+                    // cannot exist and nodes(path)/relationships(path) are exactly null. Keep every
+                    // reachable, typed, labelled, property-constrained, reverse, undirected, or
+                    // multi-hop named OPTIONAL outside this narrow adapter.
+                    let Some(start_variable) = pattern.start.variable.as_ref() else {
+                        return Ok(false);
+                    };
+                    let Some(start) = self.scope.get(start_variable).copied() else {
+                        return Ok(false);
+                    };
+                    if start.kind != ResidentNullableRelationBindingKind::Node {
+                        return Ok(false);
+                    }
+                    if self.binding_is_statically_always_null(start)? {
+                        if pattern.start.property_predicate_present
+                            || !pattern.start.labels.is_empty()
+                            || !pattern.start.properties.is_empty()
+                            || step.relationship.variable.is_none()
+                            || !step.relationship.types.is_empty()
+                            || !step.relationship.properties.is_empty()
+                            || step.relationship.direction != Direction::Outgoing
+                            || step.node.variable.is_some()
+                            || step.node.property_predicate_present
+                            || !step.node.labels.is_empty()
+                            || !step.node.properties.is_empty()
+                        {
+                            return Ok(false);
+                        }
+                        statically_null_path = Some((variable.clone(), start));
+                    }
                 }
-                statically_null_path = Some((variable.clone(), start));
             } else {
                 fixed_path = Some((variable.clone(), 1_i64));
             }
@@ -6498,6 +6535,7 @@ impl<'a> NullableRelationBuilder<'a> {
         };
 
         let mut optional_relationship_predicates = Vec::new();
+        let mut path_bindings = None;
         for (step_index, step) in pattern.steps.iter().enumerate() {
             let variable_length = step.relationship.variable_length
                 || step.relationship.min_hops.is_some()
@@ -6551,6 +6589,7 @@ impl<'a> NullableRelationBuilder<'a> {
                     None => Some((Some(variable.clone()), self.allocate_slot()?, true)),
                 },
                 None if retain_anonymous_relationships
+                    || pattern.variable.is_some()
                     || !step.relationship.properties.is_empty() =>
                 {
                     Some((None, self.allocate_slot()?, true))
@@ -6593,6 +6632,19 @@ impl<'a> NullableRelationBuilder<'a> {
             };
             let stage = self.stages.len();
             let relationship_slot = relationship.as_ref().map(|(_, slot, _)| *slot);
+            if pattern.variable.is_some()
+                && let Some(slot) = relationship_slot
+            {
+                let relationship = NullableRelationBinding {
+                    slot,
+                    kind: ResidentNullableRelationBindingKind::Relationship,
+                };
+                path_bindings = Some(if reverse_single_hop {
+                    [target_binding, relationship, source]
+                } else {
+                    [source, relationship, target_binding]
+                });
+            }
             self.stages.push(ResidentNullableRelationStage::Expand {
                 mode,
                 uniqueness_group: match_group.get(),
@@ -6712,12 +6764,23 @@ impl<'a> NullableRelationBuilder<'a> {
                     predicate,
                 });
         }
+        if statically_null_path.is_none()
+            && empty_type_path.is_none()
+            && let (Some(variable), Some(bindings)) = (&pattern.variable, path_bindings)
+        {
+            self.one_hop_paths.insert(variable.clone(), bindings);
+            self.unmaterialized_scope_values.insert(variable.clone());
+        }
         if let Some((variable, length)) = fixed_path {
             self.fixed_path_lengths.insert(variable.clone(), length);
             self.unmaterialized_scope_values.insert(variable);
         }
         if let Some((variable, binding)) = statically_null_path {
             self.statically_null_paths.insert(variable.clone(), binding);
+            self.unmaterialized_scope_values.insert(variable);
+        }
+        if let Some(variable) = empty_type_path {
+            self.statically_null_paths.insert(variable.clone(), source);
             self.unmaterialized_scope_values.insert(variable);
         }
         Ok(true)
@@ -7107,6 +7170,46 @@ impl<'a> NullableRelationBuilder<'a> {
             },
             Expression::Binary {
                 left,
+                operation: BinaryOperator::In,
+                right,
+            } => {
+                let elements = match right.as_ref() {
+                    Expression::List(elements) => elements.clone(),
+                    Expression::Literal(ScalarValue::List(list)) => {
+                        let mut elements = Vec::new();
+                        for item in list.items()? {
+                            let DocumentItem::Scalar(value) = item else {
+                                return Ok(None);
+                            };
+                            elements.push(Expression::Literal(value));
+                        }
+                        elements
+                    }
+                    _ => return Ok(None),
+                };
+                if elements.len() >= RESIDENT_NULLABLE_RELATION_MAX_PREDICATE_DEPTH {
+                    return Ok(None);
+                }
+                let mut predicate = ResidentNullableRelationPredicate::Constant(Some(false));
+                for element in elements {
+                    if !matches!(element, Expression::Literal(_)) {
+                        return Ok(None);
+                    }
+                    let Some(equal) = self.predicate(&Expression::Binary {
+                        left: left.clone(),
+                        operation: BinaryOperator::Equal,
+                        right: Box::new(element),
+                    })?
+                    else {
+                        return Ok(None);
+                    };
+                    predicate =
+                        ResidentNullableRelationPredicate::Or(Box::new(predicate), Box::new(equal));
+                }
+                Some(predicate)
+            }
+            Expression::Binary {
+                left,
                 operation,
                 right,
             } => {
@@ -7385,6 +7488,9 @@ impl<'a> NullableRelationBuilder<'a> {
             }
         }
         for (alias, binding) in aliases {
+            self.one_hop_paths.remove(&alias);
+            self.fixed_path_lengths.remove(&alias);
+            self.unmaterialized_scope_values.remove(&alias);
             self.scope.insert(alias, binding);
         }
         Ok(true)
@@ -7498,6 +7604,12 @@ impl<'a> NullableRelationBuilder<'a> {
         let Some(path) = self.statically_null_paths.keys().next() else {
             return true;
         };
+        if self.statically_null_paths.len() == 1
+            && matches!(projection.items.as_slice(), [item]
+                if matches!(&item.expression, Expression::Variable(variable) if variable == path))
+        {
+            return true;
+        }
         if self.statically_null_paths.len() != 1 || projection.items.len() != 2 {
             return false;
         }
@@ -7614,6 +7726,42 @@ impl<'a> NullableRelationBuilder<'a> {
                     }
                 }
                 Expression::Variable(variable) => {
+                    if let Some(bindings) = self.one_hop_paths.get(variable).copied() {
+                        let name = item.column_name(index);
+                        if !names.insert(name.clone()) {
+                            return Ok(None);
+                        }
+                        let start = expanded.len();
+                        self.path_outputs.insert(start, (start + 1, start + 2));
+                        for (part, binding) in bindings.into_iter().enumerate() {
+                            expanded.push((
+                                if part == 0 {
+                                    name.clone()
+                                } else {
+                                    format!("\0path:{start}:{part}")
+                                },
+                                ResidentNullableRelationOutputSource::Entity {
+                                    slot: binding.slot,
+                                    kind: binding.kind,
+                                },
+                            ));
+                        }
+                        continue;
+                    }
+                    if let Some(binding) = self.statically_null_paths.get(variable).copied() {
+                        let name = item.column_name(index);
+                        if !names.insert(name.clone()) {
+                            return Ok(None);
+                        }
+                        expanded.push((
+                            name,
+                            ResidentNullableRelationOutputSource::NullProperty {
+                                slot: binding.slot,
+                                kind: binding.kind,
+                            },
+                        ));
+                        continue;
+                    }
                     let Some(binding) = self.scope.get(variable).copied() else {
                         return Ok(None);
                     };
@@ -7762,6 +7910,7 @@ impl<'a> NullableRelationBuilder<'a> {
             .push(ResidentNullableRelationStage::ScopeProject { bindings });
         self.scope = next_scope;
         self.fixed_path_lengths.clear();
+        self.one_hop_paths.clear();
         self.statically_null_paths.clear();
         self.unmaterialized_scope_values.clear();
         Ok(true)
@@ -7885,6 +8034,7 @@ impl<'a> NullableRelationBuilder<'a> {
             .push(ResidentNullableRelationStage::ScopeProject { bindings });
         self.scope = next_scope;
         self.fixed_path_lengths.clear();
+        self.one_hop_paths.clear();
         self.statically_null_paths.clear();
         self.unmaterialized_scope_values.clear();
         if collect_name != unwind_variable {
@@ -9700,8 +9850,16 @@ mod tests {
             assert_eq!(result.row_count(), expected_rows);
         }
 
+        let path = compile_nullable_query("MATCH p = (n)-->(x) RETURN p", &graph, 64)?
+            .ok_or_else(|| Error::internal("one-hop path output did not compile"))?;
+        assert_eq!(path.one_hop_paths, BTreeMap::from([(0, (1, 2))]));
+        assert_eq!(path.outputs.len(), 3);
+        assert_eq!(
+            execute_nullable_relation_on_cpu(&graph, &path)?.row_count(),
+            2
+        );
+
         for unsupported in [
-            "MATCH p = (n)-->(x) RETURN p",
             "MATCH p = (n)-->(x) RETURN *",
             "MATCH p = (n)-->(x)-->(y) WHERE length(p) = 2 RETURN y",
             "MATCH p = (n)-[*]->(x) WHERE length(p) = 1 RETURN x",
@@ -11089,6 +11247,7 @@ mod tests {
         for query in [
             "WITH null AS a OPTIONAL MATCH p = (a)-[r]->() RETURN nodes(p), nodes(null)",
             "WITH null AS a OPTIONAL MATCH p = (a)-[r]->() RETURN relationships(p), relationships(null)",
+            "WITH null AS a OPTIONAL MATCH p = (a)-[r]->() RETURN p",
         ] {
             let compiled = compile_nullable_query(query, &graph, 64)?.ok_or_else(|| {
                 Error::internal(format!("statically-null path did not compile: {query}"))
@@ -11133,7 +11292,6 @@ mod tests {
             "WITH null AS a OPTIONAL MATCH p = (a)-[r]->(b) RETURN nodes(p)",
             "WITH null AS a OPTIONAL MATCH p = (a)-[r*]->() RETURN nodes(p)",
             "WITH null AS a OPTIONAL MATCH p = (a)-[r]->() RETURN length(p)",
-            "WITH null AS a OPTIONAL MATCH p = (a)-[r]->() RETURN p",
             "WITH null AS a OPTIONAL MATCH p = (a)-[r]->() RETURN nodes(p)",
             "WITH null AS a OPTIONAL MATCH p = (a)-[r]->() RETURN nodes(p) AS path_nodes, nodes(null)",
             "WITH null AS a OPTIONAL MATCH p = (a)-[r]->() RETURN nodes(p), a",
@@ -11143,6 +11301,55 @@ mod tests {
                 "nearby named OPTIONAL path escaped static-null admission: {query}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_type_optional_path_preserves_parent_rows_as_null() -> Result<()> {
+        let graph = optional_fixture_graph()?;
+        for query in [
+            "MATCH (a) OPTIONAL MATCH p=(a)-[:AbsentType]->(b) RETURN p",
+            "MATCH (a) OPTIONAL MATCH p=(a)<-[:AbsentType]-(b) RETURN p AS path",
+        ] {
+            let compiled = compile_nullable_query(query, &graph, 64)?.ok_or_else(|| {
+                Error::internal(format!("unknown-type path did not compile: {query}"))
+            })?;
+            compiled.request.validate()?;
+            let result = execute_nullable_relation_on_cpu(&graph, &compiled)?;
+            assert_eq!(result.row_count(), graph.node_count());
+            assert!(matches!(result.columns(),
+                [ResidentNullableRelationOutputColumn::NullProperty { source_rows, .. }]
+                    if source_rows.iter().all(|row| *row == crate::execution::RESIDENT_NULLABLE_RELATION_NULL_ROW)));
+        }
+        // Both endpoints survive the failed OPTIONAL, so its introduced relationship carries
+        // the path's null status. Publication must never infer path validity from an endpoint.
+        let compiled = compile_nullable_query(
+            "MATCH (a), (b) OPTIONAL MATCH p=(a)-[:AbsentType]->(b) RETURN p",
+            &graph,
+            64,
+        )?
+        .ok_or_else(|| Error::internal("bound unknown-type path did not compile"))?;
+        assert_eq!(compiled.one_hop_paths, BTreeMap::from([(0, (1, 2))]));
+        let result = execute_nullable_relation_on_cpu(&graph, &compiled)?;
+        assert_eq!(result.row_count(), graph.node_count() * graph.node_count());
+        assert!(
+            result.columns()[1]
+                .source_rows()
+                .iter()
+                .all(|row| *row == crate::execution::RESIDENT_NULLABLE_RELATION_NULL_ROW)
+        );
+        assert!(
+            result.columns()[0]
+                .source_rows()
+                .iter()
+                .all(|row| *row != crate::execution::RESIDENT_NULLABLE_RELATION_NULL_ROW)
+        );
+        assert!(
+            result.columns()[2]
+                .source_rows()
+                .iter()
+                .all(|row| *row != crate::execution::RESIDENT_NULLABLE_RELATION_NULL_ROW)
+        );
         Ok(())
     }
 
@@ -14521,7 +14728,7 @@ mod tests {
                 .result
                 .schema
                 .iter()
-                .all(|(_, value_type)| *value_type == ColumnType::Map)
+                .all(|(_, value_type)| *value_type == ColumnType::Null)
         );
         assert_eq!(
             single_row(&nullable)?,
@@ -14680,7 +14887,7 @@ mod tests {
                 .result
                 .schema
                 .iter()
-                .all(|(_, value_type)| *value_type == ColumnType::List)
+                .all(|(_, value_type)| *value_type == ColumnType::Null)
         );
         assert!(matches!(
             nullable.result.batches.as_slice(),

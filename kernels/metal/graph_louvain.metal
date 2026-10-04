@@ -13,10 +13,6 @@ constant uint IG_MAX_LAYER = 2u;
 constant ulong IG_LV_SIGN = 0x8000000000000000ul;
 constant ulong IG_LV_INVALID_RAW_KEY = 0xfffffffffffffffful;
 constant uint IG_LV_INVALID_NODE = 0xffffffffu;
-// This is a dispatch-latency bound, not merely a performance heuristic. The host may choose the
-// direct candidate path only while every adjacency row fits below this ceiling.
-constant ulong IG_LV_DIRECT_NEIGHBOR_HARD_LIMIT = 256ul;
-constant ulong IG_LV_SORTED_DECISION_CHUNK_ROWS = 1024ul;
 constant uint IG_LV_RADIX_THREADS = 256u;
 constant uint IG_LV_RADIX_BUCKETS = 256u;
 constant uint IG_LV_RADIX_TILE_ROWS = 1024u;
@@ -247,22 +243,6 @@ kernel void ig_louvain_read_u32(
     constant IgLouvainRadixArgs& args [[buffer(2)]],
     uint lane [[thread_position_in_grid]]) {
     if (lane == 0u && args.work_offset < args.row_count) output[0] = values[args.work_offset];
-}
-
-kernel void ig_louvain_sum_u32_clear(
-    device atomic_uint* output [[buffer(0)]],
-    uint lane [[thread_position_in_grid]]) {
-    if (lane == 0u) atomic_store_explicit(output, 0u, memory_order_relaxed);
-}
-
-kernel void ig_louvain_sum_u32(
-    device const uint* values [[buffer(0)]],
-    device atomic_uint* output [[buffer(1)]],
-    constant IgLouvainRadixArgs& args [[buffer(2)]],
-    uint local [[thread_position_in_grid]]) {
-    ulong row = args.work_offset + ulong(local);
-    if (ulong(local) >= args.work_count || row >= args.row_count) return;
-    atomic_fetch_add_explicit(output, values[row], memory_order_relaxed);
 }
 
 kernel void ig_louvain_sum_i64_clear(
@@ -581,64 +561,6 @@ kernel void ig_louvain_initialize_level(
         ? node : IG_LV_INVALID_NODE;
 }
 
-kernel void ig_louvain_candidate_keys(
-    device const long* oriented_keys [[buffer(0)]],
-    device const uint* membership [[buffer(1)]],
-    device long* candidate_keys [[buffer(2)]],
-    constant IgLouvainGraphArgs& args [[buffer(3)]],
-    uint local [[thread_position_in_grid]]) {
-    ulong position = args.work_offset + ulong(local);
-    if (ulong(local) >= args.work_count) return;
-    if (position >= args.oriented_capacity) return;
-    ulong raw = ig_lv_decode_key(oriented_keys[position]);
-    if (raw == IG_LV_INVALID_RAW_KEY) {
-        candidate_keys[position] = ig_lv_encode_key(IG_LV_INVALID_RAW_KEY);
-        return;
-    }
-    uint source = uint(raw >> 32u);
-    uint neighbor = uint(raw);
-    // Coarse self-loops encode edges internal to the represented aggregate. They remain internal
-    // under every move, so they contribute to degree but cancel from the move link term.
-    if (source == neighbor) {
-        candidate_keys[position] = ig_lv_encode_key(IG_LV_INVALID_RAW_KEY);
-        return;
-    }
-    uint community = membership[neighbor];
-    candidate_keys[position] = community == IG_LV_INVALID_NODE
-        ? ig_lv_encode_key(IG_LV_INVALID_RAW_KEY)
-        : ig_lv_encode_key(ig_lv_pair_key(source, community));
-}
-
-kernel void ig_louvain_candidate_aggregate_clear(
-    device atomic_uint* aggregate_words [[buffer(0)]],
-    constant IgLouvainGraphArgs& args [[buffer(1)]],
-    uint local [[thread_position_in_grid]]) {
-    ulong position = args.work_offset + ulong(local);
-    if (ulong(local) >= args.work_count) return;
-    if (position >= args.oriented_capacity) return;
-    ulong word = ulong(position) * 2ul;
-    atomic_store_explicit(aggregate_words + word, 0u, memory_order_relaxed);
-    atomic_store_explicit(aggregate_words + word + 1ul, 0u, memory_order_relaxed);
-}
-
-// Aggregate each `(node, community)` run at its first row. Every physical candidate row performs
-// one bounded binary search and one two-word atomic addition; no lane owns a high-degree run.
-kernel void ig_louvain_candidate_aggregate(
-    device const long* sorted_candidate_keys [[buffer(0)]],
-    device const long* sorted_candidate_weights [[buffer(1)]],
-    device atomic_uint* aggregate_words [[buffer(2)]],
-    constant IgLouvainGraphArgs& args [[buffer(3)]],
-    uint local [[thread_position_in_grid]]) {
-    ulong position = args.work_offset + ulong(local);
-    if (ulong(local) >= args.work_count) return;
-    if (position >= args.oriented_capacity) return;
-    long key = sorted_candidate_keys[position];
-    long signed_weight = sorted_candidate_weights[position];
-    if (ig_lv_decode_key(key) == IG_LV_INVALID_RAW_KEY || signed_weight <= 0l) return;
-    ulong start = ig_lv_lower_bound_key(sorted_candidate_keys, args.oriented_capacity, key);
-    ig_lv_atomic_add_u64(aggregate_words + start * 2ul, ulong(signed_weight));
-}
-
 struct IgLvWide {
     ulong high;
     ulong low;
@@ -683,6 +605,14 @@ inline int ig_lv_compare_gain(
     ulong community_b,
     ulong degree,
     ulong total_weight) {
+    // Small exact weights need no wide multiplication: both signed score terms
+    // and their sum fit in i64 under this checked bound. Larger graphs keep u128.
+    if (total_weight <= 0x7ffffffful && link_a <= total_weight && link_b <= total_weight
+        && community_a <= total_weight && community_b <= total_weight && degree <= total_weight) {
+        long score = (long(link_a) - long(link_b)) * long(total_weight)
+            + (long(community_b) - long(community_a)) * long(degree);
+        return score < 0l ? -1 : (score > 0l ? 1 : 0);
+    }
     IgLvWide left = ig_lv_add_wide(
         ig_lv_multiply_wide(link_a, total_weight),
         ig_lv_multiply_wide(degree, community_b));
@@ -692,419 +622,205 @@ inline int ig_lv_compare_gain(
     return ig_lv_compare_wide(left, right);
 }
 
-kernel void ig_louvain_sorted_initialize(
-    device const uint* active_nodes [[buffer(0)]],
-    device const uint* membership [[buffer(1)]],
-    device long* state [[buffer(2)]],
-    constant IgLouvainGraphArgs& args [[buffer(3)]],
-    uint node [[thread_position_in_grid]]) {
-    node += uint(args.work_offset);
-    if (ulong(node) >= args.work_offset + args.work_count) return;
-    if (node >= args.node_count) return;
-    ulong nodes = ulong(args.node_count);
-    state[node] = active_nodes[node] != 0u ? long(membership[node]) : long(IG_LV_INVALID_NODE);
-    state[nodes + node] = 0l;
-    state[nodes * 2ul + node] = 0l;
-}
-
-// Resume an exact sorted-candidate decision over at most 1024 physical rows per node. The host
-// synchronizes and checks cancellation between chunks, so even a single adversarial hub cannot
-// monopolize one uninterruptible dispatch.
-kernel void ig_louvain_sorted_chunk(
-    device const long* prior_state [[buffer(0)]],
-    device const uint* active_nodes [[buffer(1)]],
-    device const uint* membership [[buffer(2)]],
-    device const long* degree_values [[buffer(3)]],
-    device const long* community_weights [[buffer(4)]],
-    device const long* sorted_candidate_keys [[buffer(5)]],
-    device const long* aggregate_weights [[buffer(6)]],
-    device long* next_state [[buffer(7)]],
-    constant IgLouvainGraphArgs& args [[buffer(8)]],
-    uint node [[thread_position_in_grid]]) {
-    node += uint(args.work_offset);
-    if (ulong(node) >= args.work_offset + args.work_count) return;
-    if (node >= args.node_count) return;
-    ulong nodes = ulong(args.node_count);
-    ulong link_base = nodes;
-    ulong current_link_base = nodes * 2ul;
-    if (active_nodes[node] == 0u) {
-        next_state[node] = long(IG_LV_INVALID_NODE);
-        next_state[link_base + node] = 0l;
-        next_state[current_link_base + node] = 0l;
-        return;
+// One node commits at a time in the same dense order as the CPU oracle. Each dispatch consumes
+// only a fixed number of node/edge steps; even a single high-degree row can yield for cancellation.
+// State: community weights[N], temporary candidate weights[N], control[16].
+kernel void ig_louvain_sequential_chunk(
+    device ulong* state [[buffer(0)]],
+    device uint* membership [[buffer(1)]],
+    device const uint* active [[buffer(2)]],
+    device const long* degrees [[buffer(3)]],
+    device const long* keys [[buffer(4)]],
+    device const long* weights [[buffer(5)]],
+    constant IgLouvainGraphArgs& args [[buffer(6)]],
+    device ulong* feedback [[buffer(7)]],
+    device const ulong* offsets [[buffer(8)]],
+    device const uint* active_rows [[buffer(9)]],
+    uint tid [[thread_position_in_grid]]) {
+    if (tid != 0u) return;
+    device ulong* links = state + args.node_count;
+    device ulong* saved_control = links + args.node_count;
+    ulong ctl[16];
+    // One lane owns this bounded chunk. Keep progress local between dependent moves,
+    // then publish it once for the host checkpoint and the next chunk.
+    for (uint word = 0u; word < 16u; ++word) {
+        ctl[word] = args.reduce_mode != 0u ? 0ul : saved_control[word];
     }
-    uint current = membership[node];
-    ulong degree = ulong(max(degree_values[node], 0l));
-    uint best = uint(max(prior_state[node], 0l));
-    ulong best_link = ulong(max(prior_state[link_base + node], 0l));
-    ulong current_link = ulong(max(prior_state[current_link_base + node], 0l));
-    ulong current_weight = ulong(max(community_weights[current], 0l));
-    ulong current_adjusted = current_weight >= degree ? current_weight - degree : 0ul;
-    ulong best_weight = ulong(max(community_weights[best], 0l));
-    if (best == current) best_weight = best_weight >= degree ? best_weight - degree : 0ul;
-
-    ulong begin = ig_lv_lower_bound_high(sorted_candidate_keys, args.oriented_capacity, node);
-    ulong end = ig_lv_upper_bound_high(sorted_candidate_keys, args.oriented_capacity, node);
-    ulong cursor = min(begin + ulong(args.reduce_mode), end);
-    ulong finish = min(cursor + IG_LV_SORTED_DECISION_CHUNK_ROWS, end);
-    for (; cursor < finish; ++cursor) {
-        long signed_link = aggregate_weights[cursor];
-        if (signed_link <= 0l) continue;
-        ulong raw = ig_lv_decode_key(sorted_candidate_keys[cursor]);
-        uint candidate = uint(raw);
-        ulong link = ulong(signed_link);
-        ulong candidate_weight = ulong(max(community_weights[candidate], 0l));
-        if (candidate == current) {
-            candidate_weight = candidate_weight >= degree ? candidate_weight - degree : 0ul;
-            current_link = link;
+    for (ulong step = 0ul; step < args.work_count && ctl[10] == 0ul && ctl[11] == 0ul; ++step) {
+        if (ctl[0] >= args.work_offset) { ctl[10] = 1ul; break; }
+        uint node = active_rows[ctl[0]];
+        if (node >= args.node_count) { ctl[11] = 6ul; break; }
+        ulong degree = ulong(max(degrees[node], 0l));
+        if (ctl[1] == 0ul) {
+            if (active[node] == 0u || degree == 0ul) { ++ctl[0]; continue; }
+            uint current = membership[node];
+            if (current >= args.node_count || state[current] < degree) { ctl[11] = 1ul; break; }
+            ctl[2] = offsets[node];
+            ctl[12] = ctl[2];
+            ctl[3] = offsets[node + 1u];
+            ctl[4] = current;
+            ctl[5] = current;
+            ctl[6] = 0ul;
+            ctl[7] = state[current] - degree;
+            ctl[1] = 1ul;
+            continue;
         }
-        int ordering = ig_lv_compare_gain(
-            link, candidate_weight, best_link, best_weight,
-            degree, args.total_weight);
-        if (ordering > 0 || (ordering == 0 && candidate < best)) {
-            best = candidate;
-            best_link = link;
-            best_weight = candidate_weight;
+        if (ctl[2] < ctl[3]) {
+            ulong cursor = ctl[2]++;
+            uint neighbor = uint(ig_lv_decode_key(keys[cursor]));
+            if (neighbor >= args.node_count) { ctl[11] = 2ul; break; }
+            if (neighbor == node) continue;
+            uint candidate = membership[neighbor];
+            if (candidate >= args.node_count) { ctl[11] = 3ul; break; }
+            if (ctl[1] == 1ul) {
+                ulong weight = ulong(max(weights[cursor], 0l));
+                if (links[candidate] > ~0ul - weight) { ctl[11] = 4ul; break; }
+                links[candidate] += weight;
+            } else if (ctl[1] == 2ul) {
+                ulong candidate_weight = state[candidate];
+                if (candidate == uint(ctl[4])) candidate_weight -= degree;
+                int ordering = ig_lv_compare_gain(links[candidate], candidate_weight,
+                    ctl[6], ctl[7], degree, args.total_weight);
+                if (ordering > 0 || (ordering == 0 && candidate < uint(ctl[5]))) {
+                    ctl[5] = candidate;
+                    ctl[6] = links[candidate];
+                    ctl[7] = candidate_weight;
+                }
+            } else {
+                links[candidate] = 0ul;
+            }
+            continue;
         }
+        if (ctl[1] < 3ul) {
+            if (ctl[1] == 1ul) ctl[8] = links[uint(ctl[4])];
+            ++ctl[1];
+            ctl[2] = ctl[12];
+            continue;
+        }
+        uint current = uint(ctl[4]);
+        uint best = uint(ctl[5]);
+        if (best != current && ig_lv_compare_gain(ctl[6], ctl[7], ctl[8],
+                state[current] - degree, degree, args.total_weight) > 0) {
+            if (state[best] > ~0ul - degree) { ctl[11] = 5ul; break; }
+            state[current] -= degree;
+            state[best] += degree;
+            membership[node] = best;
+            ++ctl[9];
+        }
+        ctl[1] = 0ul;
+        ++ctl[0];
     }
-    next_state[node] = long(best);
-    next_state[link_base + node] = long(best_link);
-    next_state[current_link_base + node] = long(current_link);
+    for (uint word = 0u; word < 16u; ++word) {
+        saved_control[word] = ctl[word];
+        feedback[word] = ctl[word];
+    }
 }
 
-kernel void ig_louvain_decide_clear(
-    device atomic_uint* changed [[buffer(0)]],
-    uint lane [[thread_position_in_grid]]) {
-    if (lane == 0u) atomic_store_explicit(changed, 0u, memory_order_relaxed);
+inline ulong ig_lv_shuffle_u64(ulong value, uint lane) {
+    return ulong(simd_shuffle(uint(value), lane))
+        | (ulong(simd_shuffle(uint(value >> 32u), lane)) << 32u);
 }
 
-// Deterministic proposal phase. Every node considers every neighboring community and emits a move
-// only when the best candidate is strictly better than remaining in its current community. A
-// separate deterministic community-disjoint matching phase below selects proposals that can be
-// applied together with an additive, therefore non-negative, modularity change.
-kernel void ig_louvain_decide(
-    device const uint* active_nodes [[buffer(0)]],
-    device const uint* membership [[buffer(1)]],
-    device const long* degree_values [[buffer(2)]],
-    device const long* community_weights [[buffer(3)]],
-    device const long* sorted_oriented_keys [[buffer(4)]],
-    device const long* sorted_oriented_weights [[buffer(5)]],
-    device uint* next_membership [[buffer(6)]],
-    device atomic_uint* changed [[buffer(7)]],
-    constant IgLouvainGraphArgs& args [[buffer(8)]],
-    uint node [[thread_position_in_grid]]) {
-    node += uint(args.work_offset);
-    if (ulong(node) >= args.work_offset + args.work_count) return;
-    if (node >= args.node_count) return;
-    if (active_nodes[node] == 0u) {
-        next_membership[node] = IG_LV_INVALID_NODE;
-        return;
-    }
-    uint current = membership[node];
-    ulong degree = ulong(max(degree_values[node], 0l));
-    if (degree == 0ul || args.total_weight == 0ul) {
-        next_membership[node] = current;
-        return;
-    }
-    ulong current_weight = ulong(max(community_weights[current], 0l));
-    ulong current_adjusted = current_weight >= degree ? current_weight - degree : 0ul;
-    uint best = current;
-    ulong best_link = 0ul;
-    ulong best_community = current_adjusted;
-    ulong current_link = 0ul;
-
-    // The resident adjacency is already sorted by source. The host's cost router uses this exact
-    // path only below IG_LV_DIRECT_NEIGHBOR_HARD_LIMIT and otherwise globally radix-sorts
-    // `(node, community)`. Keep a device-side guard so a host/kernel contract drift fails closed
-    // instead of launching an unbounded quadratic row scan.
-    ulong begin = ig_lv_lower_bound_high(sorted_oriented_keys, args.oriented_capacity, node);
-    ulong end = ig_lv_upper_bound_high(sorted_oriented_keys, args.oriented_capacity, node);
-    if (end - begin > IG_LV_DIRECT_NEIGHBOR_HARD_LIMIT) {
-        next_membership[node] = current;
-        atomic_fetch_max_explicit(changed, 2u, memory_order_relaxed);
-        return;
-    }
-    for (ulong cursor = begin; cursor < end; ++cursor) {
-        ulong raw = ig_lv_decode_key(sorted_oriented_keys[cursor]);
-        uint neighbor = uint(raw);
-        if (neighbor == node) continue;
-        uint candidate = membership[neighbor];
-        if (candidate == IG_LV_INVALID_NODE) continue;
-        bool first_for_community = true;
-        for (ulong prior = begin; prior < cursor; ++prior) {
-            ulong prior_raw = ig_lv_decode_key(sorted_oriented_keys[prior]);
-            uint prior_neighbor = uint(prior_raw);
-            if (prior_neighbor != node && membership[prior_neighbor] == candidate) {
-                first_for_community = false;
-                break;
+// Small-row levels retain the same dependent node order. One SIMD group only
+// parallelizes the current node's neighborhood reads and exact candidate scores.
+kernel void ig_louvain_simd_chunk(
+    device ulong* state [[buffer(0)]],
+    device uint* membership [[buffer(1)]],
+    device const uint* active [[buffer(2)]],
+    device const long* degrees [[buffer(3)]],
+    device const long* keys [[buffer(4)]],
+    device const long* weights [[buffer(5)]],
+    constant IgLouvainGraphArgs& args [[buffer(6)]],
+    device ulong* feedback [[buffer(7)]],
+    device const ulong* offsets [[buffer(8)]],
+    device const uint* active_rows [[buffer(9)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint width [[threads_per_simdgroup]]) {
+    device ulong* saved = state + args.node_count * 2ul;
+    ulong position = (args.reduce_mode & 1u) != 0u ? 0ul : saved[0];
+    ulong accepted = (args.reduce_mode & 1u) != 0u ? 0ul : saved[9];
+    uint status = width == 32u ? 0u : 6u;
+    for (ulong work = 0ul; work < args.work_count && position < args.work_offset && status == 0u;) {
+        uint node = active_rows[position];
+        if (node >= args.node_count) { status = 6u; break; }
+        ulong begin = offsets[node];
+        ulong end = offsets[node + 1ul];
+        ulong degree = ulong(max(degrees[node], 0l));
+        if (active[node] == 0u || degree == 0ul) { ++position; ++work; continue; }
+        if (end - begin > 32ul) { status = 7u; break; }
+        uint current = membership[node];
+        if (current >= args.node_count || state[current] < degree) { status = 1u; break; }
+        uint candidate = args.node_count;
+        ulong weight = 0ul;
+        if (begin + lane < end) {
+            uint neighbor = uint(ig_lv_decode_key(keys[begin + lane]));
+            if (neighbor >= args.node_count) status = 2u;
+            else if (neighbor != uint(node)) {
+                candidate = membership[neighbor];
+                weight = ulong(max(weights[begin + lane], 0l));
+                if (candidate >= args.node_count) status = 3u;
             }
         }
-        if (!first_for_community) continue;
+        status = simd_max(status);
+        if (status != 0u) break;
         ulong link = 0ul;
-        for (ulong scan = cursor; scan < end; ++scan) {
-            ulong scan_raw = ig_lv_decode_key(sorted_oriented_keys[scan]);
-            uint scan_neighbor = uint(scan_raw);
-            if (scan_neighbor != node && membership[scan_neighbor] == candidate) {
-                link += ulong(max(sorted_oriented_weights[scan], 0l));
+        ulong current_link = 0ul;
+        uint neighbor_count = uint(end - begin);
+        for (uint neighbor_lane = 0u; neighbor_lane < neighbor_count; ++neighbor_lane) {
+            uint neighbor_community = simd_shuffle(candidate, neighbor_lane);
+            ulong neighbor_weight = ig_lv_shuffle_u64(weight, neighbor_lane);
+            if (neighbor_community == current) current_link += neighbor_weight;
+            if (neighbor_community == candidate) link += neighbor_weight;
+        }
+        uint best = current;
+        ulong best_link = 0ul;
+        ulong best_weight = state[current] - degree;
+        if (candidate < args.node_count) {
+            ulong candidate_weight = state[candidate] - (candidate == current ? degree : 0ul);
+            int ordering = ig_lv_compare_gain(link, candidate_weight,
+                best_link, best_weight, degree, args.total_weight);
+            if (ordering > 0 || (ordering == 0 && candidate < best)) {
+                best = candidate; best_link = link; best_weight = candidate_weight;
             }
         }
-        ulong candidate_weight = ulong(max(community_weights[candidate], 0l));
-        if (candidate == current) {
-            candidate_weight = candidate_weight >= degree ? candidate_weight - degree : 0ul;
-            current_link = link;
+        uint first_stride = 1u;
+        while (first_stride < neighbor_count) first_stride <<= 1u;
+        for (uint stride = first_stride >> 1u; stride != 0u; stride >>= 1u) {
+            uint other_lane = min(lane + stride, 31u);
+            uint other = simd_shuffle(best, other_lane);
+            ulong other_link = ig_lv_shuffle_u64(best_link, other_lane);
+            ulong other_weight = ig_lv_shuffle_u64(best_weight, other_lane);
+            int ordering = ig_lv_compare_gain(other_link, other_weight,
+                best_link, best_weight, degree, args.total_weight);
+            if (lane + stride < neighbor_count && (ordering > 0 || (ordering == 0 && other < best))) {
+                best = other; best_link = other_link; best_weight = other_weight;
+            }
         }
-        int ordering = ig_lv_compare_gain(
-            link, candidate_weight, best_link, best_community,
-            degree, args.total_weight);
-        if (ordering > 0 || (ordering == 0 && candidate < best)) {
-            best = candidate;
-            best_link = link;
-            best_community = candidate_weight;
+        best = simd_broadcast_first(best);
+        best_link = ig_lv_shuffle_u64(best_link, 0u);
+        best_weight = ig_lv_shuffle_u64(best_weight, 0u);
+        if (best != current && ig_lv_compare_gain(best_link, best_weight,
+                current_link, state[current] - degree, degree, args.total_weight) > 0) {
+            if (state[best] > ~0ul - degree) { status = 5u; break; }
+            if (lane == 0u) {
+                state[current] -= degree;
+                state[best] += degree;
+                membership[node] = best;
+            }
+            ++accepted;
+        }
+        simdgroup_barrier(mem_flags::mem_device);
+        ++position;
+        work += (end - begin) * 3ul + 5ul;
+    }
+    if (lane == 0u) {
+        for (uint word = 0u; word < 16u; ++word) {
+            ulong value = word == 0u ? position : (word == 9u ? accepted
+                : (word == 10u ? ulong(position >= args.work_offset) : (word == 11u ? status : 0ul)));
+            saved[word] = value;
+            feedback[word] = value;
         }
     }
-    int improvement = ig_lv_compare_gain(
-        best_link, best_community, current_link, current_adjusted,
-        degree, args.total_weight);
-    uint proposal = best != current && improvement > 0 ? best : current;
-    next_membership[node] = proposal;
-    if (proposal != current) atomic_store_explicit(changed, 1u, memory_order_relaxed);
-}
-
-kernel void ig_louvain_decide_sorted(
-    device const long* state [[buffer(0)]],
-    device const uint* active_nodes [[buffer(1)]],
-    device const uint* membership [[buffer(2)]],
-    device const long* degree_values [[buffer(3)]],
-    device const long* community_weights [[buffer(4)]],
-    device uint* next_membership [[buffer(5)]],
-    device atomic_uint* changed [[buffer(6)]],
-    constant IgLouvainGraphArgs& args [[buffer(7)]],
-    uint node [[thread_position_in_grid]]) {
-    node += uint(args.work_offset);
-    if (ulong(node) >= args.work_offset + args.work_count) return;
-    if (node >= args.node_count) return;
-    if (active_nodes[node] == 0u) {
-        next_membership[node] = IG_LV_INVALID_NODE;
-        return;
-    }
-    uint current = membership[node];
-    ulong degree = ulong(max(degree_values[node], 0l));
-    if (degree == 0ul || args.total_weight == 0ul) {
-        next_membership[node] = current;
-        return;
-    }
-    ulong current_weight = ulong(max(community_weights[current], 0l));
-    ulong current_adjusted = current_weight >= degree ? current_weight - degree : 0ul;
-    ulong nodes = ulong(args.node_count);
-    long signed_best = state[node];
-    if (signed_best < 0l || ulong(signed_best) >= nodes) {
-        next_membership[node] = current;
-        atomic_fetch_max_explicit(changed, 2u, memory_order_relaxed);
-        return;
-    }
-    uint best = uint(signed_best);
-    ulong best_link = ulong(max(state[nodes + node], 0l));
-    ulong current_link = ulong(max(state[nodes * 2ul + node], 0l));
-    ulong best_community = ulong(max(community_weights[best], 0l));
-    if (best == current) {
-        best_community = best_community >= degree ? best_community - degree : 0ul;
-    }
-    int improvement = ig_lv_compare_gain(
-        best_link, best_community, current_link, current_adjusted,
-        degree, args.total_weight);
-    uint proposal = best != current && improvement > 0 ? best : current;
-    next_membership[node] = proposal;
-    if (proposal != current) atomic_store_explicit(changed, 1u, memory_order_relaxed);
-}
-
-inline uint ig_lv_priority(uint node) {
-    uint value = node + 0x9e3779b9u;
-    value = (value ^ (value >> 16u)) * 0x85ebca6bu;
-    value = (value ^ (value >> 13u)) * 0xc2b2ae35u;
-    return value ^ (value >> 16u);
-}
-
-inline bool ig_lv_priority_before(uint left, uint right) {
-    uint left_priority = ig_lv_priority(left);
-    uint right_priority = ig_lv_priority(right);
-    return left_priority < right_priority
-        || (left_priority == right_priority && left < right);
-}
-
-kernel void ig_louvain_matching_initialize(
-    device const uint* active_nodes [[buffer(0)]],
-    device const uint* membership [[buffer(1)]],
-    device const uint* proposals [[buffer(2)]],
-    device uint* active_proposals [[buffer(3)]],
-    constant IgLouvainGraphArgs& args [[buffer(4)]],
-    uint node [[thread_position_in_grid]]) {
-    node += uint(args.work_offset);
-    if (ulong(node) >= args.work_offset + args.work_count) return;
-    if (node < args.node_count) active_proposals[node] = active_nodes[node] != 0u
-        && proposals[node] != membership[node] ? 1u : 0u;
-}
-
-kernel void ig_louvain_clear_u32_max(
-    device uint* values [[buffer(0)]],
-    constant IgLouvainGraphArgs& args [[buffer(1)]],
-    uint node [[thread_position_in_grid]]) {
-    node += uint(args.work_offset);
-    if (ulong(node) >= args.work_offset + args.work_count) return;
-    if (node < args.node_count) {
-        values[node] = IG_LV_INVALID_NODE;
-        values[ulong(args.node_count) + node] = IG_LV_INVALID_NODE;
-    }
-}
-
-// Exact deterministic `(hash priority, node)` endpoint minima without sorting 2N endpoint rows.
-// The second phase resolves the theoretically possible 32-bit hash collision by node ordinal.
-kernel void ig_louvain_matching_priority(
-    device const uint* active_proposals [[buffer(0)]],
-    device const uint* membership [[buffer(1)]],
-    device const uint* proposals [[buffer(2)]],
-    device atomic_uint* minimum_priority [[buffer(3)]],
-    constant IgLouvainGraphArgs& args [[buffer(4)]],
-    uint node [[thread_position_in_grid]]) {
-    node += uint(args.work_offset);
-    if (ulong(node) >= args.work_offset + args.work_count) return;
-    if (node >= args.node_count || active_proposals[node] == 0u) return;
-    uint priority = ig_lv_priority(node);
-    atomic_fetch_min_explicit(
-        minimum_priority + membership[node], priority, memory_order_relaxed);
-    atomic_fetch_min_explicit(
-        minimum_priority + proposals[node], priority, memory_order_relaxed);
-}
-
-kernel void ig_louvain_matching_minimum(
-    device const uint* active_proposals [[buffer(0)]],
-    device const uint* membership [[buffer(1)]],
-    device const uint* proposals [[buffer(2)]],
-    device const uint* minimum_priority [[buffer(3)]],
-    device atomic_uint* minimum_proposer [[buffer(4)]],
-    constant IgLouvainGraphArgs& args [[buffer(5)]],
-    uint node [[thread_position_in_grid]]) {
-    node += uint(args.work_offset);
-    if (ulong(node) >= args.work_offset + args.work_count) return;
-    if (node >= args.node_count || active_proposals[node] == 0u) return;
-    uint priority = ig_lv_priority(node);
-    uint current = membership[node];
-    uint target = proposals[node];
-    if (minimum_priority[current] == priority) {
-        atomic_fetch_min_explicit(minimum_proposer + current, node, memory_order_relaxed);
-    }
-    if (minimum_priority[target] == priority) {
-        atomic_fetch_min_explicit(minimum_proposer + target, node, memory_order_relaxed);
-    }
-}
-
-kernel void ig_louvain_matching_clear(
-    device atomic_uint* accepted [[buffer(0)]],
-    device atomic_uint* locked_communities [[buffer(1)]],
-    device atomic_uint* accepted_count [[buffer(2)]],
-    constant IgLouvainGraphArgs& args [[buffer(3)]],
-    uint node [[thread_position_in_grid]]) {
-    node += uint(args.work_offset);
-    if (ulong(node) >= args.work_offset + args.work_count) return;
-    if (node < args.node_count) {
-        atomic_store_explicit(accepted + node, 0u, memory_order_relaxed);
-        atomic_store_explicit(locked_communities + node, 0u, memory_order_relaxed);
-    }
-    if (node == 0u) atomic_store_explicit(accepted_count, 0u, memory_order_relaxed);
-}
-
-kernel void ig_louvain_matching_winners(
-    device const uint* active_proposals [[buffer(0)]],
-    device const uint* membership [[buffer(1)]],
-    device const uint* proposals [[buffer(2)]],
-    device const uint* minimum_proposer [[buffer(3)]],
-    device atomic_uint* accepted [[buffer(4)]],
-    device atomic_uint* locked_communities [[buffer(5)]],
-    device atomic_uint* accepted_count [[buffer(6)]],
-    constant IgLouvainGraphArgs& args [[buffer(7)]],
-    uint node [[thread_position_in_grid]]) {
-    node += uint(args.work_offset);
-    if (ulong(node) >= args.work_offset + args.work_count) return;
-    if (node >= args.node_count || active_proposals[node] == 0u) return;
-    uint current = membership[node];
-    uint target = proposals[node];
-    ulong proposer_base = ulong(args.node_count);
-    if (minimum_proposer[proposer_base + current] != node
-            || minimum_proposer[proposer_base + target] != node) return;
-    atomic_store_explicit(accepted + node, 1u, memory_order_relaxed);
-    atomic_store_explicit(locked_communities + current, 1u, memory_order_relaxed);
-    atomic_store_explicit(locked_communities + target, 1u, memory_order_relaxed);
-    atomic_fetch_add_explicit(accepted_count, 1u, memory_order_relaxed);
-}
-
-kernel void ig_louvain_matching_advance(
-    device const uint* active_proposals [[buffer(0)]],
-    device const uint* accumulated_accepted [[buffer(1)]],
-    device const uint* membership [[buffer(2)]],
-    device const uint* proposals [[buffer(3)]],
-    device const uint* round_accepted [[buffer(4)]],
-    device const uint* locked_communities [[buffer(5)]],
-    device uint* next_active [[buffer(6)]],
-    device uint* next_accumulated [[buffer(7)]],
-    constant IgLouvainGraphArgs& args [[buffer(8)]],
-    uint node [[thread_position_in_grid]]) {
-    node += uint(args.work_offset);
-    if (ulong(node) >= args.work_offset + args.work_count) return;
-    if (node >= args.node_count) return;
-    if (active_proposals[node] == 0u) {
-        next_active[node] = 0u;
-        next_accumulated[node] = accumulated_accepted[node];
-        return;
-    }
-    bool won = round_accepted[node] != 0u;
-    next_accumulated[node] = accumulated_accepted[node] | uint(won);
-    bool conflicts = locked_communities[membership[node]] != 0u
-        || locked_communities[proposals[node]] != 0u;
-    next_active[node] = active_proposals[node] != 0u && !won && !conflicts ? 1u : 0u;
-}
-
-kernel void ig_louvain_apply_matching(
-    device const uint* membership [[buffer(0)]],
-    device const uint* proposals [[buffer(1)]],
-    device const uint* accepted [[buffer(2)]],
-    device uint* next_membership [[buffer(3)]],
-    constant IgLouvainGraphArgs& args [[buffer(4)]],
-    uint node [[thread_position_in_grid]]) {
-    node += uint(args.work_offset);
-    if (ulong(node) >= args.work_offset + args.work_count) return;
-    if (node < args.node_count) next_membership[node] = accepted[node] != 0u
-        ? proposals[node] : membership[node];
-}
-
-kernel void ig_louvain_copy_community_weights(
-    device const long* community_weights [[buffer(0)]],
-    device long* next_community_weights [[buffer(1)]],
-    constant IgLouvainGraphArgs& args [[buffer(2)]],
-    uint node [[thread_position_in_grid]]) {
-    node += uint(args.work_offset);
-    if (ulong(node) >= args.work_offset + args.work_count) return;
-    if (node < args.node_count) next_community_weights[node] = community_weights[node];
-}
-
-// Accepted moves have disjoint source and target communities, so these exact I64 updates never
-// target the same row and require neither floating point nor scheduler-dependent atomics.
-kernel void ig_louvain_update_community_weights(
-    device const uint* membership [[buffer(0)]],
-    device const uint* proposals [[buffer(1)]],
-    device const uint* accepted [[buffer(2)]],
-    device const long* degree [[buffer(3)]],
-    device long* next_community_weights [[buffer(4)]],
-    constant IgLouvainGraphArgs& args [[buffer(5)]],
-    uint node [[thread_position_in_grid]]) {
-    node += uint(args.work_offset);
-    if (ulong(node) >= args.work_offset + args.work_count) return;
-    if (node >= args.node_count || accepted[node] == 0u) return;
-    uint current = membership[node];
-    uint target = proposals[node];
-    ulong node_degree = ulong(max(degree[node], 0l));
-    ulong current_weight = ulong(max(next_community_weights[current], 0l));
-    ulong target_weight = ulong(max(next_community_weights[target], 0l));
-    next_community_weights[current] = long(current_weight - node_degree);
-    next_community_weights[target] = long(target_weight + node_degree);
 }
 
 kernel void ig_louvain_active_clear(
@@ -1259,6 +975,11 @@ kernel void ig_louvain_csr_offsets(
     uint local [[thread_position_in_grid]]) {
     ulong node = args.work_offset + ulong(local);
     if (ulong(local) >= args.work_count || node > ulong(args.node_count)) return;
+    if (args.reduce_mode == 1u) {
+        reinterpret_cast<device ulong*>(offsets)[node] = ig_lv_lower_bound_high(
+            sorted_oriented_keys, args.oriented_capacity, uint(node));
+        return;
+    }
     if (node == ulong(args.node_count)) {
         offsets[node] = uint(args.total_weight);
         return;

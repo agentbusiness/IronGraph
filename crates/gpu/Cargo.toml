@@ -7,7 +7,7 @@ publish = false
 
 [features]
 default = ["accelerator"]
-accelerator = ["dep:candle-core", "dep:candle-metal-kernels", "dep:objc2-metal", "irongraph-graph/accelerator"]
+accelerator = ["dep:candle-core", "dep:candle-metal-kernels", "dep:objc2-metal", "dep:block2", "irongraph-graph/accelerator"]
 metal = ["accelerator"]
 cuda = ["accelerator", "candle-core/cuda"]
 
@@ -26,6 +26,8 @@ tokio-util = { version = "0.7.18", features = ["rt"] }
 uuid = { version = "1.19.0", features = ["serde", "v4", "v7"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+libc = "0.2"
+block2 = { version = "0.6.2", optional = true }
 candle-core = { workspace = true, optional = true, features = ["metal"] }
 candle-metal-kernels = { version = "0.11.0", optional = true }
 objc2-metal = { version = "0.3.2", optional = true }

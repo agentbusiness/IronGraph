@@ -39,18 +39,15 @@ inline IgPathCsrRow ig_path_csr_row(
     device const uint* overlay,
     uint overlay_count,
     uint row) {
-    uint low = 0u;
-    uint high = overlay_count;
-    while (low < high) {
-        uint middle = low + (high - low) / 2u;
-        uint candidate = overlay[middle];
-        if (candidate < row) low = middle + 1u;
-        else high = middle;
+    uint link = overlay_count == 0u ? 0u : overlay[1];
+    for (int shift = 31; shift >= 0 && link != 0u; --shift) {
+        if (link >= overlay[0]) { link = 0u; break; }
+        link = overlay[link * 2u + ((row >> uint(shift)) & 1u)];
     }
-    if (low < overlay_count && overlay[low] == row) {
+    if (link != 0u && link < overlay[0]) {
         return IgPathCsrRow{
-            overlay[overlay_count + low],
-            overlay[overlay_count + low + 1u],
+            overlay[link * 2u],
+            overlay[link * 2u + 1u],
             1u};
     }
     return IgPathCsrRow{offsets[row], offsets[row + 1u], 0u};
@@ -63,7 +60,7 @@ inline uint ig_path_csr_neighbor(
     IgPathCsrRow row,
     uint position) {
     return row.overlay == 0u ? neighbors[position]
-        : overlay[overlay_count * 2u + 1u + position];
+        : overlay[position * 2u];
 }
 
 inline uint ig_path_csr_edge(
@@ -73,8 +70,7 @@ inline uint ig_path_csr_edge(
     IgPathCsrRow row,
     uint position) {
     if (row.overlay == 0u) return edges[position];
-    uint payload_count = overlay[overlay_count * 2u];
-    return overlay[overlay_count * 2u + 1u + payload_count + position];
+    return overlay[position * 2u + 1u];
 }
 
 inline ulong ig_path_words_load(device const uint* words, uint row) {
@@ -269,7 +265,7 @@ kernel void ig_path_dfs_chunk(
                 IgPathCsrRow row = ig_path_csr_row(
                     outgoing_offsets, outgoing_overlay, args.overlay_count, shared_node);
                 uint bound = row.overlay == 0u ? args.adjacency_count
-                    : outgoing_overlay[args.overlay_count * 2u];
+                    : outgoing_overlay[0];
                 uint begin = row.begin;
                 shared_end = row.end;
                 if (shared_end < begin || shared_end > bound) {
@@ -433,7 +429,7 @@ kernel void ig_path_shortest_chunk(
                 IgPathCsrRow row = ig_path_csr_row(
                     outgoing_offsets, outgoing_overlay, args.overlay_count, shared_current);
                 uint bound = row.overlay == 0u ? args.adjacency_count
-                    : outgoing_overlay[args.overlay_count * 2u];
+                    : outgoing_overlay[0];
                 uint row_begin = row.begin;
                 shared_end = row.end;
                 uint saved_cursor = workspace[control + 6u];
@@ -659,7 +655,7 @@ kernel void ig_path_bfs_persistent_chunk(
             uint begin = row.begin;
             uint end = row.end;
             uint bound = row.overlay == 0u ? args.adjacency_count
-                : outgoing_overlay[args.overlay_count * 2u];
+                : outgoing_overlay[0];
             if (end < begin || end > bound) {
                 atomic_fetch_max_explicit(
                     (device atomic_uint*)(workspace + control + 2u),
@@ -759,6 +755,8 @@ struct IgPathDijkstraArgs {
     uint quantum;
     uint outgoing_overlay_count;
     uint incoming_overlay_count;
+    uint weight_base_kind;
+    uint weight_base_rows;
 };
 
 // Dijkstra workspace: distance bits[2N], present[N], frontier A[N], frontier B[N], snapshot
@@ -837,6 +835,8 @@ inline bool ig_path_decode_weight(
     device const uint* mixed_offsets,
     device const uchar* mixed_bytes,
     uint mixed_byte_count,
+    uint base_kind,
+    uint base_rows,
     thread ulong& output,
     thread uint& status) {
     uchar valid = validity[edge];
@@ -847,6 +847,21 @@ inline bool ig_path_decode_weight(
     if (valid == 0u) {
         status = IG_PATH_DIJKSTRA_QUERY_TYPE;
         return false;
+    }
+    if (weight_kind == 3u) {
+        uint begin = mixed_offsets[ulong(edge) * 2ul];
+        uint end = mixed_offsets[ulong(edge) * 2ul + 1ul];
+        if (end < begin || end > mixed_byte_count) {
+            status = IG_PATH_DIJKSTRA_CORRUPT_VALUE;
+            return false;
+        }
+        if (begin == end && base_kind != 0u) {
+            if (edge >= base_rows || base_kind > 2u) {
+                status = IG_PATH_DIJKSTRA_CORRUPT_VALUE;
+                return false;
+            }
+            weight_kind = base_kind;
+        }
     }
     if (weight_kind == 1u) {
         ulong raw = homogeneous_values[edge];
@@ -869,8 +884,8 @@ inline bool ig_path_decode_weight(
         return true;
     }
     if (weight_kind == 3u) {
-        uint begin = mixed_offsets[edge];
-        uint end = mixed_offsets[edge + 1u];
+        uint begin = mixed_offsets[ulong(edge) * 2ul];
+        uint end = mixed_offsets[ulong(edge) * 2ul + 1ul];
         if (end < begin || end > mixed_byte_count) {
             status = IG_PATH_DIJKSTRA_CORRUPT_VALUE;
             return false;
@@ -1058,7 +1073,7 @@ kernel void ig_path_dijkstra_heap_chunk(
                     shared_cursor = workspace[control + 7u];
                     shared_end = row.end;
                     uint bound = row.overlay == 0u ? args.adjacency_count
-                        : outgoing_overlay[args.outgoing_overlay_count * 2u];
+                        : outgoing_overlay[0];
                     if (shared_end < begin || shared_end > bound
                             || shared_cursor < begin || shared_cursor > shared_end) {
                         workspace[control + 2u] = IG_PATH_DIJKSTRA_CORRUPT_CSR;
@@ -1104,7 +1119,8 @@ kernel void ig_path_dijkstra_heap_chunk(
                         uint status = 0u;
                         if (ig_path_decode_weight(edge, args.weight_kind, homogeneous_values,
                                 weight_validity, mixed_offsets, mixed_bytes,
-                                args.weight_byte_count, weight, status)) {
+                                args.weight_byte_count, args.weight_base_kind,
+                                args.weight_base_rows, weight, status)) {
                             group_targets[lane] = target;
                             group_candidates[lane] = ig_path_f64_add_nonnegative(
                                 shared_source_distance, weight);
@@ -1246,15 +1262,21 @@ kernel void ig_path_dijkstra_relax(
     uint begin = row.begin;
     uint end = row.end;
     uint bound = row.overlay == 0u ? args.adjacency_count
-        : incoming_overlay[args.incoming_overlay_count * 2u];
+        : incoming_overlay[0];
     if (end < begin || end > bound) {
         atomic_fetch_max_explicit(
             (device atomic_uint*)(workspace + control + 2u),
             IG_PATH_DIJKSTRA_CORRUPT_CSR, memory_order_relaxed);
         return;
     }
-    begin = max(begin, edge_begin);
-    end = min(end, edge_end);
+    if (row.overlay != 0u) {
+        uint degree = end - begin;
+        end = begin + min(degree, edge_end);
+        begin += min(degree, edge_begin);
+    } else {
+        begin = max(begin, edge_begin);
+        end = min(end, edge_end);
+    }
     uint frontier = (round & 1u) == 0u
         ? ig_path_dijkstra_frontier_a(args.node_count)
         : ig_path_dijkstra_frontier_b(args.node_count);
@@ -1289,7 +1311,8 @@ kernel void ig_path_dijkstra_relax(
         ulong weight = 0ul;
         uint status = 0u;
         if (!ig_path_decode_weight(edge, args.weight_kind, homogeneous_values, weight_validity,
-                mixed_offsets, mixed_bytes, args.weight_byte_count, weight, status)) {
+                mixed_offsets, mixed_bytes, args.weight_byte_count, args.weight_base_kind,
+                args.weight_base_rows, weight, status)) {
             atomic_fetch_max_explicit(
                 (device atomic_uint*)(workspace + control + 2u), status, memory_order_relaxed);
             continue;
@@ -1379,14 +1402,20 @@ kernel void ig_path_dijkstra_finalize(
     uint begin = row.begin;
     uint end = row.end;
     uint bound = row.overlay == 0u ? args.adjacency_count
-        : incoming_overlay[args.incoming_overlay_count * 2u];
+        : incoming_overlay[0];
     if (end < begin || end > bound) {
         atomic_fetch_max_explicit((device atomic_uint*)(packet + packet_control),
             IG_PATH_DIJKSTRA_CORRUPT_CSR, memory_order_relaxed);
         return;
     }
-    begin = max(begin, edge_begin);
-    end = min(end, edge_end);
+    if (row.overlay != 0u) {
+        uint degree = end - begin;
+        end = begin + min(degree, edge_end);
+        begin += min(degree, edge_begin);
+    } else {
+        begin = max(begin, edge_begin);
+        end = min(end, edge_end);
+    }
     uint best = packet[packet_predecessor + target];
     for (uint position = begin; position < end; ++position) {
         uint edge = ig_path_csr_edge(
@@ -1413,7 +1442,8 @@ kernel void ig_path_dijkstra_finalize(
         ulong weight = 0ul;
         uint status = 0u;
         if (!ig_path_decode_weight(edge, args.weight_kind, homogeneous_values, weight_validity,
-                mixed_offsets, mixed_bytes, args.weight_byte_count, weight, status)) {
+                mixed_offsets, mixed_bytes, args.weight_byte_count, args.weight_base_kind,
+                args.weight_base_rows, weight, status)) {
             atomic_fetch_max_explicit((device atomic_uint*)(packet + packet_control), status, memory_order_relaxed);
             continue;
         }

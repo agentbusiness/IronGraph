@@ -1,6 +1,7 @@
 //! Typed structure-of-arrays columns and compact validity bitmaps.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, OnceLock},
 };
@@ -11,14 +12,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeSeq}
 use crate::{DocumentItem, Error, ErrorCode, Result, ScalarValue, types::PropertyId};
 
 use super::{
-    persistent::{ArenaSpan, PagedArena, PagedVec, PersistentMap},
+    persistent::{PagedVec, PersistentMap},
     shared::SharedFlat,
 };
 
 use crate::document::{DocumentRoot, validate_canonical};
-
-pub const DOCUMENT_SEAL_MIN_GARBAGE_BYTES: usize = 64 * 1_024;
-const DOCUMENT_SEAL_LIVE_FRACTION: usize = 4;
 
 const MIXED_BOOLEAN: u8 = 1;
 const MIXED_INTEGER: u8 = 2;
@@ -50,6 +48,13 @@ pub struct Validity {
 }
 
 impl Validity {
+    fn nulls(len: usize) -> Self {
+        Self {
+            words: PagedVec::repeat(0, len.div_ceil(u64::BITS as usize)),
+            len,
+        }
+    }
+
     #[cfg_attr(
         not(all(feature = "accelerator", any(target_os = "macos", target_os = "ios"))),
         allow(dead_code)
@@ -142,9 +147,16 @@ impl Validity {
     /// Byte-per-row mask used directly by accelerator kernels during project admission.
     #[must_use]
     pub fn to_byte_mask(&self) -> Vec<u8> {
-        (0..self.len)
-            .map(|row| u8::from(self.is_present(row)))
-            .collect()
+        let mut mask = Vec::with_capacity(self.len);
+        for word in self
+            .words()
+            .chain(std::iter::repeat(0))
+            .take(self.len.div_ceil(u64::BITS as usize))
+        {
+            let bits = (self.len - mask.len()).min(u64::BITS as usize);
+            mask.extend((0..bits).map(|bit| ((word >> bit) & 1) as u8));
+        }
+        mask
     }
 
     fn validate(&self) -> Result<()> {
@@ -314,6 +326,12 @@ impl Dictionary {
         self.values.values()
     }
 
+    /// Total encoded bytes, without requesting a flattened dictionary image.
+    #[must_use]
+    pub fn byte_len(&self) -> usize {
+        self.values.live_values
+    }
+
     #[must_use]
     pub fn estimated_bytes(&self) -> usize {
         self.values.estimated_bytes()
@@ -389,13 +407,13 @@ fn dictionary_key_hash(value: &str) -> u128 {
 /// Offset/child storage for compact variable-width row lists.
 #[derive(Debug)]
 pub struct PackedLists<T> {
-    /// Immutable accelerator-owned base. Mutations never rewrite it; they append into `arena`
-    /// and replace only one bounded row descriptor in `overrides`.
+    /// Immutable accelerator-owned base. Mutations replace one shared row payload descriptor;
+    /// superseded owned payloads are released as soon as their last generation is dropped.
     base: Option<SharedPackedBase<T>>,
-    spans: PagedVec<ArenaSpan>,
-    arena: PagedArena<T>,
-    overrides: PersistentMap<ArenaSpan>,
+    spans: PagedVec<Arc<Vec<T>>>,
+    overrides: PersistentMap<Arc<Vec<T>>>,
     live_values: usize,
+    owned_values: usize,
     flat: OnceLock<FlatLists<T>>,
 }
 
@@ -403,6 +421,7 @@ pub struct PackedLists<T> {
 struct SharedPackedBase<T> {
     offsets: SharedFlat<u32>,
     values: SharedFlat<T>,
+    interleaved: bool,
 }
 
 #[derive(Debug)]
@@ -422,9 +441,9 @@ impl<T> Default for PackedLists<T> {
         Self {
             base: None,
             spans: PagedVec::default(),
-            arena: PagedArena::default(),
             overrides: PersistentMap::default(),
             live_values: 0,
+            owned_values: 0,
             flat: OnceLock::new(),
         }
     }
@@ -435,9 +454,9 @@ impl<T: Clone> Clone for PackedLists<T> {
         Self {
             base: self.base.clone(),
             spans: self.spans.clone(),
-            arena: self.arena.clone(),
             overrides: self.overrides.clone(),
             live_values: self.live_values,
+            owned_values: self.owned_values,
             flat: OnceLock::new(),
         }
     }
@@ -453,6 +472,13 @@ impl<T: Clone + PartialEq> PartialEq for PackedLists<T> {
 impl<T: Clone + Eq> Eq for PackedLists<T> {}
 
 impl<T: Clone> PackedLists<T> {
+    fn empty_rows(rows: usize) -> Self {
+        Self {
+            spans: PagedVec::repeat(Arc::new(Vec::new()), rows),
+            ..Self::default()
+        }
+    }
+
     /// Rebinds the complete immutable row/value base to accelerator-owned flat allocations.
     /// Checkpoint serialization remains the same offsets-plus-values wire format.
     #[cfg_attr(
@@ -474,11 +500,59 @@ impl<T: Clone> PackedLists<T> {
                 "shared packed-list offsets are invalid",
             ));
         }
-        self.base = Some(SharedPackedBase { offsets, values });
+        self.base = Some(SharedPackedBase {
+            offsets,
+            values,
+            interleaved: false,
+        });
         self.spans = PagedVec::default();
-        self.arena = PagedArena::default();
         self.overrides = PersistentMap::default();
         self.live_values = self.base.as_ref().map_or(0, |base| base.values.len());
+        self.owned_values = 0;
+        self.flat = OnceLock::new();
+        Ok(())
+    }
+
+    /// Admits independent start/end pairs over one immutable shared payload allocation. This
+    /// cold-build operation validates descriptors, then shares their existing bytes directly.
+    pub fn rebase_shared_spans(
+        &mut self,
+        offsets: SharedFlat<u32>,
+        values: SharedFlat<T>,
+    ) -> Result<()> {
+        if !offsets.len().is_multiple_of(2) {
+            return Err(Error::new(
+                ErrorCode::CorruptStorage,
+                "shared row spans have an odd descriptor count",
+            ));
+        }
+        let mut live_values = 0_usize;
+        for pair in offsets.as_slice().chunks_exact(2) {
+            if pair[0] > pair[1] || pair[1] as usize > values.len() {
+                return Err(Error::new(
+                    ErrorCode::CorruptStorage,
+                    "shared row span is outside its payload",
+                ));
+            }
+            live_values = live_values
+                .checked_add((pair[1] - pair[0]) as usize)
+                .filter(|len| *len <= u32::MAX as usize)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorCode::ResultBudgetExceeded,
+                        "shared row payload exhausted",
+                    )
+                })?;
+        }
+        self.base = Some(SharedPackedBase {
+            offsets,
+            values,
+            interleaved: true,
+        });
+        self.spans = PagedVec::default();
+        self.overrides = PersistentMap::default();
+        self.live_values = live_values;
+        self.owned_values = 0;
         self.flat = OnceLock::new();
         Ok(())
     }
@@ -500,7 +574,8 @@ impl<T: Clone> PackedLists<T> {
         let previous_offset_len = base.offsets.len();
         let previous_value_len = base.values.len();
         let offset_slice = offsets.as_slice();
-        if previous_offset_len == 0
+        if base.interleaved
+            || previous_offset_len == 0
             || offset_slice.len() <= previous_offset_len
             || offset_slice.len() != self.rows().saturating_add(1)
             || values.len() != self.live_values
@@ -518,11 +593,15 @@ impl<T: Clone> PackedLists<T> {
                 "shared packed-list extension is invalid",
             ));
         }
-        self.base = Some(SharedPackedBase { offsets, values });
+        self.base = Some(SharedPackedBase {
+            offsets,
+            values,
+            interleaved: false,
+        });
         self.spans = PagedVec::default();
-        self.arena = PagedArena::default();
         self.overrides = PersistentMap::default();
         self.live_values = self.base.as_ref().map_or(0, |base| base.values.len());
+        self.owned_values = 0;
         self.flat = OnceLock::new();
         Ok(())
     }
@@ -530,12 +609,20 @@ impl<T: Clone> PackedLists<T> {
     fn base_rows(&self) -> usize {
         self.base
             .as_ref()
-            .and_then(|base| base.offsets.len().checked_sub(1))
+            .map(|base| {
+                if base.interleaved {
+                    base.offsets.len() / 2
+                } else {
+                    base.offsets.len().saturating_sub(1)
+                }
+            })
             .unwrap_or(0)
     }
 
     fn shared_base_is_pristine(&self) -> bool {
-        self.base.is_some() && self.spans.is_empty() && self.overrides.len() == 0
+        self.base.as_ref().is_some_and(|base| !base.interleaved)
+            && self.spans.is_empty()
+            && self.overrides.len() == 0
     }
 
     pub fn validate_push_len(&self, additional: usize) -> Result<()> {
@@ -555,12 +642,9 @@ impl<T: Clone> PackedLists<T> {
         let values = values.into_iter().collect::<Vec<_>>();
         self.validate_push_len(values.len())?;
         let len = values.len();
-        let span = self
-            .arena
-            .append(values)
-            .map_err(|message| Error::new(ErrorCode::ResultBudgetExceeded, message))?;
-        self.spans.push(span);
+        self.spans.push(Arc::new(values));
         self.live_values += len;
+        self.owned_values += len;
         self.flat = OnceLock::new();
         Ok(())
     }
@@ -576,18 +660,18 @@ impl<T: Clone> PackedLists<T> {
         let previous = if row < base_rows {
             self.overrides
                 .get(row as u128)
-                .copied()
-                .map(|span| span.len as usize)
+                .map(|values| values.len())
                 .or_else(|| {
                     let base = self.base.as_ref()?;
                     let offsets = base.offsets.as_slice();
-                    Some((offsets[row + 1] - offsets[row]) as usize)
+                    let index = if base.interleaved { row * 2 } else { row };
+                    Some((offsets[index + 1] - offsets[index]) as usize)
                 })
                 .ok_or_else(|| Error::invalid_data("packed-list row is out of bounds"))?
         } else {
             self.spans
                 .get(row - base_rows)
-                .map(|span| span.len as usize)
+                .map(|values| values.len())
                 .ok_or_else(|| Error::invalid_data("packed-list row is out of bounds"))?
         };
         let replacement = values.into_iter().collect::<Vec<_>>();
@@ -599,16 +683,21 @@ impl<T: Clone> PackedLists<T> {
             .ok_or_else(|| Error::new(ErrorCode::ResultBudgetExceeded, "packed list exhausted"))?;
         u32::try_from(final_len)
             .map_err(|_| Error::new(ErrorCode::ResultBudgetExceeded, "packed list exhausted"))?;
-        let span = self
-            .arena
-            .append(replacement)
-            .map_err(|message| Error::new(ErrorCode::ResultBudgetExceeded, message))?;
-        if row < base_rows {
-            self.overrides.insert(row as u128, span);
+        let previous_owned = if row < base_rows {
+            self.overrides
+                .get(row as u128)
+                .map_or(0, |values| values.len())
         } else {
-            self.spans[row - base_rows] = span;
+            previous
+        };
+        if row < base_rows {
+            self.overrides
+                .insert_cow(row as u128, Arc::new(replacement));
+        } else {
+            self.spans[row - base_rows] = Arc::new(replacement);
         }
         self.live_values = final_len;
+        self.owned_values = self.owned_values - previous_owned + replacement_len;
         self.flat = OnceLock::new();
         Ok(())
     }
@@ -618,21 +707,48 @@ impl<T: Clone> PackedLists<T> {
         let row = row as usize;
         let base_rows = self.base_rows();
         if row < base_rows {
-            if let Some(span) = self.overrides.get(row as u128).copied() {
-                return self.arena.get(span);
+            if let Some(values) = self.overrides.get(row as u128) {
+                return Some(values.as_slice());
             }
             let base = self.base.as_ref()?;
             let offsets = base.offsets.as_slice();
-            let start = offsets[row] as usize;
-            let end = offsets[row + 1] as usize;
+            let index = if base.interleaved { row * 2 } else { row };
+            let start = offsets[index] as usize;
+            let end = offsets[index + 1] as usize;
             return base.values.as_slice().get(start..end);
         }
-        self.arena.get(*self.spans.get(row - base_rows)?)
+        self.spans
+            .get(row - base_rows)
+            .map(|values| values.as_slice())
     }
 
     #[must_use]
     pub fn rows(&self) -> usize {
         self.base_rows().saturating_add(self.spans.len())
+    }
+
+    /// Borrows row payloads in dense order without flattening shared or changed rows.
+    pub fn iter(&self) -> impl Iterator<Item = &[T]> {
+        let (offsets, values, stride) = self.base.as_ref().map_or((&[][..], &[][..], 1), |base| {
+            (
+                base.offsets.as_slice(),
+                base.values.as_slice(),
+                if base.interleaved { 2 } else { 1 },
+            )
+        });
+        let shared = (0..self.base_rows()).map(move |row| {
+            self.overrides.get(row as u128).map_or_else(
+                || &values[offsets[row * stride] as usize..offsets[row * stride + 1] as usize],
+                |replacement| replacement.as_slice(),
+            )
+        });
+        shared.chain(self.spans.iter().map(|values| values.as_slice()))
+    }
+
+    /// Sum of live row widths; reading it never flattens or scans the rows.
+    #[must_use]
+    pub fn live_value_len(&self) -> usize {
+        self.live_values
     }
 
     #[must_use]
@@ -666,55 +782,9 @@ impl<T: Clone> PackedLists<T> {
         base.saturating_add(
             self.spans
                 .len()
-                .saturating_mul(size_of::<ArenaSpan>())
-                .saturating_add(self.arena.estimated_bytes()),
+                .saturating_mul(size_of::<Arc<Vec<T>>>())
+                .saturating_add(self.owned_values.saturating_mul(size_of::<T>())),
         )
-    }
-
-    #[must_use]
-    fn garbage_bytes(&self) -> usize {
-        let delta_live = self
-            .spans
-            .iter()
-            .map(|span| span.len as usize)
-            .chain(self.overrides.iter().map(|(_, span)| span.len as usize))
-            .fold(0_usize, usize::saturating_add);
-        self.arena
-            .elements()
-            .saturating_sub(delta_live)
-            .saturating_mul(size_of::<T>())
-    }
-
-    #[must_use]
-    fn needs_seal(&self) -> bool {
-        let garbage = self.garbage_bytes();
-        let live_threshold = self
-            .live_values
-            .saturating_mul(size_of::<T>())
-            .div_ceil(DOCUMENT_SEAL_LIVE_FRACTION);
-        garbage >= DOCUMENT_SEAL_MIN_GARBAGE_BYTES && garbage >= live_threshold
-    }
-
-    fn seal(&mut self, validity: &Validity) -> Result<()> {
-        if validity.len() != self.rows() {
-            return Err(Error::new(
-                ErrorCode::CorruptStorage,
-                "document validity and packed rows differ",
-            ));
-        }
-        let mut sealed = Self::default();
-        for row in 0..self.rows() {
-            if validity.is_present(row) {
-                let values = self.get(row as u32).ok_or_else(|| {
-                    Error::new(ErrorCode::CorruptStorage, "document row span is invalid")
-                })?;
-                sealed.push(values.iter().cloned())?;
-            } else {
-                sealed.push(std::iter::empty())?;
-            }
-        }
-        *self = sealed;
-        Ok(())
     }
 
     fn flattened(&self) -> &FlatLists<T> {
@@ -776,33 +846,138 @@ where
 }
 
 /// One flat byte range per row with checkpoint-compatible sequence serialization.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ByteValues(PackedLists<u8>);
+#[derive(Debug, Default)]
+pub struct ByteValues {
+    rows: PackedLists<u8>,
+    live_bytes: usize,
+    typed_base: Option<Arc<MixedTypedBase>>,
+    replaced: PersistentMap<()>,
+    flat: OnceLock<FlatLists<u8>>,
+}
+
+#[derive(Debug)]
+struct MixedTypedBase {
+    column: TypedColumn,
+    strings: Dictionary,
+}
+
+impl Clone for ByteValues {
+    fn clone(&self) -> Self {
+        Self {
+            rows: self.rows.clone(),
+            live_bytes: self.live_bytes,
+            typed_base: self.typed_base.clone(),
+            replaced: self.replaced.clone(),
+            flat: OnceLock::new(),
+        }
+    }
+}
+
+impl PartialEq for ByteValues {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for ByteValues {}
 
 impl ByteValues {
+    /// Shares an accelerator-owned independent row-span image without copying payload bytes.
+    pub fn rebase_shared_spans(
+        &mut self,
+        offsets: SharedFlat<u32>,
+        values: SharedFlat<u8>,
+    ) -> Result<()> {
+        self.rows.rebase_shared_spans(offsets, values)?;
+        self.live_bytes = self.rows.live_value_len();
+        self.typed_base = None;
+        self.replaced = PersistentMap::default();
+        self.flat = OnceLock::new();
+        Ok(())
+    }
+
+    /// The immutable homogeneous lane retained by a type promotion. Row overrides are tagged
+    /// payloads; unchanged rows still resolve through this lane without a conversion pass.
+    pub fn typed_base(&self) -> Option<(&TypedColumn, &Dictionary)> {
+        self.typed_base
+            .as_ref()
+            .map(|base| (&base.column, &base.strings))
+    }
+
+    /// Returns true for rows whose tagged payload supersedes the retained typed base.
+    pub fn is_override(&self, row: usize) -> bool {
+        self.typed_base
+            .as_ref()
+            .is_none_or(|base| row >= base.column.len())
+            || self.replaced.contains_key(row as u128)
+    }
+
+    /// Enumerates explicitly changed rows, independent of the original typed column length.
+    pub fn override_rows(&self) -> impl Iterator<Item = usize> + '_ {
+        self.replaced.iter().map(|(row, ())| row as usize)
+    }
+
     fn validate_push_len(&self, additional: usize) -> Result<()> {
-        self.0.validate_push_len(additional)
+        self.live_bytes
+            .checked_add(additional)
+            .filter(|length| *length <= u32::MAX as usize)
+            .map(|_| ())
+            .ok_or_else(|| Error::new(ErrorCode::ResultBudgetExceeded, "byte column exhausted"))
     }
 
     fn push(&mut self, value: &[u8]) -> Result<()> {
-        self.0.push(value.iter().copied())
+        self.validate_push_len(value.len())?;
+        self.rows.push(value.iter().copied())?;
+        self.live_bytes += value.len();
+        self.flat = OnceLock::new();
+        Ok(())
     }
 
     fn replace(&mut self, row: u32, value: &[u8]) -> Result<()> {
-        self.0.replace(row, value.iter().copied())
+        let previous = self
+            .get(row as usize)
+            .ok_or_else(|| Error::invalid_data("byte row is out of bounds"))?
+            .len();
+        let next = self
+            .live_bytes
+            .checked_sub(previous)
+            .and_then(|length| length.checked_add(value.len()))
+            .filter(|length| *length <= u32::MAX as usize)
+            .ok_or_else(|| Error::new(ErrorCode::ResultBudgetExceeded, "byte column exhausted"))?;
+        self.rows.replace(row, value.iter().copied())?;
+        self.live_bytes = next;
+        if self.typed_base.is_some() {
+            self.replaced.insert_cow(row as u128, ());
+        }
+        self.flat = OnceLock::new();
+        Ok(())
     }
 
     #[must_use]
-    pub fn get(&self, row: usize) -> Option<&[u8]> {
-        self.0.get(row as u32)
+    pub fn get(&self, row: usize) -> Option<Cow<'_, [u8]>> {
+        if let Some(base) = self.typed_base.as_ref()
+            && row < base.column.len()
+            && !self.replaced.contains_key(row as u128)
+        {
+            let value = base.column.get(row, &base.strings)?;
+            return mixed_payload(&value)
+                .ok()
+                .map(|value| Cow::Owned(value.unwrap_or_default()));
+        }
+        self.rows.get(row as u32).map(Cow::Borrowed)
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.0.rows()
+        self.rows.rows()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &[u8]> {
+    /// Encoded payload bytes, including a lazily retained typed base, without flattening.
+    pub fn live_value_len(&self) -> usize {
+        self.live_bytes
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = Cow<'_, [u8]>> {
         (0..self.len()).filter_map(|row| self.get(row))
     }
 
@@ -811,7 +986,11 @@ impl ByteValues {
         allow(dead_code)
     )]
     pub fn offsets(&self) -> &[u32] {
-        self.0.offsets()
+        if self.typed_base.is_some() {
+            &self.flattened().offsets
+        } else {
+            self.rows.offsets()
+        }
     }
 
     #[cfg_attr(
@@ -819,7 +998,11 @@ impl ByteValues {
         allow(dead_code)
     )]
     pub fn values(&self) -> &[u8] {
-        self.0.values()
+        if self.typed_base.is_some() {
+            &self.flattened().values
+        } else {
+            self.rows.values()
+        }
     }
 
     #[cfg_attr(
@@ -831,53 +1014,55 @@ impl ByteValues {
         offsets: SharedFlat<u32>,
         values: SharedFlat<u8>,
     ) -> Result<()> {
-        self.0.rebase_shared(offsets, values)
+        self.rows.rebase_shared(offsets, values)?;
+        self.live_bytes = self.rows.live_value_len();
+        self.typed_base = None;
+        self.replaced = PersistentMap::default();
+        self.flat = OnceLock::new();
+        Ok(())
     }
 
     #[must_use]
     fn estimated_bytes(&self) -> usize {
-        self.0.estimated_bytes()
+        self.rows.estimated_bytes().saturating_add(
+            self.typed_base
+                .as_ref()
+                .map_or(0, |base| base.column.estimated_bytes()),
+        )
     }
 
-    fn needs_seal(&self) -> bool {
-        self.0.needs_seal()
-    }
-
-    fn seal(&mut self) -> Result<()> {
-        let mut sealed = Self::default();
-        for row in 0..self.len() {
-            let value = self.get(row).ok_or_else(|| {
-                Error::new(ErrorCode::CorruptStorage, "byte column row span is invalid")
-            })?;
-            sealed.push(value)?;
-        }
-        *self = sealed;
-        Ok(())
+    fn flattened(&self) -> &FlatLists<u8> {
+        self.flat.get_or_init(|| {
+            let mut offsets = Vec::with_capacity(self.len().saturating_add(1));
+            let mut values = Vec::new();
+            offsets.push(0);
+            for row in self.iter() {
+                values.extend_from_slice(&row);
+                offsets.push(values.len() as u32);
+            }
+            FlatLists { offsets, values }
+        })
     }
 
     #[cfg(test)]
     fn storage_bytes(&self) -> (usize, usize) {
-        (
-            self.0.arena.estimated_bytes(),
-            self.0.live_values.saturating_mul(size_of::<u8>()),
-        )
+        (self.rows.owned_values, self.rows.live_values)
     }
 
     #[cfg(test)]
     fn detached_storage_bytes_from(&self, previous: &Self) -> usize {
-        self.0
+        self.rows
             .spans
-            .detached_page_bytes_from(&previous.0.spans)
+            .detached_page_bytes_from(&previous.rows.spans)
             .saturating_add(
-                self.0
-                    .arena
-                    .estimated_bytes()
-                    .saturating_sub(previous.0.arena.estimated_bytes()),
+                self.rows
+                    .owned_values
+                    .saturating_sub(previous.rows.owned_values),
             )
             .saturating_add(
-                self.0
+                self.rows
                     .overrides
-                    .detached_node_bytes_from(&previous.0.overrides),
+                    .detached_node_bytes_from(&previous.rows.overrides),
             )
     }
 }
@@ -889,7 +1074,7 @@ impl Serialize for ByteValues {
     {
         let mut sequence = serializer.serialize_seq(Some(self.len()))?;
         for value in self.iter() {
-            sequence.serialize_element(value)?;
+            sequence.serialize_element(&value)?;
         }
         sequence.end()
     }
@@ -976,6 +1161,24 @@ fn validate_property_value_shape(value: &ScalarValue) -> Result<()> {
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+fn mixed_payload_len(value: &ScalarValue) -> usize {
+    match value {
+        ScalarValue::Null => 0,
+        ScalarValue::Boolean(_) => 2,
+        ScalarValue::Integer(_)
+        | ScalarValue::Float(_)
+        | ScalarValue::Date(_)
+        | ScalarValue::LocalTime(_) => 9,
+        ScalarValue::String(value) => 1 + value.len(),
+        ScalarValue::Bytes(value) => 1 + value.len(),
+        ScalarValue::ZonedTime { .. } | ScalarValue::LocalDateTime { .. } => 13,
+        ScalarValue::ZonedDateTime { timezone, .. } => 13 + timezone.len(),
+        ScalarValue::Duration { .. } => 29,
+        ScalarValue::List(value) => 1 + value.as_bytes().len(),
+        ScalarValue::Map(value) => 1 + value.as_bytes().len(),
     }
 }
 
@@ -1466,28 +1669,18 @@ impl TypedColumn {
         Ok(())
     }
 
-    fn into_mixed(&self, strings: &Dictionary) -> Result<Self> {
-        self.validate(strings)?;
-        let mut values = ByteValues::default();
-        let mut validity = Validity::default();
-        for row in 0..self.len() {
-            let value = self.get(row, strings).ok_or_else(|| {
-                Error::new(
-                    ErrorCode::CorruptStorage,
-                    "typed property row cannot be materialized during mixed promotion",
-                )
-            })?;
-            match mixed_payload(&value)? {
-                Some(payload) => {
-                    values.push(&payload)?;
-                    validity.push(true)?;
-                }
-                None => {
-                    values.push(&[])?;
-                    validity.push(false)?;
-                }
-            }
-        }
+    fn into_mixed(&self, strings: &Dictionary, live_bytes: usize) -> Result<Self> {
+        let values = ByteValues {
+            rows: PackedLists::empty_rows(self.len()),
+            live_bytes,
+            typed_base: Some(Arc::new(MixedTypedBase {
+                column: self.clone(),
+                strings: strings.clone(),
+            })),
+            replaced: PersistentMap::default(),
+            flat: OnceLock::new(),
+        };
+        let validity = self.validity().clone();
         Ok(Self::Bytes { values, validity })
     }
 
@@ -1509,7 +1702,7 @@ impl TypedColumn {
                 Error::new(ErrorCode::CorruptStorage, "mixed property row is absent")
             })?;
             if validity.is_present(row) {
-                if matches!(mixed_value(payload)?, ScalarValue::Null) {
+                if matches!(mixed_value(&payload)?, ScalarValue::Null) {
                     return Err(Error::new(
                         ErrorCode::CorruptStorage,
                         "mixed property stores NULL as a present value",
@@ -1595,7 +1788,7 @@ impl TypedColumn {
         if !validity.is_present(row) {
             return Some(Ok(ScalarValue::Null));
         }
-        Some(mixed_value(values.get(row)?))
+        Some(mixed_value(&values.get(row)?))
     }
 
     fn with_value(
@@ -1603,7 +1796,13 @@ impl TypedColumn {
         preceding_nulls: usize,
         strings: &mut Dictionary,
     ) -> Result<Self> {
-        let mut column = match value {
+        let mut column = Self::with_nulls(value, preceding_nulls)?;
+        column.push(value, strings)?;
+        Ok(column)
+    }
+
+    fn with_nulls(value: &ScalarValue, rows: usize) -> Result<Self> {
+        let column = match value {
             ScalarValue::Null => {
                 return Err(Error::new(
                     ErrorCode::QueryType,
@@ -1611,69 +1810,68 @@ impl TypedColumn {
                 ));
             }
             ScalarValue::Boolean(_) => Self::Boolean {
-                values: PagedVec::default(),
-                validity: Validity::default(),
+                values: PagedVec::repeat(false, rows),
+                validity: Validity::nulls(rows),
             },
             ScalarValue::Integer(_) => Self::Integer {
-                values: PagedVec::default(),
-                validity: Validity::default(),
+                values: PagedVec::repeat(0, rows),
+                validity: Validity::nulls(rows),
             },
             ScalarValue::Float(_) => Self::Float {
-                values: PagedVec::default(),
-                validity: Validity::default(),
+                values: PagedVec::repeat(OrderedFloat(0.0), rows),
+                validity: Validity::nulls(rows),
             },
             ScalarValue::String(_) => Self::String {
-                values: PagedVec::default(),
-                validity: Validity::default(),
+                values: PagedVec::repeat(0, rows),
+                validity: Validity::nulls(rows),
             },
             ScalarValue::Bytes(_) => Self::Bytes {
-                values: ByteValues::default(),
-                validity: Validity::default(),
+                values: ByteValues {
+                    rows: PackedLists::empty_rows(rows),
+                    ..ByteValues::default()
+                },
+                validity: Validity::nulls(rows),
             },
             ScalarValue::Date(_) => Self::Date {
-                values: PagedVec::default(),
-                validity: Validity::default(),
+                values: PagedVec::repeat(0, rows),
+                validity: Validity::nulls(rows),
             },
             ScalarValue::LocalTime(_) => Self::LocalTime {
-                values: PagedVec::default(),
-                validity: Validity::default(),
+                values: PagedVec::repeat(0, rows),
+                validity: Validity::nulls(rows),
             },
             ScalarValue::ZonedTime { .. } => Self::ZonedTime {
-                nanos: PagedVec::default(),
-                offsets: PagedVec::default(),
-                validity: Validity::default(),
+                nanos: PagedVec::repeat(0, rows),
+                offsets: PagedVec::repeat(0, rows),
+                validity: Validity::nulls(rows),
             },
             ScalarValue::LocalDateTime { .. } => Self::LocalDateTime {
-                seconds: PagedVec::default(),
-                nanos: PagedVec::default(),
-                validity: Validity::default(),
+                seconds: PagedVec::repeat(0, rows),
+                nanos: PagedVec::repeat(0, rows),
+                validity: Validity::nulls(rows),
             },
             ScalarValue::ZonedDateTime { .. } => Self::ZonedDateTime {
-                seconds: PagedVec::default(),
-                nanos: PagedVec::default(),
-                timezones: PagedVec::default(),
-                validity: Validity::default(),
+                seconds: PagedVec::repeat(0, rows),
+                nanos: PagedVec::repeat(0, rows),
+                timezones: PagedVec::repeat(0, rows),
+                validity: Validity::nulls(rows),
             },
             ScalarValue::Duration { .. } => Self::Duration {
-                months: PagedVec::default(),
-                days: PagedVec::default(),
-                seconds: PagedVec::default(),
-                nanos: PagedVec::default(),
-                validity: Validity::default(),
+                months: PagedVec::repeat(0, rows),
+                days: PagedVec::repeat(0, rows),
+                seconds: PagedVec::repeat(0, rows),
+                nanos: PagedVec::repeat(0, rows),
+                validity: Validity::nulls(rows),
             },
             ScalarValue::List(_) => Self::List {
-                values: PackedLists::default(),
-                validity: Validity::default(),
+                values: PackedLists::empty_rows(rows),
+                validity: Validity::nulls(rows),
             },
             ScalarValue::Map(_) => Self::Map {
-                values: PackedLists::default(),
-                validity: Validity::default(),
+                values: PackedLists::empty_rows(rows),
+                validity: Validity::nulls(rows),
             },
         };
-        for _ in 0..preceding_nulls {
-            column.push_null()?;
-        }
-        column.push(value, strings)?;
         Ok(column)
     }
 
@@ -1883,6 +2081,9 @@ impl TypedColumn {
         }
         if matches!(value, ScalarValue::Null) {
             match self {
+                Self::Bytes { values, .. } => {
+                    values.replace(row as u32, &[])?;
+                }
                 Self::List { values, .. } | Self::Map { values, .. } => {
                     values.replace(row as u32, std::iter::empty())?;
                 }
@@ -2153,28 +2354,11 @@ impl TypedColumn {
         validity.saturating_add(values)
     }
 
-    #[must_use]
-    fn document_needs_seal(&self) -> bool {
-        match self {
-            Self::List { values, .. } | Self::Map { values, .. } => values.needs_seal(),
-            _ => false,
-        }
-    }
-
-    fn seal_document(&mut self) -> Result<()> {
-        match self {
-            Self::List { values, validity } | Self::Map { values, validity } => {
-                values.seal(validity)
-            }
-            _ => Ok(()),
-        }
-    }
-
     #[cfg(test)]
     fn document_storage_bytes(&self) -> Option<(usize, usize)> {
         match self {
             Self::List { values, .. } | Self::Map { values, .. } => Some((
-                values.arena.estimated_bytes(),
+                values.owned_values.saturating_mul(size_of::<u8>()),
                 values.live_values.saturating_mul(size_of::<u8>()),
             )),
             _ => None,
@@ -2218,6 +2402,7 @@ pub struct PropertyColumns {
     columns: BTreeMap<PropertyId, Arc<TypedColumn>>,
     strings: Arc<Dictionary>,
     mixed: BTreeSet<PropertyId>,
+    tagged_bytes: PersistentMap<usize>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2274,32 +2459,84 @@ impl<'de> Deserialize<'de> for PropertyColumns {
                 mixed.insert(*property);
             }
         }
-        let columns = Self {
+        let mut columns = Self {
             rows: wire.rows,
             columns: wire.columns,
             strings: wire.strings,
             mixed,
+            tagged_bytes: PersistentMap::default(),
         };
         columns.validate().map_err(serde::de::Error::custom)?;
+        for property in columns.columns.keys().copied() {
+            let bytes = (0..columns.rows).try_fold(0_usize, |bytes, row| {
+                bytes
+                    .checked_add(
+                        columns
+                            .get(row as u32, property)
+                            .as_ref()
+                            .map_or(0, mixed_payload_len),
+                    )
+                    .ok_or_else(|| serde::de::Error::custom("property payload size exhausted"))
+            })?;
+            columns.tagged_bytes.insert_cow(property.0 as u128, bytes);
+        }
         Ok(columns)
     }
 }
 
 impl PropertyColumns {
     pub fn push_row(&mut self, values: &[(PropertyId, ScalarValue)]) -> Result<()> {
+        let sizes = values
+            .iter()
+            .map(|(property, value)| {
+                let bytes = self
+                    .tagged_bytes
+                    .get(property.0 as u128)
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(mixed_payload_len(value))
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorCode::ResultBudgetExceeded,
+                            "property payload size exhausted",
+                        )
+                    })?;
+                Ok((*property, bytes))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.push_row_inner(values)?;
+        for (property, bytes) in sizes {
+            if self.columns.contains_key(&property) {
+                self.tagged_bytes.insert_cow(property.0 as u128, bytes);
+            }
+        }
+        Ok(())
+    }
+
+    fn push_row_inner(&mut self, values: &[(PropertyId, ScalarValue)]) -> Result<()> {
         self.validate_push_row(values)?;
         let row = self.rows;
-        let row_values = values
-            .iter()
-            .map(|(property, value)| (*property, value))
-            .collect::<BTreeMap<_, _>>();
+        let row_values: Cow<'_, [(PropertyId, ScalarValue)]> =
+            if values.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+                Cow::Borrowed(values)
+            } else {
+                let mut sorted = values.to_vec();
+                sorted.sort_unstable_by_key(|(property, _)| *property);
+                Cow::Owned(sorted)
+            };
         let mut promotions = BTreeMap::new();
-        for (property, value) in &row_values {
+        for (property, value) in row_values.iter() {
             let Some(column) = self.columns.get(property) else {
                 continue;
             };
             if !self.mixed.contains(property) && !column.accepts(value) {
-                let mut promoted = column.into_mixed(&self.strings)?;
+                let mut promoted = column.into_mixed(
+                    &self.strings,
+                    self.tagged_bytes
+                        .get(property.0 as u128)
+                        .copied()
+                        .unwrap_or(0),
+                )?;
                 promoted.mixed_push(value)?;
                 promotions.insert(*property, Arc::new(promoted));
             }
@@ -2310,8 +2547,9 @@ impl PropertyColumns {
                 continue;
             }
             let value = row_values
-                .get(property)
-                .copied()
+                .binary_search_by_key(property, |(id, _)| *id)
+                .ok()
+                .map(|index| &row_values[index].1)
                 .unwrap_or(&ScalarValue::Null);
             if self.mixed.contains(property) {
                 Arc::make_mut(column).mixed_push(value)?;
@@ -2323,10 +2561,10 @@ impl PropertyColumns {
             self.columns.insert(property, column);
             self.mixed.insert(property);
         }
-        for (property, value) in row_values {
-            if !self.columns.contains_key(&property) && !matches!(value, ScalarValue::Null) {
+        for (property, value) in row_values.iter() {
+            if !self.columns.contains_key(property) && !matches!(value, ScalarValue::Null) {
                 self.columns.insert(
-                    property,
+                    *property,
                     Arc::new(TypedColumn::with_value(
                         value,
                         row,
@@ -2340,6 +2578,31 @@ impl PropertyColumns {
     }
 
     pub fn set(&mut self, row: u32, property: PropertyId, value: &ScalarValue) -> Result<()> {
+        let before = self
+            .get(row, property)
+            .as_ref()
+            .map_or(0, mixed_payload_len);
+        let bytes = self
+            .tagged_bytes
+            .get(property.0 as u128)
+            .copied()
+            .unwrap_or(0)
+            .checked_sub(before)
+            .and_then(|bytes| bytes.checked_add(mixed_payload_len(value)))
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorCode::ResultBudgetExceeded,
+                    "property payload size exhausted",
+                )
+            })?;
+        self.set_inner(row, property, value)?;
+        if self.columns.contains_key(&property) {
+            self.tagged_bytes.insert_cow(property.0 as u128, bytes);
+        }
+        Ok(())
+    }
+
+    fn set_inner(&mut self, row: u32, property: PropertyId, value: &ScalarValue) -> Result<()> {
         let row = row as usize;
         if row >= self.rows {
             return Err(Error::invalid_data("property row is out of bounds"));
@@ -2358,7 +2621,13 @@ impl PropertyColumns {
             if column.accepts(value) {
                 Arc::make_mut(column).set(row, value, Arc::make_mut(&mut self.strings))
             } else {
-                let mut promoted = column.into_mixed(&self.strings)?;
+                let mut promoted = column.into_mixed(
+                    &self.strings,
+                    self.tagged_bytes
+                        .get(property.0 as u128)
+                        .copied()
+                        .unwrap_or(0),
+                )?;
                 promoted.mixed_set(row, value)?;
                 *column = Arc::new(promoted);
                 self.mixed.insert(property);
@@ -2367,10 +2636,8 @@ impl PropertyColumns {
         } else if matches!(value, ScalarValue::Null) {
             Ok(())
         } else {
-            let mut column = TypedColumn::with_value(value, row, Arc::make_mut(&mut self.strings))?;
-            for _ in (row + 1)..self.rows {
-                column.push_null()?;
-            }
+            let mut column = TypedColumn::with_nulls(value, self.rows)?;
+            column.set(row, value, Arc::make_mut(&mut self.strings))?;
             self.columns.insert(property, Arc::new(column));
             Ok(())
         }
@@ -2383,12 +2650,13 @@ impl PropertyColumns {
                 "property row count exhausted",
             )
         })?;
-        if values
-            .iter()
-            .map(|(property, _)| *property)
-            .collect::<BTreeSet<_>>()
-            .len()
-            != values.len()
+        if values.len() > 1
+            && values
+                .iter()
+                .map(|(property, _)| *property)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != values.len()
         {
             return Err(Error::invalid_data(
                 "property row contains a duplicate property",
@@ -2588,34 +2856,6 @@ impl PropertyColumns {
             .saturating_add(self.mixed.len().saturating_mul(size_of::<PropertyId>()))
     }
 
-    pub fn seal_documents_if_needed(&mut self) -> Result<bool> {
-        let mut sealed = false;
-        for (property, column) in &mut self.columns {
-            let mixed = self.mixed.contains(property);
-            let needs_seal = if mixed {
-                matches!(column.as_ref(), TypedColumn::Bytes { values, .. } if values.needs_seal())
-            } else {
-                column.document_needs_seal()
-            };
-            if needs_seal {
-                let column = Arc::make_mut(column);
-                if mixed {
-                    let TypedColumn::Bytes { values, .. } = column else {
-                        return Err(Error::new(
-                            ErrorCode::CorruptStorage,
-                            "mixed property is not backed by a tagged byte column",
-                        ));
-                    };
-                    values.seal()?;
-                } else {
-                    column.seal_document()?;
-                }
-                sealed = true;
-            }
-        }
-        Ok(sealed)
-    }
-
     #[cfg(test)]
     pub fn document_storage_bytes(&self, property: PropertyId) -> Option<(usize, usize)> {
         let column = self.columns.get(&property)?;
@@ -2693,6 +2933,232 @@ mod cow_tests {
     use crate::{DocumentItem, DocumentList};
 
     #[test]
+    fn surgical_missing_properties_allocate_only_touched_pages_and_round_trip() -> Result<()> {
+        for count in [4_096, 32_768] {
+            let mut columns = PropertyColumns::default();
+            let existing = PropertyId(1);
+            for row in 0..count {
+                columns.push_row(&[(
+                    existing,
+                    ScalarValue::Integer((row as i64).wrapping_mul(7_919)),
+                )])?;
+            }
+            let body = PropertyId(2);
+            columns.set(
+                0,
+                body,
+                &ScalarValue::String("dirty body λ".repeat(4_096).into()),
+            )?;
+            let pinned = columns.clone();
+            let property = PropertyId(3);
+            columns.set(
+                (count / 2) as u32,
+                property,
+                &ScalarValue::Integer(i64::MIN),
+            )?;
+            let Some(TypedColumn::Integer { values, validity }) = columns.physical_column(property)
+            else {
+                return Err(Error::internal("new integer column missing"));
+            };
+            let allocated = values.allocated_value_bytes() + validity.words.allocated_value_bytes();
+            assert!(
+                allocated <= 2 * 16_384 + 16,
+                "{count} rows allocated {allocated} bytes"
+            );
+            assert_eq!(values.len(), count);
+            assert_eq!(values.get(count / 2), Some(&i64::MIN));
+            assert_eq!(columns.get(0, property), None);
+            assert_eq!(columns.get((count - 1) as u32, property), None);
+            assert!(!pinned.contains(property));
+            assert_eq!(columns.get(0, body), pinned.get(0, body));
+            assert!(Arc::ptr_eq(
+                &columns.columns[&existing],
+                &pinned.columns[&existing]
+            ));
+            columns.set((count / 2) as u32, property, &ScalarValue::Null)?;
+            assert_eq!(columns.get((count / 2) as u32, property), None);
+            columns.push_row(&[(property, ScalarValue::Integer(99))])?;
+            assert_eq!(
+                columns.get(count as u32, property),
+                Some(ScalarValue::Integer(99))
+            );
+            let encoded = postcard::to_stdvec(&columns)
+                .map_err(|error| Error::internal(error.to_string()))?;
+            let restored: PropertyColumns = postcard::from_bytes(&encoded)
+                .map_err(|error| Error::internal(error.to_string()))?;
+            assert_eq!(
+                restored.get(count as u32, property),
+                Some(ScalarValue::Integer(99))
+            );
+            assert_eq!(restored.get(0, body), pinned.get(0, body));
+            eprintln!(
+                "surgical missing property: rows={count} materialized_value_bytes={allocated}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn surgical_type_promotion_shares_dirty_base_and_only_encodes_changed_rows() -> Result<()> {
+        let property = PropertyId(1);
+        for count in [4_096, 32_768] {
+            let mut columns = PropertyColumns::default();
+            let dirty = ScalarValue::String("old λ document ".repeat(2_049).into());
+            for _ in 0..count {
+                columns.push_row(&[(property, dirty.clone())])?;
+            }
+            let pinned = columns.clone();
+            columns.set(
+                (count / 2) as u32,
+                property,
+                &ScalarValue::Integer(i64::MIN),
+            )?;
+            let Some(TypedColumn::Bytes { values, validity }) = columns.physical_column(property)
+            else {
+                return Err(Error::internal("promoted physical column missing"));
+            };
+            let (base, _) = values
+                .typed_base()
+                .ok_or_else(|| Error::internal("promotion copied its typed base"))?;
+            let (
+                TypedColumn::String {
+                    values: base_values,
+                    ..
+                },
+                Some(TypedColumn::String {
+                    values: original_values,
+                    ..
+                }),
+            ) = (base, pinned.column(property))
+            else {
+                return Err(Error::internal("promotion lost string lane"));
+            };
+            assert_eq!(base_values.detached_page_bytes_from(original_values), 0);
+            assert_eq!(values.override_rows().collect::<Vec<_>>(), vec![count / 2]);
+            assert_eq!(values.rows.live_value_len(), 9);
+            assert!(values.flat.get().is_none());
+            assert!(values.rows.flat.get().is_none());
+            let allocated = values.rows.spans.allocated_value_bytes()
+                + validity
+                    .words
+                    .detached_page_bytes_from(&pinned.columns[&property].validity().words)
+                + values.rows.owned_values;
+            assert!(
+                allocated <= 2 * 16_384 + 32,
+                "promotion allocated {allocated} at {count} rows"
+            );
+            assert_eq!(columns.get(0, property), Some(dirty.clone()));
+            assert_eq!(
+                pinned.get((count / 2) as u32, property),
+                Some(dirty.clone())
+            );
+            assert_eq!(
+                columns.get((count / 2) as u32, property),
+                Some(ScalarValue::Integer(i64::MIN))
+            );
+            let first_promotion = columns.clone();
+            columns.set((count / 2) as u32, property, &ScalarValue::Null)?;
+            columns.set((count - 1) as u32, property, &ScalarValue::Boolean(true))?;
+            assert_eq!(
+                first_promotion.get((count / 2) as u32, property),
+                Some(ScalarValue::Integer(i64::MIN))
+            );
+            assert_eq!(columns.get((count / 2) as u32, property), None);
+            // The small mixed checkpoint test covers complete serialization; here serialize a
+            // point-selected promoted column so the fixture never duplicates its full corpus.
+            let payload = columns
+                .physical_column(property)
+                .and_then(|column| match column {
+                    TypedColumn::Bytes { values, .. } => values.get(count - 1),
+                    _ => None,
+                })
+                .ok_or_else(|| Error::internal("mixed row missing"))?;
+            assert_eq!(mixed_value(&payload)?, ScalarValue::Boolean(true));
+            eprintln!("surgical promotion: rows={count} changed_storage_bytes={allocated}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn surgical_variable_payload_replacement_releases_history_and_keeps_pinned_readers()
+    -> Result<()> {
+        for count in [4_096, 32_768] {
+            let mut rows = PackedLists::<u8>::default();
+            for row in 0..count {
+                rows.push((0..257).map(|offset| ((row * 31 + offset * 17) % 251) as u8))?;
+            }
+            rows.replace(7, (0..65_537).map(|offset| (offset % 251) as u8))?;
+            let pinned = rows.clone();
+            let original = rows
+                .get(7)
+                .ok_or_else(|| Error::internal("dirty row missing"))?
+                .to_vec();
+            let changed = 65_539;
+            rows.replace(7, (0..changed).map(|offset| (250 - offset % 251) as u8))?;
+            let private_descriptors = rows.spans.detached_page_bytes_from(&pinned.spans);
+            assert!(private_descriptors <= 16_384);
+            assert_eq!(rows.owned_values, rows.live_values);
+            assert_eq!(pinned.get(7), Some(original.as_slice()));
+            for pass in 0..128 {
+                let old = Arc::downgrade(
+                    rows.spans
+                        .get(7)
+                        .ok_or_else(|| Error::internal("payload owner missing"))?,
+                );
+                rows.replace(7, (0..1_027 + pass).map(|offset| (offset % 251) as u8))?;
+                assert!(
+                    old.upgrade().is_none(),
+                    "superseded payload retained at pass {pass}"
+                );
+                assert_eq!(rows.owned_values, rows.live_values);
+                assert!(rows.flat.get().is_none());
+            }
+            rows.replace(7, std::iter::empty())?;
+            assert_eq!(rows.get(7), Some([].as_slice()));
+            assert_eq!(pinned.get(7), Some(original.as_slice()));
+            eprintln!(
+                "surgical variable edit: rows={count} descriptor_bytes={private_descriptors} changed_payload_bytes={changed}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn surgical_all_property_kinds_support_sparse_creation_promotion_null_and_restart() -> Result<()>
+    {
+        for (ordinal, value) in heterogeneous_values()?.into_iter().enumerate() {
+            let property = PropertyId(ordinal as u64 + 1);
+            let mut columns = PropertyColumns {
+                rows: 65,
+                ..PropertyColumns::default()
+            };
+            columns.set(32, property, &value)?;
+            let pinned = columns.clone();
+            assert_eq!(columns.get(0, property), None);
+            assert_eq!(columns.get(32, property), Some(value.clone()));
+            let conflict = if matches!(value, ScalarValue::Boolean(_)) {
+                ScalarValue::Integer(9)
+            } else {
+                ScalarValue::Boolean(true)
+            };
+            columns.set(64, property, &conflict)?;
+            columns.set(32, property, &ScalarValue::Null)?;
+            columns.push_row(&[(property, value.clone())])?;
+            let encoded = postcard::to_stdvec(&columns)
+                .map_err(|error| Error::internal(error.to_string()))?;
+            let restored: PropertyColumns = postcard::from_bytes(&encoded)
+                .map_err(|error| Error::internal(error.to_string()))?;
+            assert_eq!(restored.get(32, property), None);
+            assert_eq!(restored.get(64, property), Some(conflict));
+            assert_eq!(restored.get(65, property), Some(value.clone()));
+            assert_eq!(pinned.get(32, property), Some(value));
+            assert_eq!(pinned.get(64, property), None);
+            restored.validate()?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn packed_list_shared_extension_seals_only_the_same_allocation_tail() -> Result<()> {
         let old_rows = 100_000_usize;
         let appended = 256_usize;
@@ -2717,6 +3183,12 @@ mod cow_tests {
             lists.push(std::iter::once(row as u64))?;
         }
 
+        assert_eq!(lists.iter().count(), old_rows + appended);
+        for (row, values) in lists.iter().enumerate() {
+            assert_eq!(values, [row as u64]);
+        }
+        assert!(lists.flat.get().is_none());
+
         lists.rebase_shared_extension(full_offsets, full_values)?;
 
         assert_eq!(lists.rows(), old_rows + appended);
@@ -2725,6 +3197,63 @@ mod cow_tests {
             lists.get((old_rows + appended - 1) as u32),
             Some([(old_rows + appended - 1) as u64].as_slice())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn surgical_shared_spans_share_payload_and_preserve_independent_row_ranges() -> Result<()> {
+        let payload: Arc<[u8]> = (0..65_539)
+            .map(|byte| (byte % 251) as u8)
+            .collect::<Vec<_>>()
+            .into();
+        let spans: Arc<[u32]> = vec![32_000, 65_539, 7, 12, 0, 0].into();
+        let flat = |values| SharedFlat::from_arc_slice(values).map_err(Error::internal);
+        let mut rows = PackedLists::default();
+        rows.rebase_shared_spans(
+            flat(spans.clone())?,
+            SharedFlat::from_arc_slice(payload.clone()).map_err(Error::internal)?,
+        )?;
+        assert_eq!(
+            rows.get(0).map(<[u8]>::as_ptr),
+            Some(payload[32_000..].as_ptr())
+        );
+        assert_eq!(rows.get(1), Some(&payload[7..12]));
+        let pinned = rows.clone();
+        rows.replace(0, [11, 22, 33])?;
+        assert_eq!(rows.get(0), Some([11, 22, 33].as_slice()));
+        assert_eq!(rows.get(1), pinned.get(1));
+        assert_eq!(pinned.get(0), Some(&payload[32_000..]));
+        let mut appended = rows.clone();
+        appended.push([44, 55])?;
+        assert_eq!(
+            appended.iter().collect::<Vec<_>>(),
+            vec![&[11, 22, 33][..], &payload[7..12], &[], &[44, 55]]
+        );
+        assert_eq!(
+            pinned.iter().next().map(<[u8]>::as_ptr),
+            Some(payload[32_000..].as_ptr())
+        );
+        assert!(appended.flat.get().is_none());
+        assert_eq!(rows.offsets(), &[0, 3, 8, 8]);
+        assert_eq!(rows.values(), &[11, 22, 33, 7, 8, 9, 10, 11]);
+        let mut bytes = ByteValues::default();
+        bytes.rebase_shared_spans(
+            flat(spans)?,
+            SharedFlat::from_arc_slice(payload).map_err(Error::internal)?,
+        )?;
+        assert_eq!(bytes.live_value_len(), 33_544);
+        bytes.replace(1, &[9])?;
+        assert_eq!(bytes.get(1).as_deref(), Some([9].as_slice()));
+        let before = bytes.clone();
+        assert!(
+            bytes
+                .rebase_shared_spans(
+                    flat(vec![8, 7].into())?,
+                    SharedFlat::from_arc_slice(vec![1_u8; 9].into()).map_err(Error::internal)?
+                )
+                .is_err()
+        );
+        assert_eq!(bytes, before);
         Ok(())
     }
 
@@ -2942,6 +3471,45 @@ mod cow_tests {
     }
 
     #[test]
+    fn validity_masks_preserve_shared_words_dirty_pages_and_partial_tails() -> Result<()> {
+        let len = 2_000_017;
+        let expected = (0..len)
+            .map(|row| u8::from(row % 97 < 11))
+            .collect::<Vec<_>>();
+        let bits = expected
+            .iter()
+            .map(|value| *value != 0)
+            .collect::<bitvec::vec::BitVec<u64, bitvec::order::Lsb0>>();
+        let shared = SharedFlat::from_arc_slice(bits.into_vec().into()).map_err(Error::internal)?;
+        let mut validity = Validity {
+            words: PagedVec::from_shared(shared).map_err(Error::internal)?,
+            len,
+        };
+        let pinned = validity.clone();
+        assert_eq!(validity.to_byte_mask(), expected);
+        for row in [63, 64, 131_073, len - 1] {
+            validity.set(row, expected[row] == 0)?;
+        }
+        let mut changed = expected.clone();
+        for row in [63, 64, 131_073, len - 1] {
+            changed[row] ^= 1;
+        }
+        assert_eq!(validity.to_byte_mask(), changed);
+        assert_eq!(pinned.to_byte_mask(), expected);
+        assert!(validity.words.detached_page_bytes_from(&pinned.words) <= 3 * 16 * 1024);
+        assert!(Validity::default().to_byte_mask().is_empty());
+        assert_eq!(
+            Validity {
+                words: PagedVec::default(),
+                len: 65
+            }
+            .to_byte_mask(),
+            vec![0; 65]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn malformed_validity_storage_returns_corruption_instead_of_panicking() -> Result<()> {
         let mut validity = Validity {
             words: PagedVec::default(),
@@ -2977,6 +3545,37 @@ mod cow_tests {
         let lists = PackedLists::<u8>::default();
         assert_eq!(lists.offsets(), &[0]);
         assert!(lists.values().is_empty());
+    }
+
+    #[test]
+    fn surgical_lazy_mixed_payload_bounds_reject_without_mutating_a_generation() -> Result<()> {
+        let property = PropertyId(4);
+        let large = ScalarValue::String("dirty payload λ".repeat(257).into());
+        let mut columns = PropertyColumns::default();
+        columns.push_row(&[(property, large.clone())])?;
+        columns.push_row(&[(property, ScalarValue::Integer(9))])?;
+        let mut staged = columns.clone();
+        let Some(TypedColumn::Bytes { values, .. }) = staged.physical_column_mut(property) else {
+            return Err(Error::internal("mixed column missing"));
+        };
+        // A synthetic length avoids a multi-gigabyte fixture while exercising the exact
+        // publication guard used after a lazy base has accumulated real byte counts.
+        values.live_bytes = u32::MAX as usize;
+        let before = values
+            .get(1)
+            .ok_or_else(|| Error::internal("mixed row missing"))?
+            .into_owned();
+        assert!(values.replace(1, &[1; 10]).is_err());
+        assert_eq!(values.get(1).as_deref(), Some(before.as_slice()));
+        assert_eq!(columns.get(0, property), Some(large));
+        assert_eq!(columns.get(1, property), Some(ScalarValue::Integer(9)));
+        for value in heterogeneous_values()? {
+            assert_eq!(
+                mixed_payload(&value)?.map_or(0, |payload| payload.len()),
+                mixed_payload_len(&value)
+            );
+        }
+        Ok(())
     }
 
     fn dictionary_with_values(count: usize) -> Result<Dictionary> {

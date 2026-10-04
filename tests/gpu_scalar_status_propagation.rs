@@ -8,11 +8,14 @@
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
+
+#[cfg(all(feature = "accelerator", target_os = "macos"))]
+use std::sync::Mutex;
 
 use irongraph::{
     Bookmark, Error, ErrorCode, ProjectId, Result,

@@ -450,27 +450,15 @@ impl TemporalCanonicalColumn {
         value_type: TemporalType,
         column: &TemporalColumn,
     ) -> Result<Self> {
-        let mut samples = column.samples().collect::<Vec<_>>();
-        samples.sort_by_key(|sample| {
-            (
-                sample.entity_id,
-                sample.event_time_nanos,
-                sample.sequence_index,
-            )
-        });
-        let mut flat = TemporalColumn::with_property(column.property);
-        for sample in samples {
-            flat.push(&sample)?;
-        }
         Ok(Self {
             entity_kind,
             target,
             property: column.property,
             value_type,
-            entity_ids: flat.entity_ids,
-            event_times_nanos: flat.event_times_nanos,
-            sequence_indexes: flat.sequence_indexes,
-            values: flat.values,
+            entity_ids: column.entity_ids.clone(),
+            event_times_nanos: column.event_times_nanos.clone(),
+            sequence_indexes: column.sequence_indexes.clone(),
+            values: column.values.clone(),
         })
     }
 
@@ -482,79 +470,25 @@ impl TemporalCanonicalColumn {
         self.entity_ids.len()
     }
 
-    #[cfg_attr(
-        not(all(feature = "accelerator", any(target_os = "macos", target_os = "ios"))),
-        allow(dead_code)
-    )]
-    pub fn push_and_sort(&mut self, sample: &TemporalSample) -> Result<()> {
-        self.extend_and_sort(std::slice::from_ref(sample))
-    }
-
-    /// Applies one committed batch with a single base scan and a single sort. The delta path is
-    /// intentionally column-batched: applying `k` samples must never reconstruct the `n` existing
-    /// rows `k` times. The caller groups target-qualified samples before invoking this method.
-    #[cfg_attr(
-        not(all(feature = "accelerator", any(target_os = "macos", target_os = "ios"))),
-        allow(dead_code)
-    )]
-    pub fn extend_and_sort(&mut self, additions: &[TemporalSample]) -> Result<()> {
-        if additions.is_empty() {
-            return Ok(());
-        }
+    /// Appends committed samples without moving any existing physical row. Readers order
+    /// selected samples by event time; physical publication order is deliberately independent.
+    pub fn append_samples(&mut self, additions: &[TemporalSample]) -> Result<()> {
         if additions
             .iter()
             .any(|sample| sample.property != self.property)
         {
             return Err(Error::new(
                 ErrorCode::CorruptStorage,
-                "temporal delta targets the wrong shared column",
+                "temporal append targets another property",
             ));
         }
-        let mut samples = (0..self.len())
-            .map(|row| {
-                Ok(TemporalSample {
-                    entity_id: *self
-                        .entity_ids
-                        .get(row)
-                        .ok_or_else(|| Error::internal("shared temporal entity row disappeared"))?,
-                    property: self.property,
-                    event_time_nanos: *self.event_times_nanos.get(row).ok_or_else(|| {
-                        Error::internal("shared temporal event-time row disappeared")
-                    })?,
-                    sequence_index: *self.sequence_indexes.get(row).ok_or_else(|| {
-                        Error::internal("shared temporal sequence row disappeared")
-                    })?,
-                    value: self
-                        .values
-                        .get(
-                            u32::try_from(row).map_err(|_| {
-                                Error::new(
-                                    ErrorCode::ResultBudgetExceeded,
-                                    "temporal row exceeds u32",
-                                )
-                            })?,
-                            self.property,
-                        )
-                        .unwrap_or(ScalarValue::Null),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        samples.extend(additions.iter().cloned());
-        samples.sort_by_key(|sample| {
-            (
-                sample.entity_id,
-                sample.event_time_nanos,
-                sample.sequence_index,
-            )
-        });
-        let mut flat = TemporalColumn::with_property(self.property);
-        for sample in samples {
-            flat.push(&sample)?;
+        for sample in additions {
+            self.values
+                .push_row(&[(self.property, sample.value.clone())])?;
+            self.entity_ids.push(sample.entity_id);
+            self.event_times_nanos.push(sample.event_time_nanos);
+            self.sequence_indexes.push(sample.sequence_index);
         }
-        self.entity_ids = flat.entity_ids;
-        self.event_times_nanos = flat.event_times_nanos;
-        self.sequence_indexes = flat.sequence_indexes;
-        self.values = flat.values;
         Ok(())
     }
 }
@@ -875,12 +809,19 @@ impl TemporalStore {
                 )
             })?;
             let column = Arc::make_mut(column);
+            if column.len() != row_count {
+                return Err(Error::new(
+                    ErrorCode::CorruptStorage,
+                    "shared temporal row count differs from canonical publication",
+                ));
+            }
             column.property = backing.property;
             column.entity_ids = backing.entity_ids;
             column.event_times_nanos = backing.event_times_nanos;
             column.sequence_indexes = backing.sequence_indexes;
             column.values = backing.values;
-            rebuild_current(column);
+            // Publication preserves physical row positions. Canonical append already updated
+            // `current`, including late events; rebinding allocations must not rescan history.
         }
         Ok(())
     }
@@ -2155,6 +2096,56 @@ mod tests {
             sequence_index: revision,
             value: ScalarValue::Float(OrderedFloat(value)),
         }
+    }
+
+    #[test]
+    fn surgical_temporal_rebind_keeps_physical_rows_and_current_generation() -> Result<()> {
+        let property = PropertyId(7);
+        let key = (EntityKind::Node as u8, 1, property);
+        for rows in [4_096_u64, 32_768] {
+            let mut store = TemporalStore::default();
+            store.declare(
+                TemporalDeclaration {
+                    entity_kind: EntityKind::Node,
+                    target: 1,
+                    property,
+                    value_type: TemporalType::Float,
+                    retention_nanos: i64::MAX,
+                },
+                0,
+            )?;
+            for row in 0..rows {
+                store.append(
+                    EntityKind::Node,
+                    1,
+                    sample(property, (rows - row) as i64, row + 1, (row * 3571) as f64),
+                    rows as i64,
+                )?;
+            }
+            let old = store.clone();
+            let mut backing = store.canonical_columns()?;
+            assert_eq!(backing[0].event_times_nanos[0], rows as i64);
+            let late = sample(property, -1, rows + 1, -123.0);
+            store.append(EntityKind::Node, 1, late.clone(), rows as i64)?;
+            backing[0].append_samples(&[late])?;
+            let current = store.columns[&key].current.clone();
+            store.rebind_shared(backing)?;
+            assert!(store.columns[&key].current.shared_with(&current));
+            assert_eq!(
+                store.current(EntityKind::Node, 1, 9, property),
+                old.current(EntityKind::Node, 1, 9, property)
+            );
+            assert_eq!(old.columns[&key].len(), rows as usize);
+            assert_eq!(store.columns[&key].len(), rows as usize + 1);
+            let copied = store.columns[&key]
+                .entity_ids
+                .detached_page_bytes_from(&old.columns[&key].entity_ids);
+            assert!(
+                copied <= 16 * 1024,
+                "unrelated temporal rows copied: {copied}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
