@@ -23,7 +23,8 @@ function help() {
   console.log(`IronGraph ${version} — standalone database and web console
 
   npx irongraph start [--background] [--data-dir PATH]
-                     [--http-addr LOOPBACK:PORT] [--execution-backend auto|cpu|metal]
+                     [--http-addr LOOPBACK:PORT] [--execution-backend auto|cpu]
+                     [--embedding-backend auto|cpu|metal|cuda]
   npx irongraph status [--data-dir PATH]
   npx irongraph logs [--data-dir PATH]
   npx irongraph stop [--data-dir PATH]
@@ -52,15 +53,18 @@ function options(argv) {
     if (seen.has(flag)) throw new Error(`Repeated option: ${flag}`);
     seen.add(flag);
     if (flag === '--background' && command === 'start') result.background = true;
-    else if (flag === '--data-dir' || (command === 'start' && ['--http-addr', '--execution-backend'].includes(flag))) {
+    else if (flag === '--data-dir' || (command === 'start' && ['--http-addr', '--execution-backend', '--embedding-backend'].includes(flag))) {
       const value = argv.shift();
       if (!value || value.startsWith('--')) throw new Error(`${flag} requires a value.`);
       result[flag.slice(2)] = value;
     } else throw new Error(`Unknown option for ${command}: ${flag}`);
   }
   const backend = result['execution-backend'] || process.env.IRONGRAPH_EXECUTION_BACKEND || 'auto';
-  if (command === 'start' && !['auto', 'cpu', 'metal'].includes(backend)) throw new Error('Execution backend must be auto, cpu, or metal.');
+  if (command === 'start' && !['auto', 'cpu'].includes(backend)) throw new Error('Execution backend must be auto or cpu.');
   result.backend = backend;
+  const embeddingBackend = result['embedding-backend'] || process.env.IRONGRAPH_EMBEDDING_BACKEND || 'auto';
+  if (command === 'start' && !['auto', 'cpu', 'metal', 'cuda'].includes(embeddingBackend)) throw new Error('Embedding backend must be auto, cpu, metal, or cuda.');
+  result.embeddingBackend = embeddingBackend;
   return result;
 }
 
@@ -295,7 +299,7 @@ async function start(opts, ctx) {
     if (previousStatus === 'running') throw new Error(`IronGraph is already running for ${ctx.data} (PID ${previous.pid}). Console: ${previous.url}`);
     if (previousStatus === 'unverified') throw new Error(`A live PID does not match the recorded IronGraph process. No process was signaled. Inspect ${ctx.state} before starting another instance.`);
     const native = nativePackage();
-    const env = { ...process.env, IRONGRAPH_DATA_DIR: ctx.data, IRONGRAPH_EXECUTION_BACKEND: opts.backend };
+    const env = { ...process.env, IRONGRAPH_DATA_DIR: ctx.data, IRONGRAPH_EXECUTION_BACKEND: opts.backend, IRONGRAPH_EMBEDDING_BACKEND: opts.embeddingBackend };
     for (const [key, value] of Object.entries(DEFAULT_ADDRESSES)) env[key] ||= value;
     if (opts['http-addr']) env.IRONGRAPH_HTTP_ADDR = opts['http-addr'];
     await checkPorts(env);

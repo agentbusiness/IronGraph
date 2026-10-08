@@ -2171,7 +2171,7 @@ impl GraphStore {
                     let mut incident = BTreeSet::new();
                     if self.node(*node).is_some() {
                         for edge in self.incident_edge_ids(*node)? {
-                            if !edges.get(&edge).is_some_and(|state| !state.active) {
+                            if edges.get(&edge).is_none_or(|state| state.active) {
                                 incident.insert(edge);
                             }
                         }

@@ -233,6 +233,9 @@ Graph execution uses the CPU. Its `device` option accepts `auto` or `cpu`. Text 
 independently: `embedding_device` in Python accepts `auto`, `cpu`, `metal`, or `cuda`, with
 `embedding_device_ordinal` selecting an accelerator. Automatic selection uses the supported inference
 accelerator for the packaged build and platform.
+On CPU-only hosts, select CPU inference explicitly: use `embedding_device="cpu"` in Python,
+`with_embedding_device(ExecutionDevice::Cpu)` in Rust, or the `"cpu"` embedding-device argument
+in Node.js. Setting the graph execution device alone does not select the inference device.
 
 Graph rows and indexes stay in shared host memory. GPU memory holds the enabled encoder and its
 inference work. Embedding generation runs asynchronously; source records become readable before

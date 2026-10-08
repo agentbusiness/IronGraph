@@ -41,6 +41,7 @@ int main(int argc, char **argv) {
   fprintf(state, "start %s\n", getenv("IRONGRAPH_EXECUTION_BACKEND"));
   fclose(state);
   printf("fixture ready: %s\n", address);
+  printf("fixture embedding backend: %s\n", getenv("IRONGRAPH_EMBEDDING_BACKEND"));
   printf("fixture MCP: %s %s\n", getenv("IRONGRAPH_MCP_BINARY"), getenv("IRONGRAPH_MCP_URL"));
   while (running) {
     int client = accept(listener, NULL, NULL);

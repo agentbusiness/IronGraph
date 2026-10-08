@@ -45,7 +45,7 @@ async function main() {
   const env = { ...process.env, IRONGRAPH_CLI_HOME: path.join(temporary, 'runtime'),
     IRONGRAPH_HTTP_ADDR: address, IRONGRAPH_BOLT_ADDR: `127.0.0.1:${bolt}`,
     IRONGRAPH_STREAM_ADDR: `127.0.0.1:${streams}`, IRONGRAPH_QUEUE_ADDR: `127.0.0.1:${queues}`,
-    IRONGRAPH_MCP_ADDR: `127.0.0.1:${mcp}`, IRONGRAPH_EXECUTION_BACKEND: 'cpu' }
+    IRONGRAPH_MCP_ADDR: `127.0.0.1:${mcp}`, IRONGRAPH_EXECUTION_BACKEND: 'cpu', IRONGRAPH_EMBEDDING_BACKEND: 'cpu' }
   for (const key of Object.keys(env)) {
     if (key.startsWith('IRONGRAPH_REMOTE_')) delete env[key]
   }
@@ -109,7 +109,14 @@ async function main() {
       { body: 'Graph databases connect nodes and relationships.' })
     await query('USE standalone_check CREATE EMBEDDING INDEX guide_text FOR (d:Document) FROM d.body INTO d.embedding USING MODEL default SIMILARITY COSINE')
     const search = 'USE standalone_check MATCH (d:Document) SEARCH d IN (EMBEDDING INDEX guide_text FOR TEXT $text LIMIT 1) SCORE AS score RETURN d.id, d.body, score'
-    const result = await query(search, { text: 'connected graph data' })
+    let result
+    const embeddingDeadline = Date.now() + 120000
+    do {
+      result = await query(search, { text: 'connected graph data' })
+      if (result.length === 1) break
+      assert(Date.now() < embeddingDeadline, 'Asynchronous document embedding did not finish')
+      await sleep(50)
+    } while (true)
     assert.equal(result[0][0].value, 'guide')
     assert.equal(result[0][2].type, 'float')
     for (const statement of ['CREATE TOPIC activity PARTITIONS 2', 'CREATE QUEUE jobs STREAM']) {

@@ -67,6 +67,9 @@ data. Background mode does not install an operating-system service or start afte
 Use `npx irongraph start` without `--background` for foreground execution. Keep that terminal
 open, and press `Ctrl+C` to stop cleanly. Graph execution uses the CPU. Add
 `--embedding-backend metal` to select Metal text inference on a supported Mac.
+On CPU-only hosts, including the published Linux packages, start with
+`npx irongraph start --background --embedding-backend cpu`. Automatic inference selection requires
+a supported accelerator.
 
 ## Choose the local data directory
 

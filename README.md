@@ -53,7 +53,9 @@ npx irongraph status
 ```
 
 Graph execution uses the CPU. Text inference selects its device independently; on a supported
-Mac, use `--embedding-backend metal`. To run in the
+Mac, use `--embedding-backend metal`. On CPU-only hosts, including the published Linux packages,
+start with `npx irongraph start --background --embedding-backend cpu`. Automatic inference selection
+requires a supported accelerator. To run in the
 foreground with live terminal output, use `npx irongraph start` without `--background`.
 
 ### 3. Open the web console

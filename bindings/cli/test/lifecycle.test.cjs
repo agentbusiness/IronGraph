@@ -80,11 +80,25 @@ test('help, version, strict flags, and numeric loopback validation', async () =>
   assert.throws(() => options(['start', '--background', '--background']), /Repeated/);
   assert.throws(() => options(['start', '--data-dir']), /requires/);
   assert.throws(() => options(['start', '--execution-backend', 'cuda']), /must be/);
+  assert.throws(() => options(['start', '--execution-backend', 'metal']), /must be/);
+  assert.throws(() => options(['start', '--embedding-backend', 'invalid']), /must be/);
+  assert.throws(() => options(['start', '--embedding-backend']), /requires/);
   assert.deepEqual(address('[::1]:18484', 'http'), { host: '::1', port: 18484 });
   for (const value of ['0.0.0.0:18484', 'localhost:18484', '127.0.0.1:0', '127.0.0.1:65536', '127.999.0.1:12']) assert.throws(() => address(value, 'http'));
   const output = await execute(process.execPath, [path.join(source, 'cli.cjs'), '--version']);
   assert.equal(output.stdout.trim(), `irongraph ${metadata.version}`);
   assert.match((await execute(process.execPath, [path.join(source, 'cli.cjs'), '--help'])).stdout, /IRONGRAPH_CLI_HOME/);
+});
+
+test('embedding selection reaches the native process independently and flags override environment', async (t) => {
+  const c = await setup(t, { IRONGRAPH_EMBEDDING_BACKEND: 'metal' });
+  const started = await c.run('start', '--background', '--embedding-backend', 'cpu');
+  assert.equal(started.code, 0, started.stderr);
+  assert.match((await c.run('logs')).stdout, /fixture embedding backend: cpu/);
+  assert.match(fs.readFileSync(path.join(c.data, 'fixture-persistence.txt'), 'utf8'), /start cpu/);
+  assert.equal((await c.run('stop')).code, 0);
+  assert.equal((await c.run('start', '--background')).code, 0);
+  assert.match((await c.run('logs')).stdout, /fixture embedding backend: metal/);
 });
 
 test('background lifecycle persists data and executable outside npm cache', async (t) => {
