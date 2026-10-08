@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "irongraph"
-version = "0.1.6"
+version = "0.1.7"
 description = "Embed a CPU graph database in Python with GPU text embeddings, Cypher, vector search, streaming, and queues."
 readme = "README.md"
 requires-python = ">=3.9"
