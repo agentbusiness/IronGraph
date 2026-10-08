@@ -640,7 +640,7 @@ def audit_archive(path, kind, version):
             allowed = (parts.parts[0] == f"irongraph-{version}"
                        and relative in PUBLIC_FILES | {"bin/irongraph", "bin/irongraph-mcp"})
         else:
-            allowed = (name in {"irongraph/__init__.py", "irongraph/__init__.pyi", "irongraph/py.typed"}
+            allowed = (name in {"irongraph/__init__.py", "irongraph/__init__.pyi", "irongraph/_async.py", "irongraph/py.typed"}
                        or name.startswith("irongraph/_native") and name.endswith(".so")
                        or ".dist-info/" in name and (parts.name in PUBLIC_FILES | {"METADATA", "WHEEL", "RECORD", "INSTALLER", "entry_points.txt", "top_level.txt"})
                        or name.endswith(".dist-info/sboms/auditwheel.cdx.json")

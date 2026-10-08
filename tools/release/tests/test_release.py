@@ -170,6 +170,7 @@ class ReleaseTests(unittest.TestCase):
         path = self.root / "irongraph.whl"
         with zipfile.ZipFile(path, "w") as archive:
             archive.writestr("irongraph/__init__.py", "")
+            archive.writestr("irongraph/_async.py", "import asyncio\n")
             archive.writestr("irongraph-0.1.0.dist-info/METADATA", "Version: 0.1.0\nLicense-Expression: Apache-2.0\n")
             for name in ("LICENSE.txt", "THIRD_PARTY_NOTICES.txt"):
                 archive.writestr("irongraph-0.1.0.dist-info/licenses/" + name, "terms")
