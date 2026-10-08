@@ -2606,15 +2606,20 @@ impl Database {
                     .index
                     .checked_add(1)
                     .ok_or_else(|| Error::internal("log index exhausted"))?;
-                let mut output = {
-                    execute_on_project(
-                        &snapshot,
-                        &request,
-                        planning_bookmark,
-                        next_index,
-                        capabilities,
-                        text_embedding.as_deref(),
-                    )?
+                let mut output = match execute_on_project(
+                    &snapshot,
+                    &request,
+                    planning_bookmark,
+                    next_index,
+                    capabilities,
+                    text_embedding.as_deref(),
+                ) {
+                    Ok(output) => output,
+                    Err(error) if error.code == ErrorCode::TransactionConflict => {
+                        self.ensure_apply_healthy()?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
                 };
                 let administrative = administrative_mutation(
                     output.administrative.take(),

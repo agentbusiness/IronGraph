@@ -1327,6 +1327,12 @@ impl<'a> GraphReadView<'a> {
 
     fn ensure_forward_revision(&self, revision: u64) -> Result<()> {
         if revision < self.revision {
+            if revision < self.base.revision() {
+                return Err(Error::new(
+                    ErrorCode::TransactionConflict,
+                    "canonical graph advanced while preparing statement mutations",
+                ));
+            }
             return Err(Error::invalid_data(
                 "mutation revision moves graph state backwards",
             ));
@@ -1601,6 +1607,27 @@ mod tests {
             properties: Vec::new(),
         })?;
         Ok((graph, label, property, relationship_type))
+    }
+
+    #[test]
+    fn stale_planning_revision_is_retryable_without_changing_canonical_data() -> Result<()> {
+        let (graph, _, property, _) = graph_fixture()?;
+        graph.set_node_property(NodeId(1), property, ScalarValue::Integer(30), 3)?;
+        let mut view = GraphReadView::new(&graph);
+        let error = view
+            .apply(&GraphMutation::SetNodeProperty {
+                node: NodeId(2),
+                property,
+                value: ScalarValue::Integer(40),
+                revision: 2,
+            })
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::TransactionConflict);
+        assert_eq!(
+            graph.node(NodeId(2)).unwrap().property(property),
+            Some(ScalarValue::Integer(20))
+        );
+        Ok(())
     }
 
     #[test]
