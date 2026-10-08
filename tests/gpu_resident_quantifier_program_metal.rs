@@ -4,8 +4,9 @@
 // functions that fixtures are built from. Scoping the allowance here keeps the production gate
 // enforceable instead of switched off globally.
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
-#![cfg(all(feature = "accelerator", target_os = "macos"))]
+#![cfg(all(feature = "legacy-graph", target_os = "macos"))]
 
+use irongraph::graph::legacy::{GraphStore, TemporalStore};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use irongraph::{
@@ -21,7 +22,7 @@ use irongraph::{
         ResidentQuantifierSource, ResidentQuantifierStage, ResidentQuantifierUnary,
         ResidentQuantifierValue as Value, ResidentRangeProgramRequest,
     },
-    graph::{GraphStore, IndexCatalog, TemporalStore},
+    graph::IndexCatalog,
 };
 use tokio_util::sync::CancellationToken;
 

@@ -116,7 +116,7 @@ struct Fixture {
 }
 
 fn fixture(scenario: Scenario) -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let project = ProjectId(uuid::Uuid::from_u128(
         0x4d41_5443_4834_0000 + scenario.id as u128,
     ));
@@ -190,7 +190,7 @@ fn fixture(scenario: Scenario) -> Result<Fixture> {
 }
 
 fn complete_projection_fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let label = graph.catalog_mut().intern_label("A")?;
     let relationship_type = graph.catalog_mut().intern_relationship_type("T")?;
     let name = graph.catalog_mut().intern_property("name")?;
@@ -232,7 +232,7 @@ fn complete_projection_fixture() -> Result<Fixture> {
 }
 
 fn return2_entity_container_fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let a = graph.catalog_mut().intern_label("A")?;
     let b = graph.catalog_mut().intern_label("B")?;
     let relationship_type = graph.catalog_mut().intern_relationship_type("T")?;
@@ -270,7 +270,7 @@ fn return2_entity_container_fixture() -> Result<Fixture> {
 }
 
 fn with3_relationship_rematch_fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let x = graph.catalog_mut().intern_label("X")?;
     let t1 = graph.catalog_mut().intern_relationship_type("T1")?;
     let t2 = graph.catalog_mut().intern_relationship_type("T2")?;
@@ -317,7 +317,7 @@ fn with3_relationship_rematch_fixture() -> Result<Fixture> {
 }
 
 fn with7_grouped_intermediate_fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let relationship_type = graph.catalog_mut().intern_relationship_type("REL")?;
     let name = graph.catalog_mut().intern_property("name")?;
     for (id, value) in [
@@ -373,7 +373,7 @@ fn with7_grouped_intermediate_fixture() -> Result<Fixture> {
 }
 
 fn relationship_predicate_fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let artist = graph.catalog_mut().intern_label("Artist")?;
     let a = graph.catalog_mut().intern_label("A")?;
     let b = graph.catalog_mut().intern_label("B")?;
@@ -416,7 +416,7 @@ fn relationship_predicate_fixture() -> Result<Fixture> {
 }
 
 fn intermediate_boundary_fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let contains = graph.catalog_mut().intern_relationship_type("CONTAINS")?;
     let friend = graph.catalog_mut().intern_relationship_type("FRIEND")?;
     let name = graph.catalog_mut().intern_property("name")?;
@@ -460,7 +460,7 @@ fn intermediate_boundary_fixture() -> Result<Fixture> {
 }
 
 fn bound_relationship_count_fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let edge = graph.catalog_mut().intern_relationship_type("EDGE")?;
     for id in [NodeId(1), NodeId(2), NodeId(3), NodeId(4)] {
         graph.insert_node(NodeInput {
@@ -497,7 +497,7 @@ fn bound_relationship_count_fixture() -> Result<Fixture> {
 }
 
 fn bound_relationship_list_fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let relationship_type = graph.catalog_mut().intern_relationship_type("Y")?;
     for id in [NodeId(1), NodeId(2), NodeId(3)] {
         graph.insert_node(NodeInput {
@@ -533,7 +533,7 @@ fn bound_relationship_list_fixture() -> Result<Fixture> {
 }
 
 fn last_relationship_fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let relationship_type = graph.catalog_mut().intern_relationship_type("T")?;
     for id in [NodeId(1), NodeId(2), NodeId(3)] {
         graph.insert_node(NodeInput {
@@ -564,7 +564,7 @@ fn last_relationship_fixture() -> Result<Fixture> {
 }
 
 fn match9_count_fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let blue = graph.catalog_mut().intern_label("Blue")?;
     let red = graph.catalog_mut().intern_label("Red")?;
     let green = graph.catalog_mut().intern_label("Green")?;
@@ -610,7 +610,7 @@ fn match9_count_fixture() -> Result<Fixture> {
 }
 
 fn match9_optional_null_fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let a = graph.catalog_mut().intern_label("A")?;
     let b = graph.catalog_mut().intern_label("B")?;
     for (id, label) in [(NodeId(1), a), (NodeId(2), b)] {
@@ -633,7 +633,7 @@ fn match9_optional_null_fixture() -> Result<Fixture> {
 }
 
 fn comparison1_path_equality_fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let a = graph.catalog_mut().intern_label("A")?;
     let relationship_type = graph.catalog_mut().intern_relationship_type("LOOP")?;
     graph.insert_node(NodeInput {
@@ -663,7 +663,7 @@ fn comparison1_path_equality_fixture() -> Result<Fixture> {
 }
 
 fn return7_fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let start = graph.catalog_mut().intern_label("Start")?;
     let relationship_type = graph.catalog_mut().intern_relationship_type("T")?;
     for (id, labels) in [(NodeId(1), vec![start]), (NodeId(2), Vec::new())] {
@@ -695,7 +695,7 @@ fn return7_fixture() -> Result<Fixture> {
 }
 
 fn correlated_path_disjunction_fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let terminal = graph.catalog_mut().intern_label("TheLabel")?;
     let relationship_type = graph.catalog_mut().intern_relationship_type("T")?;
     let id = graph.catalog_mut().intern_property("id")?;
@@ -732,7 +732,7 @@ fn correlated_path_disjunction_fixture() -> Result<Fixture> {
 }
 
 fn cycle_chord_fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let relationship_type = graph.catalog_mut().intern_relationship_type("R")?;
     let id = graph.catalog_mut().intern_property("id")?;
     for (node_id, value) in [
@@ -779,7 +779,7 @@ fn cycle_chord_fixture() -> Result<Fixture> {
 }
 
 fn independent_path_sum_fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let relationship_type = graph.catalog_mut().intern_relationship_type("ATE")?;
     let times = graph.catalog_mut().intern_property("times")?;
     for node_id in [NodeId(1), NodeId(2), NodeId(3)] {
@@ -813,7 +813,7 @@ fn independent_path_sum_fixture() -> Result<Fixture> {
 }
 
 fn resident_image(fixture: &Fixture) -> Result<ResidentProjectImage> {
-    ResidentProjectImage::build(
+    super::legacy_resident_build(
         fixture.project,
         fixture.bookmark,
         &fixture.graph,

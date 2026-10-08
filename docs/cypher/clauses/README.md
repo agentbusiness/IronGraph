@@ -4,13 +4,13 @@ The pieces a query pipeline is built from. Documented here are the clauses IronG
 
 ## [Time clauses](./time/README.md)
 
-Three clauses that put time into a query: `AT TIME` moves the whole query to a past instant, `HISTORY` expands one property's samples into rows, and `WINDOW` buckets rows by an instant they carry.
+Three clauses that put time into a query: `AT TIME` selects an event time for declared temporal properties, `HISTORY` expands one property's samples into rows, and `WINDOW` buckets rows by an instant they carry.
 
-They compose. `AT TIME` chooses which graph you are looking at; `HISTORY` turns one property's past into a row stream; `WINDOW` groups any row stream by time, whether its instants came from `HISTORY` or from an ordinary datetime property.
+They compose. `AT TIME` selects a temporal-property read instant; `HISTORY` turns one property's past into a row stream; `WINDOW` groups any row stream by time, whether its instants came from `HISTORY` or from an ordinary datetime property. Nodes, relationships and ordinary properties remain current.
 
 | Page | Summary |
 | --- | --- |
-| [`AT TIME`](./time/at-time.md) | Runs the whole query against the graph as it stood at a past instant. |
+| [`AT TIME`](./time/at-time.md) | Reads declared temporal properties at a chosen event time. |
 | [`HISTORY`](./time/history.md) | Expands a temporal property's samples in a time range into one row each. |
 | [`WINDOW`](./time/window.md) | Buckets rows into time windows over any instant the rows carry. |
 

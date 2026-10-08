@@ -433,7 +433,7 @@ fn official_catalog(fixture: OfficialFixture) -> Result<ProcedureCatalog> {
 }
 
 fn image(graph: &GraphStore) -> Result<ResidentProjectImage> {
-    ResidentProjectImage::build(
+    super::legacy_resident_build(
         PROJECT,
         Bookmark {
             term: 0,
@@ -591,7 +591,7 @@ fn exact_34_graph_free_official_call_scenarios_pass_the_cpu_reference() -> Resul
 }
 
 fn call1_in_query_fixture() -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let name = graph.catalog_mut().intern_property("name")?;
     for (offset, (label, value)) in [("A", "a"), ("B", "b"), ("C", "c")].into_iter().enumerate() {
         let label = graph.catalog_mut().intern_label(label)?;

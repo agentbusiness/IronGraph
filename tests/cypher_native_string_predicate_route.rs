@@ -408,7 +408,7 @@ struct Fixture {
 
 impl Fixture {
     fn new(kind: FixtureKind) -> Result<Self> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let label = graph.catalog_mut().intern_label("TheLabel")?;
         let name_property = graph.catalog_mut().intern_property("name")?;
         for (offset, name) in kind.names().iter().copied().enumerate() {
@@ -437,7 +437,7 @@ impl Fixture {
     }
 
     fn image(&self) -> Result<ResidentProjectImage> {
-        ResidentProjectImage::build(
+        super::legacy_resident_build(
             PROJECT,
             self.bookmark,
             &self.graph,

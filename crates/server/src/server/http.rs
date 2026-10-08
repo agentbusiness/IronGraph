@@ -4,16 +4,16 @@ use axum::{
     Router,
     body::Body,
     extract::{DefaultBodyLimit, Path, State},
-    http::{HeaderValue, Request, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Request, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
+    serve::ListenerExt,
 };
 #[cfg(irongraph_web_bundle)]
 use rust_embed::RustEmbed;
 use tokio::{net::TcpListener, task::JoinSet};
 use tokio_util::sync::CancellationToken;
-use tower::limit::ConcurrencyLimitLayer;
 
 use super::{
     Database,
@@ -30,14 +30,7 @@ use crate::{
         ExecutionClass, SingleNodeBootstrapConfig, WriteStorageLimits, load_existing_node_identity,
         load_or_generate_genesis_identity, open_standalone,
     },
-    gpu::{
-        BackendKind, DeviceMemoryGovernor, ResolvedComputeDevice,
-        create_execution_backend_with_governor,
-    },
-    protocol::{
-        BoltServer, QueryExecutor, QueryIngressAdmission, QueryRequest, QueryStreamEvent,
-        ndjson_channel,
-    },
+    protocol::{BoltServer, QueryExecutor, QueryRequest, QueryStreamEvent, ndjson_channel},
 };
 
 #[cfg_attr(irongraph_web_bundle, derive(RustEmbed))]
@@ -54,35 +47,95 @@ impl WebAssets {
 #[derive(Clone)]
 struct AppState {
     database: Database,
-    query_admission: Arc<QueryIngressAdmission>,
-    maximum_result_bytes: u64,
+    startup: Arc<StartupProgress>,
+}
+
+struct StartupProgress {
+    install: irongraph_embedding::ModelInstallProgress,
+    phase: parking_lot::Mutex<&'static str>,
+    error: parking_lot::Mutex<Option<String>>,
+}
+
+impl Default for StartupProgress {
+    fn default() -> Self {
+        Self {
+            install: irongraph_embedding::ModelInstallProgress::default(),
+            phase: parking_lot::Mutex::new("downloading"),
+            error: parking_lot::Mutex::new(None),
+        }
+    }
+}
+
+async fn startup_progress(State(state): State<AppState>) -> impl IntoResponse {
+    let phase = *state.startup.phase.lock();
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        axum::Json(serde_json::json!({
+            "phase": phase,
+            "downloaded_bytes": state.startup.install.written(),
+            "total_bytes": state.startup.install.total_bytes(),
+            "error": state.startup.error.lock().clone(),
+        })),
+    )
 }
 
 /// Opens durable state, loads the text encoder, and runs the standalone database protocols.
 pub async fn run(config: Config) -> Result<()> {
-    config.validate()?;
-    let existing_identity = load_existing_node_identity(&config.data_dir)?;
-    if existing_identity.is_none() {
-        let _ = load_or_generate_genesis_identity(&config.data_dir)?;
-    }
+    run_with_startup(config, CancellationToken::new(), initialize_embedding).await
+}
 
-    let execution_device = configured_execution_device(&config)?;
-    let memory_governor = DeviceMemoryGovernor::new(
-        config.device_memory_limit_bytes,
-        config.device_reserved_bytes,
-    );
-    let execution_backend =
-        create_execution_backend_with_governor(execution_device, memory_governor.clone())?;
+fn initialize_embedding(
+    progress: Arc<StartupProgress>,
+    database: Database,
+    device: crate::embeddings::EmbeddingDevice,
+) -> Result<()> {
+    let artifacts =
+        irongraph_embedding::ensure_default_embedding_model_with_progress(&progress.install)?;
+    *progress.phase.lock() = "loading";
+    let embedding = Arc::new(crate::embeddings::LocalEmbeddingModel::load(
+        artifacts, device,
+    )?);
+    *progress.phase.lock() = "warming";
+    embedding.warm_up()?;
+    database.bind_text_embedding(embedding)?;
+    *progress.phase.lock() = "ready";
+    Ok(())
+}
+
+async fn run_with_startup(
+    config: Config,
+    shutdown: CancellationToken,
+    initialize: impl FnOnce(
+        Arc<StartupProgress>,
+        Database,
+        crate::embeddings::EmbeddingDevice,
+    ) -> Result<()>
+    + Send
+    + 'static,
+) -> Result<()> {
+    config.validate()?;
+    let identity_directory = config.data_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        if load_existing_node_identity(&identity_directory)?.is_none() {
+            let _ = load_or_generate_genesis_identity(&identity_directory)?;
+        }
+        Ok::<_, Error>(())
+    })
+    .await
+    .map_err(|error| {
+        Error::internal(format!("identity initialization worker failed: {error}"))
+    })??;
+
     let bootstrap_options = SingleNodeBootstrapConfig {
-        execution_class: execution_class(execution_backend.kind()),
+        execution_class: ExecutionClass::Cpu,
         startup_timeout: config.startup_timeout(),
         storage_limits: WriteStorageLimits {
-            max_log_record_bytes: config.wal_max_record_bytes,
+            max_log_record_bytes: usize::MAX,
             max_log_entries_per_read: 4_096,
-            max_snapshot_bytes: 64 * 1024 * 1024 * 1024,
+            max_snapshot_bytes: usize::MAX,
         },
     };
-    let max_write_bytes = config.max_write_bytes;
+    let max_write_bytes = usize::MAX;
     let request_timeout = config.request_timeout();
     let boot = open_standalone(
         &config.data_dir,
@@ -99,7 +152,6 @@ pub async fn run(config: Config) -> Result<()> {
     .await?;
     boot.backend()
         .bind_runtime(Arc::downgrade(boot.runtime()))?;
-    boot.backend().bind_execution_backend(execution_backend)?;
     let database = boot.backend().as_ref().clone();
 
     let snapshot_directory = config.data_dir.join("standalone-snapshots");
@@ -122,24 +174,6 @@ pub async fn run(config: Config) -> Result<()> {
         );
     }
 
-    let embedding_device = config.embedding_device();
-    let embedding_governor = memory_governor.clone();
-    let embedding_database = database.clone();
-    let embedding = tokio::task::spawn_blocking(move || {
-        let artifacts = crate::embeddings::ensure_default_embedding_model()?;
-        let embedding = Arc::new(crate::embeddings::LocalEmbeddingModel::load(
-            artifacts,
-            embedding_device,
-        )?);
-        embedding.bind_memory_governor(embedding_governor)?;
-        embedding.warm_up()?;
-        embedding_database.bind_text_embedding(embedding.clone())?;
-        Ok::<_, Error>(embedding)
-    })
-    .await
-    .map_err(|error| Error::internal(format!("embedding startup task failed: {error}")))??;
-
-    let shutdown = CancellationToken::new();
     let snapshot_task = spawn_snapshot_maintenance(
         database.clone(),
         Arc::clone(boot.runtime()),
@@ -152,15 +186,21 @@ pub async fn run(config: Config) -> Result<()> {
         database.ensure_project(project, CommitAcknowledgement::Published)?;
     }
 
+    let startup = Arc::new(StartupProgress::default());
     let state = AppState {
         database: database.clone(),
-        query_admission: Arc::new(QueryIngressAdmission::new(256, 256 * 1024 * 1024)?),
-        maximum_result_bytes: u64::try_from(config.max_result_bytes).unwrap_or(u64::MAX),
+        startup: Arc::clone(&startup),
     };
     let http_listener = TcpListener::bind(config.http_addr).await?;
     let local_address = http_listener.local_addr()?;
+    let http_listener = http_listener.tap_io(|socket| {
+        if let Err(error) = socket.set_nodelay(true) {
+            tracing::warn!(%error, "could not enable immediate HTTP response writes");
+        }
+    });
     let app = Router::new()
         .route("/api/query", post(query))
+        .route("/system/startup", get(startup_progress))
         .route("/system/local-ai-integrations", get(local_ai_integrations))
         .route(
             "/system/local-ai-integrations/{host}/{action}",
@@ -168,8 +208,7 @@ pub async fn run(config: Config) -> Result<()> {
         )
         .route("/", get(web_root))
         .fallback(static_asset)
-        .layer(DefaultBodyLimit::max(24 * 1024 * 1024))
-        .layer(ConcurrencyLimitLayer::new(config.max_connections))
+        .layer(DefaultBodyLimit::disable())
         .layer(middleware::from_fn_with_state(
             local_address,
             guard_local_http,
@@ -230,6 +269,34 @@ pub async fn run(config: Config) -> Result<()> {
             .await
             .map_err(Error::from)
     }));
+    let embedding_device = config.embedding_device();
+    let embedding_database = database.clone();
+    let embedding_shutdown = shutdown.clone();
+    components.spawn(async move {
+        let progress = Arc::clone(&startup);
+        let mut initializer = tokio::task::spawn_blocking(move || {
+            initialize(progress, embedding_database, embedding_device)
+        });
+        let initialized = tokio::select! {
+            result = &mut initializer => result,
+            () = embedding_shutdown.cancelled() => {
+                startup.install.cancel();
+                initializer.await
+            }
+        };
+        let failure = match initialized {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(error) => Some(format!("embedding startup worker failed: {error}")),
+        };
+        if let Some(error) = failure {
+            tracing::error!(%error, "embedding startup failed");
+            *startup.error.lock() = Some(error);
+            *startup.phase.lock() = "failed";
+        }
+        embedding_shutdown.cancelled().await;
+        Ok(())
+    });
     components.spawn(run_component(
         "Bolt",
         shutdown.clone(),
@@ -297,11 +364,6 @@ pub async fn run(config: Config) -> Result<()> {
         vector_maintenance(database.clone(), shutdown.clone()),
     ));
     components.spawn(run_component(
-        "resident graph maintenance",
-        shutdown.clone(),
-        resident_maintenance(database.clone(), shutdown.clone()),
-    ));
-    components.spawn(run_component(
         "optimizer statistics maintenance",
         shutdown.clone(),
         statistics_maintenance(database.clone(), shutdown.clone()),
@@ -324,8 +386,10 @@ pub async fn run(config: Config) -> Result<()> {
     }
     snapshot_task.abort();
     let _ = snapshot_task.await;
-    drop(embedding);
-    outcome.and(boot.runtime().shutdown().await)
+    let embedding_shutdown = database.shutdown_embedding_jobs().await;
+    outcome
+        .and(embedding_shutdown)
+        .and(boot.runtime().shutdown().await)
 }
 
 /// Loopback transport alone does not establish a browser's authority to use this listener.
@@ -528,25 +592,50 @@ async fn web_root() -> Redirect {
 
 async fn query(
     State(state): State<AppState>,
-    axum::Json(mut request): axum::Json<QueryRequest>,
+    headers: HeaderMap,
+    request: Request<Body>,
 ) -> Response {
-    request.cancellation = CancellationToken::new();
-    request.deadline = Some(std::time::Instant::now() + Duration::from_secs(120));
-    request.connection_id = crate::storage::ConnectionId::new();
-    request.limits = request
-        .limits
-        .clamped_to_server_policy(state.maximum_result_bytes);
-    let ingress = match state.query_admission.try_admit(&request) {
-        Ok(permit) => permit,
-        Err(error) => return query_error(request.request_id, error).await,
+    let json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .and_then(|value| value.trim().split_once('/'))
+        .is_some_and(|(kind, subtype)| {
+            kind.eq_ignore_ascii_case("application")
+                && subtype
+                    .rsplit('+')
+                    .next()
+                    .is_some_and(|suffix| suffix.eq_ignore_ascii_case("json"))
+        });
+    if !json {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
+    let body = match axum::body::to_bytes(request.into_body(), usize::MAX).await {
+        Ok(body) => body,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
-    let request_id = request.request_id;
-    let cancellation = request.cancellation.clone();
+    let cancellation = CancellationToken::new();
     let database = state.database;
-    let (sender, body) = ndjson_channel::<QueryStreamEvent>(8);
-    let body = body.cancel_on_drop(cancellation);
+    let (sender, stream) = ndjson_channel::<QueryStreamEvent>(8);
+    let stream = stream.cancel_on_drop(cancellation.clone());
+    let (accepted, acceptance) = tokio::sync::oneshot::channel();
     tokio::task::spawn_blocking(move || {
-        let _ingress = ingress;
+        let mut request = match axum::Json::<QueryRequest>::from_bytes(&body) {
+            Ok(axum::Json(request)) => request,
+            Err(error) => {
+                let _ = accepted.send(Err(error.into_response()));
+                return;
+            }
+        };
+        request.cancellation = cancellation;
+        request.deadline = None;
+        request.connection_id = crate::storage::ConnectionId::new();
+        let request_id = request.request_id;
+        // Return the original HTTP decode error status; accepted queries continue on this
+        // same producer worker. Dropping the request before acceptance prevents execution.
+        if accepted.send(Ok(())).is_err() {
+            return;
+        }
         if let Err(error) = database.execute(request, &mut |event| sender.blocking_send(event)) {
             let _ = sender.blocking_send(QueryStreamEvent::Error {
                 request_id,
@@ -557,21 +646,11 @@ async fn query(
             });
         }
     });
-    ndjson_response(body.into_body())
-}
-
-async fn query_error(request_id: uuid::Uuid, error: Error) -> Response {
-    let (sender, body) = ndjson_channel::<QueryStreamEvent>(1);
-    let _ = sender
-        .send(QueryStreamEvent::Error {
-            request_id,
-            code: error.code,
-            message: error.message.to_string(),
-            retryable: error.retryable,
-            retry_after_ms: error.retry_after_ms,
-        })
-        .await;
-    ndjson_response(body.into_body())
+    match acceptance.await {
+        Ok(Ok(())) => ndjson_response(stream.into_body()),
+        Ok(Err(response)) => response,
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
 }
 
 fn ndjson_response(body: Body) -> Response {
@@ -646,55 +725,6 @@ fn content_type(path: &str) -> &'static str {
     }
 }
 
-fn configured_execution_device(config: &Config) -> Result<ResolvedComputeDevice> {
-    use crate::config::BackendSelection;
-    match config.execution_backend {
-        BackendSelection::Cpu => Ok(ResolvedComputeDevice {
-            backend: BackendKind::Cpu,
-            ordinal: 0,
-        }),
-        BackendSelection::Metal => Ok(ResolvedComputeDevice {
-            backend: BackendKind::Metal,
-            ordinal: config.execution_device,
-        }),
-        BackendSelection::Cuda => Ok(ResolvedComputeDevice {
-            backend: BackendKind::Cuda,
-            ordinal: config.execution_device,
-        }),
-        BackendSelection::Auto => automatic_execution_device(),
-    }
-}
-
-fn automatic_execution_device() -> Result<ResolvedComputeDevice> {
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        return Ok(ResolvedComputeDevice {
-            backend: BackendKind::Metal,
-            ordinal: 0,
-        });
-    }
-    #[cfg(all(feature = "cuda", not(any(target_os = "macos", target_os = "ios"))))]
-    {
-        return Ok(ResolvedComputeDevice {
-            backend: BackendKind::Cuda,
-            ordinal: 0,
-        });
-    }
-    #[allow(unreachable_code)]
-    Err(Error::new(
-        ErrorCode::GpuAdmissionFailure,
-        "automatic database-device selection found no compiled accelerator; select CPU explicitly",
-    ))
-}
-
-const fn execution_class(backend: BackendKind) -> ExecutionClass {
-    match backend {
-        BackendKind::Cpu => ExecutionClass::Cpu,
-        BackendKind::Metal => ExecutionClass::Metal,
-        BackendKind::Cuda => ExecutionClass::Cuda,
-    }
-}
-
 type RemoteTlsPaths<'a> = Option<(
     &'a std::path::Path,
     &'a std::path::Path,
@@ -721,7 +751,7 @@ async fn bind_remote_listener(
     paths: RemoteTlsPaths<'_>,
     database: &Database,
     scope: crate::engine::ProtocolScope,
-    config: &Config,
+    _config: &Config,
     alpn: Vec<Vec<u8>>,
 ) -> Result<Option<AuthenticatedTlsListener>> {
     let Some(address) = address else {
@@ -735,15 +765,7 @@ async fn bind_remote_listener(
     })?;
     let tls = super::tls::load_remote_service_tls(certificate, key, trust, alpn)?;
     Ok(Some(
-        AuthenticatedTlsListener::bind(
-            address,
-            tls,
-            database.clone(),
-            scope,
-            config.protocol_handshake_timeout(),
-            config.max_connections,
-        )
-        .await?,
+        AuthenticatedTlsListener::bind(address, tls, database.clone(), scope).await?,
     ))
 }
 
@@ -868,46 +890,6 @@ async fn vector_maintenance(database: Database, shutdown: CancellationToken) -> 
     }
 }
 
-async fn resident_maintenance(database: Database, shutdown: CancellationToken) -> Result<()> {
-    let mut ticker = tokio::time::interval(Duration::from_secs(2));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut previous = std::collections::HashMap::<ProjectId, u64>::new();
-    loop {
-        tokio::select! {
-            () = shutdown.cancelled() => return Ok(()),
-            _ = ticker.tick() => {
-                let deferred = database.deferred_resident_projects();
-                let mut current = std::collections::HashMap::new();
-                for (project, revision) in deferred {
-                    if previous.get(&project) == Some(&revision) {
-                        let database = database.clone();
-                        let outcome = tokio::task::spawn_blocking(move || {
-                            database.republish_resident_project(project, revision)
-                        })
-                        .await;
-                        match outcome {
-                            Ok(Ok(_)) => {}
-                            Ok(Err(error)) => tracing::warn!(
-                                %project,
-                                code = ?error.code,
-                                message = %error.message,
-                                "resident republish failed; retrying at the next interval"
-                            ),
-                            Err(error) => tracing::warn!(
-                                %project,
-                                %error,
-                                "resident maintenance task failed; retrying at the next interval"
-                            ),
-                        }
-                    }
-                    current.insert(project, revision);
-                }
-                previous = current;
-            }
-        }
-    }
-}
-
 async fn statistics_maintenance(database: Database, shutdown: CancellationToken) -> Result<()> {
     let mut ticker = tokio::time::interval(Duration::from_secs(2));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -981,6 +963,133 @@ mod tests {
     use axum::http::Method;
 
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn console_and_queries_answer_while_model_preparation_is_blocked() -> Result<()> {
+        use clap::Parser as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let directory = tempfile::tempdir()?;
+        let reservations = (0..4)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0"))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let addresses = reservations
+            .iter()
+            .map(|listener| listener.local_addr().unwrap().to_string())
+            .collect::<Vec<_>>();
+        let config = Config::try_parse_from([
+            "irongraph",
+            "--data-dir",
+            directory.path().to_str().unwrap(),
+            "--http-addr",
+            &addresses[0],
+            "--bolt-addr",
+            &addresses[1],
+            "--stream-addr",
+            &addresses[2],
+            "--queue-addr",
+            &addresses[3],
+        ])
+        .map_err(|error| Error::invalid_data(error.to_string()))?;
+        drop(reservations);
+        let shutdown = CancellationToken::new();
+        let release = shutdown.clone();
+        let server = tokio::spawn(run_with_startup(
+            config,
+            shutdown.clone(),
+            move |_progress, _database, _device| {
+                while !release.is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(Error::new(
+                    ErrorCode::Cancelled,
+                    "controlled preparation cancelled",
+                ))
+            },
+        ));
+        let check = async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                if let Ok(stream) = tokio::net::TcpStream::connect(&addresses[0]).await {
+                    break stream;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(Error::internal(
+                        "HTTP listener did not start before model initialization",
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+            stream
+                .write_all(
+                    format!(
+                        "GET /system/startup HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                        addresses[0]
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await?;
+            if !response.starts_with("HTTP/1.1 200")
+                || !response.contains("\"phase\":\"downloading\"")
+            {
+                return Err(Error::internal(format!(
+                    "startup progress did not answer while preparation was blocked: {response}"
+                )));
+            }
+            let mut stream = tokio::net::TcpStream::connect(&addresses[0]).await?;
+            stream
+                .write_all(
+                    format!(
+                        "GET /web/ HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                        addresses[0]
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            response.clear();
+            stream.read_to_string(&mut response).await?;
+            if !response.starts_with("HTTP/1.1 200") || !response.contains("id=\"root\"") {
+                return Err(Error::internal(format!(
+                    "console did not load while preparation was blocked: {response}"
+                )));
+            }
+            let request = serde_json::json!({"request_id":uuid::Uuid::new_v4(),"project_id":null,"query":"SHOW PROJECTS","bookmark":null}).to_string();
+            let mut stream = tokio::net::TcpStream::connect(&addresses[0]).await?;
+            stream.write_all(format!("POST /api/query HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{request}", addresses[0], request.len()).as_bytes()).await?;
+            response.clear();
+            stream.read_to_string(&mut response).await?;
+            if !response.starts_with("HTTP/1.1 200") || !response.contains("summary") {
+                return Err(Error::internal(format!(
+                    "query did not complete while preparation was blocked: {response}"
+                )));
+            }
+            for (content_type, body, expected_status) in [
+                ("application/json", "{", "400"),
+                ("application/json", "{}", "422"),
+                ("text/plain", "{}", "415"),
+            ] {
+                let mut stream = tokio::net::TcpStream::connect(&addresses[0]).await?;
+                stream.write_all(format!("POST /api/query HTTP/1.1\r\nHost: {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", addresses[0], body.len()).as_bytes()).await?;
+                response.clear();
+                stream.read_to_string(&mut response).await?;
+                assert!(
+                    response.starts_with(&format!("HTTP/1.1 {expected_status}")),
+                    "{response}"
+                );
+            }
+            Ok::<_, Error>(())
+        };
+        let outcome = tokio::time::timeout(Duration::from_secs(10), check).await;
+        shutdown.cancel();
+        server
+            .await
+            .map_err(|error| Error::internal(error.to_string()))??;
+        outcome
+            .map_err(|_| Error::internal("startup requests stalled during model preparation"))??;
+        println!("CONSOLE AND QUERY API RESPOND BEFORE MODEL PREPARATION COMPLETES");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn local_http_guard_preserves_local_clients_and_stops_untrusted_requests() {

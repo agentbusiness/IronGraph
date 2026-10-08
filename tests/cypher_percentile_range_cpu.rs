@@ -5,7 +5,7 @@
 // enforceable instead of switched off globally.
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use std::{collections::BTreeMap, sync::Arc, time::Instant};
+use std::{collections::BTreeMap, time::Instant};
 
 use irongraph::{
     Bookmark, Error, ErrorCode, ProjectId, Result, ScalarValue,
@@ -13,17 +13,12 @@ use irongraph::{
         BindCapabilities, ExecutionContext, ExecutionOutput, QueryEngine, ResultValue,
         bind_with_parameters, parse, plan,
     },
-    gpu::{CpuBackend, ExecutionBackend},
     graph::GraphStore,
 };
 use tokio_util::sync::CancellationToken;
 
-const MEMORY_LIMIT: usize = 64 * 1024 * 1024;
-const RESERVED_MEMORY: usize = 1024 * 1024;
-
 fn context<'a>(
     graph: &'a GraphStore,
-    backend: &'a dyn ExecutionBackend,
     parameters: BTreeMap<String, ResultValue>,
 ) -> ExecutionContext<'a> {
     ExecutionContext {
@@ -47,7 +42,7 @@ fn context<'a>(
         max_result_rows: 1_024,
         max_batch_rows: 1_024,
         optimizer_statistics: None,
-        backend: Some(backend),
+        backend: None,
         cancellation: CancellationToken::new(),
         deadline: Some(Instant::now() + std::time::Duration::from_secs(5)),
         resolved_query_at_time_nanos: None,
@@ -56,9 +51,7 @@ fn context<'a>(
 
 fn execute_cpu(query: &str, parameters: BTreeMap<String, ResultValue>) -> Result<ExecutionOutput> {
     let graph = GraphStore::default();
-    let mut backend = CpuBackend::new(MEMORY_LIMIT, RESERVED_MEMORY);
-    backend.admit_graph(Arc::new(graph.snapshot()?))?;
-    QueryEngine.execute(query, &mut context(&graph, &backend, parameters))
+    QueryEngine.execute(query, &mut context(&graph, parameters))
 }
 
 fn require_runtime_error(query: &str, parameters: BTreeMap<String, ResultValue>) -> Result<Error> {
@@ -69,10 +62,8 @@ fn require_runtime_error(query: &str, parameters: BTreeMap<String, ResultValue>)
         BindCapabilities::default(),
         &parameters,
     )?)?;
-    let mut backend = CpuBackend::new(MEMORY_LIMIT, RESERVED_MEMORY);
-    backend.admit_graph(Arc::new(graph.snapshot()?))?;
     QueryEngine
-        .execute(query, &mut context(&graph, &backend, parameters))
+        .execute(query, &mut context(&graph, parameters))
         .err()
         .ok_or_else(|| Error::internal(format!("query unexpectedly succeeded: {query}")))
 }

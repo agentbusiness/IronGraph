@@ -1136,7 +1136,7 @@ impl Fixture {
     }
 
     fn image(&self) -> Result<ResidentProjectImage> {
-        ResidentProjectImage::build(
+        super::legacy_resident_build(
             PROJECT,
             BOOKMARK,
             &self.graph,

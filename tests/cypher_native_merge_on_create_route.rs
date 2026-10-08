@@ -177,7 +177,7 @@ fn context<'a>(
 
 impl Fixture {
     fn build(case: Case, preexisting_relationship: bool) -> Result<Self> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let setup = if preexisting_relationship {
             format!(
                 "CREATE (a:A), (b:B) CREATE (a)-[:{}]->(b)",
@@ -200,7 +200,7 @@ impl Fixture {
     }
 
     fn resident_image(&self) -> Result<ResidentProjectImage> {
-        ResidentProjectImage::build(
+        super::legacy_resident_build(
             PROJECT,
             self.bookmark,
             &self.graph,
@@ -257,7 +257,7 @@ fn assert_output(
         )));
     }
 
-    let mut after = fixture.graph.clone();
+    let after = fixture.graph.clone();
     for mutation in &output.graph_mutations {
         after.apply(mutation.clone())?;
     }

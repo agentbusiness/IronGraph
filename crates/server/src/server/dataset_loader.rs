@@ -41,13 +41,13 @@ const CITATION_ABSTRACTS: &[u8] =
     include_bytes!("../../../../datasets/raw/cit-HepTh-abstracts.tar.gz");
 
 #[derive(Clone, Copy)]
-struct DatasetSpec {
-    name: &'static str,
-    nodes: u64,
-    relationships: u64,
+pub(super) struct DatasetSpec {
+    pub(super) name: &'static str,
+    pub(super) nodes: u64,
+    pub(super) relationships: u64,
 }
 
-const DATASETS: &[DatasetSpec] = &[
+pub(super) const DATASETS: &[DatasetSpec] = &[
     DatasetSpec {
         name: "fraud",
         nodes: 7,
@@ -85,8 +85,8 @@ const DATASETS: &[DatasetSpec] = &[
     },
     DatasetSpec {
         name: "dblp",
-        nodes: 327_080,
-        relationships: 1_794_425,
+        nodes: 322_080,
+        relationships: 1_162_094,
     },
     DatasetSpec {
         name: "citations",

@@ -187,6 +187,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2784,8 +2793,10 @@ dependencies = [
  "irongraph-graph",
  "irongraph-types",
  "ordered-float",
+ "papaya",
  "proptest",
  "rand 0.9.5",
+ "rayon",
  "regex",
  "serde",
  "smallvec",
@@ -2902,6 +2913,7 @@ dependencies = [
 name = "irongraph-graph"
 version = "0.1.6"
 dependencies = [
+ "arc-swap",
  "bitflags 2.13.1",
  "bitvec",
  "blake3",
@@ -2911,6 +2923,7 @@ dependencies = [
  "half",
  "irongraph-types",
  "ordered-float",
+ "papaya",
  "postcard",
  "roaring",
  "serde",
@@ -2946,6 +2959,7 @@ dependencies = [
  "napi",
  "napi-build",
  "napi-derive",
+ "serde",
  "serde_json",
  "uuid",
 ]
@@ -2956,6 +2970,7 @@ version = "0.1.6"
 dependencies = [
  "irongraph-client",
  "irongraph-embedded",
+ "irongraph-server",
  "irongraph-types",
  "pyo3",
  "pyo3-build-config",
@@ -2969,6 +2984,7 @@ name = "irongraph-server"
 version = "0.1.6"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "axum",
  "bitflags 2.13.1",
@@ -3000,6 +3016,7 @@ dependencies = [
  "lapin",
  "lz4_flex",
  "ordered-float",
+ "papaya",
  "parking_lot",
  "postcard",
  "proptest",
@@ -3920,6 +3937,16 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "x509-parser",
+]
+
+[[package]]
+name = "papaya"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da2442474a9404698c42509b8967f437249dbc7b50493e83020333d3943ec0ae"
+dependencies = [
+ "equivalent",
+ "seize",
 ]
 
 [[package]]
@@ -5144,6 +5171,16 @@ checksum = "6ce2691df843ecc5d231c0b14ece2acc3efb62c0a398c7e1d875f3983ce020e3"
 dependencies = [
  "core-foundation-sys",
  "libc",
+]
+
+[[package]]
+name = "seize"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b55fb86dfd3a2f5f76ea78310a88f96c4ea21a3031f8d212443d56123fd0521"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

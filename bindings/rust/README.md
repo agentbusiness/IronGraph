@@ -1,6 +1,6 @@
 # IronGraph for Rust
 
-**Rust access to a GPU-first temporal graph database with built-in streaming and queues.**
+**Rust access to a CPU graph database with built-in streaming and queues.**
 
 Use Cypher to query graph structure, search text and vectors, inspect property history, and
 administer the database. Built-in Kafka-compatible Streams and AMQP-compatible Queues handle event
@@ -9,12 +9,9 @@ clients for Rust. IronGraph is open-source software released under the Apache Li
 
 ## Performance at a glance
 
-- **0.834 µs graph count** at 2 million nodes on Metal — sub-microsecond at scale.
-- **12× faster indexed range count** on Metal than CPU: 1.61 ms versus 19.38 ms.
-- **7.5× faster k-core analysis** on Metal than CPU: 326 ms versus 2,430 ms.
-
-Median results from five runs on an Apple M5 Pro with 2 million nodes and 8 million
-relationships. See [more performance results](https://irongraph.tech/).
+Graph queries execute on the CPU against one shared canonical graph. Local text inference can
+use Metal or CUDA independently. Measure complete queries separately from individual graph operations;
+latency depends on the workload, graph size, indexes, and host.
 
 ## Database capabilities
 
@@ -98,7 +95,33 @@ Next, declare an embedding index on the text property and use `MATCH … SEARCH 
 to combine retrieval with graph filters.
 
 The example selects CPU across native release targets and keeps automatic text embedding
-enabled. Select `ExecutionDevice::Metal(0)` on a supported Mac to use Metal acceleration.
+enabled. Select `EmbeddingDevice::Metal(0)` with `with_embedding_device` on a supported Mac
+to accelerate text inference.
+
+## Use an async application
+
+Use the async methods inside a Tokio runtime so database work leaves the application's runtime
+threads free. Every call uses the same embedded database and shared graph.
+
+Add Tokio with its `macros` and `rt-multi-thread` features to your application.
+
+```rust
+use irongraph_sdk::{EmbeddedDatabase, EmbeddedOptions, Query};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let database = EmbeddedDatabase::open_async(EmbeddedOptions::new("./irongraph-data")).await?;
+    database.query_async(Query::new("CREATE PROJECT IF NOT EXISTS notes")).await?;
+    let result = database.query_async(Query::new("USE notes MATCH (n) RETURN count(n)")).await?;
+    println!("{} rows", result.rows.len());
+    database.close_async().await?;
+    Ok(())
+}
+```
+
+Expected output: `1 rows`. Async variants also cover streaming, status, cancellation,
+snapshots, and flushing. Await `close_async` during orderly shutdown. Concurrent data calls have
+asynchronous worker scheduling without a configurable operation quota.
 
 ## Use the database capabilities
 
@@ -111,9 +134,9 @@ Select projects explicitly with `USE` or `Query::with_project`; there is no impl
 Each project has `OBSERVED`, `KNOWLEDGE`, and `WORKSPACE` layers for source facts, curated facts,
 and working data. Query results retain typed values, including vectors and temporal values.
 
-One embedded instance owns its directory; one process selects one device. CPU is the reference
-backend, Metal is the primary local accelerator, and CUDA requires a CUDA-enabled release.
-GPU admission rejects project graphs and derived indexes that do not fit. Keep the database
+One embedded instance owns its directory. Graph execution uses one shared CPU graph; text inference
+selects its device independently. CUDA text inference requires a CUDA-enabled release. Parallel reads
+do not wait for writers and may observe mixed values during a multi-record write. Keep the database
 open for the application's lifetime and call `close` during orderly shutdown. IronGraph
 embeds text locally and does not run generative language models.
 

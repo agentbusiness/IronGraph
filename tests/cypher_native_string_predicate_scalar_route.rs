@@ -546,7 +546,7 @@ fn metal_test_guard() -> std::sync::MutexGuard<'static, ()> {
 fn real_metal_matches_cpu_for_all_four_scenarios_without_host_fallback() -> Result<()> {
     let _guard = metal_test_guard();
     let graph = GraphStore::default();
-    let image = ResidentProjectImage::graph_only(Arc::new(graph.snapshot()?));
+    let image = ResidentProjectImage::graph_only(Arc::new(super::legacy_fixture_snapshot(&graph)?));
     let mut cpu = CpuBackend::new(64 * 1024 * 1024, 16 * 1024 * 1024);
     cpu.replace_all_projects(vec![image.clone()])?;
     let mut metal = MetalBackend::new(0, 128 * 1024 * 1024, 16 * 1024 * 1024)?;

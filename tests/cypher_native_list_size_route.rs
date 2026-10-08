@@ -429,7 +429,7 @@ struct PatternCountFixture {
 }
 
 fn pattern_count_fixture() -> Result<PatternCountFixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let x = graph.catalog_mut().intern_label("X")?;
     let y = graph.catalog_mut().intern_label("Y")?;
     let t = graph.catalog_mut().intern_relationship_type("T")?;
@@ -480,7 +480,7 @@ fn install_pattern_fixture(
     fixture: &PatternCountFixture,
 ) -> Result<()> {
     backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-        fixture.graph.snapshot()?,
+        super::legacy_fixture_snapshot(&fixture.graph)?,
     ))])
 }
 
@@ -688,7 +688,7 @@ fn exact_literal_size_cases_cross_one_native_quantifier_boundary() -> Result<()>
     let graph = GraphStore::default();
     let mut backend = ObservedQuantifierBackend::new();
     backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-        graph.snapshot()?,
+        super::legacy_fixture_snapshot(&graph)?,
     ))])?;
     let observations = backend.observations();
 
@@ -800,7 +800,7 @@ fn exact_string3_reverse_crosses_one_native_quantifier_boundary() -> Result<()> 
     let graph = GraphStore::default();
     let mut backend = ObservedQuantifierBackend::new();
     backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-        graph.snapshot()?,
+        super::legacy_fixture_snapshot(&graph)?,
     ))])?;
     let observations = backend.observations();
     let query = "RETURN reverse('raksO')";
@@ -846,7 +846,7 @@ fn exact_string4_split_unwind_count_crosses_one_native_quantifier_boundary() -> 
     let graph = GraphStore::default();
     let mut backend = ObservedQuantifierBackend::new();
     backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-        graph.snapshot()?,
+        super::legacy_fixture_snapshot(&graph)?,
     ))])?;
     let observations = backend.observations();
     let query = "UNWIND split('one1two', '1') AS item RETURN count(item) AS item";
@@ -893,7 +893,7 @@ fn null_split_unwinds_no_rows_and_counts_zero_through_one_native_boundary() -> R
     let graph = GraphStore::default();
     let mut backend = ObservedQuantifierBackend::new();
     backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-        graph.snapshot()?,
+        super::legacy_fixture_snapshot(&graph)?,
     ))])?;
     let observations = backend.observations();
     let query = "UNWIND split(null, '1') AS item RETURN count(item) AS item";
@@ -946,7 +946,7 @@ fn non_size_value_projections_do_not_enter_the_quantifier_route() -> Result<()> 
     let graph = GraphStore::default();
     let mut backend = ObservedQuantifierBackend::new();
     backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-        graph.snapshot()?,
+        super::legacy_fixture_snapshot(&graph)?,
     ))])?;
     let observations = backend.observations();
 
@@ -1147,7 +1147,7 @@ fn cpu_pattern_count_backend_preserves_zero_parents_types_layers_and_self_loops(
     let fixture = pattern_count_fixture()?;
     let mut backend = CpuBackend::new(64 * 1024 * 1024, 16 * 1024 * 1024);
     backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-        fixture.graph.snapshot()?,
+        super::legacy_fixture_snapshot(&fixture.graph)?,
     ))])?;
     let cases = [
         (

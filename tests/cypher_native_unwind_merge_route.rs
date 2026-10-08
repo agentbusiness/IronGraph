@@ -60,7 +60,7 @@ impl Fixture {
     }
 
     fn with_existing_person(login_value: &str, name_value: &str) -> Result<Self> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let person = graph.catalog_mut().intern_label("Person")?;
         let login = graph.catalog_mut().intern_property("login")?;
         let name = graph.catalog_mut().intern_property("name")?;
@@ -88,7 +88,7 @@ impl Fixture {
     }
 
     fn resident_image(&self) -> Result<ResidentProjectImage> {
-        ResidentProjectImage::build(
+        super::legacy_resident_build(
             PROJECT,
             self.bookmark,
             &self.graph,
@@ -275,7 +275,7 @@ fn assert_output(
 }
 
 fn published_graph(fixture: &Fixture, output: &ExecutionOutput) -> Result<GraphStore> {
-    let mut graph = fixture.graph.clone();
+    let graph = fixture.graph.clone();
     for mutation in &output.graph_mutations {
         graph.apply(mutation.clone())?;
     }

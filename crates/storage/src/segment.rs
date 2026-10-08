@@ -520,15 +520,31 @@ impl SegmentStore {
         validate_file_name(&descriptor.file_name)?;
         if descriptor.file_name != format!("{}.segment", hex::encode(descriptor.checksum))
             || family_requires_project(descriptor.family) != descriptor.project_id.is_some()
-            || fs::metadata(self.path_for(descriptor)?)?.len() != descriptor.bytes
         {
+            return Err(Error::new(
+                ErrorCode::CorruptStorage,
+                "indexed segment identity differs from its descriptor",
+            ));
+        }
+        let path = self.path_for(descriptor)?;
+        let mut file = File::open(path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Error::new(
+                    ErrorCode::RetentionExpired,
+                    "requested immutable segment was reclaimed",
+                )
+            } else {
+                error.into()
+            }
+        })?;
+        if file.metadata()?.len() != descriptor.bytes {
             return Err(Error::new(
                 ErrorCode::CorruptStorage,
                 "indexed segment metadata differs from its descriptor",
             ));
         }
-        let framed = FramedFile::read_record_at(
-            self.path_for(descriptor)?,
+        let framed = FramedFile::read_record_from_file(
+            &mut file,
             SEGMENT_MAGIC,
             self.max_record_bytes,
             location.offset,
@@ -776,6 +792,92 @@ mod tests {
         );
         assert!(store.validate(&descriptor).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn direct_record_read_finishes_while_reclamation_registry_is_locked() -> Result<()> {
+        let directory = tempdir()?;
+        let store = SegmentStore::open(directory.path(), 1024)?;
+        let (descriptor, locations) = store.write_immutable_streaming_indexed(
+            SegmentFamily::BrokerPayload,
+            Some(ProjectId::random()),
+            1,
+            |_| {
+                Ok(SegmentRecord {
+                    kind: 1,
+                    payload: b"canonical".to_vec(),
+                })
+            },
+        )?;
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| -> Result<()> {
+            let registry = store
+                .runtime
+                .files
+                .lock()
+                .map_err(|_| Error::internal("registry poisoned"))?;
+            let reader = scope.spawn(|| {
+                let result = store.read_record_at(&descriptor, locations[0]);
+                let _ = completed_tx.send(result);
+            });
+            let result = completed_rx.recv_timeout(std::time::Duration::from_secs(2));
+            drop(registry);
+            reader
+                .join()
+                .map_err(|_| Error::internal("reader panicked"))?;
+            assert_eq!(
+                result
+                    .map_err(|_| Error::internal("reader waited for reclamation registry"))??
+                    .payload,
+                b"canonical"
+            );
+            Ok(())
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_file_read_survives_concurrent_unlink_and_missing_path_is_retention_expired()
+    -> Result<()> {
+        let directory = tempdir()?;
+        let store = SegmentStore::open(directory.path(), 1024)?;
+        let (descriptor, locations) = store.write_immutable_streaming_indexed(
+            SegmentFamily::BrokerPayload,
+            Some(ProjectId::random()),
+            1,
+            |_| {
+                Ok(SegmentRecord {
+                    kind: 1,
+                    payload: b"canonical".to_vec(),
+                })
+            },
+        )?;
+        let mut file = File::open(store.path_for(&descriptor)?)?;
+        std::thread::scope(|scope| -> Result<()> {
+            scope
+                .spawn(|| {
+                    store.reclaim_unreferenced(std::slice::from_ref(&descriptor), &BTreeSet::new())
+                })
+                .join()
+                .map_err(|_| Error::internal("reclaimer panicked"))??;
+            let framed = FramedFile::read_record_from_file(
+                &mut file,
+                SEGMENT_MAGIC,
+                1024,
+                locations[0].offset,
+                locations[0].bytes,
+            )?;
+            let record: SegmentRecord = postcard::from_bytes(&framed.payload)
+                .map_err(|error| Error::invalid_data(error.to_string()))?;
+            assert_eq!(record.payload, b"canonical");
+            assert_eq!(
+                store
+                    .read_record_at(&descriptor, locations[0])
+                    .map_err(|error| error.code),
+                Err(ErrorCode::RetentionExpired)
+            );
+            Ok(())
+        })
     }
 
     #[test]

@@ -14,9 +14,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 use std::sync::Mutex;
 
+use irongraph::graph::GraphStore as CanonicalGraphStore;
 use irongraph::{
     Bookmark, Error, ErrorCode, ProjectId, Result,
     cypher::{BindCapabilities, ExecutionContext, QueryEngine},
@@ -30,12 +31,12 @@ use irongraph::{
         ResidentSortRequest, ResidentSortResult, ResidentVectorQuery, ResidentVectorResult,
         ScratchReservation,
     },
-    graph::{GraphStore, LayerMask},
+    graph::LayerMask,
     types::{LabelId, PropertyId},
 };
 use tokio_util::sync::CancellationToken;
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 use irongraph::gpu::MetalBackend;
 
 const G: u32 = u32::MAX;
@@ -722,10 +723,10 @@ fn scalar_program_scratch_admits_exactly_and_rejects_one_byte_short() -> Result<
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 static METAL_TEST_GUARD: Mutex<()> = Mutex::new(());
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn real_metal_matches_cpu_for_complete_status_and_precedence_matrices() -> Result<()> {
@@ -780,7 +781,7 @@ fn real_metal_matches_cpu_for_complete_status_and_precedence_matrices() -> Resul
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn real_metal_scalar_scratch_admits_exactly_and_rejects_one_byte_short() -> Result<()> {
@@ -813,7 +814,7 @@ impl ObservedScalarBackend {
         }
     }
 
-    #[cfg(all(feature = "accelerator", target_os = "macos"))]
+    #[cfg(all(feature = "legacy-graph", target_os = "macos"))]
     fn strict_metal() -> Result<Self> {
         Ok(Self {
             inner: Box::new(MetalBackend::new(0, 128 * 1024 * 1024, 16 * 1024 * 1024)?),
@@ -1002,7 +1003,7 @@ impl ExecutionBackend for ObservedScalarBackend {
 }
 
 fn query_context<'a>(
-    graph: &'a GraphStore,
+    graph: &'a CanonicalGraphStore,
     backend: &'a dyn ExecutionBackend,
 ) -> ExecutionContext<'a> {
     ExecutionContext {
@@ -1069,7 +1070,7 @@ const QUERY_STATUS_CASES: [(&str, SemanticStatus); 6] = [
 fn assert_queries_use_one_native_scalar_call(backend: &ObservedScalarBackend) {
     for (query, status) in QUERY_STATUS_CASES {
         let before = backend.calls.load(Ordering::SeqCst);
-        let graph = GraphStore::default();
+        let graph = CanonicalGraphStore::default();
         let error = QueryEngine
             .execute(query, &mut query_context(&graph, backend))
             .expect_err("query must return its native scalar status");
@@ -1088,7 +1089,7 @@ fn strict_cpu_query_routes_dynamic_index_statuses_through_the_native_scalar_vm()
     assert_queries_use_one_native_scalar_call(&backend);
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn strict_real_metal_query_routes_match_cpu_native_statuses() -> Result<()> {

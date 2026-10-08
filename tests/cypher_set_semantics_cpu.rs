@@ -47,7 +47,7 @@ fn context(graph: &GraphStore) -> ExecutionContext<'_> {
 }
 
 fn graph_with_two_properties() -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let label = graph.catalog_mut().intern_label("X")?;
     let name = graph.catalog_mut().intern_property("name")?;
     let name2 = graph.catalog_mut().intern_property("name2")?;

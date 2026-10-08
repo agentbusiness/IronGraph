@@ -5,9 +5,11 @@
 // enforceable instead of switched off globally.
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+use irongraph::graph::legacy::{GraphStore, TemporalStore};
 use std::{collections::BTreeMap, sync::Arc};
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+use super::{canonical_fixture, canonical_temporal_fixture};
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 use irongraph::cypher::VectorSearchSource;
 use irongraph::{
     Bookmark, EdgeId, Layer, NodeId, ProjectId, ScalarValue,
@@ -22,18 +24,17 @@ use irongraph::{
         ResidentSortRequest, ResidentSortSource,
     },
     graph::{
-        EdgeInput, EqualityIndex, GraphIndexDefinition, GraphIndexKind, GraphMutation, GraphStore,
+        EdgeInput, EqualityIndex, GraphIndexDefinition, GraphIndexKind, GraphMutation,
         IndexCatalog, IndexKey, IvfPqConfig, IvfPqIndex, LayerMask, NodeInput, PageRankConfig,
         RangeIndex, ResolvedVectorMutation, Similarity, TemporalDeclaration, TemporalSample,
-        TemporalStore, TemporalType, TextIndex, VectorIndex, WindowSpec, bfs, page_rank,
-        triangle_count,
+        TemporalType, TextIndex, VectorIndex, WindowSpec, bfs, page_rank, triangle_count,
     },
     types::{EntityKind, PropertyId},
 };
 use ordered_float::OrderedFloat;
 use tokio_util::sync::CancellationToken;
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 use irongraph::{
     gpu::{
         DeviceMemoryGovernor, MetalBackend, ResidentTemporalDelta, ResidentTemporalPipelineRequest,
@@ -42,7 +43,7 @@ use irongraph::{
     graph::{EmbeddingDType, EmbeddingIndexDefinition, EmbeddingProfile},
 };
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn metal_test_guard() -> std::sync::MutexGuard<'static, ()> {
     static METAL_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
     match METAL_TEST.lock() {
@@ -90,7 +91,7 @@ fn sample_graph() -> irongraph::Result<GraphStore> {
     Ok(graph)
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn optional_social_graph() -> irongraph::Result<GraphStore> {
     let mut graph = GraphStore::default();
     let person = graph.catalog_mut().intern_label("Person")?;
@@ -153,7 +154,7 @@ fn optional_social_graph() -> irongraph::Result<GraphStore> {
     Ok(graph)
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn execute_resident_query(
     graph: &GraphStore,
     project: ProjectId,
@@ -164,7 +165,7 @@ fn execute_resident_query(
     execute_resident_query_with_native_requirement(graph, project, bookmark, backend, source, false)
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn execute_resident_query_with_native_requirement(
     graph: &GraphStore,
     project: ProjectId,
@@ -173,10 +174,11 @@ fn execute_resident_query_with_native_requirement(
     source: &str,
     require_native_execution: bool,
 ) -> irongraph::Result<irongraph::cypher::QueryResult> {
+    let canonical = canonical_fixture(&graph)?;
     let mut context = ExecutionContext {
         project_id: project,
-        graph,
-        binding_catalog: graph.catalog(),
+        graph: &canonical,
+        binding_catalog: canonical.catalog(),
         prior_graph_mutations: &[],
         temporal: None,
         prior_temporal_mutations: &[],
@@ -237,7 +239,7 @@ fn integer_operator_graph() -> irongraph::Result<(GraphStore, PropertyId, Proper
     Ok((graph, key, value))
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn scalable_integer_operator_graph(
     row_count: usize,
 ) -> irongraph::Result<(GraphStore, PropertyId, PropertyId)> {
@@ -506,12 +508,14 @@ fn cypher_history_window_uses_the_complete_resident_pipeline() -> irongraph::Res
                   WINDOW HOPPING 100 EVERY 50 ON sample.time AS bucket\n\
                   RETURN p.name AS name, sample.time AS time, sample.value AS value, \
                          bucket.start AS start, bucket.end AS end";
+    let canonical = canonical_fixture(&graph)?;
+    let canonical_temporal = canonical_temporal_fixture(&temporal)?;
     let mut resident_context = ExecutionContext {
         project_id: project,
-        graph: &graph,
-        binding_catalog: graph.catalog(),
+        graph: &canonical,
+        binding_catalog: canonical.catalog(),
         prior_graph_mutations: &[],
-        temporal: Some(&temporal),
+        temporal: Some(&canonical_temporal),
         prior_temporal_mutations: &[],
         vector_indexes: BTreeMap::new(),
         scalar_indexes: None,
@@ -533,12 +537,14 @@ fn cypher_history_window_uses_the_complete_resident_pipeline() -> irongraph::Res
         deadline: None,
     };
     let resident = QueryEngine.execute(source, &mut resident_context)?;
+    let canonical = canonical_fixture(&graph)?;
+    let canonical_temporal = canonical_temporal_fixture(&temporal)?;
     let mut reference_context = ExecutionContext {
         project_id: project,
-        graph: &graph,
-        binding_catalog: graph.catalog(),
+        graph: &canonical,
+        binding_catalog: canonical.catalog(),
         prior_graph_mutations: &[],
-        temporal: Some(&temporal),
+        temporal: Some(&canonical_temporal),
         prior_temporal_mutations: &[],
         vector_indexes: BTreeMap::new(),
         scalar_indexes: None,
@@ -567,7 +573,7 @@ fn cypher_history_window_uses_the_complete_resident_pipeline() -> irongraph::Res
 
 #[test]
 fn deterministic_ivf_pq_reranks_against_exact_vectors() -> irongraph::Result<()> {
-    let mut vectors = VectorIndex::new(4, Similarity::Euclidean)?;
+    let vectors = VectorIndex::new(4, Similarity::Euclidean)?;
     for id in 0..64_u64 {
         let x = id as f32 / 64.0;
         vectors.upsert(id, &[x, x * x, 1.0 - x, 0.5 * x], id + 1)?;
@@ -598,8 +604,8 @@ fn deterministic_ivf_pq_reranks_against_exact_vectors() -> irongraph::Result<()>
 
 #[test]
 fn scalar_range_and_text_indexes_have_identical_fallback_semantics() -> irongraph::Result<()> {
-    let mut equality = EqualityIndex::default();
-    let mut range = RangeIndex::default();
+    let equality = EqualityIndex::default();
+    let range = RangeIndex::default();
     for (row, value) in [10_i64, 20, 20, 30].into_iter().enumerate() {
         let value = ScalarValue::Integer(value);
         equality.insert(&value, row as u32)?;
@@ -621,7 +627,7 @@ fn scalar_range_and_text_indexes_have_identical_fallback_semantics() -> irongrap
             .collect::<Vec<_>>(),
         vec![1, 2]
     );
-    let mut text = TextIndex::default();
+    let text = TextIndex::default();
     text.upsert(1, "GPU-native graph memory");
     text.upsert(2, "Graph storage");
     assert_eq!(
@@ -660,10 +666,11 @@ fn query_engine_executes_filters_projection_sort_and_records_dependencies() -> i
         "minimum".to_owned(),
         ResultValue::Scalar(ScalarValue::Integer(35)),
     );
+    let canonical = canonical_fixture(&graph)?;
     let mut context = ExecutionContext {
         project_id: ProjectId(uuid::Uuid::nil()),
-        graph: &graph,
-        binding_catalog: graph.catalog(),
+        graph: &canonical,
+        binding_catalog: canonical.catalog(),
         prior_graph_mutations: &[],
         temporal: None,
         prior_temporal_mutations: &[],
@@ -702,10 +709,11 @@ fn query_engine_executes_filters_projection_sort_and_records_dependencies() -> i
 #[test]
 fn query_engine_streaming_yields_bounded_batches_without_retaining_them() -> irongraph::Result<()> {
     let graph = sample_graph()?;
+    let canonical = canonical_fixture(&graph)?;
     let mut context = ExecutionContext {
         project_id: ProjectId(uuid::Uuid::nil()),
-        graph: &graph,
-        binding_catalog: graph.catalog(),
+        graph: &canonical,
+        binding_catalog: canonical.catalog(),
         prior_graph_mutations: &[],
         temporal: None,
         prior_temporal_mutations: &[],
@@ -756,10 +764,11 @@ fn query_engine_dispatches_integer_top_k_to_resident_backend() -> irongraph::Res
     let graph = sample_graph()?;
     let mut backend = CpuBackend::new(32 * 1024 * 1024, 1024);
     backend.admit_graph(Arc::new(graph.snapshot()?))?;
+    let canonical = canonical_fixture(&graph)?;
     let mut context = ExecutionContext {
         project_id: ProjectId(uuid::Uuid::nil()),
-        graph: &graph,
-        binding_catalog: graph.catalog(),
+        graph: &canonical,
+        binding_catalog: canonical.catalog(),
         prior_graph_mutations: &[],
         temporal: None,
         prior_temporal_mutations: &[],
@@ -813,7 +822,7 @@ fn query_engine_dispatches_integer_top_k_to_resident_backend() -> irongraph::Res
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_query_engine_materialized_multikey_sort_matches_reference() -> irongraph::Result<()> {
@@ -825,10 +834,11 @@ fn metal_query_engine_materialized_multikey_sort_matches_reference() -> irongrap
     let mut metal = MetalBackend::with_governor(0, governor.clone())?;
     cpu.admit_graph(Arc::clone(&snapshot))?;
     metal.admit_graph(snapshot)?;
+    let canonical = canonical_fixture(&graph)?;
     let mut context = ExecutionContext {
         project_id: ProjectId(uuid::Uuid::nil()),
-        graph: &graph,
-        binding_catalog: graph.catalog(),
+        graph: &canonical,
+        binding_catalog: canonical.catalog(),
         prior_graph_mutations: &[],
         temporal: None,
         prior_temporal_mutations: &[],
@@ -877,7 +887,7 @@ fn metal_query_engine_materialized_multikey_sort_matches_reference() -> irongrap
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_native_string_property_order_uses_utf8_values_not_dictionary_ids() -> irongraph::Result<()>
@@ -955,7 +965,7 @@ fn metal_native_string_property_order_uses_utf8_values_not_dictionary_ids() -> i
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_native_float_property_order_matches_ordered_float_semantics() -> irongraph::Result<()> {
@@ -1143,7 +1153,7 @@ fn resident_pipeline_keeps_expansion_filter_order_and_projection_columnar() -> i
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_to_boolean_scalar_pipeline_is_native_and_matches_cpu_semantics() -> irongraph::Result<()> {
@@ -1205,7 +1215,7 @@ fn metal_to_boolean_scalar_pipeline_is_native_and_matches_cpu_semantics() -> iro
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_date_constructor_is_native_and_matches_cpu_semantics() -> irongraph::Result<()> {
@@ -1343,7 +1353,7 @@ fn metal_date_constructor_is_native_and_matches_cpu_semantics() -> irongraph::Re
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_dependent_temporal_projection_uses_device_registers_and_matches_cpu()
@@ -1413,7 +1423,7 @@ fn metal_dependent_temporal_projection_uses_device_registers_and_matches_cpu()
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_local_time_constructor_is_native_and_matches_cpu_semantics() -> irongraph::Result<()> {
@@ -1501,7 +1511,7 @@ fn metal_local_time_constructor_is_native_and_matches_cpu_semantics() -> irongra
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_time_constructor_is_native_and_matches_cpu_semantics() -> irongraph::Result<()> {
@@ -1600,7 +1610,7 @@ fn metal_time_constructor_is_native_and_matches_cpu_semantics() -> irongraph::Re
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_local_datetime_constructor_is_native_and_matches_cpu_semantics() -> irongraph::Result<()> {
@@ -1698,7 +1708,7 @@ fn metal_local_datetime_constructor_is_native_and_matches_cpu_semantics() -> iro
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_datetime_fixed_offset_constructor_is_native_and_matches_cpu_semantics()
@@ -1813,7 +1823,7 @@ fn metal_datetime_fixed_offset_constructor_is_native_and_matches_cpu_semantics()
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_named_datetime_constructor_is_native_and_matches_cpu_semantics() -> irongraph::Result<()> {
@@ -1918,7 +1928,7 @@ fn metal_named_datetime_constructor_is_native_and_matches_cpu_semantics() -> iro
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_literal_temporal_map_constructors_are_native_and_match_cpu_semantics()
@@ -1998,7 +2008,7 @@ fn metal_literal_temporal_map_constructors_are_native_and_match_cpu_semantics()
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_temporal_truncation_is_native_and_matches_cpu_semantics() -> irongraph::Result<()> {
@@ -2065,7 +2075,7 @@ fn metal_temporal_truncation_is_native_and_matches_cpu_semantics() -> irongraph:
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_literal_duration_map_constructors_are_native_and_match_cpu_semantics()
@@ -2135,7 +2145,7 @@ fn metal_literal_duration_map_constructors_are_native_and_match_cpu_semantics()
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_datetime_epoch_helpers_are_native_and_match_cpu_semantics() -> irongraph::Result<()> {
@@ -2187,7 +2197,7 @@ fn metal_datetime_epoch_helpers_are_native_and_match_cpu_semantics() -> irongrap
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_duration_constructor_is_native_and_matches_cpu_semantics() -> irongraph::Result<()> {
@@ -2291,7 +2301,7 @@ fn metal_duration_constructor_is_native_and_matches_cpu_semantics() -> irongraph
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_range_scalar_program_is_native_and_matches_cpu_semantics() -> irongraph::Result<()> {
@@ -2358,7 +2368,7 @@ fn metal_range_scalar_program_is_native_and_matches_cpu_semantics() -> irongraph
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_literal_sort_pipeline_is_native_and_matches_cpu_semantics() -> irongraph::Result<()> {
@@ -2412,7 +2422,7 @@ fn metal_literal_sort_pipeline_is_native_and_matches_cpu_semantics() -> irongrap
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_scalar_value_program_is_native_and_matches_cpu_semantics() -> irongraph::Result<()> {
@@ -2636,7 +2646,7 @@ fn metal_scalar_value_program_is_native_and_matches_cpu_semantics() -> irongraph
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_scalar_arithmetic_nan_and_dynamic_map_index_are_native() -> irongraph::Result<()> {
@@ -2713,7 +2723,7 @@ fn metal_scalar_arithmetic_nan_and_dynamic_map_index_are_native() -> irongraph::
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_boolean_scalar_program_is_native_and_matches_cpu_semantics() -> irongraph::Result<()> {
@@ -3042,7 +3052,7 @@ fn metal_boolean_scalar_program_is_native_and_matches_cpu_semantics() -> irongra
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_fixed_two_hop_pipeline_is_native_and_matches_cpu_semantics() -> irongraph::Result<()> {
@@ -3099,7 +3109,7 @@ fn metal_fixed_two_hop_pipeline_is_native_and_matches_cpu_semantics() -> irongra
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_count_distinct_relationships_is_native_and_matches_cpu_semantics() -> irongraph::Result<()>
@@ -3148,7 +3158,7 @@ fn metal_count_distinct_relationships_is_native_and_matches_cpu_semantics() -> i
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_correlated_optional_after_two_hops_is_native_and_matches_cpu_semantics()
@@ -3200,7 +3210,7 @@ fn metal_correlated_optional_after_two_hops_is_native_and_matches_cpu_semantics(
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_correlated_optional_one_hop_matches_cpu_for_hit_miss_and_mixed_rows()
@@ -3294,7 +3304,7 @@ fn metal_correlated_optional_one_hop_matches_cpu_for_hit_miss_and_mixed_rows()
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_optional_undirected_expansion_matches_cpu_and_emits_each_self_loop_once()
@@ -3404,10 +3414,11 @@ fn query_engine_fuses_integer_grouping_into_the_resident_pipeline() -> irongraph
     let (graph, _, _) = integer_operator_graph()?;
     let mut backend = CpuBackend::new(32 * 1024 * 1024, 1024);
     backend.admit_graph(Arc::new(graph.snapshot()?))?;
+    let canonical = canonical_fixture(&graph)?;
     let mut context = ExecutionContext {
         project_id: ProjectId(uuid::Uuid::nil()),
-        graph: &graph,
-        binding_catalog: graph.catalog(),
+        graph: &canonical,
+        binding_catalog: canonical.catalog(),
         prior_graph_mutations: &[],
         temporal: None,
         prior_temporal_mutations: &[],
@@ -3481,9 +3492,9 @@ fn query_engine_uses_online_scalar_index_without_changing_results() -> irongraph
         .catalog()
         .property("name")
         .ok_or_else(|| irongraph::Error::internal("name property missing"))?;
-    let mut indexes = IndexCatalog::default();
+    let indexes = IndexCatalog::default();
     indexes.create(
-        &graph,
+        &canonical_fixture(&graph)?,
         GraphIndexDefinition {
             name: "person_name".to_owned(),
             kind: GraphIndexKind::Equality,
@@ -3492,10 +3503,11 @@ fn query_engine_uses_online_scalar_index_without_changing_results() -> irongraph
             unique: false,
         },
     )?;
+    let canonical = canonical_fixture(&graph)?;
     let mut context = ExecutionContext {
         project_id: ProjectId(uuid::Uuid::nil()),
-        graph: &graph,
-        binding_catalog: graph.catalog(),
+        graph: &canonical,
+        binding_catalog: canonical.catalog(),
         prior_graph_mutations: &[],
         temporal: None,
         prior_temporal_mutations: &[],
@@ -3535,10 +3547,11 @@ fn query_engine_uses_online_scalar_index_without_changing_results() -> irongraph
 #[test]
 fn query_engine_sparse_overlay_preserves_multistatement_read_own_writes() -> irongraph::Result<()> {
     let graph = sample_graph()?;
+    let canonical = canonical_fixture(&graph)?;
     let mut first = ExecutionContext {
         project_id: ProjectId(uuid::Uuid::nil()),
-        graph: &graph,
-        binding_catalog: graph.catalog(),
+        graph: &canonical,
+        binding_catalog: canonical.catalog(),
         prior_graph_mutations: &[],
         temporal: None,
         prior_temporal_mutations: &[],
@@ -3593,10 +3606,11 @@ fn query_engine_sparse_overlay_preserves_multistatement_read_own_writes() -> iro
             | GraphMutation::DeleteEdge { .. } => {}
         }
     }
+    let canonical = canonical_fixture(&graph)?;
     let mut second = ExecutionContext {
         project_id: ProjectId(uuid::Uuid::nil()),
-        graph: &graph,
-        binding_catalog: &catalog,
+        graph: &canonical,
+        binding_catalog: canonical.catalog(),
         prior_graph_mutations: &created.graph_mutations,
         temporal: None,
         prior_temporal_mutations: &created.temporal_mutations,
@@ -3638,7 +3652,7 @@ fn query_engine_sparse_overlay_preserves_multistatement_read_own_writes() -> iro
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_match_reads_statement_local_gpu_overlay_before_creating_edges() -> irongraph::Result<()> {
@@ -3708,12 +3722,14 @@ fn at_time_projects_declared_scalar_history_without_resurrecting_topology() -> i
             300,
         )?;
     }
+    let canonical = canonical_fixture(&graph)?;
+    let canonical_temporal = canonical_temporal_fixture(&temporal)?;
     let mut context = ExecutionContext {
         project_id: ProjectId(uuid::Uuid::nil()),
-        graph: &graph,
-        binding_catalog: graph.catalog(),
+        graph: &canonical,
+        binding_catalog: canonical.catalog(),
         prior_graph_mutations: &[],
-        temporal: Some(&temporal),
+        temporal: Some(&canonical_temporal),
         prior_temporal_mutations: &[],
         vector_indexes: BTreeMap::new(),
         scalar_indexes: None,
@@ -3754,10 +3770,11 @@ fn at_time_projects_declared_scalar_history_without_resurrecting_topology() -> i
 #[test]
 fn query_engine_prepares_resolved_writes_without_mutating_authority() -> irongraph::Result<()> {
     let graph = sample_graph()?;
+    let canonical = canonical_fixture(&graph)?;
     let mut context = ExecutionContext {
         project_id: ProjectId(uuid::Uuid::nil()),
-        graph: &graph,
-        binding_catalog: graph.catalog(),
+        graph: &canonical,
+        binding_catalog: canonical.catalog(),
         prior_graph_mutations: &[],
         temporal: None,
         prior_temporal_mutations: &[],
@@ -3993,7 +4010,7 @@ fn cpu_resident_integer_sort_top_k_join_and_group_are_exact() -> irongraph::Resu
     assert_integer_operator_semantics(&cpu, project, key, value)
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_resident_integer_sort_top_k_join_and_group_match_cpu() -> irongraph::Result<()> {
@@ -4009,7 +4026,7 @@ fn metal_resident_integer_sort_top_k_join_and_group_match_cpu() -> irongraph::Re
     assert_integer_operator_semantics(&metal, project, key, value)
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_value_matrix_returns_device_selected_pair_indices() -> irongraph::Result<()> {
@@ -4099,7 +4116,7 @@ fn metal_value_matrix_returns_device_selected_pair_indices() -> irongraph::Resul
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_integer_sort_and_join_cover_full_i64_domain() -> irongraph::Result<()> {
@@ -4164,7 +4181,7 @@ fn metal_integer_sort_and_join_cover_full_i64_domain() -> irongraph::Result<()> 
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_large_integer_operators_are_linear_memory_and_match_cpu() -> irongraph::Result<()> {
@@ -4219,7 +4236,7 @@ fn metal_large_integer_operators_are_linear_memory_and_match_cpu() -> irongraph:
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_exact_operator_matches_cpu_reference_on_resident_graph() -> irongraph::Result<()> {
@@ -4244,7 +4261,7 @@ fn metal_exact_operator_matches_cpu_reference_on_resident_graph() -> irongraph::
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_specializes_only_type_safe_boolean_filter_identities() -> irongraph::Result<()> {
@@ -4298,7 +4315,7 @@ fn metal_specializes_only_type_safe_boolean_filter_identities() -> irongraph::Re
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_shared_adjacency_first_run_extends_empty_reserved_offsets() -> irongraph::Result<()> {
@@ -4510,7 +4527,7 @@ fn metal_shared_adjacency_first_run_extends_empty_reserved_offsets() -> irongrap
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_shared_fixed_column_rebuild_batches_keep_host_graph_coherent() -> irongraph::Result<()> {
@@ -4595,7 +4612,7 @@ fn metal_shared_fixed_column_rebuild_batches_keep_host_graph_coherent() -> irong
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_first_relationship_property_append_is_immediately_queryable() -> irongraph::Result<()> {
@@ -4649,7 +4666,7 @@ fn metal_first_relationship_property_append_is_immediately_queryable() -> irongr
     graph.validate_structure()
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_incremental_publication_matches_cpu_and_failure_is_atomic() -> irongraph::Result<()> {
@@ -4777,7 +4794,7 @@ fn metal_incremental_publication_matches_cpu_and_failure_is_atomic() -> irongrap
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn metal_admits_temporal_vector_and_ann_state_and_matches_cpu_search() -> irongraph::Result<()> {
@@ -4860,9 +4877,9 @@ fn metal_admits_temporal_vector_and_ann_state_and_matches_cpu_search() -> irongr
     .into_iter()
     .map(|(entity, vector)| Ok((entity, profile.quantize(&vector)?, 5)))
     .collect::<irongraph::Result<Vec<_>>>()?;
-    let mut indexes = IndexCatalog::default();
+    let indexes = IndexCatalog::default();
     indexes.create_embedding(
-        &graph,
+        &canonical_fixture(&graph)?,
         EmbeddingIndexDefinition {
             name: "semantic".to_owned(),
             label: person,
@@ -4908,19 +4925,21 @@ fn metal_admits_temporal_vector_and_ann_state_and_matches_cpu_search() -> irongr
         "semantic".to_owned(),
         VectorSearchSource {
             property: embedding,
-            exact,
-            approximate,
+            exact: exact.as_ref(),
+            approximate: approximate.as_deref(),
             profile_hash: indexes
                 .profile()
                 .map_or([0_u8; 32], |profile| profile.profile_hash),
         },
     )]);
+    let canonical = canonical_fixture(&graph)?;
+    let canonical_temporal = canonical_temporal_fixture(&temporal)?;
     let mut context = ExecutionContext {
         project_id: project,
-        graph: &graph,
-        binding_catalog: graph.catalog(),
+        graph: &canonical,
+        binding_catalog: canonical.catalog(),
         prior_graph_mutations: &[],
-        temporal: Some(&temporal),
+        temporal: Some(&canonical_temporal),
         prior_temporal_mutations: &[],
         vector_indexes,
         scalar_indexes: Some(&indexes),

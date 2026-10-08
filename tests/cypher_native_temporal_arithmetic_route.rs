@@ -1004,7 +1004,7 @@ impl Fixture {
     }
 
     fn image(&self) -> Result<ResidentProjectImage> {
-        ResidentProjectImage::build(
+        super::legacy_resident_build(
             PROJECT,
             self.bookmark,
             &self.graph,
@@ -2515,7 +2515,7 @@ fn real_metal_matches_independent_cpu_with_exact_dispatch_and_no_fallback() -> R
 fn debug_exact_temporal8_physical_shapes() -> Result<()> {
     use irongraph::cypher::{bind, parse, plan};
 
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     for label in ["Duration", "Duration1", "Duration2"] {
         graph.catalog_mut().intern_label(label)?;
     }

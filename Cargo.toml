@@ -42,6 +42,7 @@ thiserror = "2.0.17"
 default = ["accelerator"]
 accelerator = ["irongraph-server/accelerator", "irongraph-embedded/accelerator"]
 metal = ["accelerator"]
+legacy-graph = ["accelerator", "irongraph-server/legacy-graph"]
 cuda = ["accelerator", "irongraph-server/cuda", "irongraph-embedded/cuda"]
 perf-harness = ["dep:async-trait", "dep:futures", "dep:serde", "dep:serde_json", "dep:tempfile", "dep:tokio-util", "dep:uuid"]
 
@@ -152,6 +153,7 @@ harness = false
 [[bench]]
 name = "performance_matrix"
 harness = false
+required-features = ["legacy-graph", "perf-harness"]
 
 [[bench]]
 name = "broker_throughput"
@@ -164,6 +166,7 @@ path = "test_suites/cypher.rs"
 [[test]]
 name = "gpu"
 path = "test_suites/gpu.rs"
+required-features = ["legacy-graph"]
 
 [[test]]
 name = "graph_storage"

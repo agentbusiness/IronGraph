@@ -11,15 +11,7 @@ export interface QueryRequest {
   projectId?: string
   parameters?: Record<string, unknown>
   bookmark?: { term: number; index: number }
-  limits?: Partial<QueryLimits>
   signal?: AbortSignal
-}
-
-export interface QueryLimits {
-  rows: number
-  bytes: number
-  nodes: number
-  edges: number
 }
 
 export interface QueryColumn {
@@ -39,8 +31,6 @@ interface StreamEvent {
   type: string
   [key: string]: unknown
 }
-
-const MAXIMUM_EVENT_CHARACTERS = 64 * 1024 * 1024
 
 export class IronGraphError extends Error {
   constructor(
@@ -81,7 +71,6 @@ export class Client {
         query: request.cypher,
         parameters: request.parameters ?? {},
         bookmark: request.bookmark ?? null,
-        ...(request.limits ? { limits: request.limits } : {}),
       }),
       signal: request.signal,
     })
@@ -130,21 +119,23 @@ function appendBatch(result: QueryResult, event: StreamEvent): void {
 async function* decodeNdjson(stream: ReadableStream<Uint8Array>): AsyncGenerator<StreamEvent> {
   const reader = stream.getReader()
   const decoder = new TextDecoder()
-  let buffered = ''
+  let fragments: string[] = []
   try {
     while (true) {
       const { value, done } = await reader.read()
-      buffered += decoder.decode(value, { stream: !done })
-      if (buffered.length > MAXIMUM_EVENT_CHARACTERS && !buffered.includes('\n')) {
-        throw new IronGraphError('One query event exceeds 64 MiB', 'ProtocolError')
-      }
-      const lines = buffered.split('\n')
-      buffered = lines.pop() ?? ''
-      for (const line of lines) {
+      const chunk = decoder.decode(value, { stream: !done })
+      let start = 0
+      for (let end = chunk.indexOf('\n'); end !== -1; end = chunk.indexOf('\n', start)) {
+        fragments.push(chunk.slice(start, end))
+        const line = fragments.length === 1 ? fragments[0] : fragments.join('')
+        fragments = []
+        start = end + 1
         if (line.trim()) yield JSON.parse(line) as StreamEvent
       }
+      if (start < chunk.length) fragments.push(chunk.slice(start))
       if (done) break
     }
+    const buffered = fragments.join('')
     if (buffered.trim()) yield JSON.parse(buffered) as StreamEvent
   } finally {
     reader.releaseLock()

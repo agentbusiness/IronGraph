@@ -3429,12 +3429,35 @@ async fn handle_content_header<W: AsyncWrite + Unpin>(
             .map_err(|error| {
                 ProtocolError::channel(REPLY_RESOURCE_ERROR, error.to_string(), CLASS_BASIC, 40)
             })?;
+        pending.body = pending
+            .memory
+            .spawn_blocking(move || {
+                let mut body = Vec::new();
+                body.try_reserve_exact(body_bytes).map_err(|_| {
+                    ProtocolError::channel(
+                        REPLY_RESOURCE_ERROR,
+                        "published message allocation failed",
+                        CLASS_BASIC,
+                        40,
+                    )
+                })?;
+                Ok::<_, ProtocolError>(body)
+            })
+            .await
+            .map_err(|error| {
+                ProtocolError::channel(
+                    REPLY_INTERNAL_ERROR,
+                    format!("publish allocation worker failed: {error}"),
+                    CLASS_BASIC,
+                    40,
+                )
+            })??;
         pending.expected_body = Some(body_size);
         pending.properties = Some(properties);
         body_size == 0
     };
     if complete {
-        complete_publish(channel, state)
+        complete_publish(channel, state).await
     } else {
         Ok(HandleOutcome::NoResponse)
     }
@@ -3522,54 +3545,22 @@ async fn handle_content_body<W: AsyncWrite + Unpin>(
                 40,
             ));
         }
-        let expected_capacity = usize::try_from(expected).map_err(|_| {
-            ProtocolError::channel(
-                REPLY_RESOURCE_ERROR,
-                "published message size exceeds this platform",
-                CLASS_BASIC,
-                40,
-            )
-        })?;
-        let target_capacity = if received > pending.body.capacity() {
-            pending
-                .body
-                .capacity()
-                .max(SERVER_FRAME_MAX as usize)
-                .saturating_mul(2)
-                .max(received)
-                .min(expected_capacity)
-        } else {
-            pending.body.capacity()
-        };
-        if target_capacity > pending.body.capacity() {
-            pending
-                .body
-                .try_reserve_exact(target_capacity.saturating_sub(pending.body.len()))
-                .map_err(|_| {
-                    ProtocolError::channel(
-                        REPLY_RESOURCE_ERROR,
-                        "published message allocation failed",
-                        CLASS_BASIC,
-                        40,
-                    )
-                })?;
-        }
         pending.body.extend_from_slice(payload);
         received as u64 == expected
     };
     state.buffered_publish_bytes = connection_bytes;
     if complete {
-        complete_publish(channel, state)
+        complete_publish(channel, state).await
     } else {
         Ok(HandleOutcome::NoResponse)
     }
 }
 
-fn complete_publish(
+async fn complete_publish(
     channel: u16,
     state: &mut ConnectionState,
 ) -> std::result::Result<HandleOutcome, ProtocolError> {
-    let (mut pending, confirms) = {
+    let (pending, confirms) = {
         let channel_state = state.channels.get_mut(&channel).ok_or_else(|| {
             ProtocolError::connection(REPLY_CHANNEL_ERROR, "channel is not open", 60, 40)
         })?;
@@ -3586,36 +3577,52 @@ fn complete_publish(
     state.buffered_publish_bytes = state
         .buffered_publish_bytes
         .saturating_sub(pending.body.len());
-    let properties = pending.properties.ok_or_else(|| {
-        ProtocolError::channel(
-            REPLY_UNEXPECTED_FRAME,
-            "publish content properties are missing",
-            CLASS_BASIC,
-            40,
-        )
-    })?;
-    let returned_properties = pending.mandatory.then(|| properties.clone());
-    let (stored_properties, stored_headers) = properties.into_storage().map_err(|error| {
-        ProtocolError::channel(REPLY_INTERNAL_ERROR, error.to_string(), CLASS_BASIC, 40)
-    })?;
-    let returned_body = pending.mandatory.then(|| pending.body.clone());
-    let record = AmqpBatchRecord {
-        exchange: pending.exchange.clone(),
-        routing_key: pending.routing_key.clone(),
-        mandatory: pending.mandatory,
-        properties: stored_properties,
-        headers: stored_headers,
-        payload: std::mem::take(&mut pending.body),
-    };
-    state.ready_publishes.push(ReadyPublish {
-        channel,
-        sequence: pending.sequence,
-        confirms,
-        returned_properties,
-        returned_body,
-        record,
-        memory: pending.memory,
-    });
+    let memory = pending.memory.clone();
+    let ready = memory
+        .spawn_blocking(move || {
+            let mut pending = pending;
+            let properties = pending.properties.ok_or_else(|| {
+                ProtocolError::channel(
+                    REPLY_UNEXPECTED_FRAME,
+                    "publish content properties are missing",
+                    CLASS_BASIC,
+                    40,
+                )
+            })?;
+            let returned_properties = pending.mandatory.then(|| properties.clone());
+            let (stored_properties, stored_headers) =
+                properties.into_storage().map_err(|error| {
+                    ProtocolError::channel(REPLY_INTERNAL_ERROR, error.to_string(), CLASS_BASIC, 40)
+                })?;
+            let returned_body = pending.mandatory.then(|| pending.body.clone());
+            let record = AmqpBatchRecord {
+                exchange: pending.exchange.clone(),
+                routing_key: pending.routing_key.clone(),
+                mandatory: pending.mandatory,
+                properties: stored_properties,
+                headers: stored_headers,
+                payload: std::mem::take(&mut pending.body),
+            };
+            Ok::<_, ProtocolError>(ReadyPublish {
+                channel,
+                sequence: pending.sequence,
+                confirms,
+                returned_properties,
+                returned_body,
+                record,
+                memory: pending.memory,
+            })
+        })
+        .await
+        .map_err(|error| {
+            ProtocolError::channel(
+                REPLY_INTERNAL_ERROR,
+                format!("publish assembly worker failed: {error}"),
+                CLASS_BASIC,
+                40,
+            )
+        })??;
+    state.ready_publishes.push(ready);
     Ok(HandleOutcome::NoResponse)
 }
 

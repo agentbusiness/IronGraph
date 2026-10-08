@@ -50,7 +50,7 @@ fn context(graph: &GraphStore) -> ExecutionContext<'_> {
 }
 
 fn graph_with_live_and_null_optional_relationship_rows() -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let entity = graph.catalog_mut().intern_label("Entity")?;
     let isolated = graph.catalog_mut().intern_label("Isolated")?;
     let relationship_type = graph.catalog_mut().intern_relationship_type("R")?;
@@ -126,7 +126,7 @@ fn mixed_live_and_null_optional_rows_mutate_only_the_live_relationship() -> Resu
     );
     assert_eq!(output.graph_mutations.len(), 1);
 
-    let mut committed = graph.clone();
+    let committed = graph.clone();
     for mutation in output.graph_mutations {
         committed.apply(mutation)?;
     }

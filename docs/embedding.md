@@ -36,7 +36,7 @@ The following Python example requires an installed native package and no standal
 from irongraph import EmbeddedDatabase
 
 with EmbeddedDatabase("./data/streams", device="cpu", load_embeddings=False,
-                      budgets={"worker_threads": 2, "max_concurrent_operations": 8}) as db:
+                      budgets={"worker_threads": 2}) as db:
     db.query("CREATE PROJECT IF NOT EXISTS streams")
     project = db.query("USE streams RETURN 1")["catalog"]["project_id"]
     db.query("CREATE TOPIC IF NOT EXISTS events PARTITIONS 1", project_id=project)
@@ -63,8 +63,8 @@ Node.js exposes `streamAppend`, `streamFetch`, `flush`, `status`, and `cancel`. 
 arrays; null and empty values are distinct. Returned records include their persisted message
 identity and ingress metadata. Topic administration continues to use Cypher.
 
-Python's `query_options` and Node.js's fourth query argument accept `bookmark`, `consistency`,
-and `limits`. Rust carries these fields on `Query`. `CHECK READ ONLY` accepts candidate text
+Python's `query_options` and Node.js's fourth query argument accept `bookmark` and `consistency`.
+Rust carries these fields on `Query`. `CHECK READ ONLY` accepts candidate text
 as the `$statement` parameter through the same query method.
 
 Use `operation_options` in Python, the fifth query argument in Node.js, or
@@ -82,11 +82,10 @@ open. Explicit `close` drains and joins the WAL workers, establishes the final d
 boundary, and releases directory ownership. Independent query and stream calls are not one atomic
 transaction. Always observe errors from explicit close.
 
-Resource options include `max_write_bytes`, `max_concurrent_operations`, `worker_threads`,
-`request_timeout_ms`, `startup_timeout_ms`, `snapshot_interval_ms`, and the device memory limits.
-These are separate request, worker, and device budgets; they are not a total host-process RSS limit.
+Runtime options include `worker_threads` and `snapshot_interval_ms`.
+Database operations have no configurable data, memory, concurrency, or duration quota.
 `status` reports readiness, the resolved data directory, and active operations. One handle can
-serve concurrent projects up to its configured operation budget.
+serve concurrent projects; asynchronous work waits for a worker without rejecting requests.
 
 ## Install an SDK
 
@@ -228,15 +227,16 @@ Expected output:
 Call `close` during orderly shutdown so IronGraph can complete its snapshot and release the data
 directory.
 
-## Select an execution device
+## Select a text inference device
 
-The portable options are `auto`, `cpu`, `metal`, and `cuda`, with an optional device ordinal for
-Metal or CUDA. Automatic selection chooses the supported accelerator for the packaged build and
-platform. Select `cpu` explicitly when portability or deterministic CPU behavior matters more than
-acceleration.
+Graph execution uses the CPU. Its `device` option accepts `auto` or `cpu`. Text inference is selected
+independently: `embedding_device` in Python accepts `auto`, `cpu`, `metal`, or `cuda`, with
+`embedding_device_ordinal` selecting an accelerator. Automatic selection uses the supported inference
+accelerator for the packaged build and platform.
 
-Each process uses one device. A GPU-backed embedded database admits project data and derived indexes
-only when they fit in the available device budget; admission failure is explicit.
+Graph rows and indexes stay in shared host memory. GPU memory holds the enabled encoder and its
+inference work. Embedding generation runs asynchronously; source records become readable before
+new derived vectors are ready.
 
 The local text encoder loads and warms automatically by default. Set `load_embeddings=False` in
 Python, or the corresponding final `false` option in Node.js, only when the application supplies

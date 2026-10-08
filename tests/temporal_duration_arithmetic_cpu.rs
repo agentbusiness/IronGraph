@@ -10,19 +10,11 @@ use std::{collections::BTreeMap, time::Instant};
 use irongraph::{
     Bookmark, ErrorCode, ProjectId, Result, ScalarValue,
     cypher::{BindCapabilities, ExecutionContext, QueryEngine, ResultValue},
-    gpu::{CpuBackend, ExecutionBackend, ResidentProjectImage},
-    graph::{GraphStore, IndexCatalog, TemporalStore},
+    graph::GraphStore,
 };
 use tokio_util::sync::CancellationToken;
 
 fn context(graph: &GraphStore) -> ExecutionContext<'_> {
-    context_with_backend(graph, None)
-}
-
-fn context_with_backend<'a>(
-    graph: &'a GraphStore,
-    backend: Option<&'a dyn ExecutionBackend>,
-) -> ExecutionContext<'a> {
     ExecutionContext {
         project_id: ProjectId(uuid::Uuid::nil()),
         graph,
@@ -44,7 +36,7 @@ fn context_with_backend<'a>(
         max_result_rows: 1_024,
         max_batch_rows: 1_024,
         optimizer_statistics: None,
-        backend,
+        backend: None,
         cancellation: CancellationToken::new(),
         deadline: Some(Instant::now() + std::time::Duration::from_secs(5)),
         resolved_query_at_time_nanos: None,
@@ -55,16 +47,6 @@ fn context_with_backend<'a>(
 fn exact_numeric_tck_regressions_bypass_temporal_arithmetic_and_preserve_cpu_results() -> Result<()>
 {
     let graph = GraphStore::default();
-    let bookmark = Bookmark { term: 1, index: 0 };
-    let image = ResidentProjectImage::build(
-        ProjectId(uuid::Uuid::nil()),
-        bookmark,
-        &graph,
-        &TemporalStore::default(),
-        &IndexCatalog::default(),
-    )?;
-    let mut cpu = CpuBackend::new(32 * 1024 * 1024, 4 * 1024 * 1024);
-    cpu.admit_project(image)?;
     let cases = [
         (1956_u16, "RETURN 12 / 4 * 3 - 2 * 4"),
         (1957, "RETURN 12 / 4 * (3 - 2 * 4)"),
@@ -102,11 +84,38 @@ fn exact_numeric_tck_regressions_bypass_temporal_arithmetic_and_preserve_cpu_res
         ),
     ];
     for (report_id, query) in cases {
-        let expected = QueryEngine.execute(query, &mut context(&graph))?;
-        let actual = QueryEngine.execute(query, &mut context_with_backend(&graph, Some(&cpu)))?;
+        let expected: &[i64] = match report_id {
+            1956 => &[1],
+            1957 => &[-15],
+            2131 => &[14, 14, 40],
+            2132 => &[9, 9, 10],
+            2134 => &[2, 2, -8],
+            2135 => &[7, 7, -2],
+            2137 => &[8, 8, 0],
+            2138 => &[3, 3, 0],
+            2140 => &[-4, -4, -8],
+            2141 => &[1, 1, -2],
+            _ => {
+                return Err(irongraph::Error::internal(
+                    "unknown numeric regression case",
+                ));
+            }
+        };
+        let actual = QueryEngine.execute(query, &mut context(&graph))?;
+        let values = actual
+            .result
+            .batches
+            .iter()
+            .flat_map(|batch| batch.columns.iter())
+            .flat_map(|column| column.values.iter().cloned())
+            .collect::<Vec<_>>();
         assert_eq!(
-            actual.result, expected.result,
-            "numeric TCK report {report_id} changed under the resident CPU backend: {query}"
+            values,
+            expected
+                .iter()
+                .map(|value| ResultValue::Scalar(ScalarValue::Integer(*value)))
+                .collect::<Vec<_>>(),
+            "numeric TCK report {report_id} changed under canonical CPU execution: {query}"
         );
     }
     Ok(())

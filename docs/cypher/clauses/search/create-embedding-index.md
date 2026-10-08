@@ -23,7 +23,7 @@ Run these statements in order in an existing project named `knowledge`:
 USE knowledge
 CREATE (:Document {
   title: 'Device handbook',
-  body: 'The handbook explains how to configure the local execution device.'
+  body: 'The handbook explains how to configure local text inference.'
 })
 ```
 
@@ -51,13 +51,14 @@ The exact scores depend on your text and active model. Inspect `SHOW INDEXES` to
 
 ## Behavior
 
-IronGraph embeds existing source text when the index is created and maintains the vectors as text
-changes or nodes are deleted. The complete text stays on its original node. Generated vectors are
+IronGraph schedules existing source text for asynchronous embedding when the index is created
+and maintains the vectors as text changes or nodes are deleted. Creation can finish before
+embedding completes. The complete text stays on its original node. Generated vectors are
 derived index data; reading `document.embedding` does not return the generated vector.
 
 `MODEL` accepts `default`, the verified local model loaded by the database. The similarity must match
-the active embedding profile. GPU-backed instances perform vector search on their selected device;
-CPU instances use the CPU backend.
+the active embedding profile. Vector search runs on the CPU. Text inference uses its independently
+selected CPU, Metal, or CUDA device.
 
 Model availability, valid input, and device capacity remain operating requirements. Failed index
 operations report a diagnostic through `SHOW INDEXES`.

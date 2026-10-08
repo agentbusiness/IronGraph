@@ -10,6 +10,8 @@ default = []
 accelerator = []
 
 [dependencies]
+arc-swap = "1.9.2"
+papaya = "0.2.5"
 blake3 = { workspace = true }
 bitflags = { version = "2.10.0", features = ["serde"] }
 bitvec = { version = "1.0.1", features = ["serde"] }

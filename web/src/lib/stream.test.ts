@@ -12,6 +12,23 @@ function splitResponse(parts: string[], status = 200): Response {
 }
 
 describe('NDJSON decoder', () => {
+  it('preserves a large dirty value across UTF-8 byte boundaries and a final event without newline', async () => {
+    const body = '東京 🛫 complete owner content\n'.repeat(16384);
+    const bytes = new TextEncoder().encode(JSON.stringify({ type: 'batch', body }) + '\r\n{"type":"summary"}');
+    let offset = 0;
+    const response = new Response(new ReadableStream({
+      pull(controller) {
+        if (offset === bytes.length) { controller.close(); return; }
+        const end = Math.min(offset + 257, bytes.length);
+        controller.enqueue(bytes.subarray(offset, end));
+        offset = end;
+      },
+    }), { headers: { 'content-type': 'application/x-ndjson' } });
+    const events: unknown[] = [];
+    for await (const event of decodeResponse(response)) events.push(event.data);
+    expect(events).toEqual([{ type: 'batch', body }, { type: 'summary' }]);
+  });
+
   it('preserves events split across arbitrary transport chunks', async () => {
     const response = splitResponse(['{"type":"sche', 'ma","columns":[]}\n{"type":"sum', 'mary","truncated":false}\n']);
     const events: unknown[] = [];

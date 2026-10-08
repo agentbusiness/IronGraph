@@ -62,7 +62,7 @@ struct StrictLabelMembershipBackend {
 impl StrictLabelMembershipBackend {
     fn new(graph: &GraphStore) -> Result<Self> {
         let mut inner = CpuBackend::new(MEMORY_LIMIT_BYTES, RESERVED_BYTES);
-        inner.admit_project(ResidentProjectImage::build(
+        inner.admit_project(super::legacy_resident_build(
             PROJECT,
             bookmark(graph),
             graph,
@@ -347,7 +347,7 @@ fn context<'a>(graph: &'a GraphStore, backend: &'a dyn ExecutionBackend) -> Exec
 }
 
 fn fixture() -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let a = graph.catalog_mut().intern_label("A")?;
     let b = graph.catalog_mut().intern_label("B")?;
     let c = graph.catalog_mut().intern_label("C")?;
@@ -599,7 +599,7 @@ fn list12_6_variable_function_projection_direction_and_property_near_misses_fail
 
 #[test]
 fn list12_6_catalog_instruction_and_string_images_are_bounded_before_dispatch() -> Result<()> {
-    let mut too_many_labels = GraphStore::default();
+    let too_many_labels = GraphStore::default();
     too_many_labels.catalog_mut().intern_property("name")?;
     // One label leaf needs five instructions and the balanced OR needs one more per join. Forty-
     // three labels therefore need 257 instructions and exceed the compact 256-instruction proof.
@@ -610,7 +610,7 @@ fn list12_6_catalog_instruction_and_string_images_are_bounded_before_dispatch() 
     }
     assert_no_native_dispatch(&too_many_labels, QUERY)?;
 
-    let mut oversized_literal = GraphStore::default();
+    let oversized_literal = GraphStore::default();
     oversized_literal.catalog_mut().intern_property("name")?;
     oversized_literal
         .catalog_mut()

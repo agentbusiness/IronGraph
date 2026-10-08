@@ -10,10 +10,10 @@ use std::{
 
 use irongraph_client::{ClientError, MutualTls, Query, RemoteClient};
 use irongraph_embedded::{
-    EmbeddedDatabase, EmbeddedError, EmbeddedOptions, EmbeddingPolicy, ExecutionDevice,
-    OperationOptions, StreamAppend, StreamFetch,
+    EmbeddedDatabase, EmbeddedError, EmbeddedOptions, EmbeddingDevice, EmbeddingPolicy,
+    ExecutionDevice, OperationOptions, StreamAppend, StreamFetch,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 const ABI_VERSION: u32 = 1;
@@ -165,15 +165,13 @@ struct OpenOptions {
     execution_device: String,
     #[serde(default)]
     device_ordinal: u32,
+    #[serde(default = "default_device")]
+    embedding_device: String,
+    #[serde(default)]
+    embedding_device_ordinal: u32,
     #[serde(default = "default_embedding")]
     embedding_policy: String,
-    device_memory_limit_bytes: Option<usize>,
-    device_reserved_bytes: Option<usize>,
-    max_write_bytes: Option<usize>,
-    request_timeout_ms: Option<u64>,
-    startup_timeout_ms: Option<u64>,
     snapshot_interval_ms: Option<u64>,
-    max_concurrent_operations: Option<usize>,
     worker_threads: Option<usize>,
 }
 fn default_device() -> String {
@@ -185,15 +183,31 @@ fn default_embedding() -> String {
 
 impl OpenOptions {
     fn into_options(self) -> Result<EmbeddedOptions> {
+        if self.device_ordinal != 0 {
+            return Err(Failure::new(
+                "CONFIGURATION",
+                "CPU graph device ordinal must be zero",
+            ));
+        }
         let device = match self.execution_device.as_str() {
             "auto" => ExecutionDevice::Auto,
             "cpu" => ExecutionDevice::Cpu,
-            "metal" => ExecutionDevice::Metal(self.device_ordinal),
-            "cuda" => ExecutionDevice::Cuda(self.device_ordinal),
             _ => {
                 return Err(Failure::new(
                     "CONFIGURATION",
-                    "execution_device must be auto, cpu, metal, or cuda",
+                    "graph execution is CPU-only; execution_device must be auto or cpu",
+                ));
+            }
+        };
+        let embedding_device = match self.embedding_device.as_str() {
+            "auto" => EmbeddingDevice::Auto,
+            "cpu" => EmbeddingDevice::Cpu,
+            "metal" => EmbeddingDevice::Metal(self.embedding_device_ordinal),
+            "cuda" => EmbeddingDevice::Cuda(self.embedding_device_ordinal),
+            _ => {
+                return Err(Failure::new(
+                    "CONFIGURATION",
+                    "embedding_device must be auto, cpu, metal, or cuda",
                 ));
             }
         };
@@ -209,27 +223,10 @@ impl OpenOptions {
         };
         let mut options = EmbeddedOptions::new(self.data_dir)
             .with_execution_device(device)
+            .with_embedding_device(embedding_device)
             .with_embedding_policy(embedding);
-        if let Some(value) = self.device_memory_limit_bytes {
-            options.device_memory_limit_bytes = value;
-        }
-        if let Some(value) = self.device_reserved_bytes {
-            options.device_reserved_bytes = value;
-        }
-        if let Some(value) = self.max_write_bytes {
-            options.max_write_bytes = value;
-        }
-        if let Some(value) = self.request_timeout_ms {
-            options.request_timeout = Duration::from_millis(value);
-        }
-        if let Some(value) = self.startup_timeout_ms {
-            options.startup_timeout = Duration::from_millis(value);
-        }
         if let Some(value) = self.snapshot_interval_ms {
             options.snapshot_interval = Duration::from_millis(value);
-        }
-        if let Some(value) = self.max_concurrent_operations {
-            options.max_concurrent_operations = value;
         }
         if let Some(value) = self.worker_threads {
             options.worker_threads = value;
@@ -299,8 +296,8 @@ fn connection(handle: u64, remove: bool) -> Result<SharedConnection> {
     connection.ok_or_else(|| Failure::new("INVALID_HANDLE", "connection is closed or unknown"))
 }
 
-fn dispatch(bytes: &[u8]) -> Result<Value> {
-    match serde_json::from_slice::<Request>(bytes)? {
+fn dispatch(bytes: &[u8]) -> Result<Vec<u8>> {
+    let result = match serde_json::from_slice::<Request>(bytes)? {
         Request::OpenEmbedded { options } => insert(Connection::Embedded(Box::new(
             EmbeddedDatabase::open(options.into_options()?)?,
         ))),
@@ -323,7 +320,7 @@ fn dispatch(bytes: &[u8]) -> Result<Value> {
                     .map_err(Failure::from)?,
                 Connection::Remote(client) => client.query(query).map_err(Failure::from)?,
             };
-            Ok(serde_json::to_value(result)?)
+            return serialize_success(&result);
         }
         Request::Snapshot { handle } => {
             let shared = connection(handle, false)?;
@@ -380,7 +377,44 @@ fn dispatch(bytes: &[u8]) -> Result<Value> {
             handle,
             operation_id,
         } => with_embedded(handle, |database| Ok(json!(database.cancel(&operation_id)))),
+    }?;
+    serialize_success(&result)
+}
+
+fn serialize_success<T: Serialize>(result: &T) -> Result<Vec<u8>> {
+    struct LosslessFloats;
+    impl serde_json::ser::Formatter for LosslessFloats {
+        fn write_f32<W: std::io::Write + ?Sized>(
+            &mut self,
+            writer: &mut W,
+            value: f32,
+        ) -> std::io::Result<()> {
+            // Match the former Value serializer's exact f32-to-f64 widening, including
+            // vectors nested inside node properties, maps, lists and paths.
+            serde_json::ser::Formatter::write_f64(
+                &mut serde_json::ser::CompactFormatter,
+                writer,
+                f64::from(value),
+            )
+        }
     }
+    #[derive(Serialize)]
+    struct Success<'a, T> {
+        ok: bool,
+        version: &'static str,
+        result: &'a T,
+    }
+    let mut bytes = Vec::new();
+    Success {
+        ok: true,
+        version: env!("CARGO_PKG_VERSION"),
+        result,
+    }
+    .serialize(&mut serde_json::Serializer::with_formatter(
+        &mut bytes,
+        LosslessFloats,
+    ))?;
+    Ok(bytes)
 }
 
 fn with_embedded(
@@ -405,20 +439,18 @@ fn response(bytes: &[u8]) -> (i32, Vec<u8>) {
     guarded_response(|| dispatch(bytes))
 }
 
-fn guarded_response(operation: impl FnOnce() -> Result<Value>) -> (i32, Vec<u8>) {
+fn guarded_response(operation: impl FnOnce() -> Result<Vec<u8>>) -> (i32, Vec<u8>) {
     let result = catch_unwind(AssertUnwindSafe(operation))
         .unwrap_or_else(|_| Err(Failure::new("INTERNAL_PANIC", "native operation panicked")));
-    let (status, value) = match result {
-        Ok(result) => (
-            0,
-            json!({"ok": true, "version": env!("CARGO_PKG_VERSION"), "result": result}),
-        ),
+    match result {
+        Ok(bytes) => (0, bytes),
         Err(error) => (
             1,
-            json!({"ok": false, "version": env!("CARGO_PKG_VERSION"), "error": error.json()}),
+            json!({"ok": false, "version": env!("CARGO_PKG_VERSION"), "error": error.json()})
+                .to_string()
+                .into_bytes(),
         ),
-    };
-    (status, value.to_string().into_bytes())
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -481,6 +513,56 @@ pub unsafe extern "C" fn irongraph_buffer_free_v1(buffer: Buffer) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn direct_response_preserves_dirty_nested_values_and_float_precision() {
+        use irongraph_client::QueryResult;
+        let dirty = "long Unicode 🦀\\\"\0".repeat(16_384);
+        let values = vec![
+            0.1_f32,
+            1.234567,
+            -f32::from_bits(1),
+            f32::from_bits(1),
+            f32::MAX,
+        ];
+        let mut fixture = serde_json::to_value(QueryResult::default()).unwrap();
+        fixture["rows"] = json!([[{"type":"list","value":[
+            {"type":"string","value":dirty},
+            {"type":"integer","value":"9007199254740993"},
+            {"type":"map","value":{"vector":{"type":"vector","value":values}}}
+        ]}]]);
+        let result: QueryResult = serde_json::from_value(fixture).unwrap();
+        let encoded = super::serialize_success(&result).unwrap();
+        let decoded: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        let expected = serde_json::json!({"ok":true,"version":env!("CARGO_PKG_VERSION"),"result":serde_json::to_value(&result).unwrap()});
+        let previous_wire = serde_json::to_vec(&expected).unwrap();
+        let previous_decoded: Value = serde_json::from_slice(&previous_wire).unwrap();
+        assert!(
+            decoded == previous_decoded,
+            "direct response changed the previous wire result"
+        );
+    }
+    #[test]
+    fn native_embedding_device_options_are_independent() {
+        let options: super::OpenOptions = serde_json::from_value(serde_json::json!({
+            "data_dir":"test-data", "execution_device":"cpu", "embedding_device":"metal",
+            "embedding_device_ordinal":2
+        }))
+        .unwrap();
+        let options = options.into_options().unwrap();
+        assert_eq!(
+            options.execution_device,
+            irongraph_embedded::ExecutionDevice::Cpu
+        );
+        assert_eq!(
+            options.embedding_device,
+            irongraph_embedded::EmbeddingDevice::Metal(2)
+        );
+        let invalid: super::OpenOptions = serde_json::from_value(serde_json::json!({
+            "data_dir":"test-data", "execution_device":"metal"
+        }))
+        .unwrap();
+        assert!(invalid.into_options().is_err());
+    }
     use super::*;
     fn call(value: Value) -> Value {
         let bytes = value.to_string().into_bytes();

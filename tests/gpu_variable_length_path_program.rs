@@ -5,6 +5,7 @@
 // enforceable instead of switched off globally.
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+use irongraph::graph::legacy::{GraphStore, TemporalStore};
 use irongraph::{
     Bookmark, EdgeId, ErrorCode, Layer, NodeId, ProjectId, Result,
     gpu::{
@@ -14,12 +15,12 @@ use irongraph::{
         ResidentVariablePathMultiplicityScan, ResidentVariablePathRequest,
         ResidentVariablePathSegment,
     },
-    graph::{EdgeInput, GraphStore, IndexCatalog, LayerMask, NodeInput, TemporalStore},
+    graph::{EdgeInput, IndexCatalog, LayerMask, NodeInput},
     types::{LabelId, RelationshipTypeId},
 };
 use tokio_util::sync::CancellationToken;
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 use irongraph::gpu::MetalBackend;
 
 const MEMORY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
@@ -698,7 +699,7 @@ fn cpu_receipt_cannot_masquerade_as_metal_completion() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "hardware acceptance gate: requires a real Metal device"]
 fn real_metal_matches_cpu_for_all_29_match5_path_shapes_without_fallback() -> Result<()> {
@@ -735,7 +736,7 @@ fn real_metal_matches_cpu_for_all_29_match5_path_shapes_without_fallback() -> Re
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "hardware acceptance gate: requires a real Metal device"]
 fn real_metal_preserves_two_a_cartesian_multiplicity_for_match5_28_and_29() -> Result<()> {
@@ -749,7 +750,7 @@ fn real_metal_preserves_two_a_cartesian_multiplicity_for_match5_28_and_29() -> R
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "hardware acceptance gate: requires a real Metal device"]
 fn real_metal_null_extends_an_effectively_empty_optional_path() -> Result<()> {
@@ -793,7 +794,7 @@ fn real_metal_null_extends_an_effectively_empty_optional_path() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "hardware acceptance gate: requires a real Metal device"]
 fn real_metal_rejects_capacity_stale_generation_and_pre_cancel() -> Result<()> {

@@ -12,7 +12,6 @@ use std::{
 use irongraph::{
     Bookmark, EdgeId, Layer, ProjectId, Result, ScalarValue,
     cypher::{BindCapabilities, ExecutionContext, ExecutionOutput, QueryEngine},
-    gpu::{CpuBackend, ExecutionBackend, ResidentProjectImage},
     graph::{EdgeInput, GraphStore, IndexCatalog, NodeInput, StatisticsSnapshot, TemporalStore},
     types::NodeId,
 };
@@ -35,7 +34,7 @@ fn die<T>(r: Result<T>) -> T {
 /// Builds a labelled graph of `nodes` nodes (each with `value` + `bucket` integer properties) and
 /// `nodes * fanout` edges. Returns the graph and (nodes/sec, edges/sec) write throughput.
 fn build_graph(nodes: usize, fanout: usize) -> (GraphStore, f64, f64) {
-    let mut g = GraphStore::default();
+    let g = GraphStore::default();
     let label = die(g.catalog_mut().intern_label("Node"));
     let value = die(g.catalog_mut().intern_property("value"));
     let bucket = die(g.catalog_mut().intern_property("bucket"));
@@ -78,11 +77,7 @@ fn build_graph(nodes: usize, fanout: usize) -> (GraphStore, f64, f64) {
     (g, write_nodes, write_edges)
 }
 
-fn context<'a>(
-    graph: &'a GraphStore,
-    backend: &'a dyn ExecutionBackend,
-    statistics: &'a StatisticsSnapshot,
-) -> ExecutionContext<'a> {
+fn context<'a>(graph: &'a GraphStore, statistics: &'a StatisticsSnapshot) -> ExecutionContext<'a> {
     ExecutionContext {
         project_id: PROJECT,
         graph,
@@ -100,14 +95,14 @@ fn context<'a>(
         next_node_id: 1,
         next_edge_id: 1,
         predicate_versions: BTreeMap::new(),
-        // Production mode: allow host fallback so we measure realistic latency, not native-only.
+        // CPU graph execution uses the canonical store directly.
         capabilities: BindCapabilities::default(),
         max_result_rows: 8_000_000,
         max_batch_rows: 65_536,
         // Production supplies a pre-warmed statistics snapshot (Database::execute); mirror that here
         // so the benchmark measures the same planner + fast-path behavior production runs.
         optimizer_statistics: Some(statistics),
-        backend: Some(backend),
+        backend: None,
         cancellation: CancellationToken::new(),
         deadline: Some(Instant::now() + Duration::from_secs(120)),
         resolved_query_at_time_nanos: None,
@@ -116,13 +111,12 @@ fn context<'a>(
 
 fn run(
     graph: &GraphStore,
-    backend: &dyn ExecutionBackend,
     statistics: &StatisticsSnapshot,
     query: &str,
 ) -> std::result::Result<(Duration, usize), String> {
     let start = Instant::now();
     let out: ExecutionOutput = QueryEngine
-        .execute(query, &mut context(graph, backend, statistics))
+        .execute(query, &mut context(graph, statistics))
         .map_err(|e| e.to_string())?;
     let elapsed = start.elapsed();
     let rows: usize = out.result.batches.iter().map(|b| b.row_count).sum();
@@ -213,7 +207,7 @@ fn main() {
         .unwrap_or(4);
 
     println!(
-        "backend=cpu-reference os={} arch={} fanout={}",
+        "backend=canonical-cpu os={} arch={} fanout={}",
         std::env::consts::OS,
         std::env::consts::ARCH,
         fanout
@@ -229,18 +223,6 @@ fn main() {
         let (graph, wn, we) = build_graph(nodes, fanout);
         write_nodes.push(wn);
         write_edges.push(we);
-        let image = die(ResidentProjectImage::build(
-            PROJECT,
-            BOOKMARK,
-            &graph,
-            &TemporalStore::default(),
-            &IndexCatalog::default(),
-        ));
-        // Mirror production: unbounded device-memory ceiling (no artificial sub-hardware cap), with
-        // no host reserve for the isolated benchmark process.
-        let mut cpu = CpuBackend::new(irongraph::config::UNBOUNDED_DEVICE_MEMORY_BYTES, 0);
-        die(cpu.admit_project(image));
-
         // Pre-warmed statistics snapshot, exactly as production maintains one per project.
         let statistics = StatisticsSnapshot::collect_project(
             &graph,
@@ -250,21 +232,11 @@ fn main() {
 
         // warm the live node- and edge-count caches so per-query timings reflect the O(1) amortized
         // steady state production runs in, not the one-time lazy build.
-        let _ = run(
-            &graph,
-            &cpu,
-            &statistics,
-            "MATCH (n:Node) RETURN count(n) AS c",
-        );
-        let _ = run(
-            &graph,
-            &cpu,
-            &statistics,
-            "MATCH ()-[r]->() RETURN count(r) AS c",
-        );
+        let _ = run(&graph, &statistics, "MATCH (n:Node) RETURN count(n) AS c");
+        let _ = run(&graph, &statistics, "MATCH ()-[r]->() RETURN count(r) AS c");
 
         for (index, (name, q)) in queries.iter().enumerate() {
-            match run(&graph, &cpu, &statistics, q) {
+            match run(&graph, &statistics, q) {
                 Ok((dt, _)) => times[index].push(dt.as_secs_f64() * 1e6),
                 Err(msg) => {
                     times[index].push(f64::NAN);

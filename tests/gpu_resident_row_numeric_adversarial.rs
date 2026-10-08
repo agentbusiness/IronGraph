@@ -5,12 +5,13 @@
 // enforceable instead of switched off globally.
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+use irongraph::graph::legacy::{GraphStore, TemporalStore};
 use std::hint::black_box;
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 use irongraph::gpu::MetalBackend;
 use irongraph::{
     Bookmark, Error, ErrorCode, ProjectId, Result,
@@ -23,7 +24,7 @@ use irongraph::{
         ResidentRowProgramResultParts, ResidentRowSortKey, ResidentRowValueType,
         ValidatedResidentRowProgramResult,
     },
-    graph::{GraphStore, IndexCatalog, LayerMask, TemporalStore},
+    graph::{IndexCatalog, LayerMask},
     types::{LabelId, PropertyId},
 };
 use tokio_util::sync::CancellationToken;
@@ -64,7 +65,7 @@ impl Harness {
         Ok(backend)
     }
 
-    #[cfg(all(feature = "accelerator", target_os = "macos"))]
+    #[cfg(all(feature = "legacy-graph", target_os = "macos"))]
     fn metal(&self) -> Result<MetalBackend> {
         let mut backend = MetalBackend::new(0, MEMORY_LIMIT_BYTES, RESERVED_BYTES)?;
         backend.admit_project(self.image()?)?;
@@ -462,7 +463,7 @@ fn sort_request(
     )
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn successful_requests(
     harness: &Harness,
 ) -> Result<Vec<(&'static str, ResidentRowProgramRequest)>> {
@@ -912,7 +913,7 @@ fn assert_sort_result(result: &ValidatedResidentRowProgramResult, expected: &[u6
     );
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn assert_differential_equal(
     context: &str,
     cpu: &ValidatedResidentRowProgramResult,
@@ -1269,7 +1270,7 @@ fn cpu_result_validation_rejects_projection_receipt_position_and_scratch_corrupt
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn metal_test_guard() -> MutexGuard<'static, ()> {
     static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
     GUARD
@@ -1278,7 +1279,7 @@ fn metal_test_guard() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn real_metal_matches_cpu_for_every_successful_adversarial_program() -> Result<()> {
@@ -1301,7 +1302,7 @@ fn real_metal_matches_cpu_for_every_successful_adversarial_program() -> Result<(
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn real_metal_matches_cpu_error_codes_and_messages_without_fallback() -> Result<()> {

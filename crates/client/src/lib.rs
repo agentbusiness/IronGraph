@@ -6,20 +6,17 @@ use std::{
     net::IpAddr,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
 };
 
 use irongraph_server::protocol::{
-    BatchColumn, CatalogEvent, QueryColumn, QueryLimits, QueryRequest, QueryStatistics,
-    QueryStreamEvent, RelationshipValue, ResultNode, TypedValue,
+    BatchColumn, CatalogEvent, QueryColumn, QueryRequest, QueryStatistics, QueryStreamEvent,
+    RelationshipValue, ResultNode, TypedValue,
 };
 use irongraph_types::{Bookmark, CommitAcknowledgement, ProjectId};
 use neo4j::{ValueReceive, ValueSend};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
-const MAXIMUM_EVENT_BYTES: usize = 64 * 1024 * 1024;
 const MAXIMUM_TLS_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// PEM files used for mutual TLS. The certificate file may include intermediate certificates.
@@ -90,8 +87,6 @@ pub struct Query {
     pub bookmark: Option<Bookmark>,
     #[serde(default)]
     pub consistency: CommitAcknowledgement,
-    #[serde(default)]
-    pub limits: QueryLimits,
 }
 
 impl Query {
@@ -103,7 +98,6 @@ impl Query {
             project_id: None,
             bookmark: None,
             consistency: CommitAcknowledgement::default(),
-            limits: QueryLimits::default(),
         }
     }
 
@@ -123,9 +117,7 @@ impl Query {
         if self.cypher.trim().is_empty() {
             return Err(ClientError::Configuration("Cypher is empty".to_owned()));
         }
-        self.limits
-            .validate()
-            .map_err(|error| ClientError::Configuration(error.message.to_string()))
+        Ok(())
     }
 
     #[must_use]
@@ -137,7 +129,6 @@ impl Query {
             parameters: self.parameters,
             consistency: self.consistency,
             bookmark: self.bookmark,
-            limits: self.limits,
             cancellation: Default::default(),
             deadline: None,
             connection_id: Default::default(),
@@ -152,8 +143,6 @@ struct QueryOptions {
     bookmark: Option<Bookmark>,
     #[serde(default)]
     consistency: CommitAcknowledgement,
-    #[serde(default)]
-    limits: QueryLimits,
 }
 
 /// Apply transport-neutral query controls supplied by a language binding.
@@ -161,7 +150,6 @@ pub fn configure_query(query: &mut Query, options: serde_json::Value) -> Result<
     let options: QueryOptions = serde_json::from_value(options)?;
     query.bookmark = options.bookmark;
     query.consistency = options.consistency;
-    query.limits = options.limits;
     query.validate()
 }
 
@@ -187,48 +175,54 @@ impl QueryResult {
     pub fn from_events(events: impl IntoIterator<Item = QueryStreamEvent>) -> Result<Self> {
         let mut result = Self::default();
         for event in events {
-            match event {
-                QueryStreamEvent::Catalog { catalog } => result.catalog = Some(catalog),
-                QueryStreamEvent::Schema { columns, .. } => result.columns = columns,
-                QueryStreamEvent::Batch {
-                    row_count, columns, ..
-                } => append_batch(&mut result, row_count, columns)?,
-                QueryStreamEvent::Summary {
-                    bookmark,
+            result.append_event(event)?;
+        }
+        Ok(result)
+    }
+
+    pub fn append_event(&mut self, event: QueryStreamEvent) -> Result<()> {
+        let result = self;
+        match event {
+            QueryStreamEvent::Catalog { catalog } => result.catalog = Some(catalog),
+            QueryStreamEvent::Schema { columns, .. } => result.columns = columns,
+            QueryStreamEvent::Batch {
+                row_count, columns, ..
+            } => append_batch(result, row_count, columns)?,
+            QueryStreamEvent::Summary {
+                bookmark,
+                statistics,
+                truncated,
+                truncation_reason,
+                ..
+            } => {
+                result.summary = QuerySummary {
+                    bookmark: Some(bookmark),
                     statistics,
                     truncated,
                     truncation_reason,
-                    ..
-                } => {
-                    result.summary = QuerySummary {
-                        bookmark: Some(bookmark),
-                        statistics,
-                        truncated,
-                        truncation_reason,
-                    };
-                }
-                QueryStreamEvent::Error {
-                    code,
+                };
+            }
+            QueryStreamEvent::Error {
+                code,
+                message,
+                retryable,
+                retry_after_ms,
+                ..
+            } => {
+                return Err(ClientError::Database {
+                    code: serde_json::to_value(code)?
+                        .as_str()
+                        .ok_or_else(|| {
+                            ClientError::MalformedResult("error code is not a string".into())
+                        })?
+                        .to_owned(),
                     message,
                     retryable,
                     retry_after_ms,
-                    ..
-                } => {
-                    return Err(ClientError::Database {
-                        code: serde_json::to_value(code)?
-                            .as_str()
-                            .ok_or_else(|| {
-                                ClientError::MalformedResult("error code is not a string".into())
-                            })?
-                            .to_owned(),
-                        message,
-                        retryable,
-                        retry_after_ms,
-                    });
-                }
+                });
             }
         }
-        Ok(result)
+        Ok(())
     }
 }
 
@@ -243,11 +237,16 @@ fn append_batch(result: &mut QueryResult, row_count: u64, columns: Vec<BatchColu
             "column lengths do not match the batch row count".to_owned(),
         ));
     }
-    for row_index in 0..row_count {
+    let mut columns = columns
+        .into_iter()
+        .map(|column| column.values.into_iter())
+        .collect::<Vec<_>>();
+    result.rows.reserve(row_count);
+    for _ in 0..row_count {
         result.rows.push(
             columns
-                .iter()
-                .map(|column| column.values[row_index].clone())
+                .iter_mut()
+                .map(|column| column.next().expect("validated batch column length"))
                 .collect(),
         );
     }
@@ -267,9 +266,7 @@ impl ApiClient {
         endpoint.set_path("/api/query");
         endpoint.set_query(None);
         endpoint.set_fragment(None);
-        let http = reqwest::blocking::Client::builder()
-            .timeout(DEFAULT_TIMEOUT)
-            .build()?;
+        let http = reqwest::blocking::Client::builder().timeout(None).build()?;
         Ok(Self { endpoint, http })
     }
 
@@ -292,7 +289,7 @@ impl ApiClient {
         let authorities =
             reqwest::Certificate::from_pem_bundle(&read_tls_file(&tls.certificate_authority)?)?;
         let mut builder = reqwest::blocking::Client::builder()
-            .timeout(DEFAULT_TIMEOUT)
+            .timeout(None)
             .min_tls_version(reqwest::tls::Version::TLS_1_3)
             .identity(identity);
         for authority in authorities {
@@ -313,7 +310,7 @@ impl ApiClient {
             .json(&query.into_protocol())
             .send()?
             .error_for_status()?;
-        let mut events = Vec::new();
+        let mut result = QueryResult::default();
         let mut reader = std::io::BufReader::new(response);
         let mut line = Vec::new();
         loop {
@@ -322,19 +319,14 @@ impl ApiClient {
             if read == 0 {
                 break;
             }
-            if line.len() > MAXIMUM_EVENT_BYTES {
-                return Err(ClientError::MalformedResult(
-                    "one query event exceeds 64 MiB".to_owned(),
-                ));
-            }
             while matches!(line.last(), Some(b'\n' | b'\r')) {
                 line.pop();
             }
             if !line.is_empty() {
-                events.push(serde_json::from_slice::<QueryStreamEvent>(&line)?);
+                result.append_event(serde_json::from_slice::<QueryStreamEvent>(&line)?)?;
             }
         }
-        QueryResult::from_events(events)
+        Ok(result)
     }
 }
 
@@ -390,7 +382,6 @@ impl BoltClient {
         let project = query.project_id.ok_or_else(|| {
             ClientError::Configuration("Bolt queries require a project ID".to_owned())
         })?;
-        let limits = query.limits;
         let initial_bookmarks = query.bookmark.map(|bookmark| {
             Arc::new(Bookmarks::from_raw(std::iter::once(format!(
                 "ig:{}:{}",
@@ -404,28 +395,47 @@ impl BoltClient {
             .iter()
             .map(|(name, value)| json_to_bolt(value).map(|value| (name.clone(), value)))
             .collect::<Result<std::collections::HashMap<_, _>>>()?;
-        let eager = self
-            .driver
-            .execute_query(&query.cypher)
-            .with_database(Arc::new(project.0.to_string()))
+        let mut session = self.driver.session(
+            neo4j::session::SessionConfig::new()
+                .with_database(Arc::new(project.0.to_string()))
+                .with_fetch_all()
+                .with_bookmark_manager(Arc::clone(&bookmark_manager)),
+        );
+        // The driver's receiver requires its concrete error type; boxing it would not change
+        // that signature and would add an allocation to the error path.
+        #[allow(clippy::result_large_err)]
+        let (columns, rows, summary) = session
+            .auto_commit(&query.cypher)
             .with_parameters(&parameters)
-            .with_bookmark_manager(Arc::clone(&bookmark_manager))
-            .run()?;
-        let summary = eager.summary.clone();
-        let columns = eager
-            .keys
-            .iter()
-            .map(|name| QueryColumn {
-                name: name.to_string(),
-                value_type: "ANY".to_owned(),
-                nullable: true,
+            .with_receiver(|stream: &mut neo4j::driver::record_stream::RecordStream| {
+                let columns = stream
+                    .keys()
+                    .into_iter()
+                    .map(|name| QueryColumn {
+                        name: name.to_string(),
+                        value_type: "ANY".to_owned(),
+                        nullable: true,
+                    })
+                    .collect::<Vec<_>>();
+                let mut rows = Vec::new();
+                for record in &mut *stream {
+                    let row = record?
+                        .into_values()
+                        .map(bolt_to_typed)
+                        .collect::<Result<Vec<_>>>();
+                    match row {
+                        Ok(row) => rows.push(row),
+                        Err(error) => return Ok(Err(error)),
+                    }
+                }
+                let Some(summary) = stream.consume()? else {
+                    return Ok(Err(ClientError::MalformedResult(
+                        "Bolt stream ended without a summary".into(),
+                    )));
+                };
+                Ok(Ok((columns, rows, summary)))
             })
-            .collect();
-        let rows = eager
-            .records
-            .into_iter()
-            .map(|record| record.into_values().map(bolt_to_typed).collect())
-            .collect::<Result<Vec<Vec<_>>>>()?;
+            .run()??;
         let bookmark = bookmark_manager
             .get_bookmarks()
             .map_err(|error| ClientError::MalformedResult(error.to_string()))?
@@ -455,7 +465,7 @@ impl BoltClient {
                 truncation_reason: None,
             },
         };
-        let (rows, nodes, edges) = enforce_result_limits(&result, limits)?;
+        let (rows, nodes, edges) = result_counts(&result)?;
         result.summary.statistics.rows = rows;
         result.summary.statistics.nodes = nodes;
         result.summary.statistics.edges = edges;
@@ -619,9 +629,8 @@ fn bolt_update_count(counters: &neo4j::summary::Counters) -> u64 {
     .sum()
 }
 
-fn enforce_result_limits(result: &QueryResult, limits: QueryLimits) -> Result<(u64, u64, u64)> {
+fn result_counts(result: &QueryResult) -> Result<(u64, u64, u64)> {
     let rows = u64::try_from(result.rows.len()).unwrap_or(u64::MAX);
-    let bytes = u64::try_from(serde_json::to_vec(result)?.len()).unwrap_or(u64::MAX);
     let (nodes, edges) = result
         .rows
         .iter()
@@ -637,23 +646,6 @@ fn enforce_result_limits(result: &QueryResult, limits: QueryLimits) -> Result<(u
         .ok_or_else(|| {
             ClientError::MalformedResult("graph result accounting overflow".to_owned())
         })?;
-    for (kind, observed, limit) in [
-        ("rows", rows, limits.rows),
-        ("bytes", bytes, limits.bytes),
-        ("nodes", nodes, limits.nodes),
-        ("relationships", edges, limits.edges),
-    ] {
-        if observed > limit {
-            return Err(ClientError::Database {
-                code: "RESULT_BUDGET_EXCEEDED".to_owned(),
-                message: format!(
-                    "query result exceeds the caller's {kind} limit ({observed}/{limit})"
-                ),
-                retryable: false,
-                retry_after_ms: None,
-            });
-        }
-    }
     Ok((rows, nodes, edges))
 }
 

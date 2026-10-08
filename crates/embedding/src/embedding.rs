@@ -659,18 +659,23 @@ impl LocalEmbeddingModel {
     pub fn bind_memory_governor(&self, governor: DeviceMemoryGovernor) -> Result<()> {
         #[cfg(feature = "accelerator")]
         {
-            let mut current = self.governor.write();
-            if current
-                .as_ref()
-                .is_some_and(|bound| !bound.shares_budget_with(&governor))
-            {
-                return Err(Error::new(
-                    ErrorCode::GpuAdmissionFailure,
-                    "embedding encoder is already bound to another memory governor",
+            // Embedding admission is independent of graph execution. In particular, a CPU graph
+            // process never constructs a Metal graph backend to establish the encoder's limit.
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            if self.resolved_device.backend == BackendKind::Metal {
+                let mut governor = governor;
+                governor.set_host_available_probe(std::sync::Arc::new(
+                    crate::gpu::host_available_bytes,
                 ));
+                let device = self.candle_device();
+                let metal = device.as_metal_device().map_err(|error| {
+                    Error::new(ErrorCode::EmbeddingUnavailable, error.to_string())
+                })?;
+                let recommended = metal.metal_device().recommended_max_working_set_size();
+                governor.cap_limit(recommended)?;
+                return self.install_memory_governor(governor);
             }
-            *current = Some(governor);
-            Ok(())
+            self.install_memory_governor(governor)
         }
         #[cfg(not(feature = "accelerator"))]
         {
@@ -680,6 +685,22 @@ impl LocalEmbeddingModel {
                 "binary was built without the local embedding encoder",
             ))
         }
+    }
+
+    #[cfg(feature = "accelerator")]
+    fn install_memory_governor(&self, governor: DeviceMemoryGovernor) -> Result<()> {
+        let mut current = self.governor.write();
+        if current
+            .as_ref()
+            .is_some_and(|bound| !bound.shares_budget_with(&governor))
+        {
+            return Err(Error::new(
+                ErrorCode::GpuAdmissionFailure,
+                "embedding encoder is already bound to another memory governor",
+            ));
+        }
+        *current = Some(governor);
+        Ok(())
     }
 }
 

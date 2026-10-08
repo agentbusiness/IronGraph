@@ -296,7 +296,7 @@ struct Fixture {
 }
 
 fn official_fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let labels = [
         graph.catalog_mut().intern_label("A")?,
         graph.catalog_mut().intern_label("B")?,
@@ -346,7 +346,7 @@ fn official_fixture() -> Result<Fixture> {
 /// - a directed three-edge cycle, which requires real multi-hop reachability;
 /// - one self-loop, which is itself a valid non-empty same-endpoint trail.
 fn trail_fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let label = graph.catalog_mut().intern_label("N")?;
     let rel1 = graph.catalog_mut().intern_relationship_type("REL1")?;
     for id in 1..=8 {
@@ -388,7 +388,7 @@ fn trail_fixture() -> Result<Fixture> {
 }
 
 fn resident_image(fixture: &Fixture) -> Result<ResidentProjectImage> {
-    ResidentProjectImage::build(
+    super::legacy_resident_build(
         fixture.project,
         fixture.bookmark,
         &fixture.graph,
@@ -724,7 +724,7 @@ fn stale_bookmark_revision_layout_or_catalog_emits_nothing_and_never_falls_back(
     assert_eq!(observations.pair_calls.load(Ordering::SeqCst), 0);
     assert_no_host_pair_fallback(&observations);
 
-    let mut revision_fixture = official_fixture()?;
+    let revision_fixture = official_fixture()?;
     let backend = ObservedBackend::new(cpu_backend(&revision_fixture)?);
     let observations = backend.observations();
     revision_fixture.graph.insert_node(NodeInput {
@@ -750,7 +750,7 @@ fn stale_bookmark_revision_layout_or_catalog_emits_nothing_and_never_falls_back(
     assert_eq!(observations.pair_calls.load(Ordering::SeqCst), 0);
     assert_no_host_pair_fallback(&observations);
 
-    let mut layout_fixture = official_fixture()?;
+    let layout_fixture = official_fixture()?;
     let backend = ObservedBackend::new(cpu_backend(&layout_fixture)?);
     let observations = backend.observations();
     let prior_layout = layout_fixture.graph.layout_version();
@@ -775,7 +775,7 @@ fn stale_bookmark_revision_layout_or_catalog_emits_nothing_and_never_falls_back(
     let catalog_fixture = official_fixture()?;
     let backend = ObservedBackend::new(cpu_backend(&catalog_fixture)?);
     let observations = backend.observations();
-    let mut stale_catalog = catalog_fixture.graph.catalog().clone();
+    let stale_catalog = catalog_fixture.graph.catalog().clone();
     stale_catalog.intern_property("stale_only")?;
     let mut execution = context(&catalog_fixture, Some(&backend), true);
     execution.binding_catalog = &stale_catalog;

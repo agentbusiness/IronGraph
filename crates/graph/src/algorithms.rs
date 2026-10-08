@@ -1,6 +1,7 @@
 //! Deterministic CPU references for priority graph algorithms.
 
 use std::{
+    borrow::Cow,
     cmp::Reverse,
     collections::{BTreeMap, BinaryHeap, VecDeque},
 };
@@ -10,6 +11,51 @@ use ordered_float::OrderedFloat;
 use crate::{Error, ErrorCode, Result};
 
 use super::Csr;
+
+/// A live topology accessor. Implementations may borrow canonical edges without an image.
+pub trait AdjacencyRead {
+    type Row<'a>: DoubleEndedIterator<Item = (u32, u32)> + ExactSizeIterator
+    where
+        Self: 'a;
+    fn node_count(&self) -> usize;
+    fn row(&self, node: u32) -> Option<Self::Row<'_>>;
+    /// Appends one live row without clearing the caller's scratch buffer. The appended
+    /// neighbors need not be sorted; false means that the node row is absent.
+    fn append_row(&self, node: u32, output: &mut Vec<(u32, u32)>) -> bool {
+        if let Some(row) = self.row(node) {
+            output.extend(row);
+            true
+        } else {
+            false
+        }
+    }
+    fn degree(&self, node: u32) -> usize {
+        self.row(node).map_or(0, |row| row.len())
+    }
+    fn edge_count(&self) -> usize {
+        (0..self.node_count())
+            .map(|row| self.degree(row as u32))
+            .sum()
+    }
+}
+impl AdjacencyRead for Csr {
+    type Row<'a> = super::adjacency::CsrRow<'a>;
+    fn node_count(&self) -> usize {
+        self.offsets().len().saturating_sub(1)
+    }
+    fn row(&self, node: u32) -> Option<Self::Row<'_>> {
+        Csr::row(self, node)
+    }
+    fn degree(&self, node: u32) -> usize {
+        self.offsets()
+            .get(node as usize)
+            .zip(self.offsets().get(node as usize + 1))
+            .map_or(0, |(start, end)| end.saturating_sub(*start) as usize)
+    }
+    fn edge_count(&self) -> usize {
+        self.neighbors().len()
+    }
+}
 
 /// Component assignment by dense node ordinal.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,7 +90,7 @@ impl Default for PageRankConfig {
 }
 
 /// Breadth-first hop distances from `source`.
-pub fn bfs(adjacency: &Csr, source: u32) -> Result<Vec<Option<u32>>> {
+pub fn bfs<A: AdjacencyRead>(adjacency: &A, source: u32) -> Result<Vec<Option<u32>>> {
     bfs_cancellable(adjacency, source, || Ok(()))
 }
 
@@ -52,33 +98,57 @@ pub fn bfs(adjacency: &Csr, source: u32) -> Result<Vec<Option<u32>>> {
 ///
 /// Delegates to the CSR's multi-source frontier expansion (iterated boolean `Aᵀ·f`) with a single
 /// seed; the level-synchronous formulation yields the same shortest-hop distances as a queue BFS.
-pub fn bfs_cancellable(
-    adjacency: &Csr,
+pub fn bfs_cancellable<A: AdjacencyRead>(
+    adjacency: &A,
     source: u32,
     check: impl FnMut() -> Result<()>,
 ) -> Result<Vec<Option<u32>>> {
-    let node_count = adjacency.offsets().len().saturating_sub(1);
+    let node_count = adjacency.node_count();
     if source as usize >= node_count {
         return Err(Error::new(
             ErrorCode::QueryType,
             "BFS source is out of bounds",
         ));
     }
-    adjacency.multi_source_frontier_distances([source], None, check)
+    let mut check = check;
+    let mut distances = vec![None; node_count];
+    let mut frontier = VecDeque::from([source]);
+    distances[source as usize] = Some(0_u32);
+    let mut scanned = 0_usize;
+    let mut neighbors = Vec::new();
+    while let Some(node) = frontier.pop_front() {
+        check()?;
+        let next = distances[node as usize].unwrap_or(0).saturating_add(1);
+        neighbors.clear();
+        if adjacency.append_row(node, &mut neighbors) {
+            neighbors.sort_unstable();
+            for &(neighbor, _) in &neighbors {
+                scanned += 1;
+                if scanned & 4095 == 0 {
+                    check()?;
+                }
+                if distances[neighbor as usize].is_none() {
+                    distances[neighbor as usize] = Some(next);
+                    frontier.push_back(neighbor);
+                }
+            }
+        }
+    }
+    Ok(distances)
 }
 
 /// Iterative deterministic depth-first preorder.
-pub fn dfs(adjacency: &Csr, source: u32) -> Result<Vec<u32>> {
+pub fn dfs<A: AdjacencyRead>(adjacency: &A, source: u32) -> Result<Vec<u32>> {
     dfs_cancellable(adjacency, source, || Ok(()))
 }
 
 /// Iterative deterministic depth-first preorder with cancellation checks.
-pub fn dfs_cancellable(
-    adjacency: &Csr,
+pub fn dfs_cancellable<A: AdjacencyRead>(
+    adjacency: &A,
     source: u32,
     mut check: impl FnMut() -> Result<()>,
 ) -> Result<Vec<u32>> {
-    let node_count = adjacency.offsets().len().saturating_sub(1);
+    let node_count = adjacency.node_count();
     if source as usize >= node_count {
         return Err(Error::new(
             ErrorCode::QueryType,
@@ -88,6 +158,7 @@ pub fn dfs_cancellable(
     let mut visited = vec![false; node_count];
     let mut stack = vec![source];
     let mut order = Vec::new();
+    let mut neighbors = Vec::new();
     while let Some(node) = stack.pop() {
         if order.len() & 1023 == 0 {
             check()?;
@@ -97,11 +168,14 @@ pub fn dfs_cancellable(
         }
         visited[node as usize] = true;
         order.push(node);
-        if let Some(neighbors) = adjacency.row(node) {
+        neighbors.clear();
+        if adjacency.append_row(node, &mut neighbors) {
+            neighbors.sort_unstable();
             stack.extend(
                 neighbors
+                    .iter()
                     .rev()
-                    .map(|(neighbor, _)| neighbor)
+                    .map(|&(neighbor, _)| neighbor)
                     .filter(|neighbor| !visited[*neighbor as usize]),
             );
         }
@@ -110,26 +184,32 @@ pub fn dfs_cancellable(
 }
 
 /// Deterministic unweighted shortest path including both endpoints.
-pub fn shortest_path(adjacency: &Csr, source: u32, target: u32) -> Result<Option<Vec<u32>>> {
+pub fn shortest_path<A: AdjacencyRead>(
+    adjacency: &A,
+    source: u32,
+    target: u32,
+) -> Result<Option<Vec<u32>>> {
     shortest_path_cancellable(adjacency, source, target, || Ok(()))
 }
 
 /// Deterministic unweighted shortest path with cancellation checks.
-pub fn shortest_path_cancellable(
-    adjacency: &Csr,
+pub fn shortest_path_cancellable<A: AdjacencyRead>(
+    adjacency: &A,
     source: u32,
     target: u32,
     mut check: impl FnMut() -> Result<()>,
 ) -> Result<Option<Vec<u32>>> {
-    let node_count = adjacency.offsets().len().saturating_sub(1);
+    let node_count = adjacency.node_count();
     if source as usize >= node_count || target as usize >= node_count {
         return Err(Error::new(
             ErrorCode::QueryType,
             "shortest-path endpoint is out of bounds",
         ));
     }
+    check()?;
     let mut predecessor = vec![None; node_count];
     let mut visited = vec![false; node_count];
+    let mut neighbors = Vec::new();
     visited[source as usize] = true;
     let mut queue = VecDeque::from([source]);
     while let Some(node) = queue.pop_front() {
@@ -139,16 +219,18 @@ pub fn shortest_path_cancellable(
         if node == target {
             break;
         }
-        if let Some(neighbors) = adjacency.row(node) {
-            for (neighbor, _) in neighbors {
-                if !visited[neighbor as usize] {
-                    visited[neighbor as usize] = true;
-                    predecessor[neighbor as usize] = Some(node);
-                    queue.push_back(neighbor);
-                }
+        neighbors.clear();
+        adjacency.append_row(node, &mut neighbors);
+        neighbors.sort_unstable();
+        for &(neighbor, _) in &neighbors {
+            if !visited[neighbor as usize] {
+                visited[neighbor as usize] = true;
+                predecessor[neighbor as usize] = Some(node);
+                queue.push_back(neighbor);
             }
         }
     }
+    check()?;
     if !visited[target as usize] {
         return Ok(None);
     }
@@ -168,7 +250,11 @@ pub fn shortest_path_cancellable(
 }
 
 /// Dijkstra with non-negative finite edge weights supplied by edge ordinal.
-pub fn dijkstra<F>(adjacency: &Csr, source: u32, mut weight: F) -> Result<DijkstraResult>
+pub fn dijkstra<A: AdjacencyRead, F>(
+    adjacency: &A,
+    source: u32,
+    mut weight: F,
+) -> Result<DijkstraResult>
 where
     F: FnMut(u32) -> Result<f64>,
 {
@@ -176,8 +262,8 @@ where
 }
 
 /// Deterministic Dijkstra execution with cancellation checks.
-pub fn dijkstra_cancellable<F>(
-    adjacency: &Csr,
+pub fn dijkstra_cancellable<A: AdjacencyRead, F>(
+    adjacency: &A,
     source: u32,
     mut weight: F,
     mut check: impl FnMut() -> Result<()>,
@@ -185,7 +271,7 @@ pub fn dijkstra_cancellable<F>(
 where
     F: FnMut(u32) -> Result<f64>,
 {
-    let node_count = adjacency.offsets().len().saturating_sub(1);
+    let node_count = adjacency.node_count();
     if source as usize >= node_count {
         return Err(Error::new(
             ErrorCode::QueryType,
@@ -197,13 +283,16 @@ where
     distance[source as usize] = Some(0.0);
     let mut heap = BinaryHeap::from([(Reverse(OrderedFloat(0.0_f64)), Reverse(source))]);
     let mut visited_edges = 0_usize;
+    let mut neighbors = Vec::new();
     while let Some((Reverse(OrderedFloat(candidate)), Reverse(node))) = heap.pop() {
         check()?;
         if distance[node as usize].is_some_and(|current| candidate > current) {
             continue;
         }
-        if let Some(neighbors) = adjacency.row(node) {
-            for (neighbor, edge) in neighbors {
+        neighbors.clear();
+        if adjacency.append_row(node, &mut neighbors) {
+            neighbors.sort_unstable();
+            for &(neighbor, edge) in &neighbors {
                 visited_edges = visited_edges.saturating_add(1);
                 if visited_edges & 4095 == 0 {
                     check()?;
@@ -242,21 +331,25 @@ where
 }
 
 /// Weak components over the union of outgoing and incoming edges.
-pub fn weakly_connected_components(outgoing: &Csr, incoming: &Csr) -> Result<Components> {
+pub fn weakly_connected_components<A: AdjacencyRead>(
+    outgoing: &A,
+    incoming: &A,
+) -> Result<Components> {
     weakly_connected_components_cancellable(outgoing, incoming, || Ok(()))
 }
 
 /// Weak components with a bounded-latency cancellation/deadline callback.
-pub fn weakly_connected_components_cancellable(
-    outgoing: &Csr,
-    incoming: &Csr,
+pub fn weakly_connected_components_cancellable<A: AdjacencyRead>(
+    outgoing: &A,
+    incoming: &A,
     mut check: impl FnMut() -> Result<()>,
 ) -> Result<Components> {
     validate_pair(outgoing, incoming)?;
-    let node_count = outgoing.offsets().len().saturating_sub(1);
+    let node_count = outgoing.node_count();
     let mut component = vec![u32::MAX; node_count];
     let mut count = 0_u32;
     let mut queue = VecDeque::new();
+    let mut neighbors = Vec::new();
     for start in 0..node_count {
         if start & 1023 == 0 {
             check()?;
@@ -271,8 +364,10 @@ pub fn weakly_connected_components_cancellable(
                 check()?;
             }
             for adjacency in [outgoing, incoming] {
-                if let Some(neighbors) = adjacency.row(node) {
-                    for (neighbor, _) in neighbors {
+                neighbors.clear();
+                if adjacency.append_row(node, &mut neighbors) {
+                    neighbors.sort_unstable();
+                    for &(neighbor, _) in &neighbors {
                         if component[neighbor as usize] == u32::MAX {
                             component[neighbor as usize] = count;
                             queue.push_back(neighbor);
@@ -292,20 +387,24 @@ pub fn weakly_connected_components_cancellable(
 }
 
 /// Strong components via iterative Kosaraju traversal.
-pub fn strongly_connected_components(outgoing: &Csr, incoming: &Csr) -> Result<Components> {
+pub fn strongly_connected_components<A: AdjacencyRead>(
+    outgoing: &A,
+    incoming: &A,
+) -> Result<Components> {
     strongly_connected_components_cancellable(outgoing, incoming, || Ok(()))
 }
 
 /// Strong components via iterative Kosaraju traversal with cancellation checks.
-pub fn strongly_connected_components_cancellable(
-    outgoing: &Csr,
-    incoming: &Csr,
+pub fn strongly_connected_components_cancellable<A: AdjacencyRead>(
+    outgoing: &A,
+    incoming: &A,
     mut check: impl FnMut() -> Result<()>,
 ) -> Result<Components> {
     validate_pair(outgoing, incoming)?;
-    let node_count = outgoing.offsets().len().saturating_sub(1);
+    let node_count = outgoing.node_count();
     let mut visited = vec![false; node_count];
     let mut finish = Vec::with_capacity(node_count);
+    let mut neighbors = Vec::new();
     for start in 0..node_count {
         if start & 1023 == 0 {
             check()?;
@@ -324,11 +423,14 @@ pub fn strongly_connected_components_cancellable(
             }
             visited[node as usize] = true;
             stack.push((node, true));
-            if let Some(neighbors) = outgoing.row(node) {
+            neighbors.clear();
+            if outgoing.append_row(node, &mut neighbors) {
+                neighbors.sort_unstable();
                 stack.extend(
                     neighbors
+                        .iter()
                         .rev()
-                        .map(|(neighbor, _)| neighbor)
+                        .map(|&(neighbor, _)| neighbor)
                         .filter(|neighbor| !visited[*neighbor as usize])
                         .map(|neighbor| (neighbor, false)),
                 );
@@ -347,8 +449,10 @@ pub fn strongly_connected_components_cancellable(
             if node & 1023 == 0 {
                 check()?;
             }
-            if let Some(neighbors) = incoming.row(node) {
-                for (neighbor, _) in neighbors {
+            neighbors.clear();
+            if incoming.append_row(node, &mut neighbors) {
+                neighbors.sort_unstable();
+                for &(neighbor, _) in &neighbors {
                     if component[neighbor as usize] == u32::MAX {
                         component[neighbor as usize] = count;
                         stack.push(neighbor);
@@ -403,13 +507,13 @@ pub fn strongly_connected_components_cancellable(
 }
 
 /// Deterministic power-iteration PageRank.
-pub fn page_rank(adjacency: &Csr, config: PageRankConfig) -> Result<Vec<f64>> {
+pub fn page_rank<A: AdjacencyRead>(adjacency: &A, config: PageRankConfig) -> Result<Vec<f64>> {
     page_rank_cancellable(adjacency, config, || Ok(()))
 }
 
 /// PageRank with cancellation/deadline checks inside every iteration and scan chunk.
-pub fn page_rank_cancellable(
-    adjacency: &Csr,
+pub fn page_rank_cancellable<A: AdjacencyRead>(
+    adjacency: &A,
     config: PageRankConfig,
     mut check: impl FnMut() -> Result<()>,
 ) -> Result<Vec<f64>> {
@@ -423,19 +527,20 @@ pub fn page_rank_cancellable(
             "invalid PageRank configuration",
         ));
     }
-    let node_count = adjacency.offsets().len().saturating_sub(1);
+    let node_count = adjacency.node_count();
     if node_count == 0 {
         return Ok(Vec::new());
     }
     let count = node_count as f64;
     let mut rank = vec![1.0 / count; node_count];
     let mut next = vec![0.0; node_count];
+    let mut neighbors = Vec::new();
     for _ in 0..config.max_iterations {
         check()?;
         let dangling: f64 = rank
             .iter()
             .enumerate()
-            .filter(|(row, _)| adjacency.offsets()[*row] == adjacency.offsets()[*row + 1])
+            .filter(|(row, _)| adjacency.degree(*row as u32) == 0)
             .map(|(_, value)| *value)
             .sum();
         let base = (1.0 - config.damping) / count + config.damping * dangling / count;
@@ -444,15 +549,17 @@ pub fn page_rank_cancellable(
             if source & 4095 == 0 {
                 check()?;
             }
-            let start = adjacency.offsets()[source] as usize;
-            let end = adjacency.offsets()[source + 1] as usize;
-            let degree = end.saturating_sub(start);
+            let degree = adjacency.degree(source as u32);
             if degree == 0 {
                 continue;
             }
             let contribution = config.damping * rank[source] / degree as f64;
-            for target in &adjacency.neighbors()[start..end] {
-                next[*target as usize] += contribution;
+            neighbors.clear();
+            if adjacency.append_row(source as u32, &mut neighbors) {
+                neighbors.sort_unstable();
+                for &(target, _) in &neighbors {
+                    next[target as usize] += contribution;
+                }
             }
         }
         let change: f64 = rank
@@ -469,97 +576,162 @@ pub fn page_rank_cancellable(
 }
 
 /// Undirected triangle count with each triangle counted exactly once.
-pub fn triangle_count(outgoing: &Csr, incoming: &Csr) -> Result<u64> {
+pub fn triangle_count<A: AdjacencyRead>(outgoing: &A, incoming: &A) -> Result<u64> {
     triangle_count_cancellable(outgoing, incoming, || Ok(()))
 }
 
 /// Undirected triangle count with cancellation checks.
-pub fn triangle_count_cancellable(
-    outgoing: &Csr,
-    incoming: &Csr,
+pub fn triangle_count_cancellable<A: AdjacencyRead>(
+    outgoing: &A,
+    incoming: &A,
+    check: impl FnMut() -> Result<()>,
+) -> Result<u64> {
+    triangle_count_range_cancellable(outgoing, incoming, 0..outgoing.node_count(), check)
+}
+
+/// Counts triangles whose smallest vertex lies in the selected range.
+/// Disjoint ranges share the live adjacency and use only two reusable row buffers.
+pub fn triangle_count_range_cancellable<A: AdjacencyRead>(
+    outgoing: &A,
+    incoming: &A,
+    range: std::ops::Range<usize>,
     mut check: impl FnMut() -> Result<()>,
 ) -> Result<u64> {
-    let neighbors = undirected_neighbors(outgoing, incoming)?;
+    validate_pair(outgoing, incoming)?;
+    if range.start > range.end || range.end > outgoing.node_count() {
+        return Err(Error::internal("triangle vertex range is invalid"));
+    }
+    check()?;
     let mut count = 0_u64;
-    for first in 0..neighbors.len() {
+    let mut first_neighbors = Vec::new();
+    let mut second_neighbors = Vec::new();
+    for first in range {
         if first & 255 == 0 {
             check()?;
         }
-        let second_start = neighbors[first].partition_point(|neighbor| *neighbor <= first as u32);
-        for &second in &neighbors[first][second_start..] {
-            let third_start =
-                neighbors[second as usize].partition_point(|neighbor| *neighbor <= second);
-            for &third in &neighbors[second as usize][third_start..] {
-                if neighbors[first].binary_search(&third).is_ok() {
-                    count = count.checked_add(1).ok_or_else(|| {
-                        Error::new(ErrorCode::ResultBudgetExceeded, "triangle count overflow")
-                    })?;
-                }
+        undirected_row_into(outgoing, incoming, first as u32, &mut first_neighbors);
+        let second_start =
+            first_neighbors.partition_point(|(neighbor, _)| *neighbor <= first as u32);
+        for (position, &(second, _)) in first_neighbors[second_start..].iter().enumerate() {
+            if position != 0 && position & 255 == 0 {
+                check()?;
             }
+            let first_start = first_neighbors.partition_point(|(neighbor, _)| *neighbor <= second);
+            if first_start == first_neighbors.len() {
+                continue;
+            }
+            undirected_row_into(outgoing, incoming, second, &mut second_neighbors);
+            let third_start = second_neighbors.partition_point(|(neighbor, _)| *neighbor <= second);
+            let common = sorted_neighbor_intersection_count(
+                &first_neighbors[first_start..],
+                &second_neighbors[third_start..],
+                &mut check,
+            )?;
+            count = count.checked_add(common).ok_or_else(|| {
+                Error::new(ErrorCode::ResultBudgetExceeded, "triangle count overflow")
+            })?;
         }
     }
+    check()?;
     Ok(count)
 }
 
 /// Local undirected clustering coefficient for every node.
-pub fn clustering_coefficients(outgoing: &Csr, incoming: &Csr) -> Result<Vec<f64>> {
+pub fn clustering_coefficients<A: AdjacencyRead>(outgoing: &A, incoming: &A) -> Result<Vec<f64>> {
     clustering_coefficients_cancellable(outgoing, incoming, || Ok(()))
 }
 
 /// Local undirected clustering coefficients with cancellation checks.
-pub fn clustering_coefficients_cancellable(
-    outgoing: &Csr,
-    incoming: &Csr,
-    mut check: impl FnMut() -> Result<()>,
+pub fn clustering_coefficients_cancellable<A: AdjacencyRead>(
+    outgoing: &A,
+    incoming: &A,
+    check: impl FnMut() -> Result<()>,
 ) -> Result<Vec<f64>> {
-    let neighbors = undirected_neighbors(outgoing, incoming)?;
-    let mut result = Vec::with_capacity(neighbors.len());
-    for row in 0..neighbors.len() {
-        if row & 255 == 0 {
-            check()?;
-        }
-        let list = &neighbors[row];
-        if list.len() < 2 {
-            result.push(0.0);
-            continue;
-        }
-        let mut links = 0_u64;
-        for left in 0..list.len() {
-            for right in (left + 1)..list.len() {
-                if neighbors[list[left] as usize]
-                    .binary_search(&list[right])
-                    .is_ok()
-                {
-                    links = links.saturating_add(1);
-                }
-            }
-        }
-        let possible = list.len().saturating_mul(list.len().saturating_sub(1)) / 2;
-        result.push(links as f64 / possible as f64);
-    }
+    validate_pair(outgoing, incoming)?;
+    let mut result = vec![0.0; outgoing.node_count()];
+    clustering_coefficients_into_cancellable(outgoing, incoming, 0, &mut result, check)?;
     Ok(result)
 }
 
+/// Writes a contiguous vertex range into caller-owned coefficient output.
+/// Disjoint output slices share live adjacency and retain only two reusable neighbor rows.
+pub fn clustering_coefficients_into_cancellable<A: AdjacencyRead>(
+    outgoing: &A,
+    incoming: &A,
+    start: usize,
+    output: &mut [f64],
+    mut check: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    validate_pair(outgoing, incoming)?;
+    if start
+        .checked_add(output.len())
+        .is_none_or(|end| end > outgoing.node_count())
+    {
+        return Err(Error::internal("clustering vertex range is invalid"));
+    }
+    check()?;
+    let mut list = Vec::new();
+    let mut left_neighbors = Vec::new();
+    for (offset, coefficient) in output.iter_mut().enumerate() {
+        let row = start + offset;
+        if row & 255 == 0 {
+            check()?;
+        }
+        undirected_row_into(outgoing, incoming, row as u32, &mut list);
+        if list.len() < 2 {
+            *coefficient = 0.0;
+            continue;
+        }
+        let mut links = 0_u64;
+        for left in 0..list.len().saturating_sub(1) {
+            if left != 0 && left & 255 == 0 {
+                check()?;
+            }
+            undirected_row_into(outgoing, incoming, list[left].0, &mut left_neighbors);
+            links = links.saturating_add(sorted_neighbor_intersection_count(
+                &list[left + 1..],
+                &left_neighbors,
+                &mut check,
+            )?);
+        }
+        let possible = list.len().saturating_mul(list.len().saturating_sub(1)) / 2;
+        *coefficient = links as f64 / possible as f64;
+    }
+    check()?;
+    Ok(())
+}
+
 /// Undirected core number from deterministic degree peeling.
-pub fn k_core(outgoing: &Csr, incoming: &Csr) -> Result<Vec<u32>> {
+pub fn k_core<A: AdjacencyRead>(outgoing: &A, incoming: &A) -> Result<Vec<u32>> {
     k_core_cancellable(outgoing, incoming, || Ok(()))
 }
 
 /// Undirected core number with cancellation checks.
-pub fn k_core_cancellable(
-    outgoing: &Csr,
-    incoming: &Csr,
+pub fn k_core_cancellable<A: AdjacencyRead>(
+    outgoing: &A,
+    incoming: &A,
     mut check: impl FnMut() -> Result<()>,
 ) -> Result<Vec<u32>> {
-    let neighbors = undirected_neighbors(outgoing, incoming)?;
-    let node_count = neighbors.len();
-    let mut degree: Vec<_> = neighbors.iter().map(Vec::len).collect();
+    validate_pair(outgoing, incoming)?;
+    check()?;
+    let node_count = outgoing.node_count();
+    let mut neighbors = Vec::new();
+    let mut degree = Vec::with_capacity(node_count);
+    for node in 0..node_count {
+        if node & 1023 == 0 {
+            check()?;
+        }
+        undirected_row_into(outgoing, incoming, node as u32, &mut neighbors);
+        degree.push(neighbors.len());
+    }
     let mut removed = vec![false; node_count];
     let mut core = vec![0_u32; node_count];
-    let mut heap = BinaryHeap::new();
-    for (node, degree) in degree.iter().copied().enumerate() {
-        heap.push(Reverse((degree, node)));
-    }
+    let mut heap = degree
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(node, degree)| Reverse((degree, node)))
+        .collect::<BinaryHeap<_>>();
     let mut current = 0_usize;
     while let Some(Reverse((candidate_degree, node))) = heap.pop() {
         if node & 1023 == 0 {
@@ -572,14 +744,18 @@ pub fn k_core_cancellable(
         current = current.max(candidate_degree);
         core[node] = u32::try_from(current)
             .map_err(|_| Error::new(ErrorCode::ResultBudgetExceeded, "core number overflow"))?;
-        for neighbor in &neighbors[node] {
+        undirected_row_into(outgoing, incoming, node as u32, &mut neighbors);
+        for (neighbor, _) in &neighbors {
             let neighbor = *neighbor as usize;
-            if !removed[neighbor] {
-                degree[neighbor] = degree[neighbor].saturating_sub(1);
+            // Degrees at the current core level cannot change the eventual core number.
+            // Keeping them at that level avoids redundant heap entries during peeling.
+            if !removed[neighbor] && degree[neighbor] > current {
+                degree[neighbor] -= 1;
                 heap.push(Reverse((degree[neighbor], neighbor)));
             }
         }
     }
+    check()?;
     Ok(core)
 }
 
@@ -593,39 +769,34 @@ pub fn k_core_cancellable(
 /// scheduler order. Gain comparisons use exact integer cross-products because every initial and
 /// coarsened weight is an integer edge multiplicity. Candidate ties choose the smallest community;
 /// matching conflicts use a stable hash of the dense node ordinal followed by that ordinal.
-pub fn louvain_communities(outgoing: &Csr, incoming: &Csr) -> Result<Components> {
+pub fn louvain_communities<A: AdjacencyRead>(outgoing: &A, incoming: &A) -> Result<Components> {
     louvain_communities_cancellable(outgoing, incoming, || Ok(()))
 }
 
 /// Deterministic multilevel Louvain with cancellation checks.
-pub fn louvain_communities_cancellable(
-    outgoing: &Csr,
-    incoming: &Csr,
+pub fn louvain_communities_cancellable<A: AdjacencyRead>(
+    outgoing: &A,
+    incoming: &A,
     mut check: impl FnMut() -> Result<()>,
 ) -> Result<Components> {
-    let neighbors = undirected_neighbors(outgoing, incoming)?;
-    let original_count = neighbors.len();
+    validate_pair(outgoing, incoming)?;
+    let original_count = outgoing.node_count();
     if original_count == 0 {
         return Ok(Components {
             component: Vec::new(),
             count: 0,
         });
     }
-    let mut graph = neighbors
-        .into_iter()
-        .map(|row| {
-            row.into_iter()
-                .map(|neighbor| (neighbor as usize, 1_u64))
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
+    let mut graph = LouvainTopology::Canonical(InitialWeighted { outgoing, incoming });
     let mut original_to_current = (0..original_count).collect::<Vec<_>>();
     // Zero-degree nodes can never propose a strictly beneficial modularity move. Keeping them in
     // the local-moving set made sparse real graphs pay every O(V) pass and allocate candidate maps
     // for millions of immutable singleton communities. They remain in `original_to_current`, so
     // canonical output still publishes one distinct community for every isolated real node; only
     // work that provably cannot affect the result is skipped.
-    let mut active = graph.iter().map(|row| !row.is_empty()).collect::<Vec<_>>();
+    let mut active = (0..original_count)
+        .map(|node| !graph.weights(node).is_empty())
+        .collect::<Vec<_>>();
     let mut active_count = active.iter().filter(|active| **active).count();
 
     loop {
@@ -644,7 +815,12 @@ pub fn louvain_communities_cancellable(
         if community_count == active_count || community_count <= 1 {
             break;
         }
-        graph = coarsen_communities(&graph, &membership, &active, &mut check)?;
+        graph = LouvainTopology::Coarse(coarsen_communities(
+            &graph,
+            &membership,
+            &active,
+            &mut check,
+        )?);
         active = next_active;
         active_count = community_count;
     }
@@ -674,8 +850,8 @@ pub fn louvain_communities_cancellable(
     })
 }
 
-fn louvain_local_move(
-    graph: &[Vec<(usize, u64)>],
+fn louvain_local_move<G: WeightedAdjacency + ?Sized>(
+    graph: &G,
     active_nodes: &[bool],
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Vec<usize>> {
@@ -683,19 +859,24 @@ fn louvain_local_move(
 }
 
 #[allow(clippy::too_many_lines)]
-fn louvain_local_move_traced(
-    graph: &[Vec<(usize, u64)>],
+fn louvain_local_move_traced<G: WeightedAdjacency + ?Sized>(
+    graph: &G,
     active_nodes: &[bool],
     check: &mut impl FnMut() -> Result<()>,
     observe: &mut impl FnMut(&[usize], usize) -> Result<()>,
 ) -> Result<Vec<usize>> {
-    let node_count = graph.len();
+    let node_count = graph.node_count();
     if active_nodes.len() != node_count {
         return Err(Error::internal("Louvain active-node shape mismatch"));
     }
-    let degree = graph
-        .iter()
-        .map(|row| row.iter().map(|(_, weight)| *weight).sum::<u64>())
+    let degree = (0..graph.node_count())
+        .map(|node| {
+            graph
+                .weights(node)
+                .iter()
+                .map(|(_, weight)| *weight)
+                .sum::<u64>()
+        })
         .collect::<Vec<_>>();
     let total_weight = degree.iter().copied().sum::<u64>();
     if total_weight == 0 {
@@ -732,7 +913,7 @@ fn louvain_local_move_traced(
             let current = membership[node];
             links.clear();
             links.push((current, 0));
-            for (neighbor, weight) in &graph[node] {
+            for (neighbor, weight) in graph.weights(node).iter() {
                 // A coarse self-loop represents internal edges already absorbed into this node.
                 // It remains internal whichever community the node joins, so it contributes to
                 // degree but cancels from every move's neighboring-community link term.
@@ -816,14 +997,15 @@ fn louvain_local_move_traced(
     Ok(membership)
 }
 
-fn coarsen_communities(
-    graph: &[Vec<(usize, u64)>],
+fn coarsen_communities<G: WeightedAdjacency + ?Sized>(
+    graph: &G,
     membership: &[usize],
     active_nodes: &[bool],
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Vec<Vec<(usize, u64)>>> {
-    let mut coarse = vec![BTreeMap::<usize, u64>::new(); graph.len()];
-    for (source, row) in graph.iter().enumerate() {
+    let mut coarse = vec![BTreeMap::<usize, u64>::new(); graph.node_count()];
+    for source in 0..graph.node_count() {
+        let row = graph.weights(source);
         if !active_nodes[source] {
             continue;
         }
@@ -831,7 +1013,7 @@ fn coarsen_communities(
             check()?;
         }
         let coarse_source = membership[source];
-        for (target, weight) in row {
+        for (target, weight) in row.iter() {
             let coarse_target = membership[*target];
             let coarse_weight = coarse[coarse_source].entry(coarse_target).or_insert(0);
             *coarse_weight = (*coarse_weight).checked_add(*weight).ok_or_else(|| {
@@ -849,31 +1031,120 @@ fn coarsen_communities(
         .collect())
 }
 
-fn validate_pair(outgoing: &Csr, incoming: &Csr) -> Result<()> {
-    if outgoing.offsets().len() != incoming.offsets().len() {
+fn validate_pair<A: AdjacencyRead>(outgoing: &A, incoming: &A) -> Result<()> {
+    if outgoing.node_count() != incoming.node_count() {
         return Err(Error::invalid_data("CSR and CSC node counts differ"));
     }
     Ok(())
 }
 
-fn undirected_neighbors(outgoing: &Csr, incoming: &Csr) -> Result<Vec<Vec<u32>>> {
-    validate_pair(outgoing, incoming)?;
-    let node_count = outgoing.offsets().len().saturating_sub(1);
-    let mut result = vec![Vec::new(); node_count];
-    for node in 0..node_count {
-        for adjacency in [outgoing, incoming] {
-            if let Some(neighbors) = adjacency.row(node as u32) {
-                for (neighbor, _) in neighbors {
-                    if neighbor as usize != node {
-                        result[node].push(neighbor);
-                    }
-                }
+fn undirected_row<A: AdjacencyRead>(outgoing: &A, incoming: &A, node: u32) -> Vec<u32> {
+    let mut result = Vec::new();
+    for adjacency in [outgoing, incoming] {
+        if let Some(row) = adjacency.row(node) {
+            result.extend(row.filter_map(|(neighbor, _)| (neighbor != node).then_some(neighbor)));
+        }
+    }
+    result.sort_unstable();
+    result.dedup();
+    result
+}
+
+fn undirected_row_into<A: AdjacencyRead>(
+    outgoing: &A,
+    incoming: &A,
+    node: u32,
+    output: &mut Vec<(u32, u32)>,
+) {
+    output.clear();
+    outgoing.append_row(node, output);
+    incoming.append_row(node, output);
+    output.retain(|(neighbor, _)| *neighbor != node);
+    output.sort_unstable();
+    output.dedup_by_key(|(neighbor, _)| *neighbor);
+}
+
+fn sorted_neighbor_intersection_count(
+    left: &[(u32, u32)],
+    right: &[(u32, u32)],
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<u64> {
+    let mut left_index = 0;
+    let mut right_index = 0;
+    let mut steps = 0_usize;
+    let mut count = 0_u64;
+    while left_index < left.len() && right_index < right.len() {
+        if steps != 0 && steps & 4095 == 0 {
+            check()?;
+        }
+        steps += 1;
+        match left[left_index].0.cmp(&right[right_index].0) {
+            std::cmp::Ordering::Less => left_index += 1,
+            std::cmp::Ordering::Greater => right_index += 1,
+            std::cmp::Ordering::Equal => {
+                count += 1;
+                left_index += 1;
+                right_index += 1;
             }
         }
-        result[node].sort_unstable();
-        result[node].dedup();
     }
-    Ok(result)
+    Ok(count)
+}
+
+trait WeightedAdjacency {
+    fn node_count(&self) -> usize;
+    fn weights(&self, node: usize) -> Cow<'_, [(usize, u64)]>;
+}
+impl WeightedAdjacency for [Vec<(usize, u64)>] {
+    fn node_count(&self) -> usize {
+        self.len()
+    }
+    fn weights(&self, node: usize) -> Cow<'_, [(usize, u64)]> {
+        Cow::Borrowed(&self[node])
+    }
+}
+impl WeightedAdjacency for Vec<Vec<(usize, u64)>> {
+    fn node_count(&self) -> usize {
+        self.len()
+    }
+    fn weights(&self, node: usize) -> Cow<'_, [(usize, u64)]> {
+        self.as_slice().weights(node)
+    }
+}
+struct InitialWeighted<'a, A> {
+    outgoing: &'a A,
+    incoming: &'a A,
+}
+impl<A: AdjacencyRead> WeightedAdjacency for InitialWeighted<'_, A> {
+    fn node_count(&self) -> usize {
+        self.outgoing.node_count()
+    }
+    fn weights(&self, node: usize) -> Cow<'_, [(usize, u64)]> {
+        Cow::Owned(
+            undirected_row(self.outgoing, self.incoming, node as u32)
+                .into_iter()
+                .map(|neighbor| (neighbor as usize, 1))
+                .collect(),
+        )
+    }
+}
+enum LouvainTopology<'a, A> {
+    Canonical(InitialWeighted<'a, A>),
+    Coarse(Vec<Vec<(usize, u64)>>),
+}
+impl<A: AdjacencyRead> WeightedAdjacency for LouvainTopology<'_, A> {
+    fn node_count(&self) -> usize {
+        match self {
+            Self::Canonical(graph) => graph.node_count(),
+            Self::Coarse(graph) => graph.node_count(),
+        }
+    }
+    fn weights(&self, node: usize) -> Cow<'_, [(usize, u64)]> {
+        match self {
+            Self::Canonical(graph) => graph.weights(node),
+            Self::Coarse(graph) => graph.weights(node),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -950,6 +1221,348 @@ mod tests {
         assert_eq!(coefficient[0], 1.0);
         assert_eq!(k_core(&outgoing, &incoming)?, vec![2, 2, 2, 1, 1]);
         Ok(())
+    }
+
+    struct AppendAdjacency {
+        rows: Vec<Vec<(u32, u32)>>,
+        row_reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl AdjacencyRead for AppendAdjacency {
+        type Row<'a> = std::vec::IntoIter<(u32, u32)>;
+
+        fn node_count(&self) -> usize {
+            self.rows.len()
+        }
+
+        fn degree(&self, node: u32) -> usize {
+            self.rows.get(node as usize).map_or(0, Vec::len)
+        }
+
+        fn row(&self, node: u32) -> Option<Self::Row<'_>> {
+            self.row_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.rows.get(node as usize).cloned().map(Vec::into_iter)
+        }
+
+        fn append_row(&self, node: u32, output: &mut Vec<(u32, u32)>) -> bool {
+            let Some(row) = self.rows.get(node as usize) else {
+                return false;
+            };
+            output.extend(row.iter().copied());
+            true
+        }
+    }
+
+    #[test]
+    fn live_unsorted_rows_preserve_traversal_results_without_owned_row_copies() -> Result<()> {
+        let edges = [
+            (0, 3, 0),
+            (0, 1, 1),
+            (0, 2, 2),
+            (1, 2, 3),
+            (2, 0, 4),
+            (3, 4, 5),
+            (4, 3, 6),
+            (4, 4, 7),
+            (6, 5, 8),
+            (5, 6, 9),
+        ];
+        let (outgoing, incoming) = pair(8, &edges)?;
+        let live = |reverse: bool| {
+            let mut rows = vec![Vec::new(); 8];
+            for &(source, target, edge) in &edges {
+                let (source, target) = if reverse {
+                    (target, source)
+                } else {
+                    (source, target)
+                };
+                rows[source as usize].push((target, edge));
+            }
+            AppendAdjacency {
+                rows,
+                row_reads: std::sync::atomic::AtomicUsize::new(0),
+            }
+        };
+        let live_out = live(false);
+        let live_in = live(true);
+        assert_eq!(bfs(&live_out, 0)?, bfs(&outgoing, 0)?);
+        assert_eq!(dfs(&live_out, 0)?, dfs(&outgoing, 0)?);
+        assert_eq!(
+            dijkstra(&live_out, 0, |_| Ok(1.0))?,
+            dijkstra(&outgoing, 0, |_| Ok(1.0))?
+        );
+        assert_eq!(
+            weakly_connected_components(&live_out, &live_in)?,
+            weakly_connected_components(&outgoing, &incoming)?
+        );
+        assert_eq!(
+            strongly_connected_components(&live_out, &live_in)?,
+            strongly_connected_components(&outgoing, &incoming)?
+        );
+        assert_eq!(
+            page_rank(&live_out, PageRankConfig::default())?,
+            page_rank(&outgoing, PageRankConfig::default())?
+        );
+        for adjacency in [&live_out, &live_in] {
+            assert_eq!(
+                adjacency
+                    .row_reads
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                0
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn triangle_ranges_and_large_intersections_remain_cancellable() -> Result<()> {
+        let rows = (0..10000_u32).map(|node| (node, node)).collect::<Vec<_>>();
+        let mut checks = 0;
+        assert_eq!(
+            sorted_neighbor_intersection_count(&rows[..8], &rows[..8], &mut || {
+                checks += 1;
+                Ok(())
+            })?,
+            8
+        );
+        assert_eq!(
+            checks, 0,
+            "short intersections use the outer loop checkpoint"
+        );
+        let cancelled = sorted_neighbor_intersection_count(&rows, &rows, &mut || {
+            checks += 1;
+            Err(Error::new(ErrorCode::Cancelled, "cancelled intersection"))
+        });
+        assert!(matches!(cancelled, Err(error) if error.code == ErrorCode::Cancelled));
+        assert_eq!(checks, 1);
+        let adjacency = AppendAdjacency {
+            rows: vec![Vec::new(); 32],
+            row_reads: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let cancelled = triangle_count_range_cancellable(&adjacency, &adjacency, 17..18, || {
+            Err(Error::new(ErrorCode::Cancelled, "cancelled range"))
+        });
+        assert!(matches!(cancelled, Err(error) if error.code == ErrorCode::Cancelled));
+        assert_eq!(
+            adjacency
+                .row_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        let mut coefficient = [f64::NAN];
+        let cancelled = clustering_coefficients_into_cancellable(
+            &adjacency,
+            &adjacency,
+            17,
+            &mut coefficient,
+            || {
+                Err(Error::new(
+                    ErrorCode::Cancelled,
+                    "cancelled clustering range",
+                ))
+            },
+        );
+        assert!(matches!(cancelled, Err(error) if error.code == ErrorCode::Cancelled));
+        assert!(coefficient[0].is_nan());
+        assert!(
+            clustering_coefficients_into_cancellable(
+                &adjacency,
+                &adjacency,
+                usize::MAX,
+                &mut coefficient,
+                || Ok(()),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            adjacency
+                .row_reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reusable_triangle_and_clustering_rows_match_independent_simple_graph_counts() -> Result<()> {
+        for node_count in 0_u32..=12 {
+            let mut outgoing = AppendAdjacency {
+                rows: vec![Vec::new(); node_count as usize],
+                row_reads: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let mut incoming = AppendAdjacency {
+                rows: vec![Vec::new(); node_count as usize],
+                row_reads: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let mut connected = vec![vec![false; node_count as usize]; node_count as usize];
+            let mut edge = 0;
+            for source in (0..node_count).rev() {
+                for target in (0..node_count).rev() {
+                    if source == target || (source * 7 + target * 3) % 5 < 2 {
+                        // Unsorted reciprocal/parallel edges and self-loops must reduce to
+                        // the same undirected simple graph as the independent matrix oracle.
+                        for _ in 0..2 {
+                            outgoing.rows[source as usize].push((target, edge));
+                            incoming.rows[target as usize].push((source, edge));
+                            edge += 1;
+                        }
+                        if source != target {
+                            connected[source as usize][target as usize] = true;
+                            connected[target as usize][source as usize] = true;
+                        }
+                    }
+                }
+            }
+            let mut expected_triangles = 0;
+            for first in 0..node_count as usize {
+                for second in first + 1..node_count as usize {
+                    for third in second + 1..node_count as usize {
+                        expected_triangles += u64::from(
+                            connected[first][second]
+                                && connected[second][third]
+                                && connected[first][third],
+                        );
+                    }
+                }
+            }
+            assert_eq!(triangle_count(&outgoing, &incoming)?, expected_triangles);
+            let mut expected_cores = vec![0; node_count as usize];
+            for threshold in 1..node_count {
+                let mut active = vec![true; node_count as usize];
+                loop {
+                    let remove = (0..node_count as usize)
+                        .filter(|&node| {
+                            active[node]
+                                && connected[node]
+                                    .iter()
+                                    .zip(&active)
+                                    .filter(|(edge, present)| **edge && **present)
+                                    .count()
+                                    < threshold as usize
+                        })
+                        .collect::<Vec<_>>();
+                    if remove.is_empty() {
+                        break;
+                    }
+                    for node in remove {
+                        active[node] = false;
+                    }
+                }
+                for (node, present) in active.into_iter().enumerate() {
+                    if present {
+                        expected_cores[node] = threshold;
+                    }
+                }
+            }
+            assert_eq!(k_core(&outgoing, &incoming)?, expected_cores);
+            for source in 0..node_count {
+                for target in 0..node_count {
+                    let mut paths = vec![None; node_count as usize];
+                    paths[source as usize] = Some(vec![source]);
+                    let mut queue = VecDeque::from([source]);
+                    while let Some(node) = queue.pop_front() {
+                        for neighbor in 0..node_count {
+                            if outgoing.rows[node as usize]
+                                .iter()
+                                .any(|&(next, _)| next == neighbor)
+                                && paths[neighbor as usize].is_none()
+                            {
+                                let mut path = paths[node as usize].as_ref().unwrap().clone();
+                                path.push(neighbor);
+                                paths[neighbor as usize] = Some(path);
+                                queue.push_back(neighbor);
+                            }
+                        }
+                    }
+                    assert_eq!(
+                        shortest_path(&outgoing, source, target)?,
+                        paths[target as usize]
+                    );
+                }
+            }
+            for width in 1..=4 {
+                let partitioned = (0..node_count as usize)
+                    .step_by(width)
+                    .map(|start| {
+                        triangle_count_range_cancellable(
+                            &outgoing,
+                            &incoming,
+                            start..(start + width).min(node_count as usize),
+                            || Ok(()),
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .sum::<u64>();
+                assert_eq!(partitioned, expected_triangles);
+            }
+            let coefficients = clustering_coefficients(&outgoing, &incoming)?;
+            for width in 1..=4 {
+                let mut partitioned = vec![f64::NAN; node_count as usize];
+                for (task, output) in partitioned.chunks_mut(width).enumerate() {
+                    clustering_coefficients_into_cancellable(
+                        &outgoing,
+                        &incoming,
+                        task * width,
+                        output,
+                        || Ok(()),
+                    )?;
+                }
+                assert_eq!(partitioned, coefficients);
+            }
+            for (node, coefficient) in coefficients.iter().enumerate() {
+                let neighbors = (0..node_count as usize)
+                    .filter(|neighbor| connected[node][*neighbor])
+                    .collect::<Vec<_>>();
+                let mut links = 0;
+                for left in 0..neighbors.len() {
+                    for right in left + 1..neighbors.len() {
+                        links += usize::from(connected[neighbors[left]][neighbors[right]]);
+                    }
+                }
+                let expected = if neighbors.len() < 2 {
+                    0.0
+                } else {
+                    let possible = neighbors.len() * (neighbors.len() - 1) / 2;
+                    links as f64 / possible as f64
+                };
+                assert_eq!(*coefficient, expected);
+            }
+            assert_eq!(
+                outgoing
+                    .row_reads
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "optimized algorithms must use the append API rather than allocate row copies"
+            );
+            assert_eq!(
+                incoming
+                    .row_reads
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                0
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sorted_neighbor_intersections_cancel_inside_large_rows() {
+        let neighbors = (0..20_000)
+            .map(|neighbor| (neighbor, 0))
+            .collect::<Vec<_>>();
+        let mut checks = 0;
+        let error = sorted_neighbor_intersection_count(&neighbors, &neighbors, &mut || {
+            checks += 1;
+            if checks == 2 {
+                Err(Error::new(ErrorCode::Cancelled, "intersection cancelled"))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("intersection did not observe cancellation inside a large row");
+        assert_eq!(error.code, ErrorCode::Cancelled);
+        assert_eq!(checks, 2);
     }
 
     #[test]

@@ -553,7 +553,7 @@ struct Fixture {
 
 impl Fixture {
     fn build(case: Create3Case) -> Result<Self> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         if !case.setup.is_empty() {
             let setup =
                 QueryEngine.execute(case.setup, &mut create3_context(&graph, None, false))?;
@@ -581,7 +581,7 @@ impl Fixture {
     }
 
     fn image(&self) -> Result<ResidentProjectImage> {
-        ResidentProjectImage::build(
+        super::legacy_resident_build(
             PROJECT,
             self.bookmark,
             &self.graph,
@@ -2021,7 +2021,7 @@ const MERGE1_CASES: [Merge1Case; 7] = [
 ];
 
 fn build_merge1_fixture(setup: &str, label: &str) -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     if !setup.is_empty() {
         let output = QueryEngine.execute(setup, &mut create3_context(&graph, None, false))?;
         if !output.temporal_mutations.is_empty()
@@ -2557,7 +2557,7 @@ fn assert_merge2_literal_output(
         )));
     }
 
-    let mut after = fixture.graph.clone();
+    let after = fixture.graph.clone();
     for mutation in &output.graph_mutations {
         after.apply(mutation.clone())?;
     }
@@ -2846,7 +2846,7 @@ fn assert_merge3_literal_property_output(
         )));
     }
 
-    let mut after = fixture.graph.clone();
+    let after = fixture.graph.clone();
     for mutation in &output.graph_mutations {
         after.apply(mutation.clone())?;
     }
@@ -3514,7 +3514,7 @@ fn assert_merge1_node_path_output(fixture: &Fixture, output: &ExecutionOutput) -
         )));
     }
 
-    let mut after = fixture.graph.clone();
+    let after = fixture.graph.clone();
     for mutation in &output.graph_mutations {
         after.apply(mutation.clone())?;
     }

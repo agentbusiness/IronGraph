@@ -31,7 +31,11 @@
 
 pub use irongraph_execution as execution;
 pub use irongraph_execution::*;
-pub use irongraph_graph as graph;
+/// Graph storage used exclusively by the retained inactive graph accelerator.
+pub mod graph {
+    pub use irongraph_graph::legacy::{GraphStore, TemporalStore};
+    pub use irongraph_graph::*;
+}
 pub use irongraph_types as types;
 pub use irongraph_types::document;
 pub use irongraph_types::{
@@ -40,32 +44,54 @@ pub use irongraph_types::{
 };
 
 #[cfg(any(
-    all(feature = "accelerator", any(target_os = "macos", target_os = "ios")),
-    feature = "cuda"
+    all(
+        feature = "legacy-graph",
+        feature = "accelerator",
+        any(target_os = "macos", target_os = "ios")
+    ),
+    all(feature = "legacy-graph", feature = "cuda")
 ))]
 mod accelerator;
 #[cfg(feature = "accelerator")]
 pub mod device;
+pub mod platform_memory;
 #[cfg(feature = "accelerator")]
 pub use device::{ResolvedCandleDevice, resolve_candle_device};
-#[cfg(feature = "cuda")]
+pub use platform_memory::host_available_bytes;
+#[cfg(all(feature = "legacy-graph", feature = "cuda"))]
 mod cuda;
-#[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+#[cfg(all(
+    feature = "legacy-graph",
+    feature = "accelerator",
+    any(target_os = "macos", target_os = "ios")
+))]
 mod metal;
 #[cfg(feature = "accelerator")]
 pub mod metal_gate;
 #[cfg(feature = "accelerator")]
 pub use metal_gate::{lock_metal_device, metal_device_gate};
 
-#[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+#[cfg(all(
+    feature = "legacy-graph",
+    feature = "accelerator",
+    any(target_os = "macos", target_os = "ios")
+))]
 pub use accelerator::{
     resident_named_zone_table_bytes, stable_device_argsort, stable_device_top_k,
 };
-#[cfg(all(feature = "cuda", not(any(target_os = "macos", target_os = "ios"))))]
+#[cfg(all(
+    feature = "legacy-graph",
+    feature = "cuda",
+    not(any(target_os = "macos", target_os = "ios"))
+))]
 pub use accelerator::{stable_device_argsort, stable_device_top_k};
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "legacy-graph", feature = "cuda"))]
 pub use cuda::CudaBackend;
-#[cfg(all(feature = "accelerator", any(target_os = "macos", target_os = "ios")))]
+#[cfg(all(
+    feature = "legacy-graph",
+    feature = "accelerator",
+    any(target_os = "macos", target_os = "ios")
+))]
 pub use metal::MetalBackend;
 
 /// Serialises tests that allocate on the process-wide Metal device.
@@ -95,6 +121,7 @@ pub fn metal_test_device() -> Option<candle_core::Device> {
 }
 
 /// Constructs exactly the resolved backend or fails; it never changes execution class.
+#[cfg(feature = "legacy-graph")]
 pub fn create_execution_backend(
     resolved: ResolvedComputeDevice,
     memory_limit_bytes: usize,
@@ -107,6 +134,7 @@ pub fn create_execution_backend(
 }
 
 /// Constructs a backend participating in the caller's process-wide graph/encoder byte ledger.
+#[cfg(feature = "legacy-graph")]
 pub fn create_execution_backend_with_governor(
     resolved: ResolvedComputeDevice,
     governor: DeviceMemoryGovernor,

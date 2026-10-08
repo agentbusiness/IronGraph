@@ -10,13 +10,12 @@ use irongraph_types::ProjectId;
 
 static NATIVE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
 #[test]
-fn metal_empty_label_after_delete_and_restart() -> Result<(), Box<dyn std::error::Error>> {
+fn cpu_empty_label_after_delete_and_restart() -> Result<(), Box<dyn std::error::Error>> {
     let _guard = NATIVE_TESTS.lock().unwrap();
     let directory = tempfile::tempdir()?;
     let options = EmbeddedOptions::new(directory.path())
-        .with_execution_device(ExecutionDevice::Metal(0))
+        .with_execution_device(ExecutionDevice::Cpu)
         .with_embedding_policy(EmbeddingPolicy::Disabled);
     for round in 0..2 {
         let database = EmbeddedDatabase::open(options.clone())?;
@@ -75,7 +74,6 @@ fn native_graph_stream_bounds_isolation_and_reopen() -> Result<(), Box<dyn std::
         .with_execution_device(ExecutionDevice::Cpu)
         .with_embedding_policy(EmbeddingPolicy::Disabled);
     options.worker_threads = 1;
-    options.max_concurrent_operations = 2;
     let database = EmbeddedDatabase::open(options.clone())?;
     assert_eq!(database.status()?.data_dir, directory.path());
     assert!(database.status()?.ready);

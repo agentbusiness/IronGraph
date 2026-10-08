@@ -1,8 +1,8 @@
 //! IronGraph SDK for embedded databases and remote API/Bolt connections.
 //!
 //! Documents, vector search, graph algorithms, projects, and administration use the same
-//! [`Query`] interface. Calls block the current thread; use your async runtime's blocking
-//! task facility when calling from async applications.
+//! [`Query`] interface. Synchronous methods block the caller; asynchronous embedded methods
+//! run native work on Tokio's blocking pool and cancel active operations when dropped.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -59,6 +59,10 @@ impl Drop for OwnedBuffer {
 }
 
 fn call(request: Value) -> Result<Value> {
+    call_typed(request)
+}
+
+fn call_typed<T: serde::de::DeserializeOwned>(request: Value) -> Result<T> {
     if unsafe { irongraph_abi_version() } != 1 {
         return Err(Error::sdk("native library ABI version mismatch"));
     }
@@ -80,20 +84,40 @@ fn call(request: Value) -> Result<Value> {
         return Err(Error::sdk("native library returned an invalid buffer"));
     }
     let bytes = unsafe { std::slice::from_raw_parts(buffer.0.data, buffer.0.len) };
-    let response: Value =
+    let response: NativeResponse<'_> =
         serde_json::from_slice(bytes).map_err(|error| Error::sdk(error.to_string()))?;
-    if response.get("version").and_then(Value::as_str) != Some(env!("CARGO_PKG_VERSION")) {
+    if response.version != env!("CARGO_PKG_VERSION") {
         return Err(Error::sdk("native library package version mismatch"));
     }
-    match (status, response.get("ok").and_then(Value::as_bool)) {
-        (0, Some(true)) => response
-            .get("result")
-            .cloned()
-            .ok_or_else(|| Error::sdk("native result is missing")),
-        (1, Some(false)) => Err(serde_json::from_value(response["error"].clone())
-            .map_err(|error| Error::sdk(error.to_string()))?),
+    match (status, response.ok) {
+        (0, true) => serde_json::from_str(
+            response
+                .result
+                .ok_or_else(|| Error::sdk("native result is missing"))?
+                .get(),
+        )
+        .map_err(|error| Error::sdk(error.to_string())),
+        (1, false) => Err(response
+            .error
+            .ok_or_else(|| Error::sdk("native error is missing"))?),
         _ => Err(Error::sdk("native response status is inconsistent")),
     }
+}
+
+#[derive(Deserialize)]
+struct NativeResponse<'a> {
+    ok: bool,
+    version: &'a str,
+    #[serde(default, borrow, deserialize_with = "present_native_result")]
+    result: Option<&'a serde_json::value::RawValue>,
+    error: Option<Error>,
+}
+
+fn present_native_result<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<&'de serde_json::value::RawValue>, D::Error> {
+    // Preserve an explicitly returned null, and distinguish it from a missing result field.
+    <&serde_json::value::RawValue>::deserialize(deserializer).map(Some)
 }
 
 /// Position of an applied database write.
@@ -111,19 +135,6 @@ pub enum CommitAcknowledgement {
     Published,
 }
 
-/// Optional result limits. Omitted fields are unbounded; explicit limits must be nonzero.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
-pub struct QueryLimits {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rows: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bytes: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub nodes: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub edges: Option<u64>,
-}
-
 /// One Cypher request covering the complete database query and administration surface.
 #[derive(Clone, Debug, Serialize)]
 pub struct Query {
@@ -133,7 +144,6 @@ pub struct Query {
     pub project_id: Option<String>,
     pub bookmark: Option<Bookmark>,
     pub consistency: CommitAcknowledgement,
-    pub limits: QueryLimits,
 }
 impl Query {
     pub fn new(cypher: impl Into<String>) -> Self {
@@ -143,7 +153,6 @@ impl Query {
             project_id: None,
             bookmark: None,
             consistency: CommitAcknowledgement::Published,
-            limits: QueryLimits::default(),
         }
     }
     pub fn with_project(mut self, project_id: impl Into<String>) -> Self {
@@ -156,10 +165,6 @@ impl Query {
     }
     pub fn with_bookmark(mut self, bookmark: Bookmark) -> Self {
         self.bookmark = Some(bookmark);
-        self
-    }
-    pub fn with_limits(mut self, limits: QueryLimits) -> Self {
-        self.limits = limits;
         self
     }
 }
@@ -183,6 +188,15 @@ pub enum ExecutionDevice {
     Metal(u32),
     Cuda(u32),
 }
+/// Independently selected text inference device.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum EmbeddingDevice {
+    #[default]
+    Auto,
+    Cpu,
+    Metal(u32),
+    Cuda(u32),
+}
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EmbeddingPolicy {
@@ -196,14 +210,9 @@ pub enum EmbeddingPolicy {
 pub struct EmbeddedOptions {
     pub data_dir: PathBuf,
     pub execution_device: ExecutionDevice,
+    pub embedding_device: EmbeddingDevice,
     pub embedding_policy: EmbeddingPolicy,
-    pub device_memory_limit_bytes: Option<usize>,
-    pub device_reserved_bytes: Option<usize>,
-    pub max_write_bytes: Option<usize>,
-    pub request_timeout_ms: Option<u64>,
-    pub startup_timeout_ms: Option<u64>,
     pub snapshot_interval_ms: Option<u64>,
-    pub max_concurrent_operations: Option<usize>,
     pub worker_threads: Option<usize>,
 }
 impl EmbeddedOptions {
@@ -211,14 +220,9 @@ impl EmbeddedOptions {
         Self {
             data_dir: data_dir.into(),
             execution_device: ExecutionDevice::Auto,
+            embedding_device: EmbeddingDevice::Auto,
             embedding_policy: EmbeddingPolicy::Automatic,
-            device_memory_limit_bytes: None,
-            device_reserved_bytes: None,
-            max_write_bytes: None,
-            request_timeout_ms: None,
-            startup_timeout_ms: None,
             snapshot_interval_ms: None,
-            max_concurrent_operations: None,
             worker_threads: None,
         }
     }
@@ -230,6 +234,10 @@ impl EmbeddedOptions {
         self.embedding_policy = policy;
         self
     }
+    pub fn with_embedding_device(mut self, device: EmbeddingDevice) -> Self {
+        self.embedding_device = device;
+        self
+    }
     fn json(self) -> Value {
         let (device, ordinal) = match self.execution_device {
             ExecutionDevice::Auto => ("auto", 0),
@@ -237,43 +245,341 @@ impl EmbeddedOptions {
             ExecutionDevice::Metal(ordinal) => ("metal", ordinal),
             ExecutionDevice::Cuda(ordinal) => ("cuda", ordinal),
         };
+        let (embedding_device, embedding_ordinal) = match self.embedding_device {
+            EmbeddingDevice::Auto => ("auto", 0),
+            EmbeddingDevice::Cpu => ("cpu", 0),
+            EmbeddingDevice::Metal(ordinal) => ("metal", ordinal),
+            EmbeddingDevice::Cuda(ordinal) => ("cuda", ordinal),
+        };
         json!({"data_dir":self.data_dir,"execution_device":device,"device_ordinal":ordinal,"embedding_policy":self.embedding_policy,
-            "device_memory_limit_bytes":self.device_memory_limit_bytes,"device_reserved_bytes":self.device_reserved_bytes,"max_write_bytes":self.max_write_bytes,
-            "request_timeout_ms":self.request_timeout_ms,"startup_timeout_ms":self.startup_timeout_ms,"snapshot_interval_ms":self.snapshot_interval_ms,
-            "max_concurrent_operations":self.max_concurrent_operations,"worker_threads":self.worker_threads})
+            "embedding_device":embedding_device,"embedding_device_ordinal":embedding_ordinal,
+            "snapshot_interval_ms":self.snapshot_interval_ms,"worker_threads":self.worker_threads})
     }
 }
 
-struct Handle(Option<u64>);
+struct Handle(Option<u64>, Option<tokio::sync::OwnedSemaphorePermit>);
+
+struct HandleTeardown {
+    handle: u64,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+struct HandleReaper {
+    sender: std::sync::mpsc::SyncSender<HandleTeardown>,
+    permits: std::sync::Arc<tokio::sync::Semaphore>,
+    failed: std::sync::atomic::AtomicBool,
+}
+static HANDLE_REAPER: std::sync::OnceLock<std::result::Result<HandleReaper, String>> =
+    std::sync::OnceLock::new();
+#[cfg(test)]
+type HandleTeardownGate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+#[cfg(test)]
+static HANDLE_TEARDOWN_GATE: std::sync::Mutex<Option<HandleTeardownGate>> =
+    std::sync::Mutex::new(None);
+
+fn handle_reaper() -> Result<&'static HandleReaper> {
+    let reaper = HANDLE_REAPER
+        .get_or_init(|| {
+            let (sender, receiver) = std::sync::mpsc::sync_channel::<HandleTeardown>(64);
+            std::thread::Builder::new()
+                .name("irongraph-sdk-teardown".into())
+                .spawn(move || {
+                    for teardown in receiver {
+                        #[cfg(test)]
+                        if let Some((entered, release)) =
+                            HANDLE_TEARDOWN_GATE.lock().unwrap().take()
+                        {
+                            let _ = entered.send(());
+                            let _ = release.recv();
+                        }
+                        let _ = std::panic::catch_unwind(|| {
+                            let _ = call(json!({"action":"close","handle":teardown.handle}));
+                        });
+                        drop(teardown);
+                    }
+                })
+                .map_err(|error| error.to_string())?;
+            Ok(HandleReaper {
+                sender,
+                permits: std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+                failed: std::sync::atomic::AtomicBool::new(false),
+            })
+        })
+        .as_ref()
+        .map_err(|error| Error::sdk(format!("SDK teardown worker failed: {error}")))?;
+    if reaper.failed.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(Error::sdk("SDK teardown worker is unavailable"));
+    }
+    Ok(reaper)
+}
+#[cfg(test)]
+mod embedding_configuration_tests {
+    use super::*;
+
+    #[test]
+    fn native_envelope_borrows_result_and_distinguishes_null_from_missing() {
+        let null: NativeResponse<'_> =
+            serde_json::from_str(r#"{"ok":true,"version":"0.1.6","result":null}"#).unwrap();
+        assert_eq!(null.result.unwrap().get(), "null");
+        let missing: NativeResponse<'_> =
+            serde_json::from_str(r#"{"ok":true,"version":"0.1.6"}"#).unwrap();
+        assert!(missing.result.is_none());
+        let dirty = serde_json::json!({"rows":[[{"type":"string","value":"Unicode 🦀\\\"\0".repeat(16_384)}]],"columns":[],"catalog":null,"summary":{}});
+        let encoded = serde_json::json!({"ok":true,"version":"0.1.6","result":dirty}).to_string();
+        let response: NativeResponse<'_> = serde_json::from_str(&encoded).unwrap();
+        let raw = response.result.unwrap().get();
+        assert!(raw.as_ptr() >= encoded.as_ptr());
+        assert!(raw.as_bytes().as_ptr_range().end <= encoded.as_bytes().as_ptr_range().end);
+        let result: QueryResult = serde_json::from_str(raw).unwrap();
+        assert_eq!(serde_json::to_value(result).unwrap(), dirty);
+    }
+
+    #[test]
+    fn cpu_graph_serializes_independent_embedding_device() {
+        let options = EmbeddedOptions::new("test-data")
+            .with_execution_device(ExecutionDevice::Cpu)
+            .with_embedding_device(EmbeddingDevice::Metal(2))
+            .json();
+        assert_eq!(options["execution_device"], "cpu");
+        assert_eq!(options["embedding_device"], "metal");
+        assert_eq!(options["embedding_device_ordinal"], 2);
+        assert_eq!(
+            EmbeddedOptions::new("test-data").json()["embedding_device"],
+            "auto"
+        );
+    }
+}
 impl Handle {
     fn open(request: Value) -> Result<Self> {
+        let permit = handle_reaper()?
+            .permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error {
+                code: "BACKPRESSURE".into(),
+                message: "SDK native handle capacity exhausted before open".into(),
+                retryable: true,
+                retry_after_ms: None,
+            })?;
         call(request)?["handle"]
             .as_u64()
             .filter(|handle| *handle != 0)
-            .map(|handle| Self(Some(handle)))
+            .map(|handle| Self(Some(handle), Some(permit)))
             .ok_or_else(|| Error::sdk("native open returned an invalid handle"))
     }
     fn query(&self, query: Query) -> Result<QueryResult> {
-        serde_json::from_value(call(
-            json!({"action":"query","handle":self.0,"query":query}),
-        )?)
-        .map_err(|error| Error::sdk(error.to_string()))
+        call_typed(json!({"action":"query","handle":self.0,"query":query}))
     }
     fn close(&mut self) -> Result<()> {
         if let Some(handle) = self.0.take() {
-            call(json!({"action":"close","handle":handle}))?;
+            let result = call(json!({"action":"close","handle":handle}));
+            self.1.take();
+            result?;
         }
         Ok(())
     }
 }
 impl Drop for Handle {
     fn drop(&mut self) {
-        let _ = self.close();
+        if let Some(handle) = self.0.take() {
+            let teardown = HandleTeardown {
+                handle,
+                _permit: self
+                    .1
+                    .take()
+                    .expect("live handle retains lifecycle admission"),
+            };
+            let reaper = HANDLE_REAPER
+                .get()
+                .expect("open initialized reaper")
+                .as_ref()
+                .expect("open admitted reaper");
+            if let Err(error) = reaper.sender.try_send(teardown) {
+                reaper
+                    .failed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                let (std::sync::mpsc::TrySendError::Full(teardown)
+                | std::sync::mpsc::TrySendError::Disconnected(teardown)) = error;
+                std::mem::forget(teardown);
+            }
+        }
     }
 }
 
-/// Synchronous database backed by the bundled native engine. Only one embedded instance can be
-/// active in a process. Close explicitly to observe snapshot or shutdown errors.
+#[cfg(test)]
+mod bounded_teardown_tests {
+    use super::*;
+
+    #[test]
+    fn paused_native_teardown_bounds_handles_and_keeps_current_thread_responsive() {
+        let directory = tempfile::tempdir().unwrap();
+        let options =
+            EmbeddedOptions::new(directory.path()).with_embedding_policy(EmbeddingPolicy::Disabled);
+        let database = EmbeddedDatabase::open(options.clone()).unwrap();
+        let (entered, observed) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        *HANDLE_TEARDOWN_GATE.lock().unwrap() = Some((entered, blocked));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            drop(database);
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        });
+        observed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let mut handles = Vec::new();
+        for _ in 0..63 {
+            handles.push(RemoteClient::api("http://127.0.0.1:1").unwrap());
+        }
+        let error = match RemoteClient::api("http://127.0.0.1:1") {
+            Err(error) => error,
+            Ok(_) => panic!("teardown did not retain handle admission"),
+        };
+        assert_eq!(error.code, "BACKPRESSURE");
+        for handle in handles {
+            handle.close().unwrap();
+        }
+        assert!(
+            EmbeddedDatabase::open(options.clone()).is_err(),
+            "instance guard released before actual teardown"
+        );
+        release.send(()).unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while handle_reaper().unwrap().permits.available_permits() != 64 {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        EmbeddedDatabase::open(options.clone())
+            .unwrap()
+            .close()
+            .unwrap();
+        EmbeddedDatabase::open(options).unwrap().close().unwrap();
+    }
+}
+
+static ASYNC_JOBS: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(64)));
+static ASYNC_CONTROLS: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(64)));
+static ASYNC_CANCELLATIONS: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(64)));
+static ASYNC_OPERATION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct AsyncCancellation {
+    operation: Option<(u64, String)>,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    abort: tokio::task::AbortHandle,
+    runtime: tokio::runtime::Handle,
+    control: Option<tokio::sync::OwnedSemaphorePermit>,
+    job: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
+}
+impl Drop for AsyncCancellation {
+    fn drop(&mut self) {
+        let Some((handle, operation_id)) = self.operation.take() else {
+            return;
+        };
+        if self.abort.is_finished() {
+            return;
+        }
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        // Blocking tasks can only be aborted before they start. A running native request
+        // may still be parsing its packet, so retry until registration or completion.
+        self.abort.abort();
+        let abort = self.abort.clone();
+        let control = self.control.take();
+        let job = self.job.clone();
+        self.runtime.spawn_blocking(move || {
+            let _control = control;
+            let _job = job;
+            while !abort.is_finished() {
+                match call(json!({"action":"cancel","handle":handle,"operation_id":operation_id})) {
+                    Ok(result) if result.as_bool() == Some(true) => break,
+                    Err(_) => break,
+                    _ => std::thread::sleep(std::time::Duration::from_millis(1)),
+                }
+            }
+        });
+    }
+}
+async fn blocking<T: Send + 'static>(
+    operation: Option<(u64, String)>,
+    bounded: bool,
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let runtime = tokio::runtime::Handle::try_current()
+        .map_err(|_| Error::sdk("asynchronous embedded calls require a Tokio runtime"))?;
+    let admission = if bounded {
+        &*ASYNC_JOBS
+    } else {
+        &*ASYNC_CONTROLS
+    };
+    let permit = admission
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| Error::sdk("asynchronous SDK workers are closed"))?;
+    let control = if operation.is_some() {
+        Some(
+            ASYNC_CANCELLATIONS
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| Error::sdk("asynchronous SDK cancellation workers are closed"))?,
+        )
+    } else {
+        None
+    };
+    let permit = std::sync::Arc::new(permit);
+    let worker_permit = permit.clone();
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_cancelled = cancelled.clone();
+    let task = runtime.spawn_blocking(move || {
+        let _permit = worker_permit;
+        if worker_cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::sdk(
+                "asynchronous operation cancelled before dispatch",
+            ));
+        }
+        work()
+    });
+    let mut cancellation = AsyncCancellation {
+        operation,
+        control,
+        job: permit,
+        cancelled,
+        abort: task.abort_handle(),
+        runtime,
+    };
+    let result = task.await;
+    cancellation.operation = None;
+    result.map_err(|error| Error::sdk(format!("native worker failed: {error}")))?
+}
+fn async_options(mut options: OperationOptions) -> (OperationOptions, String) {
+    let id = options
+        .operation_id
+        .get_or_insert_with(|| {
+            format!(
+                "sdk:{}:{}",
+                std::process::id(),
+                ASYNC_OPERATION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )
+        })
+        .clone();
+    (options, id)
+}
+fn decode<T: serde::de::DeserializeOwned>(request: Value) -> Result<T> {
+    call_typed(request)
+}
+
+/// Database with synchronous and Tokio asynchronous access to the same native owner.
+/// Only one embedded instance can be active in a process. Close explicitly to observe shutdown errors.
 pub struct EmbeddedDatabase(Handle);
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -337,11 +643,79 @@ pub struct RuntimeStatus {
     pub data_dir: PathBuf,
     pub ready: bool,
     pub active_operations: usize,
-    pub max_concurrent_operations: usize,
     pub worker_threads: usize,
 }
 
 impl EmbeddedDatabase {
+    pub async fn open_async(options: EmbeddedOptions) -> Result<Self> {
+        blocking(None, true, move || Self::open(options)).await
+    }
+    pub async fn query_async(&self, query: Query) -> Result<QueryResult> {
+        self.query_with_options_async(query, OperationOptions::default())
+            .await
+    }
+    pub async fn query_with_options_async(
+        &self,
+        query: Query,
+        options: OperationOptions,
+    ) -> Result<QueryResult> {
+        let handle = self.0.0.ok_or_else(|| Error::sdk("database is closed"))?;
+        let (options, id) = async_options(options);
+        blocking(Some((handle, id)), true, move || {
+            decode(json!({"action":"query","handle":handle,"query":query,"options":options}))
+        })
+        .await
+    }
+    pub async fn stream_append_async(
+        &self,
+        request: StreamAppend,
+        options: OperationOptions,
+    ) -> Result<StreamAcknowledgement> {
+        let handle = self.0.0.ok_or_else(|| Error::sdk("database is closed"))?;
+        let (options, id) = async_options(options);
+        blocking(Some((handle, id)), true, move || decode(json!({"action":"stream_append","handle":handle,"request":request,"options":options}))).await
+    }
+    pub async fn stream_fetch_async(
+        &self,
+        request: StreamFetch,
+        options: OperationOptions,
+    ) -> Result<StreamPage> {
+        let handle = self.0.0.ok_or_else(|| Error::sdk("database is closed"))?;
+        let (options, id) = async_options(options);
+        blocking(Some((handle, id)), true, move || decode(json!({"action":"stream_fetch","handle":handle,"request":request,"options":options}))).await
+    }
+    pub async fn status_async(&self) -> Result<RuntimeStatus> {
+        let handle = self.0.0;
+        blocking(None, false, move || {
+            decode(json!({"action":"status","handle":handle}))
+        })
+        .await
+    }
+    pub async fn cancel_async(&self, operation_id: &str) -> Result<bool> {
+        let handle = self.0.0;
+        let operation_id = operation_id.to_owned();
+        blocking(None, false, move || {
+            decode(json!({"action":"cancel","handle":handle,"operation_id":operation_id}))
+        })
+        .await
+    }
+    pub async fn snapshot_async(&self) -> Result<Bookmark> {
+        let handle = self.0.0;
+        blocking(None, true, move || {
+            decode(json!({"action":"snapshot","handle":handle}))
+        })
+        .await
+    }
+    pub async fn flush_async(&self) -> Result<()> {
+        let handle = self.0.0;
+        blocking(None, true, move || {
+            call(json!({"action":"flush","handle":handle})).map(|_| ())
+        })
+        .await
+    }
+    pub async fn close_async(self) -> Result<()> {
+        blocking(None, false, move || self.close()).await
+    }
     pub fn open(options: EmbeddedOptions) -> Result<Self> {
         Handle::open(json!({"action":"open_embedded","options":options.json()})).map(Self)
     }
@@ -353,44 +727,34 @@ impl EmbeddedDatabase {
         query: Query,
         options: OperationOptions,
     ) -> Result<QueryResult> {
-        serde_json::from_value(call(
-            json!({"action":"query","handle":self.0.0,"query":query,"options":options}),
-        )?)
-        .map_err(|error| Error::sdk(error.to_string()))
+        call_typed(json!({"action":"query","handle":self.0.0,"query":query,"options":options}))
     }
     pub fn stream_append(
         &self,
         request: StreamAppend,
         options: OperationOptions,
     ) -> Result<StreamAcknowledgement> {
-        serde_json::from_value(call(
+        call_typed(
             json!({"action":"stream_append","handle":self.0.0,"request":request,"options":options}),
-        )?)
-        .map_err(|error| Error::sdk(error.to_string()))
+        )
     }
     pub fn stream_fetch(
         &self,
         request: StreamFetch,
         options: OperationOptions,
     ) -> Result<StreamPage> {
-        serde_json::from_value(call(
+        call_typed(
             json!({"action":"stream_fetch","handle":self.0.0,"request":request,"options":options}),
-        )?)
-        .map_err(|error| Error::sdk(error.to_string()))
+        )
     }
     pub fn status(&self) -> Result<RuntimeStatus> {
-        serde_json::from_value(call(json!({"action":"status","handle":self.0.0}))?)
-            .map_err(|error| Error::sdk(error.to_string()))
+        call_typed(json!({"action":"status","handle":self.0.0}))
     }
     pub fn cancel(&self, operation_id: &str) -> Result<bool> {
-        serde_json::from_value(call(
-            json!({"action":"cancel","handle":self.0.0,"operation_id":operation_id}),
-        )?)
-        .map_err(|error| Error::sdk(error.to_string()))
+        call_typed(json!({"action":"cancel","handle":self.0.0,"operation_id":operation_id}))
     }
     pub fn snapshot(&self) -> Result<Bookmark> {
-        serde_json::from_value(call(json!({"action":"snapshot","handle":self.0.0}))?)
-            .map_err(|error| Error::sdk(error.to_string()))
+        call_typed(json!({"action":"snapshot","handle":self.0.0}))
     }
     pub fn flush(&self) -> Result<()> {
         call(json!({"action":"flush","handle":self.0.0}))?;

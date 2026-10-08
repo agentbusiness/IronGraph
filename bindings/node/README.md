@@ -1,6 +1,6 @@
 # IronGraph for Node.js
 
-**Node.js access to a GPU-first temporal graph database with built-in streaming and queues.**
+**Node.js access to a CPU graph database with built-in streaming and queues.**
 
 Use Cypher to query graph structure, search text and vectors, inspect property history, and
 administer the database. Built-in Kafka-compatible Streams and AMQP-compatible Queues handle event
@@ -10,12 +10,9 @@ the Apache License 2.0.
 
 ## Performance at a glance
 
-- **0.834 µs graph count** at 2 million nodes on Metal — sub-microsecond at scale.
-- **12× faster indexed range count** on Metal than CPU: 1.61 ms versus 19.38 ms.
-- **7.5× faster k-core analysis** on Metal than CPU: 326 ms versus 2,430 ms.
-
-Median results from five runs on an Apple M5 Pro with 2 million nodes and 8 million
-relationships. See [more performance results](https://irongraph.tech/).
+Graph queries execute on the CPU against one shared canonical graph. Local text inference can
+use Metal or CUDA independently. Measure complete queries separately from individual graph operations;
+latency depends on the workload, graph size, indexes, and host.
 
 ## Database capabilities
 
@@ -111,9 +108,9 @@ Select projects explicitly with `USE` or the `projectId` argument. Each project 
 `KNOWLEDGE`, and `WORKSPACE` layers for source facts, curated facts, and working data. There is
 no implicit default project.
 
-One embedded instance owns its directory; one process selects one device. CPU is the reference
-backend, Metal is the primary local accelerator, and CUDA requires a CUDA-enabled release.
-GPU admission rejects project graphs and indexes that do not fit. IronGraph embeds text
+One embedded instance owns its directory. Graph execution uses one shared CPU graph; text inference
+selects its device independently. CUDA text inference requires a CUDA-enabled release. Parallel reads
+do not wait for writers and may observe mixed values during a multi-record write. IronGraph embeds text
 locally and does not run generative language models.
 
 Use `Client.apiMtls` or `Client.boltMtls` for remote access with certificate, private-key, and

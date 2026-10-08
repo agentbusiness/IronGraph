@@ -1,4 +1,4 @@
-//! Compact, canonical, device-addressable labeled-property graph representation.
+//! One canonical concurrent CPU graph, indexes, temporal records, and graph algorithms.
 
 #![allow(
     clippy::collapsible_if,
@@ -18,6 +18,8 @@ pub use irongraph_types::*;
 mod adjacency;
 mod algorithms;
 mod columns;
+mod concurrent;
+pub use columns::validate_property_value_shape;
 mod index;
 pub mod knowledge;
 mod persistent;
@@ -27,17 +29,32 @@ mod statistics;
 mod store;
 mod temporal;
 
+/// Inactive graph accelerator storage retained separately from the canonical CPU runtime.
+pub mod legacy {
+    pub use crate::store::{
+        LegacyEdgeView as EdgeView, LegacyGraphStore as GraphStore,
+        LegacyNameCatalog as NameCatalog, LegacyNodeView as NodeView,
+    };
+    pub use crate::temporal::InactiveTemporalStore as TemporalStore;
+}
+
 pub use adjacency::{Adjacency, AdjacencyDelta, Csr};
 pub use algorithms::{
-    Components, DijkstraResult, PageRankConfig, bfs, bfs_cancellable, clustering_coefficients,
-    clustering_coefficients_cancellable, dfs, dfs_cancellable, dijkstra, dijkstra_cancellable,
+    AdjacencyRead, Components, DijkstraResult, PageRankConfig, bfs, bfs_cancellable,
+    clustering_coefficients, clustering_coefficients_cancellable,
+    clustering_coefficients_into_cancellable, dfs, dfs_cancellable, dijkstra, dijkstra_cancellable,
     k_core, k_core_cancellable, louvain_communities, louvain_communities_cancellable, page_rank,
     page_rank_cancellable, shortest_path, shortest_path_cancellable, strongly_connected_components,
     strongly_connected_components_cancellable, triangle_count, triangle_count_cancellable,
-    weakly_connected_components, weakly_connected_components_cancellable,
+    triangle_count_range_cancellable, weakly_connected_components,
+    weakly_connected_components_cancellable,
 };
 pub use columns::MIXED_STRING_TAG;
 pub use columns::{ByteValues, Dictionary, PackedLists, PropertyColumns, TypedColumn, Validity};
+pub use concurrent::{
+    CanonicalCounts, ConcurrentPropertyColumn, EdgeView, GraphStore, LabelsHandle, NameCatalog,
+    NodePropertyReader, NodeView,
+};
 pub use index::SharedVectorBacking;
 pub use index::{
     AnnDeviceImage, DerivedIndexDeviceImage, DerivedIndexState, EmbeddingDType,
@@ -53,15 +70,17 @@ pub use index::{
 pub use persistent::PagedVec;
 pub use persistent::PersistentMap;
 pub use persistent::{stable_id_key, stable_id_row};
-pub use semantic::{SemanticText, SemanticTextBatch, semantic_text_delta, semantic_texts};
+pub use semantic::{
+    SemanticText, SemanticTextBatch, semantic_affected_owners, semantic_owner_text,
+    semantic_text_delta, semantic_texts,
+};
 #[allow(unused_imports)]
 pub use shared::{SharedAllocation, SharedFlat};
 pub use statistics::{FanoutStatistics, NumericHistogram, PropertyStatistics, StatisticsSnapshot};
 pub use store::GraphSharedBacking;
 pub use store::{
-    AdjacencyRowDeviceDelta, CompactionMap, EdgeDeviceDelta, EdgeInput, EdgeView, GraphChangeIds,
-    GraphDeviceDelta, GraphMutation, GraphSnapshot, GraphStore, NameCatalog, NodeDeviceDelta,
-    NodeInput, NodeView,
+    AdjacencyRowDeviceDelta, CompactionMap, EdgeDeviceDelta, EdgeInput, GraphChangeIds,
+    GraphDeviceDelta, GraphMutation, GraphSnapshot, NodeDeviceDelta, NodeInput,
 };
 pub use temporal::TemporalCanonicalColumn;
 pub use temporal::{

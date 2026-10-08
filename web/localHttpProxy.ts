@@ -18,7 +18,7 @@ export function localProxyRequestAllowed(req: IncomingMessage): boolean {
 
 export function localHttpProxyGuard(): Plugin {
   const guard: Connect.NextHandleFunction = (req, res, next) => {
-    if (!req.url?.startsWith('/api/') && !req.url?.startsWith('/system/local-ai-integrations')) return next();
+    if (!req.url?.startsWith('/api/') && !req.url?.startsWith('/system/local-ai-integrations') && !req.url?.startsWith('/system/startup')) return next();
     let allowed = false;
     try { allowed = localProxyRequestAllowed(req); } catch { /* Malformed authority. */ }
     if (!allowed) {

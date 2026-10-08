@@ -120,6 +120,50 @@ pub use irongraph_types::{
     ProjectId, Result, ScalarValue,
 };
 
+/// Materializes the inactive backend fixture only in legacy qualification tests.
+/// The active query path never calls this function or builds a resident graph.
+#[cfg(test)]
+pub(crate) fn legacy_graph_fixture(
+    source: &graph::GraphStore,
+) -> Result<graph::legacy::GraphStore> {
+    use graph::{EdgeInput, NodeInput};
+    let mut target = graph::legacy::GraphStore::default();
+    for (id, name) in source.catalog().labels() {
+        target.catalog_mut().declare_label(name.to_string(), id)?;
+    }
+    for (id, name) in source.catalog().properties() {
+        target
+            .catalog_mut()
+            .declare_property(name.to_string(), id)?;
+    }
+    for (id, name) in source.catalog().relationship_types() {
+        target
+            .catalog_mut()
+            .declare_relationship_type(name.to_string(), id)?;
+    }
+    for node in source.nodes() {
+        target.insert_node(NodeInput {
+            id: node.id(),
+            layer: node.layer(),
+            revision: node.revision(),
+            labels: node.labels().to_vec(),
+            properties: node.properties(),
+        })?;
+    }
+    for edge in source.edges() {
+        target.insert_edge(EdgeInput {
+            id: edge.id(),
+            source: edge.source(),
+            target: edge.target(),
+            relationship_type: edge.relationship_type(),
+            layer: edge.layer(),
+            revision: edge.revision(),
+            properties: edge.properties(),
+        })?;
+    }
+    Ok(target)
+}
+
 pub mod cypher {
     pub use crate::*;
 }

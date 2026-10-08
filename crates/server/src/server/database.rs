@@ -1,15 +1,16 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, OnceLock, Weak,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
@@ -33,19 +34,18 @@ use crate::{
         SnapshotAttachment, StoreId, TransactionFence, WriteCommand, WriteRequest, WriteResponse,
         WriteRuntime,
     },
-    gpu::{ExecutionBackend, ResidentProjectDelta, ResidentProjectImage, ResidentTemporalDelta},
     graph::{
         GraphMutation, GraphStore, IndexCatalog, ResolvedVectorMutation, StatisticsSnapshot,
         TemporalStore,
     },
     protocol::{
         BatchColumn, CatalogEvent, PathValue, QueryColumn, QueryExecutor, QueryRequest,
-        QueryResultBudget, QueryStatistics, QueryStreamEvent, QueryTransaction, RelationshipValue,
-        ResultNode, TypedValue,
+        QueryResultStatistics, QueryStatistics, QueryStreamEvent, QueryTransaction,
+        RelationshipValue, ResultNode, TypedValue,
     },
     storage::{
-        AdmissionClass, AdmissionController, AdmissionLimits, ConnectionId, CowArc, MutationEntry,
-        MutationKind, SegmentDescriptor, SegmentPin, SegmentStore,
+        AdmissionClass, AdmissionController, ConnectionId, MutationEntry, MutationKind,
+        SegmentDescriptor, SegmentPin, SegmentStore,
     },
 };
 // Durability is the runtime-owned WAL plus this backend's periodic self-contained snapshot.
@@ -56,7 +56,6 @@ const DATABASE_SNAPSHOT_COPY_BYTES: usize = 1024 * 1024;
 const REQUEST_RESULT_INDEX_WINDOW: u64 = 65_536;
 const MAX_REQUEST_RESULTS: usize = 16_384;
 const MAX_REQUEST_RESULT_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_SINGLE_REQUEST_RESULT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_OPEN_TRANSACTIONS: usize = 256;
 const MILLIS_PER_DAY: u64 = 86_400_000;
 
@@ -87,17 +86,28 @@ const OPTIMIZER_STATISTICS_BACKGROUND_ROWS: usize = 100_000;
 const BROKER_RECLAIM_BATCH_SEGMENTS: usize = 256;
 const QUERY_STREAM_BATCH_ROWS: usize = 4_096;
 
-/// The host (CPU) backend builds no on-device command buffer and reserves no fixed device scratch —
-/// its only bound is system memory — so it is not subject to the device row budget above. This is
-/// large enough never to be an artificial cap (a query that genuinely exceeds it exhausts RAM rather
-/// than being refused), while staying far below the arithmetic limit so intermediate scratch
-/// estimates cannot overflow `usize`.
-const HOST_QUERY_EXECUTION_ROW_ADDRESS_SPACE: usize = u32::MAX as usize;
+thread_local! {
+    /// Embedding callbacks run synchronously inside a dedicated blocking worker.
+    static DATABASE_BLOCKING_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
-/// Conservative worst-case device scratch a single result row can require (the variable-path
-/// frontier is the heaviest at ~5 KiB/row). Dividing the admitted device scratch by this scales the
-/// GPU row budget to the machine's actual memory while keeping the peak reservation within it.
-const DEVICE_SCRATCH_BYTES_PER_ROW: usize = 5368;
+struct DatabaseBlockingWorker(bool);
+
+impl DatabaseBlockingWorker {
+    fn enter() -> Self {
+        Self(DATABASE_BLOCKING_WORKER.with(|context| context.replace(true)))
+    }
+}
+
+impl Drop for DatabaseBlockingWorker {
+    fn drop(&mut self) {
+        DATABASE_BLOCKING_WORKER.with(|context| context.set(self.0));
+    }
+}
+
+/// CPU execution's row address-space bound stays below arithmetic overflow; requests separately
+/// enforce their output limits and cancellation. Query scratch stays in host memory.
+const HOST_QUERY_EXECUTION_ROW_ADDRESS_SPACE: usize = u32::MAX as usize;
 
 struct BrokerCommittedWrite {
     response: WriteResponse,
@@ -118,7 +128,6 @@ struct TransactionPinKey {
 
 #[derive(Clone, Copy, Debug)]
 struct TransactionPinUsage {
-    device_bytes: usize,
     references: usize,
 }
 
@@ -126,7 +135,7 @@ struct OpenTransactionRecord {
     connection: ConnectionId,
     encoded_bytes: usize,
     pin: TransactionPinKey,
-    deadline: Instant,
+    deadline: Option<Instant>,
     fence: TransactionFence,
     finalizing: bool,
     resource: Weak<TransactionResource>,
@@ -138,16 +147,15 @@ struct TransactionAdmissionState {
     connection_counts: BTreeMap<ConnectionId, usize>,
     encoded_bytes: usize,
     pins: BTreeMap<TransactionPinKey, TransactionPinUsage>,
-    pinned_device_bytes: usize,
-    device_limit_bytes: usize,
 }
 
 struct TransactionAdmissionRegistry {
-    max_encoded_bytes: usize,
+    max_encoded_bytes: Option<usize>,
     state: Mutex<TransactionAdmissionState>,
 }
 
 impl TransactionAdmissionRegistry {
+    #[cfg(test)]
     fn new(max_encoded_bytes: usize) -> Result<Self> {
         if max_encoded_bytes < MIN_TRANSACTION_ACCOUNTED_BYTES {
             return Err(Error::invalid_data(
@@ -155,34 +163,25 @@ impl TransactionAdmissionRegistry {
             ));
         }
         Ok(Self {
-            max_encoded_bytes,
+            max_encoded_bytes: Some(max_encoded_bytes),
             state: Mutex::new(TransactionAdmissionState {
-                device_limit_bytes: usize::MAX,
                 ..TransactionAdmissionState::default()
             }),
         })
     }
 
-    fn set_device_limit(&self, bytes: usize) -> Result<()> {
-        if bytes == 0 {
-            return Err(Error::new(
-                ErrorCode::GpuAdmissionFailure,
-                "execution backend exposes no explicit-transaction device headroom",
-            ));
+    const fn maximum_encoded_bytes(&self) -> usize {
+        match self.max_encoded_bytes {
+            Some(bytes) => bytes,
+            None => usize::MAX,
         }
-        let mut state = self.state.lock();
-        if state.pinned_device_bytes > bytes {
-            return Err(Error::new(
-                ErrorCode::GpuAdmissionFailure,
-                "existing transaction pins exceed the execution device limit",
-            ));
-        }
-        state.device_limit_bytes = bytes;
-        Ok(())
     }
 
-    const fn maximum_encoded_bytes(&self) -> usize {
-        self.max_encoded_bytes
+    fn unrestricted() -> Self {
+        Self {
+            max_encoded_bytes: None,
+            state: Mutex::new(TransactionAdmissionState::default()),
+        }
     }
 
     fn register(
@@ -191,14 +190,14 @@ impl TransactionAdmissionRegistry {
         connection: ConnectionId,
         encoded_bytes: usize,
         pin: TransactionPinKey,
-        pin_device_bytes: usize,
-        deadline: Instant,
+        deadline: impl Into<Option<Instant>>,
         fence: TransactionFence,
         resource: &Arc<TransactionResource>,
     ) -> Result<()> {
+        let deadline = deadline.into();
         if !connection.is_valid()
             || encoded_bytes < MIN_TRANSACTION_ACCOUNTED_BYTES
-            || deadline <= Instant::now()
+            || deadline.is_some_and(|deadline| deadline <= Instant::now())
         {
             return Err(Error::invalid_data(
                 "invalid explicit-transaction admission request",
@@ -208,13 +207,14 @@ impl TransactionAdmissionRegistry {
         if state.records.contains_key(&id) {
             return Err(Error::internal("duplicate explicit transaction identity"));
         }
-        if state.records.len() >= MAX_OPEN_TRANSACTIONS
-            || state
-                .connection_counts
-                .get(&connection)
-                .copied()
-                .unwrap_or_default()
-                >= MAX_OPEN_TRANSACTIONS_PER_CONNECTION
+        if self.max_encoded_bytes.is_some()
+            && (state.records.len() >= MAX_OPEN_TRANSACTIONS
+                || state
+                    .connection_counts
+                    .get(&connection)
+                    .copied()
+                    .unwrap_or_default()
+                    >= MAX_OPEN_TRANSACTIONS_PER_CONNECTION)
         {
             return Err(transaction_admission_full(
                 "explicit-transaction count admission is full",
@@ -224,45 +224,23 @@ impl TransactionAdmissionRegistry {
             .encoded_bytes
             .checked_add(encoded_bytes)
             .ok_or_else(|| Error::internal("transaction byte accounting overflow"))?;
-        if next_encoded > self.max_encoded_bytes {
+        if self
+            .max_encoded_bytes
+            .is_some_and(|limit| next_encoded > limit)
+        {
             return Err(transaction_admission_full(
                 "explicit-transaction byte admission is full",
             ));
         }
-        let new_pin = !state.pins.contains_key(&pin);
-        let next_pinned = if new_pin {
-            state
-                .pinned_device_bytes
-                .checked_add(pin_device_bytes)
-                .ok_or_else(|| Error::internal("transaction device accounting overflow"))?
-        } else {
-            state.pinned_device_bytes
-        };
-        if next_pinned > state.device_limit_bytes {
-            return Err(transaction_admission_full(
-                "explicit-transaction device pin admission is full",
-            ));
-        }
         if let Some(existing) = state.pins.get_mut(&pin) {
-            if existing.device_bytes != pin_device_bytes {
-                return Err(Error::new(
-                    ErrorCode::CorruptStorage,
-                    "shared transaction pin has inconsistent device bytes",
-                ));
-            }
             existing.references = existing
                 .references
                 .checked_add(1)
                 .ok_or_else(|| Error::internal("transaction pin reference overflow"))?;
         } else {
-            state.pins.insert(
-                pin,
-                TransactionPinUsage {
-                    device_bytes: pin_device_bytes,
-                    references: 1,
-                },
-            );
-            state.pinned_device_bytes = next_pinned;
+            state
+                .pins
+                .insert(pin, TransactionPinUsage { references: 1 });
         }
         state.encoded_bytes = next_encoded;
         *state.connection_counts.entry(connection).or_default() += 1;
@@ -289,7 +267,11 @@ impl TransactionAdmissionRegistry {
         }
         let mut state = self.state.lock();
         let current = state.records.get(&id).ok_or_else(transaction_expired)?;
-        if current.finalizing || current.deadline <= Instant::now() {
+        if current.finalizing
+            || current
+                .deadline
+                .is_some_and(|deadline| deadline <= Instant::now())
+        {
             return Err(Error::new(
                 ErrorCode::TransactionExpired,
                 "explicit transaction is expired or already finalizing",
@@ -300,7 +282,7 @@ impl TransactionAdmissionRegistry {
             .checked_sub(current.encoded_bytes)
             .and_then(|bytes| bytes.checked_add(encoded_bytes))
             .ok_or_else(|| Error::internal("transaction byte accounting overflow"))?;
-        if next > self.max_encoded_bytes {
+        if self.max_encoded_bytes.is_some_and(|limit| next > limit) {
             return Err(transaction_admission_full(
                 "explicit-transaction byte admission is full",
             ));
@@ -315,7 +297,11 @@ impl TransactionAdmissionRegistry {
     fn ensure_active(&self, id: Uuid, fence: TransactionFence) -> Result<()> {
         let state = self.state.lock();
         let record = state.records.get(&id).ok_or_else(transaction_expired)?;
-        if record.finalizing || record.deadline <= Instant::now() {
+        if record.finalizing
+            || record
+                .deadline
+                .is_some_and(|deadline| deadline <= Instant::now())
+        {
             return Err(transaction_expired());
         }
         if record.fence != fence {
@@ -327,7 +313,11 @@ impl TransactionAdmissionRegistry {
     fn mark_finalizing(&self, id: Uuid) -> Result<()> {
         let mut state = self.state.lock();
         let record = state.records.get_mut(&id).ok_or_else(transaction_expired)?;
-        if record.deadline <= Instant::now() || record.finalizing {
+        if record
+            .deadline
+            .is_some_and(|deadline| deadline <= Instant::now())
+            || record.finalizing
+        {
             return Err(transaction_expired());
         }
         record.finalizing = true;
@@ -355,7 +345,7 @@ impl TransactionAdmissionRegistry {
                 if record.finalizing {
                     return None;
                 }
-                let reason = if record.deadline <= now {
+                let reason = if record.deadline.is_some_and(|deadline| deadline <= now) {
                     TransactionTerminal::Expired
                 } else if current.is_none_or(|(term, leader)| {
                     record.fence.term != term || record.fence.sequencer != leader
@@ -368,7 +358,7 @@ impl TransactionAdmissionRegistry {
             })
             .collect::<Vec<_>>();
         for (id, reason, resource) in expired {
-            // Keep accounting and the immutable pin until an in-flight query releases the
+            // Keep accounting and the shared owner reference until an in-flight query releases the
             // resource lock. The atomic terminal request makes that query discard its staged
             // overlay before returning, and the next maintenance tick performs removal.
             let removable = resource
@@ -383,11 +373,7 @@ impl TransactionAdmissionRegistry {
     #[cfg(test)]
     fn usage(&self) -> (usize, usize, usize) {
         let state = self.state.lock();
-        (
-            state.records.len(),
-            state.encoded_bytes,
-            state.pinned_device_bytes,
-        )
+        (state.records.len(), state.encoded_bytes, state.pins.len())
     }
 }
 
@@ -413,8 +399,8 @@ fn remove_transaction_record(
     } else {
         false
     };
-    if remove_pin && let Some(pin) = state.pins.remove(&record.pin) {
-        state.pinned_device_bytes = state.pinned_device_bytes.saturating_sub(pin.device_bytes);
+    if remove_pin {
+        state.pins.remove(&record.pin);
     }
     Some(record)
 }
@@ -438,63 +424,180 @@ fn transaction_sequencer_changed_error() -> Error {
     )
 }
 
+#[derive(Clone, Debug, Default)]
+pub(super) struct SharedCounter(Arc<AtomicU64>);
+
+impl SharedCounter {
+    fn get(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn set(&self, value: u64) {
+        self.0.store(value, Ordering::Release);
+    }
+
+    fn advance(&self, value: u64) {
+        self.0.fetch_max(value, Ordering::AcqRel);
+    }
+}
+
+impl From<u64> for SharedCounter {
+    fn from(value: u64) -> Self {
+        Self(Arc::new(AtomicU64::new(value)))
+    }
+}
+
+impl Serialize for SharedCounter {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        self.get().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SharedCounter {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        u64::deserialize(deserializer).map(Into::into)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct SharedName(Arc<ArcSwap<String>>);
+
+impl SharedName {
+    fn get(&self) -> Arc<String> {
+        self.0.load_full()
+    }
+
+    fn set(&self, value: String) {
+        self.0.store(Arc::new(value));
+    }
+}
+
+impl From<String> for SharedName {
+    fn from(value: String) -> Self {
+        Self(Arc::new(ArcSwap::from_pointee(value)))
+    }
+}
+
+impl Serialize for SharedName {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        self.get().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SharedName {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Into::into)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct SharedStatistics(Arc<ArcSwapOption<StatisticsSnapshot>>);
+
+impl SharedStatistics {
+    fn get(&self) -> Option<Arc<StatisticsSnapshot>> {
+        self.0.load_full()
+    }
+
+    fn set(
+        &self,
+        value: Arc<StatisticsSnapshot>,
+    ) -> std::result::Result<(), Arc<StatisticsSnapshot>> {
+        let previous = self
+            .0
+            .compare_and_swap(&None::<Arc<StatisticsSnapshot>>, Some(Arc::clone(&value)));
+        if previous.is_none() {
+            Ok(())
+        } else {
+            Err(value)
+        }
+    }
+
+    fn get_or_init(
+        &self,
+        initialize: impl FnOnce() -> Arc<StatisticsSnapshot>,
+    ) -> Arc<StatisticsSnapshot> {
+        if let Some(value) = self.get() {
+            return value;
+        }
+        let value = initialize();
+        match self.set(Arc::clone(&value)) {
+            Ok(()) => value,
+            Err(_) => self.get().unwrap_or(value),
+        }
+    }
+
+    fn clear(&self) {
+        self.0.store(None);
+    }
+}
+
+impl From<OnceLock<Arc<StatisticsSnapshot>>> for SharedStatistics {
+    fn from(value: OnceLock<Arc<StatisticsSnapshot>>) -> Self {
+        Self(Arc::new(ArcSwapOption::from(value.into_inner())))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct ProjectState {
     pub(super) id: ProjectId,
-    pub(super) display_name: String,
-    pub(super) graph: CowArc<GraphStore>,
-    pub(super) temporal: CowArc<TemporalStore>,
-    pub(super) predicate_versions: CowArc<BTreeMap<DependencyStamp, u64>>,
-    pub(super) indexes: CowArc<IndexCatalog>,
-    pub(super) next_node_id: u64,
-    pub(super) next_edge_id: u64,
+    pub(super) display_name: SharedName,
+    pub(super) graph: GraphStore,
+    pub(super) temporal: TemporalStore,
+    pub(super) predicate_versions: BTreeMap<DependencyStamp, u64>,
+    pub(super) indexes: IndexCatalog,
+    pub(super) next_node_id: SharedCounter,
+    pub(super) next_edge_id: SharedCounter,
     #[serde(default)]
-    pub(super) authority_revision: u64,
+    pub(super) authority_revision: SharedCounter,
     /// Ephemeral and rebuildable; never part of durable state or a checkpoint.
     #[serde(skip)]
-    pub(super) optimizer_statistics: OnceLock<Arc<StatisticsSnapshot>>,
+    pub(super) optimizer_statistics: SharedStatistics,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(super) struct DatabaseState {
     pub(super) projects: BTreeMap<ProjectId, Arc<ProjectState>>,
     pub(super) names: BTreeMap<String, ProjectId>,
-    pub(super) broker: CowArc<BrokerStateMachine>,
+    pub(super) broker: BrokerStateMachine,
     #[serde(default)]
     pub(super) embedding_activation: Option<EmbeddingProfileActivation>,
     #[serde(default)]
-    pub(super) security: CowArc<SecurityState>,
+    pub(super) security: SecurityState,
     #[serde(default)]
     pub(super) applied: Bookmark,
     #[serde(default)]
-    request_results: CowArc<BTreeMap<Uuid, RequestResultRecord>>,
+    request_results: BTreeMap<Uuid, RequestResultRecord>,
     #[serde(default)]
-    request_result_order: CowArc<BTreeMap<u64, Uuid>>,
+    request_result_order: BTreeMap<u64, Uuid>,
     #[serde(default)]
     request_result_bytes: u64,
     #[serde(default)]
     last_payload_checksum: Option<[u8; 32]>,
     #[serde(default)]
-    last_response: CowArc<Vec<u8>>,
+    last_response: Vec<u8>,
 }
 
 #[derive(Default)]
 struct OrderedMutationOverlay {
-    /// Fully staged COW generations keyed by the exact ordered position they represent. Keeping
-    /// each generation lets independent queued graph writes publish in order without a later
-    /// reservation overwriting the state the earlier entry must publish.
-    states: BTreeMap<u64, DatabaseState>,
     reservations: BTreeMap<u64, OrderedMutationReservation>,
 }
 
 struct OrderedMutationReservation {
     token: Uuid,
+    payload_digest: [u8; 32],
+    request_id: Option<Uuid>,
+    commit_time_millis: i64,
     broker_segments: Vec<SegmentDescriptor>,
-    /// Exact digest of the sequencer-resolved command bytes. Publication compares this inexpensive
-    /// digest instead of decoding and re-encoding a large staged batch solely to bind the overlay.
-    staged_payload_digest: Option<[u8; 32]>,
-    is_broker: bool,
-    broker_publish_cursor: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -511,6 +614,8 @@ struct DatabaseCheckpointManifest {
     store_id: StoreId,
     included: Bookmark,
     state_bytes: u64,
+    #[serde(default)]
+    state_checksum: Option<[u8; 32]>,
     #[serde(default)]
     broker_segments: Vec<SegmentDescriptor>,
 }
@@ -730,9 +835,12 @@ pub(super) struct PersistedTemporalMutation {
 
 pub(super) struct DatabaseInner {
     pub(super) state: RwLock<DatabaseState>,
-    // Weak fences for older host generations held by snapshots or background readers.
-    // They own no graph bytes; dead fences are removed on the next project publication.
-    retired_project_views: Mutex<BTreeMap<ProjectId, Vec<Weak<ProjectState>>>>,
+    // Identity access paths to the same canonical stores, not graph images.
+    reader_projects: papaya::HashMap<ProjectId, Arc<ProjectState>>,
+    reader_names: papaya::HashMap<String, ProjectId>,
+    reader_bookmark: ArcSwap<Bookmark>,
+    reader_broker: ArcSwap<BrokerStateMachine>,
+    reader_security: ArcSwap<SecurityState>,
     // Serializes local sequencer writes while the mutation is applied.
     pub(super) apply: Mutex<()>,
     pub(super) admission: AdmissionController,
@@ -745,14 +853,12 @@ pub(super) struct DatabaseInner {
     /// Uncommitted immutable payload publications awaiting their write entry. This bounded,
     /// ephemeral set is only a reclamation fence; the WAL remains the durable queue.
     pending_broker_segments: Mutex<BTreeMap<SegmentDescriptor, PendingBrokerSegment>>,
-    /// Local speculative state through the highest durably appended command.
-    /// It is shallow/COW, bounded by sequencer admission, and never checkpointed.
+    /// Bounded identity-only work reserved before the ordered WAL append.
     ordered_overlay: Mutex<OrderedMutationOverlay>,
     broker_changes: tokio::sync::watch::Sender<u64>,
     text_embedding: RwLock<Option<Arc<dyn TextEmbedding>>>,
+    embedding_jobs: OnceLock<super::embedding_jobs::DurableEmbeddingWorker>,
     semantic_initialization: parking_lot::Mutex<()>,
-    pub(super) execution: RwLock<Option<Box<dyn ExecutionBackend>>>,
-    selected_backend: OnceLock<crate::gpu::BackendKind>,
     store_id: StoreId,
     write_runtime: OnceLock<WriteBinding>,
     fatal_apply: AtomicBool,
@@ -786,23 +892,20 @@ impl Database {
     ) -> Result<Self> {
         identity.validate()?;
         std::fs::create_dir_all(directory.as_ref())?;
-        let admission = AdmissionController::new(AdmissionLimits {
-            max_requests: 1_024,
-            max_encoded_bytes: maximum_write_bytes,
-            reserved_control_requests: 64,
-            reserved_control_bytes: maximum_write_bytes / 16,
-            max_requests_per_connection: 64,
-            // One legal maximum-sized mutation must fit; request-count fairness prevents one
-            // connection from occupying every slot concurrently.
-            max_encoded_bytes_per_connection: maximum_write_bytes,
-            retry_after_ms: 25,
-        })?;
+        let admission = AdmissionController::unrestricted();
         let segments = SegmentStore::open(directory.as_ref(), maximum_write_bytes.max(1 << 20))?;
-        let transactions = TransactionAdmissionRegistry::new(maximum_write_bytes)?;
+        let transactions = TransactionAdmissionRegistry::unrestricted();
         let (broker_changes, _) = tokio::sync::watch::channel(0);
+        let state = DatabaseState::default();
+        let reader_broker = ArcSwap::from_pointee(state.broker.clone());
+        let reader_security = ArcSwap::from_pointee(state.security.clone());
         Ok(Self(Arc::new(DatabaseInner {
-            state: RwLock::new(DatabaseState::default()),
-            retired_project_views: Mutex::new(BTreeMap::new()),
+            state: RwLock::new(state),
+            reader_projects: papaya::HashMap::new(),
+            reader_names: papaya::HashMap::new(),
+            reader_bookmark: ArcSwap::from_pointee(Bookmark::default()),
+            reader_broker,
+            reader_security,
             apply: Mutex::new(()),
             admission,
             transactions,
@@ -813,9 +916,8 @@ impl Database {
             ordered_overlay: Mutex::new(OrderedMutationOverlay::default()),
             broker_changes,
             text_embedding: RwLock::new(None),
+            embedding_jobs: OnceLock::new(),
             semantic_initialization: parking_lot::Mutex::new(()),
-            execution: RwLock::new(None),
-            selected_backend: OnceLock::new(),
             store_id: identity.store_id,
             write_runtime: OnceLock::new(),
             fatal_apply: AtomicBool::new(false),
@@ -875,63 +977,186 @@ impl Database {
             ));
         }
         *current = Some(embedding);
+        drop(current);
+        self.start_embedding_jobs()?;
         Ok(())
     }
 
-    pub fn bind_execution_backend(&self, mut backend: Box<dyn ExecutionBackend>) -> Result<()> {
-        let mut current = self.0.execution.write();
-        let mut state = self.0.state.write();
-        let cancellation = tokio_util::sync::CancellationToken::new();
-        for project in state.projects.values_mut() {
-            let project = Arc::make_mut(project);
-            project.indexes.retry_failed_vectors();
-            project.indexes.rebuild_vectors_with(|source, config| {
-                backend.build_ivf_pq(source, config, &cancellation)
-            })?;
-            project.optimizer_statistics = OnceLock::new();
+    fn start_embedding_jobs(&self) -> Result<()> {
+        use super::embedding_jobs::*;
+        if self.0.embedding_jobs.get().is_some() {
+            return Ok(());
         }
-        let mut resident_bytes = 0_usize;
-        let project_ids = state.projects.keys().copied().collect::<Vec<_>>();
-        for project_id in project_ids {
-            let image = {
-                let project = state.projects.get(&project_id).ok_or_else(|| {
-                    Error::internal("project disappeared during execution admission")
-                })?;
-                ResidentProjectImage::build(
-                    project.id,
-                    state.applied,
-                    &project.graph,
-                    &project.temporal,
-                    &project.indexes,
-                )?
-            };
-            resident_bytes = resident_bytes
-                .checked_add(image.resident_bytes())
-                .ok_or_else(|| {
-                    Error::new(ErrorCode::GpuAdmissionFailure, "resident byte overflow")
-                })?;
-            backend.admit_project(image)?;
-            rebind_shared_project(&mut state, backend.as_ref(), project_id)?;
-        }
-        let transaction_device_limit = resident_bytes
-            .checked_add(backend.available_query_scratch_bytes())
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorCode::GpuAdmissionFailure,
-                    "transaction device admission limit overflow",
-                )
-            })?
-            .max(1);
+        let load_database = Arc::downgrade(&self.0);
+        let publish_database = Arc::downgrade(&self.0);
+        let completed_wal = Arc::new(AtomicU64::new(0));
+        self.write_binding()?
+            .runtime
+            .upgrade()
+            .ok_or_else(|| Error::new(ErrorCode::Cancelled, "write runtime is unavailable"))?
+            .register_embedding_replay_floor(Arc::clone(&completed_wal))?;
+        let queue = DurableEmbeddingWorker::start(
+            self.committed_embedding_owners(Arc::clone(&completed_wal)),
+            EmbeddingCallbacks {
+                load: Arc::new(move |job, cancellation| {
+                    if cancellation.is_cancelled() {
+                        return Ok(None);
+                    }
+                    let Some(inner) = load_database.upgrade() else {
+                        return Ok(None);
+                    };
+                    let database = Database(inner);
+                    let (project, _) = match database.capture_canonical_project(job.owner.project) {
+                        Ok(project) => project,
+                        Err(error) if error.code == ErrorCode::ProjectNotFound => return Ok(None),
+                        Err(error) => return Err(error),
+                    };
+                    let (revision, _) = embedding_owner_dependencies(&project, job.owner);
+                    if revision.is_some_and(|revision| revision != job.revision) {
+                        return Ok(None);
+                    }
+                    let encoder = database.text_embedding()?;
+                    let property = match job.owner.kind {
+                        crate::types::EntityKind::Node => crate::graph::SEMANTIC_NODE_PROPERTY,
+                        crate::types::EntityKind::Relationship => {
+                            crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY
+                        }
+                    };
+                    let mut chunks = Vec::new();
+                    let semantic_index = match job.owner.kind {
+                        crate::types::EntityKind::Node => crate::graph::SEMANTIC_NODE_INDEX,
+                        crate::types::EntityKind::Relationship => {
+                            crate::graph::SEMANTIC_RELATIONSHIP_INDEX
+                        }
+                    };
+                    let current_vector = |name: &str| {
+                        project
+                            .indexes
+                            .vector_search_source(name)
+                            .and_then(|(column, _)| column.row_revision(job.owner.entity_id))
+                            .is_some_and(|revision| revision >= job.revision)
+                    };
+                    if project.indexes.contains(semantic_index) && !current_vector(semantic_index) {
+                        chunks.push(SemanticTextChunk {
+                            property,
+                            text: crate::graph::semantic_owner_text(
+                                &project.graph,
+                                job.owner.kind,
+                                job.owner.entity_id,
+                            )?
+                            .map(Arc::from),
+                        });
+                    }
+                    if job.owner.kind == crate::types::EntityKind::Node {
+                        for definition in project.indexes.embedding_definitions() {
+                            if current_vector(&definition.name) {
+                                continue;
+                            }
+                            let text = project
+                                .graph
+                                .node(crate::NodeId(job.owner.entity_id))
+                                .filter(|node| node.labels().contains(&definition.label))
+                                .and_then(|node| node.property(definition.source_property))
+                                .and_then(|value| match value {
+                                    crate::ScalarValue::String(text) => Some(text),
+                                    _ => None,
+                                });
+                            chunks.push(SemanticTextChunk {
+                                property: definition.target_property,
+                                text,
+                            });
+                        }
+                    }
+                    let current_database = Arc::downgrade(&database.0);
+                    let is_current = Arc::new(move || {
+                        let Some(inner) = current_database.upgrade() else {
+                            return false;
+                        };
+                        let database = Database(inner);
+                        let Ok((project, _)) =
+                            database.capture_canonical_project(job.owner.project)
+                        else {
+                            return false;
+                        };
+                        embedding_owner_dependencies(&project, job.owner).0 == revision
+                    });
+                    Ok(Some(EmbeddingWork {
+                        encoder,
+                        chunks,
+                        is_current: Some(is_current),
+                    }))
+                }),
+                publish: Arc::new(move |job, vectors, cancellation| {
+                    let _worker = DatabaseBlockingWorker::enter();
+                    if cancellation.is_cancelled() {
+                        return Ok(false);
+                    }
+                    let Some(inner) = publish_database.upgrade() else {
+                        return Ok(false);
+                    };
+                    let database = Database(inner);
+                    let (project, bookmark) = match database
+                        .capture_canonical_project(job.owner.project)
+                    {
+                        Ok(project) => project,
+                        Err(error) if error.code == ErrorCode::ProjectNotFound => return Ok(false),
+                        Err(error) => return Err(error),
+                    };
+                    let (revision, dependencies) =
+                        embedding_owner_dependencies(&project, job.owner);
+                    if revision.is_some_and(|revision| revision != job.revision) {
+                        return Ok(false);
+                    }
+                    if revision.is_none()
+                        && vectors.iter().any(|mutation| {
+                            matches!(mutation, ResolvedVectorMutation::Upsert { .. })
+                        })
+                    {
+                        return Ok(false);
+                    }
+                    if vectors.is_empty() {
+                        return Ok(true);
+                    }
+                    match database.commit_scoped_from(
+                        DatabaseMutation::Graph {
+                            project: job.owner.project,
+                            validation: MutationValidation {
+                                snapshot: bookmark,
+                                dependencies,
+                            },
+                            graph: Vec::new(),
+                            temporal: Vec::new(),
+                            vectors,
+                            administrative: None,
+                        },
+                        MutationKind::Graph,
+                        Some(job.owner.project),
+                        Some(Uuid::new_v4()),
+                        AdmissionClass::Control,
+                        CommitAcknowledgement::Published,
+                        ConnectionId::new(),
+                        None,
+                    ) {
+                        Ok(_) => Ok(true),
+                        Err(error) if error.code == ErrorCode::TransactionConflict => Ok(false),
+                        Err(error) => Err(error),
+                    }
+                }),
+                failed: Arc::new(
+                    |job, error| tracing::error!(project = %job.owner.project, owner = job.owner.entity_id, code = ?error.code, message = %error.message, "asynchronous embedding failed"),
+                ),
+            },
+        )?;
         self.0
-            .transactions
-            .set_device_limit(transaction_device_limit)?;
-        if current.is_some() {
-            return Err(Error::invalid_data(
-                "database execution backend is already bound",
-            ));
+            .embedding_jobs
+            .set(queue)
+            .map_err(|_| Error::internal("embedding queue was concurrently bound"))
+    }
+
+    pub async fn shutdown_embedding_jobs(&self) -> Result<()> {
+        if let Some(queue) = self.0.embedding_jobs.get() {
+            queue.shutdown().await?;
         }
-        let _ = self.0.selected_backend.set(backend.kind());
-        *current = Some(backend);
         Ok(())
     }
 
@@ -950,7 +1175,7 @@ impl Database {
         consistency: CommitAcknowledgement,
     ) -> Result<Bookmark> {
         let bookmark = self.consistency_barrier(consistency, None)?;
-        if !self.0.state.read().projects.contains_key(&project) {
+        if !self.0.reader_projects.pin().contains_key(&project) {
             return Err(Error::new(
                 ErrorCode::ProjectNotFound,
                 "configured project does not exist",
@@ -961,7 +1186,25 @@ impl Database {
 
     #[must_use]
     pub fn bookmark(&self) -> Bookmark {
-        self.0.state.read().applied
+        **self.0.reader_bookmark.load()
+    }
+
+    /// Executes on the database's blocking worker pool while the caller's async runtime remains free.
+    pub async fn execute_async(&self, request: QueryRequest) -> Result<Vec<QueryStreamEvent>> {
+        let database = self.clone();
+        let handle = self.write_binding()?.handle.clone();
+        handle
+            .spawn_blocking(move || {
+                let _worker = DatabaseBlockingWorker::enter();
+                let mut events = Vec::new();
+                database.execute(request, &mut |event| {
+                    events.push(event);
+                    Ok(())
+                })?;
+                Ok(events)
+            })
+            .await
+            .map_err(|error| Error::internal(format!("query worker failed: {error}")))?
     }
 
     /// Standalone durability: write a self-contained snapshot of the current committed state into
@@ -978,7 +1221,7 @@ impl Database {
             })??;
         let mut last_error = None;
         for _ in 0..16 {
-            let bookmark = self.0.state.read().applied;
+            let bookmark = self.bookmark();
             let destination = dir.join(format!(
                 "snapshot-{:020}-{:020}.igdb",
                 bookmark.term, bookmark.index
@@ -1181,7 +1424,13 @@ impl Database {
             .map_or(Ok(self.0.request_timeout), |deadline| {
                 deadline
                     .checked_duration_since(Instant::now())
-                    .map(|remaining| remaining.min(self.0.request_timeout))
+                    .map(|remaining| {
+                        if self.0.request_timeout.is_zero() {
+                            remaining
+                        } else {
+                            remaining.min(self.0.request_timeout)
+                        }
+                    })
                     .ok_or_else(|| {
                         Error::retryable(
                             ErrorCode::DeadlineExceeded,
@@ -1214,7 +1463,7 @@ impl Database {
 
     pub(crate) fn security_view(&self) -> Result<SecurityState> {
         self.ensure_apply_healthy()?;
-        Ok((*self.0.state.read().security).clone())
+        Ok(self.0.reader_security.load().as_ref().clone())
     }
 
     pub(crate) fn authenticate_client(
@@ -1355,8 +1604,183 @@ impl Database {
         Ok(false)
     }
 
-    /// Initializes graph-wide semantic vectors through the same ordered WAL path as graph writes.
-    fn ensure_automatic_semantic(&self, project: ProjectId) -> Result<()> {
+    fn committed_embedding_owners(
+        &self,
+        completed: Arc<AtomicU64>,
+    ) -> Arc<super::embedding_jobs::NextCommittedOwner> {
+        use super::embedding_jobs::{EmbeddingJob, EmbeddingOwner, EmbeddingSeed};
+        let initial = self.bookmark();
+        let projects = self
+            .0
+            .reader_projects
+            .pin()
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>()
+            .into_iter();
+        let initializer = self.embedding_seed_initializer();
+        let weak = Arc::downgrade(&self.0);
+        // Only one recovered project cursor and one WAL mutation's owner identities are held.
+        // Source text remains on the canonical graph; completed WAL records can be compacted.
+        let state = Mutex::new((
+            projects,
+            None::<EmbeddingSeed>,
+            Vec::<EmbeddingJob>::new().into_iter(),
+            initial.index,
+            false,
+        ));
+        Arc::new(move |cancellation| {
+            let mut state = state.lock();
+            loop {
+                if cancellation.is_cancelled() {
+                    return Ok(None);
+                }
+                if let Some(seed) = &mut state.1 {
+                    if let Some(job) = seed.next() {
+                        return job.map(Some);
+                    }
+                    state.1 = None;
+                }
+                if let Some(job) = state.2.next() {
+                    return Ok(Some(job));
+                }
+                if !state.4 {
+                    if let Some(project) = state.0.next() {
+                        match initializer(project, cancellation) {
+                            Ok(seed) => state.1 = seed,
+                            Err(error) if error.code == ErrorCode::ProjectNotFound => {}
+                            Err(error) => return Err(error),
+                        }
+                        continue;
+                    }
+                    state.4 = true;
+                }
+                completed.store(state.3, Ordering::Release);
+                let Some(inner) = weak.upgrade() else {
+                    return Ok(None);
+                };
+                let database = Database(inner);
+                let runtime = database.write_binding()?.runtime.upgrade().ok_or_else(|| {
+                    Error::new(ErrorCode::Cancelled, "write runtime is unavailable")
+                })?;
+                let Some(entry) = runtime.committed_embedding_entry(state.3.saturating_add(1))?
+                else {
+                    return Ok(None);
+                };
+                if entry.index() > database.bookmark().index {
+                    return Ok(None);
+                }
+                let mutation = decode_database_mutation(entry.payload())?;
+                if let DatabaseMutation::Graph {
+                    project,
+                    graph,
+                    administrative,
+                    ..
+                } = mutation
+                {
+                    let live = match database.capture_canonical_project(project) {
+                        Ok((live, _)) => Some(live),
+                        Err(error) if error.code == ErrorCode::ProjectNotFound => None,
+                        Err(error) => return Err(error),
+                    };
+                    if let Some(live) = live {
+                        database.initialize_automatic_semantic(project)?;
+                        if matches!(
+                            administrative,
+                            Some(AdministrativeMutation::CreateEmbedding { .. })
+                        ) {
+                            state.1 = initializer(project, cancellation)?;
+                        } else if !graph.is_empty() {
+                            let (nodes, edges) = embedding_changed_owners(&live, &graph)?;
+                            state.2 = nodes
+                                .into_iter()
+                                .map(|id| (crate::types::EntityKind::Node, id.0))
+                                .chain(
+                                    edges
+                                        .into_iter()
+                                        .map(|id| (crate::types::EntityKind::Relationship, id.0)),
+                                )
+                                .map(|(kind, entity_id)| {
+                                    let owner = EmbeddingOwner {
+                                        project,
+                                        kind,
+                                        entity_id,
+                                    };
+                                    let (revision, _) = embedding_owner_dependencies(&live, owner);
+                                    EmbeddingJob {
+                                        owner,
+                                        revision: revision.unwrap_or(entry.index()).max(1),
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .into_iter();
+                        }
+                    }
+                }
+                state.3 = entry.index();
+            }
+        })
+    }
+
+    fn embedding_seed_initializer(&self) -> Arc<super::embedding_jobs::InitializeProject> {
+        let database = Arc::downgrade(&self.0);
+        Arc::new(move |project, cancellation| {
+            let _worker = DatabaseBlockingWorker::enter();
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            let Some(inner) = database.upgrade() else {
+                return Ok(None);
+            };
+            let database = Database(inner);
+            database.initialize_automatic_semantic(project)?;
+            let (live, _) = database.capture_canonical_project(project)?;
+            let node_limit = live.graph.node_slot_count();
+            let edge_limit = live.graph.edge_slot_count();
+            let live = Arc::downgrade(&live);
+            let mut node = 0;
+            let mut edge = 0;
+            let seed = std::iter::from_fn(move || {
+                let live = live.upgrade()?;
+                loop {
+                    let owner = if node < node_limit {
+                        let dense = node;
+                        node += 1;
+                        let Some(row) = live.graph.node_dense(dense as u32) else {
+                            continue;
+                        };
+                        super::embedding_jobs::EmbeddingOwner {
+                            project,
+                            kind: crate::types::EntityKind::Node,
+                            entity_id: row.id().0,
+                        }
+                    } else if edge < edge_limit {
+                        let dense = edge;
+                        edge += 1;
+                        let Some(row) = live.graph.edge_dense(dense as u32) else {
+                            continue;
+                        };
+                        super::embedding_jobs::EmbeddingOwner {
+                            project,
+                            kind: crate::types::EntityKind::Relationship,
+                            entity_id: row.id().0,
+                        }
+                    } else {
+                        return None;
+                    };
+                    let (revision, _) = embedding_owner_dependencies(&live, owner);
+                    return Some(Ok(super::embedding_jobs::EmbeddingJob {
+                        owner,
+                        revision: revision.unwrap_or(1).max(1),
+                    }));
+                }
+            });
+            Ok(Some(Box::new(seed) as super::embedding_jobs::EmbeddingSeed))
+        })
+    }
+
+    /// Initializes empty semantic access paths; the worker seeds owner identities incrementally.
+    fn initialize_automatic_semantic(&self, project: ProjectId) -> Result<()> {
         let Some(embedding) = self.0.text_embedding.read().clone() else {
             return Ok(());
         };
@@ -1392,11 +1816,6 @@ impl Database {
         if initialized {
             return Ok(());
         }
-        let vectors = resolve_semantic_texts(
-            crate::graph::semantic_texts(&snapshot.graph)?,
-            embedding.as_ref(),
-            bookmark.index,
-        )?;
         self.commit_scoped_from(
             DatabaseMutation::Graph {
                 project,
@@ -1406,7 +1825,7 @@ impl Database {
                 },
                 graph: Vec::new(),
                 temporal: Vec::new(),
-                vectors,
+                vectors: Vec::new(),
                 administrative: Some(AdministrativeMutation::InitializeSemantic {
                     profile: embedding.profile().clone(),
                     graph_revision: snapshot.graph.revision(),
@@ -1450,13 +1869,17 @@ impl Database {
             }
         }
 
-        let deadline = Instant::now() + self.0.request_timeout;
+        let deadline = if self.0.request_timeout.is_zero() {
+            None
+        } else {
+            Instant::now().checked_add(self.0.request_timeout)
+        };
         loop {
             self.maintain_local_artifact_readiness()?;
             if self.project_embedding_profile(project)?.as_ref() == Some(&profile) {
                 return Ok(());
             }
-            if Instant::now() >= deadline {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 if self.pending_embedding_profile()?.is_some_and(|pending| {
                     pending.barrier().subject()
                         == &(ActivationSubject::EmbeddingProfile {
@@ -1488,13 +1911,8 @@ impl Database {
         project: ProjectId,
     ) -> Result<Option<crate::graph::EmbeddingProfile>> {
         self.ensure_apply_healthy()?;
-        self.0
-            .state
-            .read()
-            .projects
-            .get(&project)
-            .map(|state| state.indexes.profile().cloned())
-            .ok_or_else(|| Error::new(ErrorCode::ProjectNotFound, "project does not exist"))
+        let (live, _) = self.capture_canonical_project(project)?;
+        Ok(live.indexes.profile().map(|profile| (*profile).clone()))
     }
 
     fn validate_embedding_profile_readiness(
@@ -1503,20 +1921,14 @@ impl Database {
         profile: &crate::graph::EmbeddingProfile,
     ) -> Result<()> {
         profile.validate()?;
-        if self.0.execution.read().is_none()
-            || self.text_embedding()?.profile().profile_hash != profile.profile_hash
-        {
+        if self.text_embedding()?.profile().profile_hash != profile.profile_hash {
             return Err(Error::new(
                 ErrorCode::GpuAdmissionFailure,
-                "local embedding artifacts or resident execution backend are not ready",
+                "local embedding artifacts are not ready",
             ));
         }
-        let state = self.0.state.read();
-        let project_state = state
-            .projects
-            .get(&project)
-            .ok_or_else(|| Error::new(ErrorCode::ProjectNotFound, "project does not exist"))?;
-        if project_state.indexes.profile() == Some(profile) {
+        let (project_state, _) = self.capture_canonical_project(project)?;
+        if project_state.indexes.profile().as_deref() == Some(profile) {
             return Ok(());
         }
         if !project_state.indexes.embedding_profile_is_mutable() {
@@ -1592,11 +2004,15 @@ impl Database {
         self.ensure_apply_healthy()?;
         let payload =
             encode_database_mutation_bounded(&mutation, self.0.admission.maximum_encoded_bytes())?;
-        let _permit = self.0.admission.try_admit(
+        let _permit = self.0.admission.try_admit_until(
             connection_id,
             class,
             payload.len(),
-            Instant::now() + request_timeout,
+            if request_timeout.is_zero() {
+                None
+            } else {
+                Instant::now().checked_add(request_timeout)
+            },
         )?;
         let binding = self.0.write_runtime.get().ok_or_else(|| {
             Error::new(ErrorCode::Cancelled, "database write runtime is not bound")
@@ -1697,7 +2113,7 @@ impl Database {
 
     fn resolve_project(&self, requested: Option<ProjectId>, source: &str) -> Result<ProjectId> {
         if let Some(project) = requested {
-            if self.0.state.read().projects.contains_key(&project) {
+            if self.0.reader_projects.pin().contains_key(&project) {
                 return Ok(project);
             }
             return Err(Error::new(
@@ -1717,188 +2133,58 @@ impl Database {
 
     pub(super) fn resolve_project_name(&self, name: &str) -> Result<ProjectId> {
         self.0
-            .state
-            .read()
-            .names
+            .reader_names
+            .pin()
             .get(&normalize_name(name))
             .copied()
             .ok_or_else(|| Error::new(ErrorCode::ProjectNotFound, "project does not exist"))
     }
 
-    pub(super) fn capture_project_execution(
+    fn capture_canonical_project(
         &self,
         project: ProjectId,
-    ) -> Result<(
-        Arc<ProjectState>,
-        Bookmark,
-        Option<Box<dyn ExecutionBackend>>,
-    )> {
-        // Acquire resident access before state, matching publication. This captures one exact
-        // host/device generation without blocking
-        // execution for the lifetime of the query or transaction.
-        let execution = self.0.execution.read();
-        let state = self.0.state.read();
-        let snapshot = state
-            .projects
+    ) -> Result<(Arc<ProjectState>, Bookmark)> {
+        let live = self
+            .0
+            .reader_projects
+            .pin()
             .get(&project)
             .cloned()
             .ok_or_else(|| Error::new(ErrorCode::ProjectNotFound, "project does not exist"))?;
-        let bookmark = state.applied;
-        let pinned = match execution.as_deref() {
-            Some(backend)
-                if backend.resident_bookmark(project) == Some(bookmark)
-                    && backend.resident_graph_revision(project)
-                        == Some(snapshot.graph.revision()) =>
-            {
-                Some(backend.pin_project(project)?)
-            }
-            // The resident image lags the host snapshot (or there is no device). Under Apple unified
-            // memory the host store is the authority — it holds the exact committed generation — so a
-            // read simply executes on the host instead of failing. This is the single read policy:
-            // a stale resident never raises GpuAdmissionFailure, whatever the publish cadence, which
-            // is what lets device publication move off the write path without breaking reads.
-            _ => None,
-        };
-        Ok((snapshot, bookmark, pinned))
+        let bookmark = **self.0.reader_bookmark.load();
+        Ok((live, bookmark))
     }
 
-    /// Semantic queries wait for an admitted GPU generation instead of silently scoring on CPU.
-    fn capture_semantic_execution(
-        &self,
-        project: ProjectId,
-    ) -> Result<(
-        Arc<ProjectState>,
-        Bookmark,
-        Option<Box<dyn ExecutionBackend>>,
-    )> {
-        let deadline = Instant::now() + self.0.request_timeout;
-        loop {
-            let captured = self.capture_project_execution(project)?;
-            if captured.2.is_some()
-                || self
-                    .0
-                    .selected_backend
-                    .get()
-                    .is_none_or(|kind| *kind == crate::gpu::BackendKind::Cpu)
-            {
-                return Ok(captured);
-            }
-            self.republish_resident_project(project, captured.0.graph.revision())?;
-            if Instant::now() >= deadline {
-                return Err(Error::retryable(
-                    ErrorCode::GpuAdmissionFailure,
-                    "semantic search is waiting for GPU publication",
-                    Some(25),
-                ));
-            }
-            std::thread::yield_now();
+    fn publish_reader_project(&self, state: &DatabaseState, project: ProjectId) {
+        let projects = self.0.reader_projects.pin();
+        let names = self.0.reader_names.pin();
+        if let Some(live) = state.projects.get(&project) {
+            projects.insert(project, Arc::clone(live));
+            names.insert(normalize_name(&live.display_name.get()), project);
+        } else if let Some(previous) = projects.remove(&project) {
+            names.remove(&normalize_name(&previous.display_name.get()));
         }
     }
 
-    /// Large projects whose resident device image lags the committed host graph.
-    ///
-    /// Returns projects covered by an explicitly enabled device-publication deferral policy.
-    /// Publication is synchronous today, so this is normally empty; the catch-up worker remains a
-    /// recovery guard rather than part of ordinary write behavior.
-    pub(super) fn deferred_resident_projects(&self) -> Vec<(ProjectId, u64)> {
-        let execution = self.0.execution.read();
-        let state = self.0.state.read();
-        let Some(backend) = execution.as_deref() else {
-            return Vec::new();
-        };
-        state
-            .projects
-            .iter()
-            .filter(|(id, project)| {
-                backend.resident_graph_revision(**id) != Some(project.graph.revision())
-                    || backend.resident_bookmark(**id) != Some(state.applied)
-            })
-            .map(|(id, project)| (*id, project.graph.revision()))
-            .collect()
-    }
-
-    /// Rebuilds and republishes one large project's resident device image off the write path.
-    ///
-    /// This is the counterpart to the write-path deferral in [`should_defer_device_publish`]: the
-    /// expensive O(N) image assembly runs here without holding the apply or state-write lock, so it
-    /// never stalls the write gate. The assembled image is installed only if the project has not
-    /// changed since `expected_revision` — a concurrent write makes it stale, and the caller retries
-    /// once the project quiesces. Installing advances the device fence to the current applied
-    /// bookmark, so the republished project (and every already-fresh project) serves reads from the
-    /// GPU again. Returns whether an image was installed.
-    pub(super) fn republish_resident_project(
-        &self,
-        project: ProjectId,
-        expected_revision: u64,
-    ) -> Result<bool> {
-        // Capture a consistent, immutable snapshot (Arc/COW clone). Bail if the project already moved
-        // past the revision the caller observed as quiescent.
-        let (snapshot, applied) = {
-            let state = self.0.state.read();
-            let Some(project_state) = state.projects.get(&project) else {
-                return Ok(false);
-            };
-            if project_state.graph.revision() != expected_revision {
-                return Ok(false);
-            }
-            (Arc::clone(project_state), state.applied)
-        };
-        // O(N) host assembly + device image, entirely off the apply/state-write lock.
-        let image = ResidentProjectImage::build(
-            project,
-            applied,
-            &snapshot.graph,
-            &snapshot.temporal,
-            &snapshot.indexes,
-        )?;
-        // GPU admission may allocate, encode, submit, and synchronize a complete image. Move the
-        // backend out while that happens: queries deliberately route to the canonical host graph
-        // and writes see no resident backend to update, so neither waits behind a supposedly
-        // background cold rebuild. The short publication section below restores the backend under
-        // the normal apply -> execution -> state lock order and rechecks the captured revision.
-        let mut backend = {
-            let mut execution = self.0.execution.write();
-            let Some(backend) = execution.take() else {
-                return Ok(false);
-            };
-            backend
-        };
-        if let Err(error) = backend.admit_project(image) {
-            let mut execution = self.0.execution.write();
-            if execution.is_some() {
-                return Err(Error::internal(
-                    "execution backend was replaced during resident admission failure",
-                ));
-            }
-            *execution = Some(backend);
-            return Err(error);
+    fn publish_reader_registry(&self, state: &DatabaseState) {
+        let projects = self.0.reader_projects.pin();
+        let names = self.0.reader_names.pin();
+        for live in state.projects.values() {
+            projects.insert(live.id, Arc::clone(live));
+            names.insert(normalize_name(&live.display_name.get()), live.id);
         }
-
-        let _apply = self.0.apply.lock();
-        let mut execution = self.0.execution.write();
-        let mut state = self.0.state.write();
-        let unchanged = state
-            .projects
-            .get(&project)
-            .is_some_and(|current| current.graph.revision() == expected_revision);
-        let fence = state.applied;
-        if execution.is_some() {
-            return Err(Error::internal(
-                "execution backend was replaced during resident admission",
-            ));
-        }
-        let published = if unchanged {
-            // Advance the device fence to the committed bookmark so this project — and every
-            // project already resident at this fence — passes the read-time freshness check.
-            // Projects changed while admission ran still fail the independent graph-revision
-            // check and remain host-routed until their own quiescent republish.
-            backend.advance_bookmark(fence);
-            rebind_shared_project(&mut state, backend.as_ref(), project).map(|()| true)
-        } else {
-            Ok(false)
-        };
-        *execution = Some(backend);
-        published
+        names.retain(|name, id| {
+            state
+                .projects
+                .get(id)
+                .is_some_and(|live| normalize_name(&live.display_name.get()) == *name)
+        });
+        projects.retain(|id, _| state.projects.contains_key(id));
+        self.0.reader_bookmark.store(Arc::new(state.applied));
+        self.0.reader_broker.store(Arc::new(state.broker.clone()));
+        self.0
+            .reader_security
+            .store(Arc::new(state.security.clone()));
     }
 
     /// Large projects whose optimizer-statistics cache is cold, with their current graph revision.
@@ -1906,9 +2192,8 @@ impl Database {
     /// Only cold admission or an explicit administrative rebuild can leave a cache absent.
     /// Ordinary writes install or advance a bounded count summary and never request resampling.
     pub(super) fn cold_statistics_projects(&self) -> Vec<(ProjectId, u64)> {
-        let state = self.0.state.read();
-        state
-            .projects
+        let projects = self.0.reader_projects.pin();
+        projects
             .iter()
             .filter(|(_, project)| {
                 project
@@ -1925,29 +2210,22 @@ impl Database {
     /// Samples a cold project's property, index and temporal distributions off the query path.
     /// Queries can instead initialize a bounded exact-count summary without waiting for sampling.
     ///
-    /// Captures the live project `Arc` and populates its statistics cache through
-    /// `OnceLock::get_or_init` — interior mutability, so no state-write lock is taken. If the project
-    /// is unchanged since `expected_revision`, this warms exactly the cache the query will read
-    /// (same `Arc`, same `OnceLock`); if a concurrent write published a count summary in a new
-    /// project generation, this warms only the older immutable generation. Returns whether it
-    /// computed a fresh snapshot.
+    /// Captures the shared canonical project without taking the writer's state lock. The
+    /// statistics cache publishes one derived sample; concurrent writes can publish their
+    /// current count summary without replacing or copying the graph. Returns whether sampling ran.
     pub(super) fn prewarm_optimizer_statistics(
         &self,
         project: ProjectId,
         expected_revision: u64,
     ) -> bool {
-        let snapshot = {
-            let state = self.0.state.read();
-            match state.projects.get(&project) {
-                Some(project_state)
-                    if project_state.graph.revision() == expected_revision
-                        && project_state.optimizer_statistics.get().is_none() =>
-                {
-                    Arc::clone(project_state)
-                }
-                _ => return false,
-            }
+        let Ok((snapshot, _)) = self.capture_canonical_project(project) else {
+            return false;
         };
+        if snapshot.graph.revision() != expected_revision
+            || snapshot.optimizer_statistics.get().is_some()
+        {
+            return false;
+        }
         let mut computed = false;
         snapshot.optimizer_statistics.get_or_init(|| {
             computed = true;
@@ -1974,12 +2252,15 @@ impl Database {
 
     pub(super) fn execute_autocommit(
         &self,
-        request: QueryRequest,
+        mut request: QueryRequest,
         emit: &mut dyn FnMut(QueryStreamEvent) -> Result<()>,
     ) -> Result<()> {
         request.validate()?;
         let parsed = parse(&request.query)?;
         let writes = statement_writes(&parsed.statement);
+        if writes && request.deadline.is_none() && !self.0.request_timeout.is_zero() {
+            request.deadline = Instant::now().checked_add(self.0.request_timeout);
+        }
         let barrier_bookmark = self.consistency_barrier(
             if writes {
                 CommitAcknowledgement::Published
@@ -1998,7 +2279,7 @@ impl Database {
                         Error::invalid_data("CHECK READ ONLY requires string parameter $statement")
                     })?;
                 let candidate_project = self.resolve_project(request.project_id, candidate)?;
-                let (snapshot, bookmark, _) = self.capture_project_execution(candidate_project)?;
+                let (snapshot, bookmark) = self.capture_canonical_project(candidate_project)?;
                 let candidate = parse(candidate)?;
                 let checked = bind(
                     candidate,
@@ -2033,7 +2314,6 @@ impl Database {
             }
             Statement::ShowIndexes => {
                 let project = self.resolve_project(request.project_id, &request.query)?;
-                self.ensure_automatic_semantic(project)?;
                 return self.show_indexes(
                     request.request_id,
                     project,
@@ -2277,77 +2557,17 @@ impl Database {
             _ => {}
         }
         let project = self.resolve_project(request.project_id, &request.query)?;
-        self.ensure_automatic_semantic(project)?;
         if matches!(&parsed.statement, Statement::CreateEmbedding(_)) {
             self.ensure_embedding_profile_activated(project)?;
         }
-        let semantic_search = matches!(&parsed.statement, Statement::Query(body) if body.clauses.iter().chain(body.unions.iter().flat_map(|branch| &branch.body)).any(|clause| matches!(clause, crate::cypher::Clause::Search(_))));
-        if semantic_search && !writes {
-            // Complete any required admission before taking the query's read lock.
-            drop(self.capture_semantic_execution(project)?);
-        }
-        // Direct Metal scalar reads already execute on the CPU and need only the canonical
-        // state lock. Do not queue them behind a writer waiting for resident GPU readback.
-        let direct_read =
-            if !writes && self.0.selected_backend.get() == Some(&crate::gpu::BackendKind::Metal) {
-                let state = self.0.state.read();
-                let snapshot = state.projects.get(&project).ok_or_else(|| {
-                    Error::new(ErrorCode::ProjectNotFound, "project does not exist")
-                })?;
-                QueryEngine.uses_direct_node_scan(bind(
-                    parsed.clone(),
-                    snapshot.graph.catalog(),
-                    full_capabilities(),
-                )?)?
-            } else {
-                false
-            };
-        // Publication waits for resident readers before acquiring canonical write access.
-        // Both locks remain held through the query and device readback, so no generation is pinned.
-        let read_execution = (!writes && !direct_read).then(|| self.0.execution.read());
-        let read_state = (!writes).then(|| self.0.state.read());
-        let (snapshot, captured_bookmark, captured_execution) =
-            if let Some(state) = &read_state {
-                let snapshot = state.projects.get(&project).cloned().ok_or_else(|| {
-                    Error::new(ErrorCode::ProjectNotFound, "project does not exist")
-                })?;
-                (snapshot, state.applied, None)
-            } else if semantic_search {
-                self.capture_semantic_execution(project)?
-            } else if writes {
-                let state = self.0.state.read();
-                let snapshot = state.projects.get(&project).cloned().ok_or_else(|| {
-                    Error::new(ErrorCode::ProjectNotFound, "project does not exist")
-                })?;
-                (snapshot, state.applied, None)
-            } else {
-                self.capture_project_execution(project)?
-            };
+        let (snapshot, captured_bookmark) = self.capture_canonical_project(project)?;
         let text_embedding = self.0.text_embedding.read().clone();
         let capabilities = full_capabilities();
-        let read_only = bind(parsed, snapshot.graph.catalog(), capabilities)?.read_only;
+        // The parsed statement already determines whether it writes. The query engine owns
+        // binding and capability validation, including cache reuse; do not bind it twice.
+        let read_only = !writes;
         if read_only {
-            if read_state.is_some() {
-                // The held state lock already proves this bookmark is fully applied. Re-entering
-                // it through the barrier could deadlock behind a waiting writer.
-                self.ensure_apply_healthy()?;
-            } else {
-                self.wait_for_captured_all(
-                    request.consistency,
-                    barrier_bookmark,
-                    captured_bookmark,
-                )?;
-            }
-            let execution = read_execution
-                .as_ref()
-                .and_then(|execution| {
-                    execution.as_deref().filter(|backend| {
-                        backend.resident_bookmark(project) == Some(captured_bookmark)
-                            && backend.resident_graph_revision(project)
-                                == Some(snapshot.graph.revision())
-                    })
-                })
-                .or(captured_execution.as_deref());
+            self.ensure_apply_healthy()?;
             emit_catalog(
                 Some(project),
                 captured_bookmark,
@@ -2374,100 +2594,86 @@ impl Database {
                     captured_bookmark.index,
                     capabilities,
                     text_embedding.as_deref(),
-                    execution,
                     &mut stream,
                 )?
             };
             emit_query_summary(request.request_id, output.result, rows, emit)
         } else {
-            let (snapshot, planning_bookmark, planning_execution) = if semantic_search {
-                (snapshot, captured_bookmark, captured_execution)
-            } else {
-                drop(snapshot);
-                let state = self.0.state.read();
-                let snapshot = state.projects.get(&project).cloned().ok_or_else(|| {
-                    Error::new(ErrorCode::ProjectNotFound, "project does not exist")
-                })?;
-                (snapshot, state.applied, None)
-            };
-            let next_index = planning_bookmark
-                .index
-                .checked_add(1)
-                .ok_or_else(|| Error::internal("log index exhausted"))?;
-            let mut output = {
-                // Semantic reads in a write statement use the pinned execution generation too.
-                // The canonical mutation and its derived vectors still commit together, then
-                // publish one sparse resident delta.
-                execute_on_project(
+            loop {
+                let (snapshot, planning_bookmark) = self.capture_canonical_project(project)?;
+                self.remaining_query_write_time(&request)?;
+                let next_index = planning_bookmark
+                    .index
+                    .checked_add(1)
+                    .ok_or_else(|| Error::internal("log index exhausted"))?;
+                let mut output = {
+                    execute_on_project(
+                        &snapshot,
+                        &request,
+                        planning_bookmark,
+                        next_index,
+                        capabilities,
+                        text_embedding.as_deref(),
+                    )?
+                };
+                let administrative = administrative_mutation(
+                    output.administrative.take(),
                     &snapshot,
-                    &request,
-                    planning_bookmark,
-                    next_index,
-                    capabilities,
+                    &mut output.graph_mutations,
                     text_embedding.as_deref(),
-                    planning_execution.as_deref(),
-                )?
-            };
-            let administrative = administrative_mutation(
-                output.administrative.take(),
-                &snapshot,
-                &mut output.graph_mutations,
-                text_embedding.as_deref(),
-                next_index,
-            )?;
-            let vectors = resolve_embedding_mutations(
-                &snapshot,
-                &[],
-                &output.graph_mutations,
-                text_embedding.as_deref(),
-                next_index,
-            )?;
-            let mutation = DatabaseMutation::Graph {
-                project,
-                validation: MutationValidation {
-                    snapshot: planning_bookmark,
-                    dependencies: output.dependencies.clone(),
-                },
-                graph: output.graph_mutations,
-                temporal: output
-                    .temporal_mutations
-                    .into_iter()
-                    .map(|mutation| PersistedTemporalMutation {
-                        entity_kind: mutation.entity_kind,
-                        target: mutation.target,
-                        sample: mutation.sample,
-                        uses_commit_time: mutation.uses_commit_time,
-                    })
-                    .collect(),
-                vectors,
-                administrative,
-            };
-            drop(planning_execution);
-            drop(snapshot);
-            let (bookmark, _) = self.commit_from(
-                mutation,
-                MutationKind::Graph,
-                project,
-                Some(request.request_id),
-                AdmissionClass::Client,
-                request.consistency,
-                request.connection_id,
-                None,
-                self.remaining_query_write_time(&request)?,
-            )?;
-            output.result.bookmark = bookmark;
-            let current = self.0.state.read();
-            let project_state = current
-                .projects
-                .get(&project)
-                .ok_or_else(|| Error::internal("committed project disappeared"))?;
-            emit_result(
-                request.request_id,
-                output.result,
-                project_state.graph.catalog(),
-                &project_state.indexes,
-                emit,
-            )
+                    next_index,
+                )?;
+                let vectors = Vec::new();
+                let mutation = DatabaseMutation::Graph {
+                    project,
+                    validation: MutationValidation {
+                        snapshot: planning_bookmark,
+                        dependencies: output.dependencies.clone(),
+                    },
+                    graph: output.graph_mutations,
+                    temporal: output
+                        .temporal_mutations
+                        .into_iter()
+                        .map(|mutation| PersistedTemporalMutation {
+                            entity_kind: mutation.entity_kind,
+                            target: mutation.target,
+                            sample: mutation.sample,
+                            uses_commit_time: mutation.uses_commit_time,
+                        })
+                        .collect(),
+                    vectors,
+                    administrative,
+                };
+                drop(snapshot);
+                let committed = self.commit_from(
+                    mutation,
+                    MutationKind::Graph,
+                    project,
+                    Some(request.request_id),
+                    AdmissionClass::Client,
+                    request.consistency,
+                    request.connection_id,
+                    None,
+                    self.remaining_query_write_time(&request)?,
+                );
+                let (bookmark, _) = match committed {
+                    Ok(committed) => committed,
+                    Err(error) if error.code == ErrorCode::TransactionConflict => {
+                        self.ensure_apply_healthy()?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                output.result.bookmark = bookmark;
+                let (project_state, _) = self.capture_canonical_project(project)?;
+                return emit_result(
+                    request.request_id,
+                    output.result,
+                    project_state.graph.catalog(),
+                    &project_state.indexes,
+                    emit,
+                );
+            }
         }
     }
 
@@ -2479,14 +2685,18 @@ impl Database {
         emit: &mut dyn FnMut(QueryStreamEvent) -> Result<()>,
     ) -> Result<()> {
         let (values, bookmark) = {
-            let state = self.0.state.read();
+            let state = self.0.reader_projects.pin();
             (
                 state
-                    .projects
-                    .values()
-                    .map(|project| (project.id.to_string(), project.display_name.clone()))
+                    .iter()
+                    .map(|(_, project)| {
+                        (
+                            project.id.to_string(),
+                            project.display_name.get().as_ref().clone(),
+                        )
+                    })
                     .collect::<Vec<_>>(),
-                state.applied,
+                **self.0.reader_bookmark.load(),
             )
         };
         self.wait_for_captured_all(consistency, barrier, bookmark)?;
@@ -2549,15 +2759,8 @@ impl Database {
         emit: &mut dyn FnMut(QueryStreamEvent) -> Result<()>,
     ) -> Result<()> {
         let (rows, bookmark) = {
-            let state = self.0.state.read();
-            let project = state
-                .projects
-                .get(&project)
-                .ok_or_else(|| Error::new(ErrorCode::ProjectNotFound, "project does not exist"))?;
-            (
-                project.indexes.statuses().collect::<Vec<_>>(),
-                state.applied,
-            )
+            let (project, bookmark) = self.capture_canonical_project(project)?;
+            (project.indexes.statuses().collect::<Vec<_>>(), bookmark)
         };
         self.wait_for_captured_all(consistency, barrier, bookmark)?;
         emit(QueryStreamEvent::Schema {
@@ -2654,11 +2857,7 @@ impl Database {
         emit: &mut dyn FnMut(QueryStreamEvent) -> Result<()>,
     ) -> Result<()> {
         let (rows, bookmark) = {
-            let state = self.0.state.read();
-            let project = state
-                .projects
-                .get(&project)
-                .ok_or_else(|| Error::new(ErrorCode::ProjectNotFound, "project does not exist"))?;
+            let (project, bookmark) = self.capture_canonical_project(project)?;
             let rows = project
                 .indexes
                 .constraint_definitions()
@@ -2682,7 +2881,7 @@ impl Database {
                     Ok((definition.name.clone(), label, property))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            (rows, state.applied)
+            (rows, bookmark)
         };
         self.wait_for_captured_all(consistency, barrier, bookmark)?;
         emit(QueryStreamEvent::Schema {
@@ -2707,11 +2906,11 @@ impl Database {
                 ),
                 (
                     "label",
-                    rows.iter().map(|row| row.1.clone()).collect::<Vec<_>>(),
+                    rows.iter().map(|row| row.1.to_string()).collect::<Vec<_>>(),
                 ),
                 (
                     "property",
-                    rows.iter().map(|row| row.2.clone()).collect::<Vec<_>>(),
+                    rows.iter().map(|row| row.2.to_string()).collect::<Vec<_>>(),
                 ),
             ]
             .into_iter()
@@ -2740,10 +2939,8 @@ impl Database {
         project: ProjectId,
         emit: &mut dyn FnMut(QueryStreamEvent) -> Result<()>,
     ) -> Result<()> {
-        let (rows, bookmark) = {
-            let state = self.0.state.read();
-            (state.broker.topic_metrics(project), state.applied)
-        };
+        let rows = self.0.reader_broker.load().topic_metrics(project);
+        let bookmark = self.bookmark();
         emit(QueryStreamEvent::Schema {
             request_id,
             columns: [
@@ -2809,10 +3006,8 @@ impl Database {
         project: ProjectId,
         emit: &mut dyn FnMut(QueryStreamEvent) -> Result<()>,
     ) -> Result<()> {
-        let (rows, bookmark) = {
-            let state = self.0.state.read();
-            (state.broker.queue_metrics(project), state.applied)
-        };
+        let rows = self.0.reader_broker.load().queue_metrics(project);
+        let bookmark = self.bookmark();
         emit(QueryStreamEvent::Schema {
             request_id,
             columns: [
@@ -2877,10 +3072,8 @@ impl Database {
         project: ProjectId,
         emit: &mut dyn FnMut(QueryStreamEvent) -> Result<()>,
     ) -> Result<()> {
-        let (rows, bookmark) = {
-            let state = self.0.state.read();
-            (state.broker.exchange_metrics(project), state.applied)
-        };
+        let rows = self.0.reader_broker.load().exchange_metrics(project);
+        let bookmark = self.bookmark();
         emit(QueryStreamEvent::Schema {
             request_id,
             columns: [
@@ -2931,10 +3124,8 @@ impl Database {
         project: ProjectId,
         emit: &mut dyn FnMut(QueryStreamEvent) -> Result<()>,
     ) -> Result<()> {
-        let (rows, bookmark) = {
-            let state = self.0.state.read();
-            (state.broker.consumer_lag_metrics(project), state.applied)
-        };
+        let rows = self.0.reader_broker.load().consumer_lag_metrics(project);
+        let bookmark = self.bookmark();
         emit(QueryStreamEvent::Schema {
             request_id,
             columns: [
@@ -2993,11 +3184,14 @@ impl Database {
         emit: &mut dyn FnMut(QueryStreamEvent) -> Result<()>,
     ) -> Result<()> {
         let normalized = normalize_name(name);
-        if let Some(id) = self.0.state.read().names.get(&normalized).copied() {
+        let existing = self.0.reader_names.pin().get(&normalized).copied();
+        if let Some(id) = existing {
             if if_not_exists {
-                return emit_admin_summary(request.request_id, self.bookmark(), emit);
+                self.initialize_automatic_semantic(id)?;
+                let bookmark =
+                    self.consistency_barrier(request.consistency, Some(self.bookmark()))?;
+                return emit_admin_summary(request.request_id, bookmark, emit);
             }
-            let _ = id;
             return Err(Error::new(
                 ErrorCode::TransactionConflict,
                 "project name already exists",
@@ -3018,6 +3212,12 @@ impl Database {
             None,
             self.remaining_query_write_time(request)?,
         )?;
+        // Publish the constant-size semantic definitions before acknowledging a new project.
+        // Owner text and vectors are still seeded by the independent embedding worker; reads
+        // after this acknowledgement can observe an empty ready index while that work proceeds.
+        self.initialize_automatic_semantic(id)?;
+        let bookmark =
+            self.consistency_barrier(request.consistency, Some(self.bookmark().max(bookmark)))?;
         emit_admin_summary(request.request_id, bookmark, emit)
     }
 
@@ -3097,73 +3297,6 @@ impl Database {
     }
 }
 
-fn apply_reserved_broker_entry(
-    database: &Database,
-    entry: &MutationEntry,
-) -> Result<Option<MutationApplyResult>> {
-    if entry.request_id().is_some() || entry.kind() != MutationKind::Broker {
-        return Ok(None);
-    }
-    let payload_digest = *blake3::hash(entry.payload()).as_bytes();
-    let _apply = database.0.apply.lock();
-    let mut execution = database.0.execution.write();
-    let mut state = database.0.state.write();
-    if entry.index() != state.applied.index.saturating_add(1) {
-        return Ok(None);
-    }
-    let (mut staged, broker_publish_cursor) = {
-        let mut ordered = database.0.ordered_overlay.lock();
-        let Some(record) = ordered.reservations.get(&entry.index()) else {
-            return Ok(None);
-        };
-        if !record.is_broker || record.staged_payload_digest != Some(payload_digest) {
-            return Ok(None);
-        }
-        let broker_publish_cursor = record.broker_publish_cursor;
-        let Some(staged) = ordered.states.remove(&entry.index()) else {
-            database.0.fatal_apply.store(true, Ordering::Release);
-            return Err(Error::new(
-                ErrorCode::CorruptStorage,
-                "ordered broker reservation lost its staged canonical state",
-            ));
-        };
-        (staged, broker_publish_cursor)
-    };
-    if staged.applied != entry.bookmark() {
-        database.0.fatal_apply.store(true, Ordering::Release);
-        return Err(Error::new(
-            ErrorCode::CorruptStorage,
-            "ordered broker reservation bookmark differs from committed mutation",
-        ));
-    }
-    let response = (*staged.last_response).clone();
-    staged.last_payload_checksum = Some(entry.checksum());
-    staged.last_response = response.clone().into();
-    if let Err(error) = prune_request_results(&mut staged) {
-        database.0.fatal_apply.store(true, Ordering::Release);
-        return Err(error);
-    }
-    if let Some(execution) = execution.as_deref_mut() {
-        execution.advance_bookmark(entry.bookmark());
-    }
-    let committed_broker_segment = broker_publish_cursor
-        .and_then(|previous_cursor| staged.broker.newest_payload_segment_after(previous_cursor));
-    *state = staged;
-    drop(state);
-    database.0.broker_changes.send_replace(entry.index());
-    if let Some(descriptor) = committed_broker_segment {
-        database
-            .0
-            .pending_broker_segments
-            .lock()
-            .remove(&descriptor);
-    }
-    Ok(Some(MutationApplyResult {
-        response,
-        duplicate: false,
-    }))
-}
-
 #[async_trait]
 impl MutationStateBackend for Database {
     async fn prepare_command(
@@ -3171,39 +3304,34 @@ impl MutationStateBackend for Database {
         mut command: WriteCommand,
         sequencer_time_millis: i64,
     ) -> Result<WriteCommand> {
-        command.validate()?;
-        if command.kind == MutationKind::Broker {
-            // Broker replay already carries this canonical timestamp in the WAL entry header.
-            // Keep the potentially large command bytes unchanged and resolve its in-memory view
-            // during reservation/replay instead of decoding and encoding the complete batch here.
-            command.commit_time_millis = sequencer_time_millis;
-            return Ok(command);
-        }
-        let mut mutation = decode_database_mutation(&command.payload)?;
-        resolve_sequencer_values(&mut mutation, sequencer_time_millis)?;
+        // Admission and replay resolve values from this authoritative WAL header. The original
+        // journal bytes need no additional decode, clone, encode, or worker round trip here.
+        millis_to_nanos(sequencer_time_millis)?;
         command.commit_time_millis = sequencer_time_millis;
-        command.payload = encode_database_value_bounded(
-            &mutation,
-            "sequencer-resolved mutation",
-            self.0.admission.maximum_encoded_bytes(),
-        )?;
         command.validate()?;
         Ok(command)
     }
 
     async fn validate_command(&self, command: &WriteCommand) -> Result<()> {
-        self.ensure_apply_healthy()?;
-        let _apply = self.0.apply.lock();
-        let current = self.0.state.read();
-        let position = Bookmark {
-            term: current.applied.term.max(1),
-            index: current
-                .applied
-                .index
-                .checked_add(1)
-                .ok_or_else(|| Error::internal("local write index exhausted"))?,
-        };
-        validate_resolved_database_command(&current, command, position).map(|_| ())
+        let database = self.clone();
+        let owned_command = command.clone();
+        tokio::task::spawn_blocking(move || {
+            let command = &owned_command;
+            database.ensure_apply_healthy()?;
+            let _apply = database.0.apply.lock();
+            let current = database.0.state.read();
+            let position = Bookmark {
+                term: current.applied.term.max(1),
+                index: current
+                    .applied
+                    .index
+                    .checked_add(1)
+                    .ok_or_else(|| Error::internal("local write index exhausted"))?,
+            };
+            validate_resolved_database_command(&current, command, position).map(|_| ())
+        })
+        .await
+        .map_err(|error| Error::internal(format!("validate_command worker failed: {error}")))?
     }
 
     async fn reserve_command(
@@ -3211,78 +3339,209 @@ impl MutationStateBackend for Database {
         command: &WriteCommand,
         position: Bookmark,
     ) -> Result<CommandReservation> {
-        self.ensure_apply_healthy()?;
-        command.validate()?;
-        let mut mutation = decode_database_mutation(&command.payload)?;
-        resolve_sequencer_values(&mut mutation, command.commit_time_millis)?;
-        validate_database_envelope(command.kind, command.project_id, &mutation)?;
-        let _apply = self.0.apply.lock();
-        let current = self.0.state.read();
-        let mut ordered = self.0.ordered_overlay.lock();
-        if ordered.reservations.contains_key(&position.index) {
-            return Err(Error::new(
-                ErrorCode::CorruptStorage,
-                "local write position already has an ordered command reservation",
-            ));
-        }
+        let database = self.clone();
+        let owned_command = command.clone();
+        tokio::task::spawn_blocking(move || {
+            let command = &owned_command;
+            database.ensure_apply_healthy()?;
+            let _apply = database.0.apply.lock();
+            let current = database.0.state.read();
+            let mut ordered = database.0.ordered_overlay.lock();
+            if ordered.reservations.contains_key(&position.index) {
+                return Err(Error::new(
+                    ErrorCode::CorruptStorage,
+                    "local write position already has an ordered command reservation",
+                ));
+            }
 
-        if matches!(mutation, DatabaseMutation::Graph { .. }) {
-            let base = ordered
-                .states
-                .last_key_value()
-                .map_or(&*current, |(_, state)| state);
-            if base.applied.index.checked_add(1) != Some(position.index) {
+            if !ordered.reservations.is_empty() {
                 return Err(Error::retryable(
                     ErrorCode::WriteAdmissionFull,
-                    "ordered database state has not reached the next reserved position",
+                    "an ordered mutation is still awaiting local application",
                     Some(1),
                 ));
             }
-            let staged_intent_digest = command
-                .request_id
-                .map(|_| request_intent_digest(&mutation))
-                .transpose()?
-                .unwrap_or([0; 32]);
-            let staged = stage_ordered_database_command_with_digest(
-                base,
-                command,
-                mutation,
-                position,
-                &self.0.segments,
-                staged_intent_digest,
-            )?;
-            let reservation = CommandReservation::pipelined(position)?;
-            let token = reservation.token().ok_or_else(|| {
-                Error::internal("pipelined database reservation has no owner token")
-            })?;
-            ordered.states.insert(position.index, staged);
+            validate_resolved_database_command(&current, command, position)?;
+            let reservation = CommandReservation::owned_serialized(position)?;
+            let token = reservation
+                .token()
+                .ok_or_else(|| Error::internal("owned database reservation has no token"))?;
+            let broker_segments = Vec::new();
             ordered.reservations.insert(
                 position.index,
                 OrderedMutationReservation {
                     token,
-                    broker_segments: Vec::new(),
-                    staged_payload_digest: Some(*blake3::hash(&command.payload).as_bytes()),
-                    is_broker: false,
-                    broker_publish_cursor: None,
+                    payload_digest: *blake3::hash(&command.payload).as_bytes(),
+                    request_id: command.request_id,
+                    commit_time_millis: command.commit_time_millis,
+                    broker_segments,
                 },
             );
-            return Ok(reservation);
-        }
+            Ok(reservation)
+        })
+        .await
+        .map_err(|error| Error::internal(format!("reserve_command worker failed: {error}")))?
+    }
 
-        if !ordered.reservations.is_empty() {
-            return Err(Error::retryable(
-                ErrorCode::WriteAdmissionFull,
-                "ordered graph mutations are still awaiting local application",
-                Some(1),
-            ));
-        }
-        validate_resolved_database_command(&current, command, position)?;
-        let reservation = CommandReservation::owned_serialized(position)?;
-        let token = reservation
-            .token()
-            .ok_or_else(|| Error::internal("owned database reservation has no token"))?;
-        let is_broker = matches!(&mutation, DatabaseMutation::Broker { .. });
-        let (broker_segments, staged_payload_digest, broker_publish_cursor) = if is_broker {
+    async fn complete_command_reservation(
+        &self,
+        reservation: CommandReservation,
+        outcome: CommandReservationOutcome,
+    ) -> Result<()> {
+        let database = self.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let Some(token) = reservation.token() else {
+                return Ok(());
+            };
+            let mut released = Vec::<(Uuid, Vec<SegmentDescriptor>)>::new();
+            {
+                let _apply = database.0.apply.lock();
+                let mut ordered = database.0.ordered_overlay.lock();
+                let Some(record) = ordered.reservations.get(&reservation.position().index) else {
+                    return Ok(());
+                };
+                if record.token != token {
+                    return Ok(());
+                }
+                if outcome == CommandReservationOutcome::Rejected
+                    && reservation.may_release_after_append()
+                {
+                    released.extend(
+                        ordered
+                            .reservations
+                            .values()
+                            .map(|record| (record.token, record.broker_segments.clone())),
+                    );
+                    ordered.reservations.clear();
+                } else if let Some(record) =
+                    ordered.reservations.remove(&reservation.position().index)
+                {
+                    released.push((record.token, record.broker_segments));
+                }
+            }
+            let rejected = outcome == CommandReservationOutcome::Rejected;
+            for (owner, descriptors) in released {
+                release_pending_broker_segments(&database.0, owner, &descriptors, rejected);
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| {
+            Error::internal(format!(
+                "complete_command_reservation worker failed: {error}"
+            ))
+        })?
+    }
+
+    async fn applied_bookmark(&self) -> Bookmark {
+        self.bookmark()
+    }
+
+    async fn apply_mutation(&self, entry: &MutationEntry) -> Result<MutationApplyResult> {
+        let database = self.clone();
+        let owned_entry = entry.clone();
+        tokio::task::spawn_blocking(move || {
+            let entry = &owned_entry;
+            database.ensure_apply_healthy()?;
+            entry.verify()?;
+            let mut mutation = decode_database_mutation(entry.payload())?;
+            resolve_sequencer_values(&mut mutation, entry.commit_time_millis())?;
+            let intent_digest = entry
+                .request_id()
+                .map(|_| request_intent_digest(&mutation))
+                .transpose()?
+                .unwrap_or([0; 32]);
+            let broker_may_retire_segments = matches!(
+                &mutation,
+                DatabaseMutation::DropProject { .. }
+                    | DatabaseMutation::Broker {
+                        command: BrokerCommand::DeleteTopic { .. }
+                            | BrokerCommand::ClearTopic { .. }
+                            | BrokerCommand::Retain { .. }
+                    }
+            );
+            let is_broker_mutation = matches!(&mutation, DatabaseMutation::Broker { .. });
+            let commit_time_nanos = millis_to_nanos(entry.commit_time_millis())?;
+            validate_database_entry(entry, &mutation)?;
+            let _apply = database.0.apply.lock();
+            let mut state = database.0.state.write();
+
+            let previous_project_name = match &mutation {
+                DatabaseMutation::RenameProject { id, .. } => state
+                    .projects
+                    .get(id)
+                    .map(|project| normalize_name(&project.display_name.get())),
+                _ => None,
+            };
+            let affected_project = match &mutation {
+                DatabaseMutation::CreateProject { id, .. }
+                | DatabaseMutation::RenameProject { id, .. }
+                | DatabaseMutation::DropProject { id, .. } => Some(*id),
+                _ => None,
+            };
+            if entry.index() < state.applied.index {
+                let response = match entry.request_id().and_then(|request| {
+                    state
+                        .request_results
+                        .get(&request)
+                        .map(|record| record.response.clone())
+                }) {
+                    Some(response) => response,
+                    None => {
+                        encode_database_value(&Option::<BrokerReply>::None, "empty apply response")?
+                    }
+                };
+                return Ok(MutationApplyResult {
+                    response,
+                    duplicate: true,
+                });
+            }
+            if entry.index() == state.applied.index {
+                if state.last_payload_checksum != Some(entry.checksum()) {
+                    database.0.fatal_apply.store(true, Ordering::Release);
+                    return Err(Error::new(
+                        ErrorCode::CorruptStorage,
+                        "database mutation differs at an applied local write index",
+                    ));
+                }
+                return Ok(MutationApplyResult {
+                    response: state.last_response.clone(),
+                    duplicate: true,
+                });
+            }
+            if entry.index() != state.applied.index.saturating_add(1) {
+                database.0.fatal_apply.store(true, Ordering::Release);
+                return Err(Error::new(
+                    ErrorCode::CorruptStorage,
+                    "database mutation apply has a local write-index gap",
+                ));
+            }
+            if let Some(request_id) = entry.request_id()
+                && let Some(record) = state.request_results.get(&request_id)
+            {
+                if record.intent_digest != intent_digest {
+                    database.0.fatal_apply.store(true, Ordering::Release);
+                    return Err(Error::new(
+                        ErrorCode::CorruptStorage,
+                        "committed request ID refers to a different mutation intent",
+                    ));
+                }
+                let response = record.response.clone();
+                state.applied = entry.bookmark();
+                database.0.reader_bookmark.store(Arc::new(entry.bookmark()));
+                state.last_payload_checksum = Some(entry.checksum());
+                state.last_response = response.clone();
+                if let Err(error) = prune_request_results(&mut state) {
+                    database.0.fatal_apply.store(true, Ordering::Release);
+                    return Err(error);
+                }
+                return Ok(MutationApplyResult {
+                    response,
+                    duplicate: true,
+                });
+            }
+
             let broker_publish_cursor = matches!(
                 &mutation,
                 DatabaseMutation::Broker {
@@ -3292,466 +3551,130 @@ impl MutationStateBackend for Database {
                         | BrokerCommand::PublishAmqpUniformBatch { .. }
                 }
             )
-            .then(|| current.broker.message_cursor());
-            let previous_segments = current
-                .broker
-                .payload_segments()
-                .into_iter()
-                .collect::<BTreeSet<_>>();
-            let staged_intent_digest = command
-                .request_id
-                .map(|_| request_intent_digest(&mutation))
-                .transpose()?
-                .unwrap_or([0; 32]);
-            // Broker payload materialization is part of this exact intent-bound generation.
-            // Publication consumes the generation below instead of encoding and writing the
-            // same segment a second time. Replay has no reservation and reconstructs it from
-            // the eventual-durability WAL command as before.
-            let staged = stage_ordered_database_command_with_digest(
-                &current,
-                command,
-                mutation,
-                position,
-                &self.0.segments,
-                staged_intent_digest,
-            )?;
-            let descriptors = staged
-                .broker
-                .payload_segments()
-                .into_iter()
-                .filter(|descriptor| !previous_segments.contains(descriptor))
-                .collect::<Vec<_>>();
-            retain_pending_broker_segments(&self.0, token, &descriptors)?;
-            ordered.states.insert(position.index, staged);
-            (
-                descriptors,
-                Some(*blake3::hash(&command.payload).as_bytes()),
-                broker_publish_cursor,
-            )
-        } else {
-            (Vec::new(), None, None)
-        };
-        ordered.reservations.insert(
-            position.index,
-            OrderedMutationReservation {
-                token,
-                broker_segments,
-                staged_payload_digest,
-                is_broker,
-                broker_publish_cursor,
-            },
-        );
-        Ok(reservation)
-    }
-
-    async fn complete_command_reservation(
-        &self,
-        reservation: CommandReservation,
-        outcome: CommandReservationOutcome,
-    ) -> Result<()> {
-        let Some(token) = reservation.token() else {
-            return Ok(());
-        };
-        let mut released = Vec::<(Uuid, Vec<SegmentDescriptor>)>::new();
-        {
-            let _apply = self.0.apply.lock();
-            let mut ordered = self.0.ordered_overlay.lock();
-            let Some(record) = ordered.reservations.get(&reservation.position().index) else {
-                return Ok(());
-            };
-            if record.token != token {
-                return Ok(());
-            }
-            if outcome == CommandReservationOutcome::Rejected
-                && reservation.may_release_after_append()
-            {
-                released.extend(
-                    ordered
-                        .reservations
-                        .values()
-                        .map(|record| (record.token, record.broker_segments.clone())),
-                );
-                ordered.reservations.clear();
-                ordered.states.clear();
-            } else if let Some(record) = ordered.reservations.remove(&reservation.position().index)
-            {
-                released.push((record.token, record.broker_segments));
-                ordered.states.remove(&reservation.position().index);
-            }
-        }
-        let rejected = outcome == CommandReservationOutcome::Rejected;
-        for (owner, descriptors) in released {
-            release_pending_broker_segments(&self.0, owner, &descriptors, rejected);
-        }
-        Ok(())
-    }
-
-    async fn applied_bookmark(&self) -> Bookmark {
-        self.0.state.read().applied
-    }
-
-    async fn apply_mutation(&self, entry: &MutationEntry) -> Result<MutationApplyResult> {
-        self.ensure_apply_healthy()?;
-        entry.verify()?;
-        if let Some(applied) = apply_reserved_broker_entry(self, entry)? {
-            return Ok(applied);
-        }
-        let mut mutation = decode_database_mutation(entry.payload())?;
-        resolve_sequencer_values(&mut mutation, entry.commit_time_millis())?;
-        let intent_digest = entry
-            .request_id()
-            .map(|_| request_intent_digest(&mutation))
-            .transpose()?
-            .unwrap_or([0; 32]);
-        let payload_digest = *blake3::hash(entry.payload()).as_bytes();
-        let broker_may_retire_segments = matches!(
-            &mutation,
-            DatabaseMutation::DropProject { .. }
-                | DatabaseMutation::Broker {
-                    command: BrokerCommand::DeleteTopic { .. }
-                        | BrokerCommand::ClearTopic { .. }
-                        | BrokerCommand::Retain { .. }
-                }
-        );
-        let is_broker_mutation = matches!(&mutation, DatabaseMutation::Broker { .. });
-        let commit_time_nanos = millis_to_nanos(entry.commit_time_millis())?;
-        let device_impact = device_impact(&mutation, entry.bookmark(), commit_time_nanos);
-        validate_database_entry(entry, &mutation)?;
-        let _apply = self.0.apply.lock();
-        let mut execution = self.0.execution.write();
-        let mut state = self.0.state.write();
-
-        let affected_project = match &device_impact {
-            DeviceImpact::Project { project, .. }
-            | DeviceImpact::Create(project)
-            | DeviceImpact::Rebuild(project)
-            | DeviceImpact::Drop(project) => Some(*project),
-            DeviceImpact::None => entry.project_id(),
-        };
-        let has_retained_view = affected_project.is_some_and(|project| {
-            let mut retired = self.0.retired_project_views.lock();
-            let Some(views) = retired.get_mut(&project) else {
-                return false;
-            };
-            views.retain(|view| view.strong_count() != 0);
-            if views.is_empty() {
-                retired.remove(&project);
-                false
-            } else {
-                true
-            }
-        });
-        let exclusive_project = match &device_impact {
-            DeviceImpact::Project { project, .. }
-                if !has_retained_view
-                    && state
-                        .projects
-                        .get(project)
-                        .is_some_and(|state| Arc::strong_count(state) == 1) =>
-            {
-                Some(*project)
-            }
-            _ => None,
-        };
-
-        if entry.index() < state.applied.index {
-            let response = match entry.request_id().and_then(|request| {
-                state
-                    .request_results
-                    .get(&request)
-                    .map(|record| record.response.clone())
-            }) {
-                Some(response) => response,
-                None => {
-                    encode_database_value(&Option::<BrokerReply>::None, "empty apply response")?
-                }
-            };
-            return Ok(MutationApplyResult {
-                response,
-                duplicate: true,
-            });
-        }
-        if entry.index() == state.applied.index {
-            if state.last_payload_checksum != Some(entry.checksum()) {
-                self.0.fatal_apply.store(true, Ordering::Release);
-                return Err(Error::new(
-                    ErrorCode::CorruptStorage,
-                    "database mutation differs at an applied local write index",
-                ));
-            }
-            return Ok(MutationApplyResult {
-                response: (*state.last_response).clone(),
-                duplicate: true,
-            });
-        }
-        if entry.index() != state.applied.index.saturating_add(1) {
-            self.0.fatal_apply.store(true, Ordering::Release);
-            return Err(Error::new(
-                ErrorCode::CorruptStorage,
-                "database mutation apply has a local write-index gap",
-            ));
-        }
-        if let Some(request_id) = entry.request_id()
-            && let Some(record) = state.request_results.get(&request_id)
-        {
-            if record.intent_digest != intent_digest {
-                self.0.fatal_apply.store(true, Ordering::Release);
-                return Err(Error::new(
-                    ErrorCode::CorruptStorage,
-                    "committed request ID refers to a different mutation intent",
-                ));
-            }
-            let response = record.response.clone();
-            state.applied = entry.bookmark();
-            if let Some(execution) = execution.as_deref_mut() {
-                execution.advance_bookmark(entry.bookmark());
-            }
-            state.last_payload_checksum = Some(entry.checksum());
-            state.last_response = response.clone().into();
-            if let Err(error) = prune_request_results(&mut state) {
-                self.0.fatal_apply.store(true, Ordering::Release);
-                return Err(error);
-            }
-            return Ok(MutationApplyResult {
-                response,
-                duplicate: true,
-            });
-        }
-
-        let broker_publish_cursor = matches!(
-            &mutation,
-            DatabaseMutation::Broker {
-                command: BrokerCommand::PublishKafkaBatch { .. }
-                    | BrokerCommand::PublishAmqp { .. }
-                    | BrokerCommand::PublishAmqpBatch { .. }
-                    | BrokerCommand::PublishAmqpUniformBatch { .. }
-            }
-        )
-        .then(|| state.broker.message_cursor());
-        let mut committed_broker_segment = None;
-        let mut retired_broker_segments = Vec::new();
-        let reserved_staged_state = {
-            let mut ordered = self.0.ordered_overlay.lock();
-            match ordered.reservations.get(&entry.index()) {
-                Some(record) if record.staged_payload_digest == Some(payload_digest) => {
-                    let Some(staged) = ordered.states.remove(&entry.index()) else {
-                        self.0.fatal_apply.store(true, Ordering::Release);
+            .then(|| state.broker.message_cursor());
+            let mut committed_broker_segment = None;
+            let mut retired_broker_segments = Vec::new();
+            // Admission already checked the exact predecessor while excluding other writers.
+            // Replaying persisted entries has no live reservation and needs its own preflight.
+            let reserved = {
+                let ordered = database.0.ordered_overlay.lock();
+                if let Some(reservation) = ordered.reservations.get(&entry.index()) {
+                    if reservation.payload_digest != *blake3::hash(entry.payload()).as_bytes()
+                        || reservation.request_id != entry.request_id()
+                        || reservation.commit_time_millis != entry.commit_time_millis()
+                    {
                         return Err(Error::new(
                             ErrorCode::CorruptStorage,
-                            "ordered graph reservation lost its staged canonical state",
-                        ));
-                    };
-                    if staged.applied != entry.bookmark() {
-                        self.0.fatal_apply.store(true, Ordering::Release);
-                        return Err(Error::new(
-                            ErrorCode::CorruptStorage,
-                            "ordered graph reservation bookmark differs from committed mutation",
+                            "committed write differs from its validated reservation",
                         ));
                     }
-                    Some(staged)
-                }
-                Some(record) if record.staged_payload_digest.is_some() => {
-                    self.0.fatal_apply.store(true, Ordering::Release);
-                    return Err(Error::new(
-                        ErrorCode::CorruptStorage,
-                        "ordered graph reservation differs from committed mutation intent",
-                    ));
-                }
-                _ => None,
-            }
-        };
-        // Read-only client/data preflight. In the standalone direct-apply path this is the only
-        // place a mutation is validated, so a failure here is a first-time client rejection — it
-        // must NOT trip `fatal_apply`. Keep it OUTSIDE the fatal closure below: state is a clone
-        // that is only committed on success, so a rejected mutation leaves canonical state intact.
-        if reserved_staged_state.is_none() {
-            validate_sequencer_mutation(&state, &mutation, entry.bookmark(), commit_time_nanos)?;
-        }
-        let result = (|| -> Result<MutationApplyResult> {
-            // Any error past this point is a local invariant/device/storage failure: in-place
-            // publication has begun and the preflight above already accepted the mutation.
-            let previous_broker_segments = broker_may_retire_segments.then(|| {
-                state
-                    .broker
-                    .payload_segments()
-                    .into_iter()
-                    .collect::<BTreeSet<_>>()
-            });
-            // The normal standalone path already cloned and applied this graph mutation during
-            // pre-WAL reservation. Consume that exact intent-bound overlay here: work tracks the
-            // changed rows once and does not repeat canonical/index mutation after fsync. Replay
-            // and non-graph mutations have no reservation overlay and use the cold apply path.
-            let (mut staged_state, response, state_already_staged) =
-                if let Some(staged_state) = reserved_staged_state {
-                    let response = (*staged_state.last_response).clone();
-                    (staged_state, response, true)
+                    true
                 } else {
-                    let mut staged_state = state.clone();
-                    let reply = apply_mutation(
-                        &mut staged_state,
-                        mutation,
-                        entry.bookmark(),
-                        commit_time_nanos,
-                        Some(&self.0.segments),
-                    )?;
-                    let response = encode_database_value(&reply, "apply response")?;
-                    (staged_state, response, false)
-                };
-            if let Some(previous_cursor) = broker_publish_cursor {
-                committed_broker_segment = staged_state
-                    .broker
-                    .newest_payload_segment_after(previous_cursor);
-            }
-            if response.len() > MAX_SINGLE_REQUEST_RESULT_BYTES {
-                return Err(Error::new(
-                    ErrorCode::CorruptStorage,
-                    "committed mutation response exceeds the durable result bound",
-                ));
-            }
-            staged_state.applied = entry.bookmark();
-            staged_state.last_payload_checksum = Some(entry.checksum());
-            staged_state.last_response = response.clone().into();
-            if !state_already_staged && let Some(request_id) = entry.request_id() {
-                retain_request_result(
-                    &mut staged_state,
-                    request_id,
-                    intent_digest,
-                    response.clone(),
-                )?;
-            }
-            prune_request_results(&mut staged_state)?;
-            {
-                populate_pending_vector_indexes(
-                    &mut staged_state,
-                    &device_impact,
-                    execution.as_deref(),
-                )?;
-                let resident_already_stale = match (&device_impact, execution.as_deref()) {
-                    (
-                        DeviceImpact::Project { project, .. } | DeviceImpact::Rebuild(project),
-                        Some(backend),
-                    ) => state.projects.get(project).is_none_or(|current| {
-                        backend.resident_graph_revision(*project) != Some(current.graph.revision())
-                    }),
-                    _ => false,
-                };
-                let semantic_project = match &device_impact {
-                    DeviceImpact::Project { project, .. } | DeviceImpact::Rebuild(project) => {
-                        staged_state
-                            .projects
-                            .get(project)
-                            .filter(|state| {
-                                state.indexes.contains(crate::graph::SEMANTIC_NODE_INDEX)
-                            })
-                            .map(|_| *project)
-                    }
-                    _ => None,
-                };
-                let device_impact = if resident_already_stale {
-                    semantic_project
-                        .map(DeviceImpact::Rebuild)
-                        .unwrap_or(device_impact)
-                } else {
-                    device_impact
-                };
-                if semantic_project.is_none()
-                    && (resident_already_stale
-                        || match &device_impact {
-                            DeviceImpact::Project { project, .. }
-                            | DeviceImpact::Rebuild(project) => staged_state
-                                .projects
-                                .get(project)
-                                .is_some_and(|state| should_defer_device_publish(&state.graph)),
-                            _ => false,
-                        })
-                {
-                    // Deferred: leave the resident image at its last-published revision so the query
-                    // freshness check routes reads to host execution. The bookmark is intentionally
-                    // NOT advanced on the device — advancing it would let a stale resident image
-                    // answer queries. Rebuild is deferred too: an administrative graph mutation (e.g.
-                    // declaring a new relationship type on the first edge of a bulk seed) otherwise
-                    // rebuilds the whole resident image on the GPU under the apply lock, stalling the
-                    // write gate at million scale. On a large graph every read is on host anyway.
-                    // See `should_defer_device_publish`.
-                } else if let Err(error) = publish_execution_state_inner(
-                    &mut *execution,
-                    &mut staged_state,
-                    device_impact,
+                    false
+                }
+            };
+            if !reserved {
+                validate_sequencer_mutation(
+                    &state,
+                    &mutation,
                     entry.bookmark(),
-                    exclusive_project,
-                ) {
-                    // The resident is a derived execution image. The canonical state clone has
-                    // already passed deterministic validation, and the backend publishes staged
-                    // generations atomically, so a failed device delta leaves the old resident
-                    // intact. Commit the canonical write, leave the resident fence behind, and let
-                    // the off-path catch-up worker rebuild it. Poisoning the state machine here
-                    // turned one bad GPU byte into the loss of every database protocol.
-                    tracing::warn!(
-                        code = ?error.code,
-                        message = %error.message,
-                        bookmark = entry.index(),
-                        "resident publication failed; canonical mutation committed and off-path rebuild queued"
-                    );
+                    commit_time_nanos,
+                )?;
+            }
+            let result = (|| -> Result<MutationApplyResult> {
+                // Any error past this point is a local invariant/device/storage failure: in-place
+                // publication has begun and the preflight above already accepted the mutation.
+                let previous_broker_segments = broker_may_retire_segments.then(|| {
+                    state
+                        .broker
+                        .payload_segments()
+                        .into_iter()
+                        .collect::<BTreeSet<_>>()
+                });
+                let reply = apply_mutation(
+                    &mut state,
+                    mutation,
+                    entry.bookmark(),
+                    commit_time_nanos,
+                    Some(&database.0.segments),
+                )?;
+                let response = encode_database_value(&reply, "apply response")?;
+                let staged_state = &mut *state;
+                if let Some(previous_cursor) = broker_publish_cursor {
+                    committed_broker_segment = staged_state
+                        .broker
+                        .newest_payload_segment_after(previous_cursor);
+                }
+                staged_state.applied = entry.bookmark();
+                staged_state.last_payload_checksum = Some(entry.checksum());
+                staged_state.last_response = response.clone();
+                if let Some(request_id) = entry.request_id() {
+                    retain_request_result(
+                        staged_state,
+                        request_id,
+                        intent_digest,
+                        response.clone(),
+                    )?;
+                }
+                prune_request_results(staged_state)?;
+                if let Some(previous) = previous_broker_segments {
+                    let current = staged_state
+                        .broker
+                        .payload_segments()
+                        .into_iter()
+                        .collect::<BTreeSet<_>>();
+                    retired_broker_segments.extend(previous.difference(&current).cloned());
+                }
+                if let Some(project) = affected_project {
+                    database.publish_reader_project(staged_state, project);
+                    if let Some(previous_name) = &previous_project_name
+                        && staged_state.projects.get(&project).is_none_or(|live| {
+                            normalize_name(&live.display_name.get()) != *previous_name
+                        })
+                    {
+                        database.0.reader_names.pin().remove(previous_name);
+                    }
+                }
+                database.0.reader_bookmark.store(Arc::new(entry.bookmark()));
+                Ok(MutationApplyResult {
+                    response,
+                    duplicate: false,
+                })
+            })();
+            if let Err(error) = &result {
+                tracing::error!(
+                    code = ?error.code,
+                    message = %error.message,
+                    bookmark = entry.index(),
+                    "database state-machine apply invariant failed"
+                );
+                database.0.fatal_apply.store(true, Ordering::Release);
+            } else {
+                // The canonical graph mutation is committed. Release writer state before broker
+                // notification and segment reclamation.
+                drop(state);
+                if is_broker_mutation {
+                    database.0.broker_changes.send_replace(entry.index());
+                }
+                if let Some(descriptor) = committed_broker_segment {
+                    database
+                        .0
+                        .pending_broker_segments
+                        .lock()
+                        .remove(&descriptor);
+                }
+                if !retired_broker_segments.is_empty() {
+                    database
+                        .0
+                        .retired_broker_segments
+                        .lock()
+                        .extend(retired_broker_segments);
                 }
             }
-            if let Some(previous) = previous_broker_segments {
-                let current = staged_state
-                    .broker
-                    .payload_segments()
-                    .into_iter()
-                    .collect::<BTreeSet<_>>();
-                retired_broker_segments.extend(previous.difference(&current).cloned());
-            }
-            // This exact staged generation is the canonical publication boundary. The dedicated
-            // writer acknowledges it and persists the same ordered mutation on its background WAL
-            // path afterward; no full graph build appears on that delta path.
-            if let Some(project) = affected_project
-                && let Some(previous) = state.projects.get(&project)
-                && staged_state
-                    .projects
-                    .get(&project)
-                    .is_none_or(|next| !Arc::ptr_eq(previous, next))
-                && Arc::strong_count(previous) > 1
-            {
-                self.0
-                    .retired_project_views
-                    .lock()
-                    .entry(project)
-                    .or_default()
-                    .push(Arc::downgrade(previous));
-            }
-            *state = staged_state;
-            Ok(MutationApplyResult {
-                response,
-                duplicate: false,
-            })
-        })();
-        if let Err(error) = &result {
-            tracing::error!(
-                code = ?error.code,
-                message = %error.message,
-                bookmark = entry.index(),
-                "database state-machine apply invariant failed"
-            );
-            self.0.fatal_apply.store(true, Ordering::Release);
-        } else {
-            // The graph is now committed and resident. Release canonical state before broker
-            // notification and segment reclamation.
-            drop(state);
-            if is_broker_mutation {
-                self.0.broker_changes.send_replace(entry.index());
-            }
-            if let Some(descriptor) = committed_broker_segment {
-                self.0.pending_broker_segments.lock().remove(&descriptor);
-            }
-            if !retired_broker_segments.is_empty() {
-                self.0
-                    .retired_broker_segments
-                    .lock()
-                    .extend(retired_broker_segments);
-            }
-        }
-        result
+            result
+        })
+        .await
+        .map_err(|error| Error::internal(format!("apply_mutation worker failed: {error}")))?
     }
 
     async fn build_snapshot(
@@ -3779,257 +3702,6 @@ impl MutationStateBackend for Database {
     }
 }
 
-#[derive(Clone, Debug)]
-enum DeviceImpact {
-    None,
-    Create(ProjectId),
-    Rebuild(ProjectId),
-    Project {
-        project: ProjectId,
-        temporal: Vec<ResidentTemporalDelta>,
-        vectors: Vec<ResolvedVectorMutation>,
-        invalidate_derived: bool,
-    },
-    Drop(ProjectId),
-}
-
-fn device_impact(
-    mutation: &DatabaseMutation,
-    bookmark: Bookmark,
-    commit_time_nanos: i64,
-) -> DeviceImpact {
-    match mutation {
-        DatabaseMutation::CreateProject { id, .. } => DeviceImpact::Create(*id),
-        DatabaseMutation::Graph {
-            project,
-            graph,
-            temporal,
-            vectors,
-            administrative,
-            ..
-        } => {
-            if administrative.is_some() {
-                return DeviceImpact::Rebuild(*project);
-            }
-            let vector_delta = vectors
-                .iter()
-                .cloned()
-                .map(|mutation| retag_vector_mutation(mutation, bookmark.index))
-                .collect::<Vec<_>>();
-            DeviceImpact::Project {
-                project: *project,
-                temporal: temporal
-                    .iter()
-                    .cloned()
-                    .map(|mut mutation| {
-                        mutation.sample.sequence_index = bookmark.index;
-                        if mutation.uses_commit_time {
-                            mutation.sample.event_time_nanos = commit_time_nanos;
-                        }
-                        ResidentTemporalDelta {
-                            entity_kind: mutation.entity_kind,
-                            target: mutation.target,
-                            sample: mutation.sample,
-                        }
-                    })
-                    .collect(),
-                vectors: vector_delta,
-                invalidate_derived: !graph.is_empty(),
-            }
-        }
-        DatabaseMutation::DropProject { id, .. } => DeviceImpact::Drop(*id),
-        DatabaseMutation::EmbeddingProfile {
-            command: EmbeddingProfileCommand::Activate { project, .. },
-        } => DeviceImpact::Rebuild(*project),
-        DatabaseMutation::EmbeddingProfile {
-            command:
-                EmbeddingProfileCommand::Begin { .. }
-                | EmbeddingProfileCommand::Acknowledge { .. }
-                | EmbeddingProfileCommand::Abort { .. },
-        } => DeviceImpact::None,
-        DatabaseMutation::RenameProject { .. }
-        | DatabaseMutation::Broker { .. }
-        | DatabaseMutation::Security { .. } => DeviceImpact::None,
-    }
-}
-
-/// One-row mutations use the bounded sparse resident delta synchronously. A multi-row mutation is
-/// source/bulk work and never waits on GPU publication under the canonical apply mutex: the
-/// off-path worker builds and publishes a coherent latest resident generation after quiescence.
-/// This check reads only the current change journal, so its work tracks changed rows and never
-/// scales with unrelated graph content.
-fn should_defer_device_publish(graph: &GraphStore) -> bool {
-    graph
-        .change_ids(graph.revision())
-        .map(|changes| changes.nodes.len().saturating_add(changes.edges.len()) > 1)
-        .unwrap_or(true)
-}
-
-#[cfg(test)]
-fn publish_execution_state(
-    execution: &mut Option<Box<dyn ExecutionBackend>>,
-    state: &mut DatabaseState,
-    impact: DeviceImpact,
-    bookmark: Bookmark,
-) -> Result<()> {
-    publish_execution_state_inner(execution, state, impact, bookmark, None)
-}
-
-fn publish_execution_state_inner(
-    execution: &mut Option<Box<dyn ExecutionBackend>>,
-    state: &mut DatabaseState,
-    impact: DeviceImpact,
-    bookmark: Bookmark,
-    exclusive_project: Option<ProjectId>,
-) -> Result<()> {
-    let Some(execution) = execution.as_deref_mut() else {
-        return Ok(());
-    };
-    match impact {
-        DeviceImpact::None => {
-            execution.advance_bookmark(bookmark);
-            Ok(())
-        }
-        DeviceImpact::Drop(project) => {
-            execution.evict_project(project)?;
-            execution.advance_bookmark(bookmark);
-            Ok(())
-        }
-        DeviceImpact::Create(project) => {
-            let project_state = state.projects.get(&project).ok_or_else(|| {
-                Error::new(
-                    ErrorCode::CorruptStorage,
-                    "device publication references a missing project",
-                )
-            })?;
-            execution.admit_project(ResidentProjectImage::build(
-                project,
-                bookmark,
-                &project_state.graph,
-                &project_state.temporal,
-                &project_state.indexes,
-            )?)?;
-            rebind_shared_project(state, execution, project)?;
-            execution.advance_bookmark(bookmark);
-            Ok(())
-        }
-        DeviceImpact::Rebuild(project) => {
-            let project_state = state.projects.get(&project).ok_or_else(|| {
-                Error::new(
-                    ErrorCode::CorruptStorage,
-                    "device rebuild references a missing project",
-                )
-            })?;
-            execution.admit_project(ResidentProjectImage::build(
-                project,
-                bookmark,
-                &project_state.graph,
-                &project_state.temporal,
-                &project_state.indexes,
-            )?)?;
-            rebind_shared_project(state, execution, project)?;
-            execution.advance_bookmark(bookmark);
-            Ok(())
-        }
-        DeviceImpact::Project {
-            project,
-            temporal,
-            vectors,
-            invalidate_derived,
-        } => {
-            {
-                let project_state = state.projects.get(&project).ok_or_else(|| {
-                    Error::new(
-                        ErrorCode::CorruptStorage,
-                        "device publication references a missing project",
-                    )
-                })?;
-                let delta = ResidentProjectDelta {
-                    project,
-                    bookmark,
-                    graph: project_state.graph.device_delta(bookmark.index)?,
-                    temporal,
-                    vectors,
-                    invalidate_derived,
-                };
-                if exclusive_project == Some(project) {
-                    // SAFETY: apply retains the canonical state write lock. The old project
-                    // has no external Arc owners; ordinary readers also retain this lock for
-                    // their complete execution. The backend checks its own resident pins.
-                    #[allow(unsafe_code)]
-                    unsafe {
-                        execution.apply_project_delta_exclusive(delta)?;
-                    }
-                } else {
-                    execution.apply_project_delta(delta)?;
-                }
-            }
-            rebind_shared_project(state, execution, project)?;
-            execution.advance_bookmark(bookmark);
-            Ok(())
-        }
-    }
-}
-
-fn rebind_shared_project(
-    state: &mut DatabaseState,
-    execution: &dyn ExecutionBackend,
-    project: ProjectId,
-) -> Result<()> {
-    let Some(backing) = execution.shared_project_backing(project) else {
-        return Ok(());
-    };
-    let project = state.projects.get_mut(&project).ok_or_else(|| {
-        Error::new(
-            ErrorCode::CorruptStorage,
-            "shared device publication references a missing project",
-        )
-    })?;
-    let project = Arc::make_mut(project);
-    project.graph.rebind_shared(backing.graph)?;
-    project.temporal.rebind_shared(backing.temporal)?;
-    project.indexes.rebind_shared_vectors(backing.vectors)?;
-    // Rebinding changes physical ownership only. Exact count generations and shared empirical
-    // cost samples remain valid without expiring a cache and deferring a graph scan to a query.
-    refresh_optimizer_statistics(project);
-    Ok(())
-}
-
-/// Populates only vector definitions staged by the current administrative mutation. The state
-/// clone and old runtime remain private until every local build has either atomically published a
-/// validated generation or recorded a non-destructive FAILED/old-ONLINE outcome.
-fn populate_pending_vector_indexes(
-    state: &mut DatabaseState,
-    impact: &DeviceImpact,
-    backend: Option<&dyn ExecutionBackend>,
-) -> Result<()> {
-    let DeviceImpact::Rebuild(project) = impact else {
-        return Ok(());
-    };
-    let project = state.projects.get_mut(project).ok_or_else(|| {
-        Error::new(
-            ErrorCode::CorruptStorage,
-            "vector population references a missing project",
-        )
-    })?;
-    let project = Arc::make_mut(project);
-    let cancellation = tokio_util::sync::CancellationToken::new();
-    if let Some(backend) = backend {
-        project.indexes.rebuild_vectors_with(|source, config| {
-            backend.build_ivf_pq(source, config, &cancellation)
-        })?;
-    } else {
-        // No device has been bound, so this is the explicit semantic CPU fallback. Its governor
-        // still admits the deterministic build plan; there is no implicit GPU-to-host fallback.
-        let cpu = crate::gpu::CpuBackend::new(usize::MAX, 0);
-        project.indexes.rebuild_vectors_with(|source, config| {
-            cpu.build_ivf_pq(source, config, &cancellation)
-        })?;
-    }
-    project.optimizer_statistics = OnceLock::new();
-    Ok(())
-}
-
 impl Database {
     fn begin_transaction(
         &self,
@@ -4042,32 +3714,27 @@ impl Database {
             Error::new(ErrorCode::ProjectNotFound, "transaction requires a project")
         })?;
         let barrier = self.consistency_barrier(consistency, bookmark)?;
-        self.ensure_automatic_semantic(project)?;
-        let (snapshot, current_bookmark, execution) = self.capture_semantic_execution(project)?;
+        let (snapshot, current_bookmark) = self.capture_canonical_project(project)?;
         self.wait_for_captured_all(consistency, barrier, current_bookmark)?;
         let fence = self.current_transaction_fence(current_bookmark)?;
-        let deadline = Instant::now()
-            .checked_add(self.0.request_timeout)
-            .ok_or_else(|| Error::invalid_data("transaction deadline overflow"))?;
+        let deadline = if self.0.request_timeout.is_zero() {
+            None
+        } else {
+            Some(
+                Instant::now()
+                    .checked_add(self.0.request_timeout)
+                    .ok_or_else(|| Error::invalid_data("transaction deadline overflow"))?,
+            )
+        };
         let mut state = TransactionState {
             catalog: snapshot.graph.catalog().clone(),
             working: Arc::clone(&snapshot),
-            snapshot,
-            execution,
             bookmark: current_bookmark,
             consistency,
-            batches: crate::graph::PagedVec::default(),
+            batches: Vec::new(),
             accounted_bytes: 0,
         };
         state.accounted_bytes = MIN_TRANSACTION_ACCOUNTED_BYTES;
-        // The backend already tracks the admitted complete image. Reading that O(1) counter is
-        // essential here: rebuilding a project image merely to account a BEGIN would make
-        // transaction latency proportional to the entire database.
-        let pin_device_bytes = state
-            .execution
-            .as_deref()
-            .and_then(|execution| execution.resident_project_bytes(project))
-            .unwrap_or(0);
         let resource = Arc::new(TransactionResource {
             terminal: AtomicU8::new(0),
             lifecycle: Mutex::new(TransactionLifecycle::Active(state)),
@@ -4084,7 +3751,6 @@ impl Database {
                 project,
                 bookmark: current_bookmark,
             },
-            pin_device_bytes,
             deadline,
             fence,
             &resource,
@@ -4124,74 +3790,148 @@ impl Database {
     }
 }
 
-fn stage_transaction_project(
-    current: &ProjectState,
-    graph: &[GraphMutation],
-    temporal: &[crate::cypher::PreparedTemporalMutation],
-    vectors: &[ResolvedVectorMutation],
-    now_nanos: i64,
-) -> Result<ProjectState> {
-    let mut staged = current.clone();
-    staged.graph.begin_device_delta_batch();
-    for mutation in graph {
-        update_next_ids(&mut staged, mutation);
-        crate::graph::knowledge::validate_mutation(&staged.graph, mutation)?;
-        staged.indexes.before_graph_apply(&staged.graph, mutation)?;
-        staged.graph.apply(mutation.clone())?;
-        staged.indexes.after_graph_apply(&staged.graph, mutation)?;
-    }
-    for mutation in temporal {
-        staged.temporal.append(
-            mutation.entity_kind,
-            mutation.target,
-            mutation.sample.clone(),
-            now_nanos,
-        )?;
-    }
-    for mutation in vectors {
-        staged.indexes.apply_vector_mutation(mutation)?;
-    }
-    refresh_optimizer_statistics(&mut staged);
-    Ok(staged)
+fn embedding_owner_dependencies(
+    project: &ProjectState,
+    owner: super::embedding_jobs::EmbeddingOwner,
+) -> (Option<u64>, TransactionDependencies) {
+    let mut dependencies = TransactionDependencies::default();
+    let revision = match owner.kind {
+        crate::types::EntityKind::Node => {
+            let id = crate::NodeId(owner.entity_id);
+            let revision = project.graph.node(id).map(|row| row.revision());
+            dependencies.entities.insert(
+                crate::cypher::EntityDependency::Node(id),
+                revision.unwrap_or(0),
+            );
+            revision
+        }
+        crate::types::EntityKind::Relationship => {
+            let id = crate::EdgeId(owner.entity_id);
+            match project.graph.edge(id) {
+                Some(edge) => {
+                    let mut revision = edge.revision();
+                    dependencies
+                        .entities
+                        .insert(crate::cypher::EntityDependency::Relationship(id), revision);
+                    for node in [edge.source(), edge.target()] {
+                        let node_revision =
+                            project.graph.node(node).map_or(0, |row| row.revision());
+                        revision = revision.max(node_revision);
+                        dependencies
+                            .entities
+                            .insert(crate::cypher::EntityDependency::Node(node), node_revision);
+                    }
+                    Some(revision)
+                }
+                None => {
+                    dependencies
+                        .entities
+                        .insert(crate::cypher::EntityDependency::Relationship(id), 0);
+                    None
+                }
+            }
+        }
+    };
+    (revision, dependencies)
 }
 
-fn stage_transaction_execution(
-    current: Option<&dyn ExecutionBackend>,
-    project: ProjectId,
-    bookmark: Bookmark,
-    staged: &ProjectState,
-    graph_changed: bool,
-    temporal: &[crate::cypher::PreparedTemporalMutation],
-    vectors: &[ResolvedVectorMutation],
-) -> Result<Option<Box<dyn ExecutionBackend>>> {
-    let Some(current) = current else {
-        return Ok(None);
-    };
-    let mut next = current.pin_project(project)?;
-    if graph_changed || !temporal.is_empty() || !vectors.is_empty() {
-        let overlay_revision = bookmark.index.checked_add(1).ok_or_else(|| {
-            Error::new(
-                ErrorCode::GpuAdmissionFailure,
-                "transaction resident revision exhausted",
-            )
-        })?;
-        next.apply_project_overlay(ResidentProjectDelta {
-            project,
-            bookmark,
-            graph: staged.graph.device_delta(overlay_revision)?,
-            temporal: temporal
-                .iter()
-                .map(|mutation| ResidentTemporalDelta {
-                    entity_kind: mutation.entity_kind,
-                    target: mutation.target,
-                    sample: mutation.sample.clone(),
-                })
-                .collect(),
-            vectors: vectors.to_vec(),
-            invalidate_derived: graph_changed,
-        })?;
+fn embedding_changed_owners(
+    project: &ProjectState,
+    mutations: &[GraphMutation],
+) -> Result<(BTreeSet<crate::NodeId>, BTreeSet<crate::EdgeId>)> {
+    let (mut nodes, edges) =
+        crate::graph::semantic_affected_owners(&project.graph, &[], mutations)?;
+    let sources = project
+        .indexes
+        .embedding_definitions()
+        .map(|definition| definition.source_property)
+        .collect::<BTreeSet<_>>();
+    for mutation in mutations {
+        if let GraphMutation::SetNodeProperty { node, property, .. } = mutation
+            && sources.contains(property)
+        {
+            nodes.insert(*node);
+        }
     }
-    Ok(Some(next))
+    Ok((nodes, edges))
+}
+
+/// Keeps current embeddings fresh across excluded metadata changes without rerunning inference.
+/// Only a vector that already covered the previous owner state can advance its freshness stamp.
+fn embedding_freshness_updates(
+    project: &ProjectState,
+    mutations: &[GraphMutation],
+) -> Result<Vec<(super::embedding_jobs::EmbeddingOwner, String, u64)>> {
+    use super::embedding_jobs::EmbeddingOwner;
+    use crate::types::EntityKind;
+    let (dirty_nodes, dirty_edges) = embedding_changed_owners(project, mutations)?;
+    let mut candidates = BTreeSet::new();
+    for mutation in mutations {
+        match mutation {
+            GraphMutation::SetNodeProperty { node, .. } => {
+                candidates.insert(EmbeddingOwner {
+                    project: project.id,
+                    kind: EntityKind::Node,
+                    entity_id: node.0,
+                });
+                // Newly created owners have no prior embedding or canonical adjacency.
+                // Their inserted relationships are already covered by dirty_edges.
+                if project.graph.node(*node).is_some() {
+                    for edge in project.graph.incident_edge_ids(*node)? {
+                        candidates.insert(EmbeddingOwner {
+                            project: project.id,
+                            kind: EntityKind::Relationship,
+                            entity_id: edge.0,
+                        });
+                    }
+                }
+            }
+            GraphMutation::SetEdgeProperty { edge, .. } => {
+                candidates.insert(EmbeddingOwner {
+                    project: project.id,
+                    kind: EntityKind::Relationship,
+                    entity_id: edge.0,
+                });
+            }
+            _ => {}
+        }
+    }
+    let mut updates = Vec::new();
+    for owner in candidates {
+        let dirty = match owner.kind {
+            EntityKind::Node => dirty_nodes.contains(&crate::NodeId(owner.entity_id)),
+            EntityKind::Relationship => dirty_edges.contains(&crate::EdgeId(owner.entity_id)),
+        };
+        if dirty {
+            continue;
+        }
+        let Some(previous_revision) = embedding_owner_dependencies(project, owner).0 else {
+            continue;
+        };
+        let mut names = vec![match owner.kind {
+            EntityKind::Node => crate::graph::SEMANTIC_NODE_INDEX.to_owned(),
+            EntityKind::Relationship => crate::graph::SEMANTIC_RELATIONSHIP_INDEX.to_owned(),
+        }];
+        if owner.kind == EntityKind::Node {
+            names.extend(
+                project
+                    .indexes
+                    .embedding_definitions()
+                    .map(|definition| definition.name),
+            );
+        }
+        for name in names {
+            if let Some(revision) = project
+                .indexes
+                .vector_search_source(&name)
+                .and_then(|(index, _)| index.row_revision(owner.entity_id))
+                .filter(|revision| *revision >= previous_revision)
+            {
+                updates.push((owner, name, revision));
+            }
+        }
+    }
+    Ok(updates)
 }
 
 fn transaction_batch_bytes(batch: &TransactionBatch, limit: usize) -> Result<usize> {
@@ -4231,14 +3971,13 @@ impl QueryExecutor for Database {
         self.ensure_apply_healthy()?;
         if let Ok(id) = Uuid::parse_str(selector) {
             let project = ProjectId(id);
-            if self.0.state.read().projects.contains_key(&project) {
+            if self.0.reader_projects.pin().contains_key(&project) {
                 return Ok(project);
             }
         }
         self.0
-            .state
-            .read()
-            .names
+            .reader_names
+            .pin()
             .get(&normalize_name(selector))
             .copied()
             .ok_or_else(|| Error::new(ErrorCode::ProjectNotFound, "project does not exist"))
@@ -4249,10 +3988,10 @@ impl QueryExecutor for Database {
         request: QueryRequest,
         emit: &mut dyn FnMut(QueryStreamEvent) -> Result<()>,
     ) -> Result<()> {
-        let mut budget = QueryResultBudget::new(request.limits);
+        let mut statistics = QueryResultStatistics::new();
         self.execute_autocommit(request, &mut |mut event| {
-            budget.observe(&event)?;
-            budget.settle(&mut event);
+            statistics.observe(&event)?;
+            statistics.settle(&mut event);
             emit(event)
         })
     }
@@ -4279,12 +4018,10 @@ impl QueryExecutor for Database {
 
 struct TransactionState {
     catalog: crate::graph::NameCatalog,
-    snapshot: Arc<ProjectState>,
     working: Arc<ProjectState>,
-    execution: Option<Box<dyn ExecutionBackend>>,
     bookmark: Bookmark,
     consistency: CommitAcknowledgement,
-    batches: crate::graph::PagedVec<Arc<TransactionBatch>>,
+    batches: Vec<Arc<TransactionBatch>>,
     accounted_bytes: usize,
 }
 
@@ -4358,7 +4095,7 @@ struct DatabaseTransaction {
     project: ProjectId,
     connection: ConnectionId,
     fence: TransactionFence,
-    deadline: Instant,
+    deadline: Option<Instant>,
     resource: Arc<TransactionResource>,
 }
 
@@ -4392,7 +4129,7 @@ impl QueryTransaction for DatabaseTransaction {
         emit: &mut dyn FnMut(QueryStreamEvent) -> Result<()>,
     ) -> Result<()> {
         self.ensure_active()?;
-        let mut budget = QueryResultBudget::new(request.limits);
+        let mut statistics = QueryResultStatistics::new();
         if request
             .project_id
             .is_some_and(|project| project != self.project)
@@ -4411,6 +4148,16 @@ impl QueryTransaction for DatabaseTransaction {
         };
         let provisional = state.bookmark.index.saturating_add(1);
         let text_embedding = self.database.0.text_embedding.read().clone();
+        let prior_graph = state
+            .batches
+            .iter()
+            .flat_map(|batch| batch.graph_mutations.iter().cloned())
+            .collect::<Vec<_>>();
+        let prior_temporal = state
+            .batches
+            .iter()
+            .flat_map(|batch| batch.temporal_mutations.iter().cloned())
+            .collect::<Vec<_>>();
         let output = execute_on_project_inner(
             &state.working,
             &request,
@@ -4418,7 +4165,8 @@ impl QueryTransaction for DatabaseTransaction {
             provisional,
             full_capabilities(),
             text_embedding.as_deref(),
-            state.execution.as_deref(),
+            &prior_graph,
+            &prior_temporal,
             None,
         )?;
         if output.administrative.is_some() {
@@ -4427,29 +4175,7 @@ impl QueryTransaction for DatabaseTransaction {
                 "schema and index DDL is autocommit-only",
             ));
         }
-        let vectors = resolve_embedding_mutations(
-            &state.working,
-            &[],
-            &output.graph_mutations,
-            text_embedding.as_deref(),
-            provisional,
-        )?;
-        let working = Arc::new(stage_transaction_project(
-            &state.working,
-            &output.graph_mutations,
-            &output.temporal_mutations,
-            &vectors,
-            unix_nanos(SystemTime::now())?,
-        )?);
-        let execution = stage_transaction_execution(
-            state.execution.as_deref(),
-            self.project,
-            state.bookmark,
-            &working,
-            !output.graph_mutations.is_empty(),
-            &output.temporal_mutations,
-            &vectors,
-        )?;
+        let vectors = Vec::new();
         let batch = Arc::new(TransactionBatch {
             dependencies: output.dependencies,
             graph_mutations: output.graph_mutations,
@@ -4468,29 +4194,15 @@ impl QueryTransaction for DatabaseTransaction {
                     "transaction retained bytes overflow",
                 )
             })?;
-        let mut next = TransactionState {
-            catalog: working.graph.catalog().clone(),
-            snapshot: Arc::clone(&state.snapshot),
-            working,
-            execution,
-            bookmark: state.bookmark,
-            consistency: state.consistency,
-            batches: state.batches.clone(),
-            accounted_bytes: next_bytes,
-        };
-        next.batches.push(batch);
-        self.database
-            .0
-            .transactions
-            .resize(self.id, next.accounted_bytes)?;
+        self.database.0.transactions.resize(self.id, next_bytes)?;
         let emitted = emit_result(
             request.request_id,
             output.result,
-            &next.catalog,
-            &next.working.indexes,
+            &state.catalog,
+            &state.working.indexes,
             &mut |mut event| {
-                budget.observe(&event)?;
-                budget.settle(&mut event);
+                statistics.observe(&event)?;
+                statistics.settle(&mut event);
                 emit(event)
             },
         );
@@ -4514,7 +4226,8 @@ impl QueryTransaction for DatabaseTransaction {
                 TransactionTerminal::SequencerChanged => transaction_sequencer_changed_error(),
             });
         }
-        *state = next;
+        state.batches.push(batch);
+        state.accounted_bytes = next_bytes;
         Ok(())
     }
 
@@ -4595,8 +4308,13 @@ impl DatabaseTransaction {
             .collect::<Vec<_>>();
         let timeout = self
             .deadline
-            .checked_duration_since(Instant::now())
-            .ok_or_else(transaction_expired)?;
+            .map(|deadline| {
+                deadline
+                    .checked_duration_since(Instant::now())
+                    .ok_or_else(transaction_expired)
+            })
+            .transpose()?
+            .unwrap_or(Duration::ZERO);
         let committed = self.database.commit_scoped_with_timeout_from(
             DatabaseMutation::Graph {
                 project: self.project,
@@ -4647,16 +4365,16 @@ impl Database {
         &self,
         read: &crate::broker::PartitionRead<'_>,
     ) -> Result<(u64, Vec<(u64, Arc<crate::broker::PayloadRecord>)>)> {
-        let state = self.0.state.read();
-        if !state.projects.contains_key(&read.project) {
+        if !self.0.reader_projects.pin().contains_key(&read.project) {
             return Err(Error::new(
                 ErrorCode::ProjectNotFound,
                 "project does not exist",
             ));
         }
-        // Keeping the publication read lock also prevents payload reclamation until the bounded
-        // load completes. No data from another publication enters this page or watermark.
-        state.broker.fetch_partition_bounded(read, &self.0.segments)
+        self.0
+            .reader_broker
+            .load()
+            .fetch_partition_bounded(read, &self.0.segments)
     }
 }
 
@@ -4700,7 +4418,7 @@ impl BrokerCoordinator for Database {
             None,
             AdmissionClass::Broker,
             wait,
-            Duration::from_millis(u64::from(timeout_millis.max(1))),
+            Duration::from_millis(u64::from(timeout_millis)),
             connection,
             None,
         )?;
@@ -4715,7 +4433,7 @@ impl BrokerCoordinator for Database {
     }
 
     fn snapshot(&self) -> Result<BrokerStateMachine> {
-        Ok((*self.0.state.read().broker).clone())
+        Ok(self.0.reader_broker.load().as_ref().clone())
     }
 
     fn reclaim_payload_storage(&self) -> Result<u64> {
@@ -4749,11 +4467,11 @@ impl BrokerCoordinator for Database {
     }
 
     fn projects_with_state(&self) -> Result<BTreeSet<ProjectId>> {
-        Ok(self.0.state.read().broker.projects_with_state())
+        Ok(self.0.reader_broker.load().projects_with_state())
     }
 
     fn topic_metadata(&self, project: ProjectId) -> Result<Vec<(String, usize)>> {
-        Ok(self.0.state.read().broker.topic_metadata(project))
+        Ok(self.0.reader_broker.load().topic_metadata(project))
     }
 
     fn committed_offset(
@@ -4765,9 +4483,8 @@ impl BrokerCoordinator for Database {
     ) -> Result<Option<u64>> {
         Ok(self
             .0
-            .state
-            .read()
-            .broker
+            .reader_broker
+            .load()
             .committed_offset(project, group, topic, partition))
     }
 
@@ -4779,11 +4496,9 @@ impl BrokerCoordinator for Database {
     ) -> Result<Option<String>> {
         Ok(self
             .0
-            .state
-            .read()
-            .broker
-            .group_leader(project, group, generation)
-            .map(str::to_owned))
+            .reader_broker
+            .load()
+            .group_leader(project, group, generation))
     }
 
     fn group_assignment(
@@ -4795,9 +4510,8 @@ impl BrokerCoordinator for Database {
     ) -> Result<Option<Vec<u8>>> {
         Ok(self
             .0
-            .state
-            .read()
-            .broker
+            .reader_broker
+            .load()
             .group_assignment(project, group, generation, member))
     }
 
@@ -4810,8 +4524,7 @@ impl BrokerCoordinator for Database {
         maximum_bytes: usize,
     ) -> Result<Vec<(u64, Arc<crate::broker::PayloadRecord>)>> {
         let (broker, _pins) = {
-            let state = self.0.state.read();
-            let broker = (*state.broker).clone();
+            let broker = self.0.reader_broker.load().as_ref().clone();
             let descriptors = broker.partition_fetch_segment_descriptors(
                 project,
                 topic,
@@ -4843,9 +4556,8 @@ impl BrokerCoordinator for Database {
         timestamp: i64,
     ) -> Result<Option<(u64, i64)>> {
         self.0
-            .state
-            .read()
-            .broker
+            .reader_broker
+            .load()
             .list_offset(project, topic, partition, timestamp)
     }
 
@@ -4854,7 +4566,7 @@ impl BrokerCoordinator for Database {
         project: ProjectId,
         name: &str,
     ) -> Result<Option<crate::broker::QueueInfo>> {
-        Ok(self.0.state.read().broker.queue_info(project, name))
+        Ok(self.0.reader_broker.load().queue_info(project, name))
     }
 
     fn fetch_stream_queue(
@@ -4867,8 +4579,7 @@ impl BrokerCoordinator for Database {
         automatic_ack: bool,
     ) -> Result<Vec<crate::broker::Delivery>> {
         let (broker, _pins) = {
-            let state = self.0.state.read();
-            let broker = (*state.broker).clone();
+            let broker = self.0.reader_broker.load().as_ref().clone();
             let descriptors =
                 broker.stream_queue_fetch_segment_descriptors(project, queue, offset, maximum)?;
             let pins = descriptors
@@ -4896,7 +4607,6 @@ fn execute_on_project(
     mutation_revision: u64,
     capabilities: BindCapabilities,
     text_embedding: Option<&dyn TextEmbedding>,
-    backend: Option<&dyn ExecutionBackend>,
 ) -> Result<ExecutionOutput> {
     execute_on_project_inner(
         project,
@@ -4905,7 +4615,8 @@ fn execute_on_project(
         mutation_revision,
         capabilities,
         text_embedding,
-        backend,
+        &[],
+        &[],
         None,
     )
 }
@@ -4918,7 +4629,6 @@ fn execute_on_project_streaming(
     mutation_revision: u64,
     capabilities: BindCapabilities,
     text_embedding: Option<&dyn TextEmbedding>,
-    backend: Option<&dyn ExecutionBackend>,
     emit: &mut dyn FnMut(ExecutionStreamItem) -> Result<()>,
 ) -> Result<ExecutionOutput> {
     execute_on_project_inner(
@@ -4928,7 +4638,8 @@ fn execute_on_project_streaming(
         mutation_revision,
         capabilities,
         text_embedding,
-        backend,
+        &[],
+        &[],
         Some(emit),
     )
 }
@@ -4941,7 +4652,8 @@ fn execute_on_project_inner(
     mutation_revision: u64,
     capabilities: BindCapabilities,
     text_embedding: Option<&dyn TextEmbedding>,
-    backend: Option<&dyn ExecutionBackend>,
+    prior_graph_mutations: &[GraphMutation],
+    prior_temporal_mutations: &[crate::cypher::PreparedTemporalMutation],
     stream: Option<&mut dyn FnMut(ExecutionStreamItem) -> Result<()>>,
 ) -> Result<ExecutionOutput> {
     let parameters = request
@@ -4949,34 +4661,48 @@ fn execute_on_project_inner(
         .iter()
         .map(|(name, value)| json_to_result(value).map(|value| (name.clone(), value)))
         .collect::<Result<BTreeMap<_, _>>>()?;
-    let vector_indexes = project
+    let vector_sources = project
         .indexes
         .definitions()
         .filter_map(|definition| {
             project
                 .indexes
                 .vector_search_source(&definition.name)
-                .map(|(exact, approximate)| {
-                    (
-                        definition.name.clone(),
-                        crate::cypher::VectorSearchSource {
-                            property: definition.properties[0],
-                            exact,
-                            approximate,
-                            profile_hash: project
-                                .indexes
-                                .profile()
-                                .map_or([0_u8; 32], |profile| profile.profile_hash),
-                        },
-                    )
-                })
+                .map(|(exact, approximate)| (definition, exact, approximate))
+        })
+        .collect::<Vec<_>>();
+    let profile_hash = project
+        .indexes
+        .profile()
+        .map_or([0_u8; 32], |profile| profile.profile_hash);
+    let vector_indexes = vector_sources
+        .iter()
+        .map(|(definition, exact, approximate)| {
+            (
+                definition.name.clone(),
+                crate::cypher::VectorSearchSource {
+                    property: definition.properties[0],
+                    exact: exact.as_ref(),
+                    approximate: approximate.as_deref(),
+                    profile_hash,
+                },
+            )
         })
         .collect();
     let binding_catalog = project.graph.catalog();
-    let prior_graph_mutations = &[][..];
-    let prior_temporal_mutations = &[][..];
-    let next_node_id = project.next_node_id;
-    let next_edge_id = project.next_edge_id;
+    let mut next_node_id = project.next_node_id.get();
+    let mut next_edge_id = project.next_edge_id.get();
+    for mutation in prior_graph_mutations {
+        match mutation {
+            GraphMutation::InsertNode(input) => {
+                next_node_id = next_node_id.max(input.id.0.saturating_add(1))
+            }
+            GraphMutation::InsertEdge(input) => {
+                next_edge_id = next_edge_id.max(input.id.0.saturating_add(1))
+            }
+            _ => {}
+        }
+    }
     // Every route supplies current count statistics. Omitting them makes the planner collect
     // the whole graph on a plan-cache miss, including a host-routed point write.
     let optimizer_statistics = project.optimizer_statistics.get_or_init(|| {
@@ -4994,10 +4720,9 @@ fn execute_on_project_inner(
         prior_temporal_mutations,
         vector_indexes,
         scalar_indexes: Some(&project.indexes),
-        text_embedding: project
-            .indexes
-            .profile()
-            .and_then(|profile| text_embedding.filter(|embedding| embedding.profile() == profile)),
+        text_embedding: project.indexes.profile().and_then(|profile| {
+            text_embedding.filter(|embedding| embedding.profile() == profile.as_ref())
+        }),
         parameters,
         bookmark,
         mutation_revision,
@@ -5005,23 +4730,12 @@ fn execute_on_project_inner(
         resolved_query_at_time_nanos: None,
         next_node_id,
         next_edge_id,
-        predicate_versions: (*project.predicate_versions).clone(),
+        predicate_versions: project.predicate_versions.clone(),
         capabilities,
-        // The device row budget only bounds operators whose GPU command-buffer scratch is sized by
-        // it. Push it to what the device can actually hold: the host backend has no command buffer
-        // (its only limit is system memory), and a GPU is scaled to its admitted working set — so a
-        // high-VRAM / large unified-memory machine gets a proportionally larger budget instead of a
-        // fixed constant. A device with less headroom gets a smaller budget; admission never invents
-        // capacity merely to preserve a historical test floor.
-        max_result_rows: match backend {
-            Some(backend) if backend.kind() != crate::gpu::BackendKind::Cpu => {
-                (backend.available_query_scratch_bytes() / DEVICE_SCRATCH_BYTES_PER_ROW).max(1)
-            }
-            _ => HOST_QUERY_EXECUTION_ROW_ADDRESS_SPACE,
-        },
+        max_result_rows: HOST_QUERY_EXECUTION_ROW_ADDRESS_SPACE,
         max_batch_rows: QUERY_STREAM_BATCH_ROWS,
         optimizer_statistics: Some(optimizer_statistics.as_ref()),
-        backend,
+        backend: None,
         cancellation: request.cancellation.clone(),
         deadline: request.deadline,
     };
@@ -5032,16 +4746,6 @@ fn execute_on_project_inner(
 }
 
 pub(super) fn apply_mutation(
-    state: &mut DatabaseState,
-    mutation: DatabaseMutation,
-    bookmark: Bookmark,
-    commit_time_nanos: i64,
-    segments: Option<&SegmentStore>,
-) -> Result<Option<BrokerReply>> {
-    apply_mutation_inner(state, mutation, bookmark, commit_time_nanos, segments)
-}
-
-fn apply_mutation_speculative(
     state: &mut DatabaseState,
     mutation: DatabaseMutation,
     bookmark: Bookmark,
@@ -5073,15 +4777,15 @@ fn apply_mutation_inner(
                 id,
                 Arc::new(ProjectState {
                     id,
-                    display_name,
-                    graph: GraphStore::default().into(),
-                    temporal: TemporalStore::default().into(),
-                    predicate_versions: BTreeMap::new().into(),
-                    indexes: IndexCatalog::default().into(),
-                    next_node_id: 1,
-                    next_edge_id: 1,
-                    authority_revision: bookmark.index,
-                    optimizer_statistics: OnceLock::new(),
+                    display_name: display_name.into(),
+                    graph: GraphStore::default(),
+                    temporal: TemporalStore::default(),
+                    predicate_versions: BTreeMap::new(),
+                    indexes: IndexCatalog::default(),
+                    next_node_id: 1.into(),
+                    next_edge_id: 1.into(),
+                    authority_revision: bookmark.index.into(),
+                    optimizer_statistics: OnceLock::new().into(),
                 }),
             );
             Ok(None)
@@ -5103,9 +4807,11 @@ fn apply_mutation_inner(
                 .projects
                 .get_mut(&id)
                 .ok_or_else(|| Error::new(ErrorCode::ProjectNotFound, "project does not exist"))?;
-            let project = Arc::make_mut(project);
-            state.names.remove(&normalize_name(&project.display_name));
-            project.display_name = display_name;
+            let project = project.as_ref();
+            state
+                .names
+                .remove(&normalize_name(&project.display_name.get()));
+            project.display_name.set(display_name);
             state.names.insert(normalized, id);
             Ok(None)
         }
@@ -5120,7 +4826,9 @@ fn apply_mutation_inner(
                 .projects
                 .remove(&id)
                 .ok_or_else(|| Error::new(ErrorCode::ProjectNotFound, "project does not exist"))?;
-            state.names.remove(&normalize_name(&project.display_name));
+            state
+                .names
+                .remove(&normalize_name(&project.display_name.get()));
             state.broker.drop_project(id)?;
             Ok(None)
         }
@@ -5136,7 +4844,13 @@ fn apply_mutation_inner(
                 .projects
                 .get_mut(&project)
                 .ok_or_else(|| Error::new(ErrorCode::ProjectFenced, "project does not exist"))?;
-            let project_state = Arc::make_mut(project_state);
+            let project_state = project_state.as_ref();
+            let changes_graph =
+                !graph.is_empty() || !temporal.is_empty() || administrative.is_some();
+            project_state
+                .indexes
+                .bind_catalog_graph(&project_state.graph);
+            let freshness = embedding_freshness_updates(project_state, &graph)?;
             for mutation in graph {
                 let mutation = retag_graph_mutation(mutation, bookmark.index);
                 update_next_ids(project_state, &mutation);
@@ -5147,6 +4861,18 @@ fn apply_mutation_inner(
                 project_state
                     .indexes
                     .after_graph_apply(&project_state.graph, &mutation)?;
+            }
+            for (owner, index, previous_vector_revision) in freshness {
+                if let (Some(index), Some(revision)) = (
+                    project_state.indexes.vector_search_source(&index),
+                    embedding_owner_dependencies(project_state, owner).0,
+                ) {
+                    index.0.advance_row_revision(
+                        owner.entity_id,
+                        previous_vector_revision,
+                        revision,
+                    );
+                }
             }
             for mut mutation in temporal {
                 mutation.sample.sequence_index = bookmark.index;
@@ -5168,15 +4894,15 @@ fn apply_mutation_inner(
                 )?;
             }
             for mutation in vectors {
-                project_state
-                    .indexes
-                    .apply_vector_mutation(&retag_vector_mutation(mutation, bookmark.index))?;
+                project_state.indexes.apply_vector_mutation_from_graph(
+                    &project_state.graph,
+                    &retag_vector_mutation(mutation, bookmark.index),
+                )?;
             }
-            for version in project_state.predicate_versions.values_mut() {
-                *version = bookmark.index;
+            if changes_graph {
+                project_state.authority_revision.set(bookmark.index);
+                refresh_optimizer_statistics(project_state);
             }
-            project_state.authority_revision = bookmark.index;
-            refresh_optimizer_statistics(project_state);
             Ok(None)
         }
         DatabaseMutation::Broker { command } => {
@@ -5197,9 +4923,12 @@ fn apply_mutation_inner(
             Ok(None)
         }
         DatabaseMutation::Security { command } => {
-            state.security =
-                staged_security_command(state, &command, bookmark, commit_time_nanos / 1_000_000)?
-                    .into();
+            apply_security_command(
+                &state.security,
+                &command,
+                bookmark,
+                commit_time_nanos / 1_000_000,
+            )?;
             Ok(None)
         }
     }
@@ -5207,7 +4936,7 @@ fn apply_mutation_inner(
 
 type StagedEmbeddingProfile = (
     Option<EmbeddingProfileActivation>,
-    Option<(ProjectId, IndexCatalog)>,
+    Option<(ProjectId, crate::graph::EmbeddingProfile)>,
 );
 
 fn staged_embedding_profile_command(
@@ -5288,9 +5017,8 @@ fn staged_embedding_profile_command(
                 .projects
                 .get(project)
                 .ok_or_else(|| Error::new(ErrorCode::ProjectNotFound, "project does not exist"))?;
-            let mut indexes = (*project_state.indexes).clone();
-            indexes.activate_profile(profile)?;
-            activated = Some((*project, indexes));
+            project_state.indexes.validate_activate_profile(&profile)?;
+            activated = Some((*project, profile));
         }
         EmbeddingProfileCommand::Abort {
             project,
@@ -5334,47 +5062,65 @@ fn apply_embedding_profile_command(
     command: &EmbeddingProfileCommand,
 ) -> Result<()> {
     let (activation, activated) = staged_embedding_profile_command(state, command)?;
-    if let Some((project, indexes)) = activated {
+    if let Some((project, profile)) = activated {
         let project_state = state.projects.get_mut(&project).ok_or_else(|| {
             Error::new(ErrorCode::CorruptStorage, "activated project disappeared")
         })?;
-        Arc::make_mut(project_state).indexes = indexes.into();
+        project_state.indexes.activate_profile(profile)?;
     }
     state.embedding_activation = activation;
     Ok(())
 }
 
-fn staged_security_command(
-    state: &DatabaseState,
+fn apply_security_command(
+    security: &SecurityState,
     command: &SecurityCommand,
     bookmark: Bookmark,
     now_millis: i64,
-) -> Result<SecurityState> {
-    let mut security = (*state.security).clone();
+) -> Result<()> {
     match command {
         SecurityCommand::RegisterCredential { record } => security
-            .client_credentials_mut()
+            .client_credentials()
             .register(record.clone(), now_millis)?,
         SecurityCommand::RotateCredential {
             old_fingerprint,
             replacement,
-        } => security.client_credentials_mut().rotate(
+        } => security.client_credentials().rotate(
             *old_fingerprint,
             replacement.clone(),
             bookmark.index,
             now_millis,
         )?,
         SecurityCommand::RevokeCredential { fingerprint } => security
-            .client_credentials_mut()
+            .client_credentials()
             .revoke(*fingerprint, bookmark.index)?,
         SecurityCommand::CleanupExpired => {
-            security
-                .client_credentials_mut()
-                .cleanup_expired(now_millis);
+            security.client_credentials().cleanup_expired(now_millis);
         }
     }
-    security.validate()?;
-    Ok(security)
+    Ok(())
+}
+
+fn validate_security_command(
+    security: &SecurityState,
+    command: &SecurityCommand,
+    bookmark: Bookmark,
+    now_millis: i64,
+) -> Result<()> {
+    let credentials = security.client_credentials();
+    match command {
+        SecurityCommand::RegisterCredential { record } => {
+            credentials.validate_register(record, now_millis)
+        }
+        SecurityCommand::RotateCredential {
+            old_fingerprint,
+            replacement,
+        } => credentials.validate_rotate(*old_fingerprint, replacement, bookmark.index, now_millis),
+        SecurityCommand::RevokeCredential { fingerprint } => {
+            credentials.validate_revoke(*fingerprint, bookmark.index)
+        }
+        SecurityCommand::CleanupExpired => Ok(()),
+    }
 }
 
 fn validate_resolved_database_command(
@@ -5383,7 +5129,8 @@ fn validate_resolved_database_command(
     position: Bookmark,
 ) -> Result<DatabaseMutation> {
     command.validate()?;
-    let mutation = decode_database_mutation(&command.payload)?;
+    let mut mutation = decode_database_mutation(&command.payload)?;
+    resolve_sequencer_values(&mut mutation, command.commit_time_millis)?;
     validate_database_envelope(command.kind, command.project_id, &mutation)?;
     if state.applied.index.checked_add(1) != Some(position.index) {
         return Err(Error::retryable(
@@ -5406,155 +5153,13 @@ fn validate_resolved_database_command(
         }
         return Ok(mutation);
     }
-    let reply = validate_sequencer_mutation(
+    validate_sequencer_mutation(
         state,
         &mutation,
         position,
         millis_to_nanos(command.commit_time_millis)?,
     )?;
-    let response = encode_database_value(&reply, "validated apply response")?;
-    if response.len() > MAX_SINGLE_REQUEST_RESULT_BYTES {
-        return Err(Error::new(
-            ErrorCode::ResultBudgetExceeded,
-            "mutation response exceeds the durable result bound",
-        ));
-    }
     Ok(mutation)
-}
-
-#[cfg(test)]
-fn stage_ordered_database_command(
-    base: &DatabaseState,
-    command: &WriteCommand,
-    mutation: DatabaseMutation,
-    position: Bookmark,
-    segments: &SegmentStore,
-) -> Result<DatabaseState> {
-    let intent_digest = request_intent_digest(&mutation)?;
-    stage_ordered_database_command_with_digest(
-        base,
-        command,
-        mutation,
-        position,
-        segments,
-        intent_digest,
-    )
-}
-
-fn stage_ordered_database_command_with_digest(
-    base: &DatabaseState,
-    command: &WriteCommand,
-    mutation: DatabaseMutation,
-    position: Bookmark,
-    segments: &SegmentStore,
-    intent_digest: [u8; 32],
-) -> Result<DatabaseState> {
-    if !matches!(
-        mutation,
-        DatabaseMutation::Graph { .. } | DatabaseMutation::Broker { .. }
-    ) {
-        return Err(Error::internal(
-            "only graph and broker mutations may enter the ordered pending-state overlay",
-        ));
-    }
-    if base.applied.index.checked_add(1) != Some(position.index) {
-        return Err(Error::retryable(
-            ErrorCode::WriteAdmissionFull,
-            "ordered database state is not the reservation predecessor",
-            Some(1),
-        ));
-    }
-    let mut staged = base.clone();
-    // The digest covers the planned mutation — allocated node/edge ids and the planning snapshot
-    // included — so only a command-level retry of the same planned write replays. A client
-    // re-issuing even a byte-identical statement plans a new mutation and lands here: reuse of a
-    // request ID across /api/query calls is always this error, never a silent success.
-    if let Some(request_id) = command.request_id
-        && let Some(record) = staged.request_results.get(&request_id)
-    {
-        if record.intent_digest != intent_digest {
-            return Err(Error::new(
-                ErrorCode::ProtocolViolation,
-                "request ID was already reserved for a different mutation: the request ID is an \
-                 idempotency key, and every new mutation needs its own fresh UUID (a reused or nil \
-                 ID fails every write after the first)",
-            ));
-        }
-        staged.applied = position;
-        staged.last_payload_checksum = None;
-        staged.last_response = record.response.clone().into();
-        prune_request_results(&mut staged)?;
-        return Ok(staged);
-    }
-
-    let commit_time_nanos = millis_to_nanos(command.commit_time_millis)?;
-    validate_sequencer_mutation(&staged, &mutation, position, commit_time_nanos)?;
-    let reply = apply_mutation_speculative(
-        &mut staged,
-        mutation,
-        position,
-        commit_time_nanos,
-        Some(segments),
-    )?;
-    let response = encode_database_value(&reply, "ordered mutation response")?;
-    if response.len() > MAX_SINGLE_REQUEST_RESULT_BYTES {
-        return Err(Error::new(
-            ErrorCode::ResultBudgetExceeded,
-            "ordered mutation response exceeds the durable result bound",
-        ));
-    }
-    staged.applied = position;
-    staged.last_payload_checksum = None;
-    staged.last_response = response.clone().into();
-    if let Some(request_id) = command.request_id {
-        retain_request_result(&mut staged, request_id, intent_digest, response)?;
-    }
-    prune_request_results(&mut staged)?;
-    Ok(staged)
-}
-
-fn retain_pending_broker_segments(
-    database: &DatabaseInner,
-    owner: Uuid,
-    descriptors: &[SegmentDescriptor],
-) -> Result<()> {
-    let mut retained = database.pending_broker_segments.lock();
-    let mut processed = Vec::new();
-    for descriptor in descriptors {
-        let result = if let Some(existing) = retained.get_mut(descriptor) {
-            existing.owners.insert(owner);
-            Ok(())
-        } else {
-            database.segments.pin(descriptor).map(|pin| {
-                retained.insert(
-                    descriptor.clone(),
-                    PendingBrokerSegment {
-                        _pin: pin,
-                        owners: BTreeSet::from([owner]),
-                    },
-                );
-            })
-        };
-        if let Err(error) = result {
-            for processed in processed {
-                let remove = retained.get_mut(&processed).is_some_and(|record| {
-                    record.owners.remove(&owner);
-                    record.owners.is_empty()
-                });
-                if remove {
-                    retained.remove(&processed);
-                }
-            }
-            drop(retained);
-            database
-                .retired_broker_segments
-                .lock()
-                .extend(descriptors.iter().cloned());
-            return Err(error);
-        }
-        processed.push(descriptor.clone());
-    }
-    Ok(())
 }
 
 fn release_pending_broker_segments(
@@ -5638,9 +5243,10 @@ fn validate_sequencer_mutation(
         DatabaseMutation::Graph {
             project,
             validation,
+            graph,
             temporal,
+            vectors,
             administrative,
-            ..
         } => {
             validate_mutation_plan(validation)?;
             if validation.snapshot.index > state.applied.index {
@@ -5659,6 +5265,37 @@ fn validate_sequencer_mutation(
                 project_state,
                 validation.snapshot.index,
             )?;
+            project_state
+                .graph
+                .validate_mutations_at_revision(graph, bookmark.index)?;
+            crate::graph::knowledge::validate_batch(&project_state.graph, graph)?;
+            project_state
+                .indexes
+                .validate_graph_mutations(&project_state.graph, graph)?;
+            match administrative {
+                Some(AdministrativeMutation::InitializeSemantic { profile, .. }) => project_state
+                    .indexes
+                    .validate_vector_mutations_with_planned_columns(
+                        vectors,
+                        Some(profile),
+                        &[
+                            crate::graph::SEMANTIC_NODE_PROPERTY,
+                            crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY,
+                        ],
+                    )?,
+                Some(AdministrativeMutation::CreateEmbedding {
+                    profile,
+                    target_property,
+                    ..
+                }) => project_state
+                    .indexes
+                    .validate_vector_mutations_with_planned_columns(
+                        vectors,
+                        Some(profile),
+                        &[*target_property],
+                    )?,
+                _ => project_state.indexes.validate_vector_mutations(vectors)?,
+            }
             for mutation in temporal {
                 let mut sample = mutation.sample.clone();
                 sample.sequence_index = bookmark.index;
@@ -5673,8 +5310,7 @@ fn validate_sequencer_mutation(
                 )?;
             }
             if let Some(administrative) = administrative {
-                let mut staged = project_state.as_ref().clone();
-                apply_administrative(&mut staged, administrative.clone(), commit_time_nanos)?;
+                validate_administrative(project_state, administrative, graph)?;
             }
             Ok(None)
         }
@@ -5693,7 +5329,12 @@ fn validate_sequencer_mutation(
             Ok(None)
         }
         DatabaseMutation::Security { command } => {
-            staged_security_command(state, command, bookmark, commit_time_nanos / 1_000_000)?;
+            validate_security_command(
+                &state.security,
+                command,
+                bookmark,
+                commit_time_nanos / 1_000_000,
+            )?;
             Ok(None)
         }
     }
@@ -5714,12 +5355,6 @@ fn retain_request_result(
                 "idempotency result changed for an existing request ID",
             ))
         };
-    }
-    if response.len() > MAX_SINGLE_REQUEST_RESULT_BYTES {
-        return Err(Error::new(
-            ErrorCode::ResultBudgetExceeded,
-            "committed response exceeds the idempotency-result bound",
-        ));
     }
     if state
         .request_result_order
@@ -5755,10 +5390,12 @@ fn build_database_snapshot_file(
     bookmark: Bookmark,
     destination: &Path,
 ) -> Result<BackendSnapshot> {
-    // Freeze the canonical Arc-backed project roots and pin broker payload segments while holding
-    // the publication lock. Encoding and file IO then run without blocking mutation apply.
+    // Checkpoints represent an exact committed WAL prefix. Pause mutation application while
+    // streaming the canonical state; do not create an in-memory graph generation for encoding.
+    // Canonical concurrent graph readers do not acquire this writer ordering gate.
+    let _apply = database.0.apply.lock();
     let (state, segment_pins) = {
-        let _apply = database.0.apply.lock();
+        database.ensure_apply_healthy()?;
         let state = database.0.state.read();
         if state.applied != bookmark {
             return Err(Error::new(
@@ -5766,10 +5403,8 @@ fn build_database_snapshot_file(
                 "database state does not exactly match the requested snapshot bookmark",
             ));
         }
-        validate_database_state(&state)?;
-        let frozen = state.clone();
         let mut segment_pins = BTreeMap::<[u8; 32], (SegmentDescriptor, SegmentPin)>::new();
-        for descriptor in frozen.broker.payload_segments() {
+        for descriptor in state.broker.payload_segments() {
             if let Some((existing, _)) = segment_pins.get(&descriptor.checksum) {
                 if existing.bytes != descriptor.bytes {
                     return Err(Error::new(
@@ -5782,7 +5417,7 @@ fn build_database_snapshot_file(
             let pin = database.0.segments.pin(&descriptor)?;
             segment_pins.insert(descriptor.checksum, (descriptor, pin));
         }
-        (frozen, segment_pins)
+        (state, segment_pins)
     };
     let state_path = snapshot_temporary_path(destination, "state")?;
     let attachment_directory = snapshot_attachment_staging_directory(destination)?;
@@ -5791,24 +5426,30 @@ fn build_database_snapshot_file(
             .write(true)
             .create_new(true)
             .open(&state_path)?;
-        ciborium::ser::into_writer(&state, &mut state_file).map_err(|error| {
+        let mut output = BufWriter::with_capacity(64 * 1024, &mut state_file);
+        ciborium::ser::into_writer(&*state, &mut output).map_err(|error| {
             Error::invalid_data(format!(
                 "database checkpoint state encoding failed: {error}"
             ))
         })?;
+        output.flush()?;
+        drop(output);
         crate::storage::sync_durable(&state_file)?;
         let state_bytes = state_file.metadata()?.len();
         drop(state_file);
-
-        let manifest = DatabaseCheckpointManifest {
+        let mut manifest = DatabaseCheckpointManifest {
             format_version: DATABASE_SNAPSHOT_FORMAT,
             store_id: database.0.store_id,
             included: bookmark,
             state_bytes,
+            state_checksum: None,
             broker_segments: state.broker.payload_segments(),
         };
+        let mut state_hash = checkpoint_state_hasher(&manifest)?;
+        state_hash.update_reader(File::open(&state_path)?)?;
+        manifest.state_checksum = Some(*state_hash.finalize().as_bytes());
         let manifest_bytes = encode_database_value(&manifest, "database checkpoint manifest")?;
-        if manifest_bytes.is_empty() || manifest_bytes.len() > 16 * 1024 * 1024 {
+        if manifest_bytes.is_empty() {
             return Err(Error::new(
                 ErrorCode::ResultBudgetExceeded,
                 "database checkpoint manifest is oversized",
@@ -5856,28 +5497,7 @@ fn install_database_snapshot_file(
     snapshot: &BackendSnapshot,
 ) -> Result<()> {
     let snapshot_path = snapshot.state_path();
-    let mut file = File::open(snapshot_path)?;
-    let mut magic = [0_u8; 8];
-    file.read_exact(&mut magic)?;
-    if magic != DATABASE_SNAPSHOT_MAGIC {
-        return Err(Error::new(
-            ErrorCode::CorruptStorage,
-            "database checkpoint format is unsupported",
-        ));
-    }
-    let mut length = [0_u8; 4];
-    file.read_exact(&mut length)?;
-    let manifest_len = u32::from_be_bytes(length) as usize;
-    if manifest_len == 0 || manifest_len > 16 * 1024 * 1024 {
-        return Err(Error::new(
-            ErrorCode::CorruptStorage,
-            "database checkpoint manifest is oversized",
-        ));
-    }
-    let mut manifest_bytes = vec![0_u8; manifest_len];
-    file.read_exact(&mut manifest_bytes)?;
-    let manifest: DatabaseCheckpointManifest =
-        decode_database_value(&manifest_bytes, "database checkpoint manifest")?;
+    let (mut file, manifest, manifest_len) = open_database_checkpoint(snapshot_path)?;
     if manifest.format_version != DATABASE_SNAPSHOT_FORMAT
         || manifest.store_id != database.0.store_id
         || manifest.included != bookmark
@@ -5888,44 +5508,23 @@ fn install_database_snapshot_file(
             "database checkpoint metadata is invalid",
         ));
     }
+    verify_checkpoint_state_checksum(&mut file, &manifest)?;
     let mut state_reader = (&mut file).take(manifest.state_bytes);
-    let mut state: DatabaseState =
-        ciborium::de::from_reader(&mut state_reader).map_err(|error| {
-            Error::new(
-                ErrorCode::CorruptStorage,
-                format!("database checkpoint state is invalid: {error}"),
-            )
-        })?;
+    let state: DatabaseState = ciborium::de::from_reader(&mut state_reader).map_err(|error| {
+        Error::new(
+            ErrorCode::CorruptStorage,
+            format!("database checkpoint state is invalid: {error}"),
+        )
+    })?;
     if state_reader.limit() != 0 || state.applied != bookmark {
         return Err(Error::new(
             ErrorCode::CorruptStorage,
             "database checkpoint state length or bookmark is invalid",
         ));
     }
-    for (project_id, project) in &mut state.projects {
-        let project_state = Arc::make_mut(project);
-        if let Err(structure_error) = project_state.graph.validate_structure() {
-            let quarantined = project_state
-                .graph
-                .quarantine_invalid_relationships()
-                .map_err(|recovery_error| {
-                    Error::new(
-                        ErrorCode::CorruptStorage,
-                        format!(
-                            "checkpoint project {project_id} cannot be recovered: {}; relationship quarantine failed: {}",
-                            structure_error.message, recovery_error.message
-                        ),
-                    )
-                })?;
-            tracing::warn!(
-                project = %project_id,
-                relationships = quarantined,
-                reason = %structure_error.message,
-                "recovered checkpoint by quarantining invalid relationship state"
-            );
-        }
-    }
-    validate_database_state(&state)?;
+    // Graph deserialization validates canonical structure. The database owns metadata and
+    // attachment consistency; it must not rescan every decoded graph again.
+    validate_database_checkpoint_metadata(&state)?;
     let expected_broker_segments = state.broker.payload_segments();
     if expected_broker_segments != manifest.broker_segments {
         return Err(Error::new(
@@ -5934,7 +5533,11 @@ fn install_database_snapshot_file(
         ));
     }
     let broker_segments = expected_broker_segments;
-    validate_database_checkpoint_state_extent(&manifest, file.metadata()?.len(), manifest_len)?;
+    validate_database_checkpoint_state_extent(
+        &manifest,
+        file.get_ref().metadata()?.len(),
+        manifest_len,
+    )?;
     let attachments = validate_database_snapshot_attachments(snapshot, &broker_segments)?;
 
     if database.0.state.read().applied.index > bookmark.index {
@@ -5960,21 +5563,7 @@ fn install_database_snapshot_file(
     state
         .broker
         .validate_payload_segments(&database.0.segments)?;
-    let replacement_images = state
-        .projects
-        .iter()
-        .map(|(project, project_state)| {
-            ResidentProjectImage::build(
-                *project,
-                bookmark,
-                &project_state.graph,
-                &project_state.temporal,
-                &project_state.indexes,
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
     let _apply = database.0.apply.lock();
-    let mut execution = database.0.execution.write();
     let mut current = database.0.state.write();
     if current.applied.index > bookmark.index {
         let current_broker_segments = current
@@ -5992,15 +5581,8 @@ fn install_database_snapshot_file(
         return Ok(());
     }
     reset_ephemeral_after_snapshot_install(&database.0)?;
-    {
-        if let Some(execution) = execution.as_deref_mut() {
-            execution.replace_all_projects(replacement_images)?;
-            for project in state.projects.keys().copied().collect::<Vec<_>>() {
-                rebind_shared_project(&mut state, execution, project)?;
-            }
-        }
-    }
     *current = state;
+    database.publish_reader_registry(&current);
     Ok(())
 }
 
@@ -6080,14 +5662,13 @@ fn validate_database_checkpoint_state_extent(
 /// crash/abort leftovers; the installed snapshot is authoritative, so release and enqueue them
 /// for bounded reclamation before exposing the replacement state.
 fn reset_ephemeral_after_snapshot_install(database: &DatabaseInner) -> Result<()> {
-    let mut ordered = database.ordered_overlay.lock();
+    let ordered = database.ordered_overlay.lock();
     if !ordered.reservations.is_empty() {
         return Err(Error::new(
             ErrorCode::CorruptStorage,
             "cannot install a snapshot over ordered command reservations",
         ));
     }
-    ordered.states.clear();
     drop(ordered);
 
     let abandoned = {
@@ -6102,7 +5683,10 @@ fn reset_ephemeral_after_snapshot_install(database: &DatabaseInner) -> Result<()
     Ok(())
 }
 
-fn validate_database_state(state: &DatabaseState) -> Result<()> {
+fn validate_database_checkpoint_metadata(state: &DatabaseState) -> Result<()> {
+    for project in state.projects.values() {
+        project.indexes.bind_catalog_graph(&project.graph);
+    }
     validate_request_results(state)?;
     state.broker.validate_state()?;
     state.security.validate()?;
@@ -6116,13 +5700,16 @@ fn validate_database_state(state: &DatabaseState) -> Result<()> {
                 "checkpoint project key differs from its immutable ID",
             ));
         }
-        if state.names.get(&normalize_name(&project.display_name)) != Some(id) {
+        if state
+            .names
+            .get(&normalize_name(&project.display_name.get()))
+            != Some(id)
+        {
             return Err(Error::new(
                 ErrorCode::CorruptStorage,
                 "checkpoint project name index is inconsistent",
             ));
         }
-        project.graph.validate_structure()?;
     }
     if state.names.len() != state.projects.len() {
         return Err(Error::new(
@@ -6274,10 +5861,10 @@ fn quarantine_standalone_snapshot(path: &Path) -> Result<PathBuf> {
     Ok(quarantined)
 }
 
-fn read_standalone_snapshot_state(
+fn open_database_checkpoint(
     path: &Path,
-) -> Result<(DatabaseCheckpointManifest, DatabaseState)> {
-    let mut file = File::open(path)?;
+) -> Result<(BufReader<File>, DatabaseCheckpointManifest, usize)> {
+    let mut file = BufReader::with_capacity(64 * 1024, File::open(path)?);
     let mut magic = [0_u8; 8];
     file.read_exact(&mut magic)?;
     if magic != DATABASE_SNAPSHOT_MAGIC {
@@ -6289,7 +5876,9 @@ fn read_standalone_snapshot_state(
     let mut length = [0_u8; 4];
     file.read_exact(&mut length)?;
     let manifest_len = u32::from_be_bytes(length) as usize;
-    if manifest_len == 0 || manifest_len > 16 * 1024 * 1024 {
+    if manifest_len == 0
+        || manifest_len as u64 > file.get_ref().metadata()?.len().saturating_sub(12)
+    {
         return Err(Error::new(
             ErrorCode::CorruptStorage,
             "standalone snapshot manifest is oversized",
@@ -6305,32 +5894,53 @@ fn read_standalone_snapshot_state(
             "standalone snapshot format version or state length is invalid",
         ));
     }
-    let mut state_reader = (&mut file).take(manifest.state_bytes);
-    let state: DatabaseState = ciborium::de::from_reader(&mut state_reader).map_err(|error| {
-        Error::new(
-            ErrorCode::CorruptStorage,
-            format!("standalone snapshot state is invalid: {error}"),
-        )
-    })?;
-    if state_reader.limit() != 0 || state.applied != manifest.included {
+    validate_database_checkpoint_state_extent(
+        &manifest,
+        file.get_ref().metadata()?.len(),
+        manifest_len,
+    )?;
+    Ok((file, manifest, manifest_len))
+}
+
+fn checkpoint_state_hasher(manifest: &DatabaseCheckpointManifest) -> Result<blake3::Hasher> {
+    let mut metadata = manifest.clone();
+    metadata.state_checksum = None;
+    let mut hash = blake3::Hasher::new_derive_key("irongraph.checkpoint-state.v1");
+    hash.update(&encode_database_value(
+        &metadata,
+        "checkpoint checksum metadata",
+    )?);
+    Ok(hash)
+}
+
+fn verify_checkpoint_state_checksum(
+    file: &mut BufReader<File>,
+    manifest: &DatabaseCheckpointManifest,
+) -> Result<()> {
+    let Some(expected) = manifest.state_checksum else {
+        return Ok(());
+    };
+    let start = file.stream_position()?;
+    let mut hash = checkpoint_state_hasher(manifest)?;
+    hash.update_reader((&mut *file).take(manifest.state_bytes))?;
+    if hash.finalize().as_bytes() != &expected {
         return Err(Error::new(
             ErrorCode::CorruptStorage,
-            "standalone snapshot state length or bookmark is invalid",
+            "checkpoint state checksum differs",
         ));
     }
-    validate_database_checkpoint_state_extent(&manifest, file.metadata()?.len(), manifest_len)?;
-    validate_database_state(&state)?;
-    if state.broker.payload_segments() != manifest.broker_segments {
-        return Err(Error::new(
-            ErrorCode::CorruptStorage,
-            "standalone snapshot broker payload segment set is incomplete",
-        ));
-    }
-    Ok((manifest, state))
+    file.seek(SeekFrom::Start(start))?;
+    Ok(())
 }
 
 fn standalone_snapshot_is_complete(path: &Path) -> Result<bool> {
-    let (manifest, _) = read_standalone_snapshot_state(path)?;
+    let (mut file, manifest, _) = open_database_checkpoint(path)?;
+    // A file without a persisted checksum can be recovered by the full reader, but cannot
+    // authorize online WAL compaction. Never rebuild a second graph to probe its readiness.
+    if manifest.state_checksum.is_none() {
+        return Ok(false);
+    }
+    verify_checkpoint_state_checksum(&mut file, &manifest)?;
     let segments = manifest.broker_segments;
     if segments.is_empty() {
         return Ok(true);
@@ -6354,34 +5964,7 @@ fn standalone_snapshot_is_complete(path: &Path) -> Result<bool> {
 /// returning the committed bookmark and any referenced broker payload segments without decoding
 /// the full state body.
 fn read_standalone_snapshot_manifest(path: &Path) -> Result<(Bookmark, Vec<SegmentDescriptor>)> {
-    let mut file = File::open(path)?;
-    let mut magic = [0_u8; 8];
-    file.read_exact(&mut magic)?;
-    if magic != DATABASE_SNAPSHOT_MAGIC {
-        return Err(Error::new(
-            ErrorCode::CorruptStorage,
-            "standalone snapshot format is unsupported",
-        ));
-    }
-    let mut length = [0_u8; 4];
-    file.read_exact(&mut length)?;
-    let manifest_len = u32::from_be_bytes(length) as usize;
-    if manifest_len == 0 || manifest_len > 16 * 1024 * 1024 {
-        return Err(Error::new(
-            ErrorCode::CorruptStorage,
-            "standalone snapshot manifest is oversized",
-        ));
-    }
-    let mut manifest_bytes = vec![0_u8; manifest_len];
-    file.read_exact(&mut manifest_bytes)?;
-    let manifest: DatabaseCheckpointManifest =
-        decode_database_value(&manifest_bytes, "standalone snapshot manifest")?;
-    if manifest.format_version != DATABASE_SNAPSHOT_FORMAT {
-        return Err(Error::new(
-            ErrorCode::CorruptStorage,
-            "standalone snapshot format version mismatch",
-        ));
-    }
+    let (_, manifest, _) = open_database_checkpoint(path)?;
     Ok((manifest.included, manifest.broker_segments))
 }
 
@@ -6391,13 +5974,27 @@ fn read_standalone_snapshot_manifest(path: &Path) -> Result<(Bookmark, Vec<Segme
 /// forensic inspection; only older validated generations are pruned.
 fn prune_standalone_snapshots(dir: &Path, keep: &Path) {
     let mut retained = BTreeSet::from([keep.to_owned()]);
+    let mut verified = 1;
     for path in standalone_snapshot_paths(dir) {
         if path == keep {
             continue;
         }
-        match standalone_snapshot_is_complete(&path) {
-            Ok(true) if retained.len() < 2 => {
+        if open_database_checkpoint(&path)
+            .is_ok_and(|(_, manifest, _)| manifest.state_checksum.is_none())
+        {
+            // Keep existing recovery authorities until two checksummed checkpoints exist.
+            // Probing a file must not instantiate its graph beside the running database.
+            if verified < 2 {
                 retained.insert(path);
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+            continue;
+        }
+        match standalone_snapshot_is_complete(&path) {
+            Ok(true) if verified < 2 => {
+                retained.insert(path);
+                verified += 1;
             }
             Ok(true) => {
                 let _ = std::fs::remove_file(&path);
@@ -6468,7 +6065,10 @@ fn prune_request_results(state: &mut DatabaseState) -> Result<()> {
             )
             .ok_or_else(|| Error::internal("idempotency result byte accounting underflow"))?;
     }
-    validate_request_results(state)
+    // Retention changes update both indexes and byte accounting locally. Full validation
+    // belongs to checkpoint/recovery, rather than scanning every unchanged cached response
+    // after each write.
+    Ok(())
 }
 
 fn validate_request_results(state: &DatabaseState) -> Result<()> {
@@ -6482,9 +6082,8 @@ fn validate_request_results(state: &DatabaseState) -> Result<()> {
         ));
     }
     let mut bytes = 0_u64;
-    for (request_id, record) in &*state.request_results {
-        if record.response.len() > MAX_SINGLE_REQUEST_RESULT_BYTES
-            || record.intent_digest == [0; 32]
+    for (request_id, record) in &state.request_results {
+        if record.intent_digest == [0; 32]
             || state.request_result_order.get(&record.index) != Some(request_id)
         {
             return Err(Error::new(
@@ -6508,10 +6107,15 @@ fn validate_request_results(state: &DatabaseState) -> Result<()> {
     Ok(())
 }
 
-fn refresh_optimizer_statistics(project: &mut ProjectState) {
+fn refresh_optimizer_statistics(project: &ProjectState) {
     let generation = project.indexes.optimizer_generation();
-    if let Some(statistics) = project.optimizer_statistics.get_mut() {
-        Arc::make_mut(statistics).refresh_counts(&project.graph, generation);
+    if let Some(statistics) = project.optimizer_statistics.get() {
+        let mut updated = statistics.as_ref().clone();
+        updated.refresh_counts(&project.graph, generation);
+        project
+            .optimizer_statistics
+            .0
+            .store(Some(Arc::new(updated)));
     } else {
         let _ = project
             .optimizer_statistics
@@ -6534,8 +6138,205 @@ fn project_has_data(state: &DatabaseState, project: ProjectId) -> Result<bool> {
         || !state.broker.project_is_empty(project))
 }
 
+fn validate_administrative(
+    project: &ProjectState,
+    mutation: &AdministrativeMutation,
+    planned_graph: &[GraphMutation],
+) -> Result<()> {
+    let catalog = project.graph.catalog();
+    let label_id = |name: &str| {
+        catalog
+            .label(name)
+            .ok_or_else(|| Error::new(ErrorCode::QueryType, "label is not declared"))
+    };
+    let property_id = |name: &str| {
+        catalog
+            .property(name)
+            .ok_or_else(|| Error::new(ErrorCode::QueryType, "property is not declared"))
+    };
+    match mutation {
+        AdministrativeMutation::InitializeSemantic {
+            profile,
+            graph_revision,
+        } => {
+            if project.graph.revision() != *graph_revision {
+                return Err(Error::retryable(
+                    ErrorCode::TransactionConflict,
+                    "graph changed during semantic initialization",
+                    None,
+                ));
+            }
+            project.indexes.validate_initialize_semantic(profile)
+        }
+        AdministrativeMutation::CreateIndex {
+            name,
+            kind,
+            label,
+            properties,
+        } => {
+            let kind = match kind.to_ascii_uppercase().as_str() {
+                "EQUALITY" => crate::graph::GraphIndexKind::Equality,
+                "RANGE" => crate::graph::GraphIndexKind::Range,
+                "TEXT" => crate::graph::GraphIndexKind::Text,
+                "VECTOR" => crate::graph::GraphIndexKind::Vector,
+                _ => return Err(Error::new(ErrorCode::QueryType, "unknown index family")),
+            };
+            project.indexes.validate_create(
+                &project.graph,
+                &crate::graph::GraphIndexDefinition {
+                    name: name.clone(),
+                    kind,
+                    label: label_id(label)?,
+                    properties: properties
+                        .iter()
+                        .map(|name| property_id(name))
+                        .collect::<Result<Vec<_>>>()?,
+                    unique: false,
+                },
+            )
+        }
+        AdministrativeMutation::CreateConstraint {
+            name,
+            label,
+            property,
+        } => project.indexes.validate_create(
+            &project.graph,
+            &crate::graph::GraphIndexDefinition {
+                name: name.clone(),
+                kind: crate::graph::GraphIndexKind::Equality,
+                label: label_id(label)?,
+                properties: vec![property_id(property)?],
+                unique: true,
+            },
+        ),
+        AdministrativeMutation::RebuildIndex { name } => {
+            if project.indexes.contains(name) {
+                Ok(())
+            } else {
+                Err(Error::new(
+                    ErrorCode::IndexUnavailable,
+                    "index does not exist",
+                ))
+            }
+        }
+        AdministrativeMutation::DropIndex { name, if_exists } => {
+            match project.indexes.validate_drop_index(name) {
+                Err(error) if *if_exists && error.code == ErrorCode::IndexUnavailable => Ok(()),
+                result => result,
+            }
+        }
+        AdministrativeMutation::DropConstraint { name, if_exists } => {
+            match project.indexes.validate_drop_constraint(name) {
+                Err(error) if *if_exists && error.code == ErrorCode::IndexUnavailable => Ok(()),
+                result => result,
+            }
+        }
+        AdministrativeMutation::DeclareTemporal {
+            entity_kind,
+            label_or_type,
+            property,
+            scalar_type,
+            retention_nanos,
+        } => {
+            let target = match entity_kind {
+                crate::types::EntityKind::Node => label_id(label_or_type)?.0,
+                crate::types::EntityKind::Relationship => {
+                    catalog
+                        .relationship_type(label_or_type)
+                        .ok_or_else(|| {
+                            Error::new(ErrorCode::QueryType, "relationship type is not declared")
+                        })?
+                        .0
+                }
+            };
+            project
+                .temporal
+                .validate_declare(&crate::graph::TemporalDeclaration {
+                    entity_kind: *entity_kind,
+                    target,
+                    property: property_id(property)?,
+                    value_type: temporal_type(scalar_type)?,
+                    retention_nanos: *retention_nanos,
+                })
+        }
+        AdministrativeMutation::CreateRollup {
+            name,
+            label,
+            property,
+            hopping,
+            width_nanos,
+            every_nanos,
+            align_nanos,
+            timezone,
+            aggregates,
+        } => {
+            let mut aggregate_set = crate::graph::AggregateSet::empty();
+            for aggregate in aggregates {
+                match aggregate.to_ascii_uppercase().as_str() {
+                    "AVG" => aggregate_set.insert(crate::graph::AggregateSet::AVG),
+                    "MIN" => aggregate_set.insert(crate::graph::AggregateSet::MIN),
+                    "MAX" => aggregate_set.insert(crate::graph::AggregateSet::MAX),
+                    "COUNT" => aggregate_set.insert(crate::graph::AggregateSet::COUNT),
+                    "SUM" => aggregate_set.insert(crate::graph::AggregateSet::SUM),
+                    _ => {
+                        return Err(Error::new(
+                            ErrorCode::QueryType,
+                            "unsupported rollup aggregate",
+                        ));
+                    }
+                }
+            }
+            let mut window = if *hopping {
+                crate::graph::WindowSpec::hopping(
+                    *width_nanos,
+                    every_nanos.ok_or_else(|| {
+                        Error::new(ErrorCode::TemporalRange, "HOPPING requires EVERY")
+                    })?,
+                )
+            } else {
+                crate::graph::WindowSpec::tumbling(*width_nanos)
+            };
+            window.align_nanos = *align_nanos;
+            window.timezone = timezone.clone();
+            project
+                .temporal
+                .validate_create_rollup(&crate::graph::TemporalRollupDefinition {
+                    name: name.clone(),
+                    entity_kind: crate::types::EntityKind::Node,
+                    target: label_id(label)?.0,
+                    property: property_id(property)?,
+                    window,
+                    aggregates: aggregate_set,
+                })
+        }
+        AdministrativeMutation::CreateEmbedding {
+            name,
+            label,
+            source_property,
+            target_property,
+            model,
+            profile,
+            rows,
+        } => project
+            .indexes
+            .validate_create_embedding_with_planned_schema(
+                &project.graph,
+                &crate::graph::EmbeddingIndexDefinition {
+                    name: name.clone(),
+                    label: *label,
+                    source_property: *source_property,
+                    target_property: *target_property,
+                    model: model.clone(),
+                },
+                profile,
+                rows,
+                planned_graph,
+            ),
+    }
+}
+
 fn apply_administrative(
-    project: &mut ProjectState,
+    project: &ProjectState,
     mutation: AdministrativeMutation,
     resolved_commit_time_nanos: i64,
 ) -> Result<()> {
@@ -6756,7 +6557,7 @@ fn apply_administrative(
             )?;
         }
     }
-    project.optimizer_statistics = OnceLock::new();
+    project.optimizer_statistics.clear();
     Ok(())
 }
 
@@ -6765,7 +6566,7 @@ fn administrative_mutation(
     project: &ProjectState,
     graph_mutations: &mut Vec<GraphMutation>,
     text_embedding: Option<&dyn TextEmbedding>,
-    revision: u64,
+    _revision: u64,
 ) -> Result<Option<AdministrativeMutation>> {
     match statement {
         None
@@ -6859,12 +6660,16 @@ fn administrative_mutation(
             })?;
             let local_profile = embedding.profile();
             local_profile.validate()?;
-            let profile = project.indexes.profile().cloned().ok_or_else(|| {
-                Error::new(
-                    ErrorCode::EmbeddingProfileMismatch,
-                    "project embedding profile has not passed all-node activation",
-                )
-            })?;
+            let profile = project
+                .indexes
+                .profile()
+                .map(|profile| (*profile).clone())
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorCode::EmbeddingProfileMismatch,
+                        "project embedding profile has not passed all-node activation",
+                    )
+                })?;
             if &profile != local_profile {
                 return Err(Error::new(
                     ErrorCode::EmbeddingProfileImmutable,
@@ -6908,22 +6713,18 @@ fn administrative_mutation(
             {
                 Some(property) => property,
                 None => {
-                    let mut catalog = project.graph.catalog().clone();
-                    for mutation in graph_mutations.iter() {
-                        match mutation {
-                            GraphMutation::DeclareLabel { name, id } => {
-                                catalog.declare_label(name.clone(), *id)?;
+                    let next = graph_mutations
+                        .iter()
+                        .filter_map(|mutation| match mutation {
+                            GraphMutation::DeclareProperty { id, .. } => {
+                                Some(id.0.saturating_add(1))
                             }
-                            GraphMutation::DeclareProperty { name, id } => {
-                                catalog.declare_property(name.clone(), *id)?;
-                            }
-                            GraphMutation::DeclareRelationshipType { name, id } => {
-                                catalog.declare_relationship_type(name.clone(), *id)?;
-                            }
-                            _ => {}
-                        }
-                    }
-                    let property = catalog.intern_property(&definition.target_property)?;
+                            _ => None,
+                        })
+                        .max()
+                        .unwrap_or(0)
+                        .max(project.graph.catalog().next_property_id());
+                    let property = crate::types::PropertyId(next);
                     graph_mutations.push(GraphMutation::DeclareProperty {
                         name: definition.target_property.clone(),
                         id: property,
@@ -6931,18 +6732,13 @@ fn administrative_mutation(
                     property
                 }
             };
-            let mut sources = Vec::new();
             for node in project
                 .graph
                 .nodes()
                 .filter(|node| node.labels().contains(&label))
             {
-                match node.property(source_property) {
-                    Some(ScalarValue::String(text)) => {
-                        sources.push((node.id().0, text.to_string()))
-                    }
-                    Some(ScalarValue::Null) | None => {}
-                    Some(_) => {
+                if let Some(value) = node.property(source_property) {
+                    if !matches!(value, ScalarValue::String(_) | ScalarValue::Null) {
                         return Err(Error::new(
                             ErrorCode::QueryType,
                             "embedding source property contains a non-string value",
@@ -6950,22 +6746,7 @@ fn administrative_mutation(
                     }
                 }
             }
-            // Cold population gathers every owner first and submits its derived windows in one
-            // encoder batch. Incremental writes use the separate affected-row path below.
-            let vectors = embed_complete_texts(
-                embedding,
-                &sources
-                    .iter()
-                    .map(|(_, text)| text.as_str())
-                    .collect::<Vec<_>>(),
-            )?;
-            let rows = sources
-                .into_iter()
-                .zip(vectors)
-                .map(|((entity_id, _), vector)| {
-                    Ok((entity_id, profile.quantize(&vector)?, revision))
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let rows = Vec::new();
             Ok(Some(AdministrativeMutation::CreateEmbedding {
                 name: definition.name,
                 label,
@@ -6993,254 +6774,6 @@ fn parse_similarity(value: &str) -> Result<crate::graph::Similarity> {
             "embedding similarity must be COSINE, DOT, or EUCLIDEAN",
         )),
     }
-}
-
-/// Encodes every byte of each canonical text through overlapping derived windows and folds those
-/// windows into one canonical vector row. Window strings are transient and retain no identity.
-/// One batched encoder call covers the complete input set, so cold work scales with all owners while
-/// the caller-controlled delta set below scales only with changed owners.
-fn embed_complete_texts(embedding: &dyn TextEmbedding, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-    let dimension = usize::try_from(embedding.profile().dimension)
-        .map_err(|_| Error::internal("embedding dimension does not fit this process"))?;
-    let mut flattened = Vec::new();
-    let mut ranges = Vec::with_capacity(texts.len());
-    for text in texts {
-        let start = flattened.len();
-        let mut windows = embedding.index_windows(text)?;
-        if windows.is_empty() {
-            windows.push((*text).to_owned());
-        }
-        flattened.extend(windows);
-        ranges.push(start..flattened.len());
-    }
-    let encoded = embedding.embed_batch(&flattened)?;
-    if encoded.len() != flattened.len() || encoded.iter().any(|vector| vector.len() != dimension) {
-        return Err(Error::new(
-            ErrorCode::EmbeddingProfileMismatch,
-            "embedding output shape differs from the active profile",
-        ));
-    }
-
-    ranges
-        .into_iter()
-        .map(|range| {
-            let count = range.len();
-            let mut aggregate = vec![0.0_f64; dimension];
-            for vector in &encoded[range] {
-                for (target, coordinate) in aggregate.iter_mut().zip(vector) {
-                    *target += f64::from(*coordinate);
-                }
-            }
-            let divisor = count as f64;
-            let mut vector = aggregate
-                .into_iter()
-                .map(|coordinate| (coordinate / divisor) as f32)
-                .collect::<Vec<_>>();
-            if embedding.profile().normalized {
-                let norm = vector
-                    .iter()
-                    .map(|coordinate| f64::from(*coordinate).powi(2))
-                    .sum::<f64>()
-                    .sqrt();
-                if norm > 0.0 {
-                    for coordinate in &mut vector {
-                        *coordinate = (f64::from(*coordinate) / norm) as f32;
-                    }
-                }
-            }
-            Ok(vector)
-        })
-        .collect()
-}
-
-fn resolve_semantic_texts(
-    texts: crate::graph::SemanticTextBatch,
-    embedding: &dyn TextEmbedding,
-    revision: u64,
-) -> Result<Vec<ResolvedVectorMutation>> {
-    let mut mutations = Vec::new();
-    for (property, owners) in [
-        (crate::graph::SEMANTIC_NODE_PROPERTY, texts.nodes),
-        (
-            crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY,
-            texts.relationships,
-        ),
-    ] {
-        let mut pending = Vec::new();
-        for owner in owners {
-            match owner.text {
-                Some(text) => pending.push((owner.entity_id, text)),
-                None => mutations.push(ResolvedVectorMutation::Remove {
-                    property,
-                    entity_id: owner.entity_id,
-                    revision,
-                }),
-            }
-        }
-        let encoded = embed_complete_texts(
-            embedding,
-            &pending
-                .iter()
-                .map(|(_, text)| text.as_str())
-                .collect::<Vec<_>>(),
-        )?;
-        for ((entity_id, _), vector) in pending.into_iter().zip(encoded) {
-            mutations.push(ResolvedVectorMutation::Upsert {
-                property,
-                entity_id,
-                coordinates: embedding.profile().quantize(&vector)?,
-                revision,
-            });
-        }
-    }
-    Ok(mutations)
-}
-
-fn resolve_embedding_mutations(
-    project: &ProjectState,
-    prior_graph_mutations: &[GraphMutation],
-    graph_mutations: &[GraphMutation],
-    text_embedding: Option<&dyn TextEmbedding>,
-    revision: u64,
-) -> Result<Vec<ResolvedVectorMutation>> {
-    if graph_mutations.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut vectors = if project.indexes.contains(crate::graph::SEMANTIC_NODE_INDEX) {
-        let embedding = text_embedding.ok_or_else(|| {
-            Error::new(
-                ErrorCode::EmbeddingUnavailable,
-                "automatic semantic updates require the active local encoder",
-            )
-        })?;
-        resolve_semantic_texts(
-            crate::graph::semantic_text_delta(
-                &project.graph,
-                prior_graph_mutations,
-                graph_mutations,
-            )?,
-            embedding,
-            revision,
-        )?
-    } else {
-        Vec::new()
-    };
-    if project.indexes.embedding_definitions().next().is_none() {
-        return Ok(vectors);
-    }
-    let definitions = project
-        .indexes
-        .embedding_definitions()
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut affected = BTreeMap::<u64, bool>::new();
-    for mutation in graph_mutations {
-        match mutation {
-            GraphMutation::InsertNode(node) => {
-                affected.insert(node.id.0, true);
-            }
-            GraphMutation::SetNodeProperty { node, property, .. }
-                if definitions
-                    .iter()
-                    .any(|definition| definition.source_property == *property) =>
-            {
-                affected.insert(node.0, true);
-            }
-            GraphMutation::AddNodeLabels { node, .. }
-            | GraphMutation::RemoveNodeLabels { node, .. } => {
-                affected.insert(node.0, true);
-            }
-            GraphMutation::DeleteNode { node, .. } => {
-                affected.insert(node.0, true);
-            }
-            _ => {}
-        }
-    }
-    if affected.is_empty() {
-        return Ok(vectors);
-    }
-
-    let states = crate::cypher::sparse_node_states_after_mutations(
-        &project.graph,
-        prior_graph_mutations,
-        graph_mutations,
-        affected.keys().copied().map(crate::NodeId),
-    )?;
-    let profile = project.indexes.profile().ok_or_else(|| {
-        Error::new(
-            ErrorCode::EmbeddingProfileMismatch,
-            "embedding definitions exist without a project profile",
-        )
-    })?;
-    profile.validate()?;
-    let embedding = text_embedding.ok_or_else(|| {
-        Error::new(
-            ErrorCode::EmbeddingUnavailable,
-            "updating an embedded source requires the active local embedding artifact",
-        )
-    })?;
-    if embedding.profile() != profile {
-        return Err(Error::new(
-            ErrorCode::EmbeddingProfileMismatch,
-            "local embedding artifact differs from the project's active profile",
-        ));
-    }
-
-    for definition in definitions {
-        let mut pending = Vec::new();
-        for entity_id in affected.keys().copied() {
-            let Some(node) = states.get(&crate::NodeId(entity_id)) else {
-                vectors.push(ResolvedVectorMutation::Remove {
-                    property: definition.target_property,
-                    entity_id,
-                    revision,
-                });
-                continue;
-            };
-            if !node.labels.contains(&definition.label) {
-                vectors.push(ResolvedVectorMutation::Remove {
-                    property: definition.target_property,
-                    entity_id,
-                    revision,
-                });
-                continue;
-            }
-            match node.properties.get(&definition.source_property) {
-                Some(ScalarValue::String(text)) => {
-                    pending.push((entity_id, text.to_string()));
-                }
-                Some(ScalarValue::Null) | None => {
-                    vectors.push(ResolvedVectorMutation::Remove {
-                        property: definition.target_property,
-                        entity_id,
-                        revision,
-                    });
-                }
-                Some(_) => {
-                    return Err(Error::new(
-                        ErrorCode::QueryType,
-                        "embedding source property must remain a string or NULL",
-                    ));
-                }
-            }
-        }
-        let embedded = embed_complete_texts(
-            embedding,
-            &pending
-                .iter()
-                .map(|(_, text)| text.as_str())
-                .collect::<Vec<_>>(),
-        )?;
-        for ((entity_id, _), vector) in pending.into_iter().zip(embedded) {
-            vectors.push(ResolvedVectorMutation::Upsert {
-                property: definition.target_property,
-                entity_id,
-                coordinates: profile.quantize(&vector)?,
-                revision,
-            });
-        }
-    }
-    Ok(vectors)
 }
 
 fn emit_result(
@@ -7288,14 +6821,14 @@ fn emit_catalog(
         catalog: CatalogEvent {
             project_id,
             schema_revision: bookmark.index,
-            labels: catalog.labels().map(|(_, name)| name.to_owned()).collect(),
+            labels: catalog.labels().map(|(_, name)| name.to_string()).collect(),
             relationship_types: catalog
                 .relationship_types()
-                .map(|(_, name)| name.to_owned())
+                .map(|(_, name)| name.to_string())
                 .collect(),
             properties: catalog
                 .properties()
-                .map(|(_, name)| name.to_owned())
+                .map(|(_, name)| name.to_string())
                 .collect(),
             functions: builtin_functions(),
             indexes: indexes.statuses().map(|index| index.name).collect(),
@@ -7736,6 +7269,9 @@ fn validate_dependencies(
         if current.is_none() && dependencies.write_targets.contains(entity) {
             continue;
         }
+        if current.is_none() && *revision == 0 {
+            continue;
+        }
         if current != Some(*revision) {
             return Err(Error::retryable(
                 ErrorCode::TransactionConflict,
@@ -7745,12 +7281,10 @@ fn validate_dependencies(
         }
     }
     for (stamp, revision) in &dependencies.predicates {
-        let changed = project
-            .predicate_versions
-            .get(stamp)
-            .map_or(project.authority_revision > planning_index, |current| {
-                current != revision
-            });
+        let changed = project.predicate_versions.get(stamp).map_or(
+            project.authority_revision.get() > planning_index,
+            |current| current != revision,
+        );
         if changed {
             return Err(Error::retryable(
                 ErrorCode::TransactionConflict,
@@ -7881,13 +7415,13 @@ fn retag_administrative_mutation(
     }
 }
 
-fn update_next_ids(project: &mut ProjectState, mutation: &GraphMutation) {
+fn update_next_ids(project: &ProjectState, mutation: &GraphMutation) {
     match mutation {
         GraphMutation::InsertNode(node) => {
-            project.next_node_id = project.next_node_id.max(node.id.0.saturating_add(1))
+            project.next_node_id.advance(node.id.0.saturating_add(1))
         }
         GraphMutation::InsertEdge(edge) => {
-            project.next_edge_id = project.next_edge_id.max(edge.id.0.saturating_add(1))
+            project.next_edge_id.advance(edge.id.0.saturating_add(1))
         }
         _ => {}
     }
@@ -8163,12 +7697,42 @@ fn resolve_sequencer_values(
 }
 
 fn request_intent_digest(mutation: &DatabaseMutation) -> Result<[u8; 32]> {
-    let mut normalized = mutation.clone();
-    resolve_sequencer_values(&mut normalized, 0)?;
-    let encoded = encode_database_value(&normalized, "idempotent request intent")?;
+    let needs_normalization = match mutation {
+        DatabaseMutation::Graph { temporal, .. } => temporal.iter().any(|row| row.uses_commit_time),
+        DatabaseMutation::Broker { .. } => true,
+        _ => false,
+    };
+    let normalized = if needs_normalization {
+        let mut normalized = mutation.clone();
+        resolve_sequencer_values(&mut normalized, 0)?;
+        Some(normalized)
+    } else {
+        None
+    };
     let mut hasher = blake3::Hasher::new_derive_key("irongraph.request-intent.v1");
-    hasher.update(&encoded);
+    {
+        let mut output = BufWriter::with_capacity(16 * 1024, IntentHashOutput(&mut hasher));
+        ciborium::ser::into_writer(normalized.as_ref().unwrap_or(mutation), &mut output).map_err(
+            |error| {
+                Error::invalid_data(format!(
+                    "idempotent request intent encoding failed: {error}"
+                ))
+            },
+        )?;
+        output.flush()?;
+    }
     Ok(*hasher.finalize().as_bytes())
+}
+
+struct IntentHashOutput<'a>(&'a mut blake3::Hasher);
+impl Write for IntentHashOutput<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn millis_to_nanos(millis: i64) -> Result<i64> {
@@ -8431,6 +7995,9 @@ where
         Ok(current) if current.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(|| binding.handle.block_on(future))
         }
+        Ok(_) if DATABASE_BLOCKING_WORKER.with(std::cell::Cell::get) => {
+            binding.handle.block_on(future)
+        }
         Ok(_) => Err(Error::internal(
             "synchronous database execution requires a multi-thread Tokio runtime",
         )),
@@ -8683,12 +8250,44 @@ mod project_lifecycle_tests {
         // Tests import the private identity owner directly to construct isolated stores.
         engine::NodeIdentity,
         graph::{DocumentItem, EdgeInput, LayerMask, NodeInput},
-        protocol::QueryLimits,
         storage::{SegmentFamily, SegmentRecord},
         types::DocumentList,
     };
 
     use super::*;
+
+    fn apply_canonical_test_command(
+        state: &mut DatabaseState,
+        command: &WriteCommand,
+        position: Bookmark,
+        segments: &SegmentStore,
+    ) -> Result<()> {
+        let mutation = validate_resolved_database_command(state, command, position)?;
+        let digest = request_intent_digest(&mutation)?;
+        if let Some(record) = command
+            .request_id
+            .and_then(|id| state.request_results.get(&id))
+        {
+            let response = record.response.clone();
+            state.last_response = response;
+            state.applied = position;
+            return Ok(());
+        }
+        let reply = apply_mutation(
+            state,
+            mutation,
+            position,
+            millis_to_nanos(command.commit_time_millis)?,
+            Some(segments),
+        )?;
+        let response = encode_database_value(&reply, "canonical test apply response")?;
+        state.last_response = response.clone();
+        state.applied = position;
+        if let Some(id) = command.request_id {
+            retain_request_result(state, id, digest, response)?;
+        }
+        prune_request_results(state)
+    }
 
     struct WindowEmbedding {
         profile: crate::graph::EmbeddingProfile,
@@ -8854,20 +8453,25 @@ mod project_lifecycle_tests {
 
     fn write_unchecked_test_snapshot(
         database: &Database,
-        state: &DatabaseState,
+        state: &impl Serialize,
+        included: Bookmark,
         destination: &Path,
     ) -> Result<BackendSnapshot> {
         let mut state_bytes = Vec::new();
         ciborium::ser::into_writer(state, &mut state_bytes).map_err(|error| {
             Error::invalid_data(format!("test checkpoint state encoding failed: {error}"))
         })?;
-        let manifest = DatabaseCheckpointManifest {
+        let mut manifest = DatabaseCheckpointManifest {
             format_version: DATABASE_SNAPSHOT_FORMAT,
             store_id: database.0.store_id,
-            included: state.applied,
+            included,
             state_bytes: state_bytes.len() as u64,
+            state_checksum: None,
             broker_segments: Vec::new(),
         };
+        let mut state_hash = checkpoint_state_hasher(&manifest)?;
+        state_hash.update(&state_bytes);
+        manifest.state_checksum = Some(*state_hash.finalize().as_bytes());
         let manifest_bytes = encode_database_value(&manifest, "test checkpoint manifest")?;
         let mut output = File::create(destination)?;
         output.write_all(&DATABASE_SNAPSHOT_MAGIC)?;
@@ -8881,6 +8485,104 @@ mod project_lifecycle_tests {
     }
 
     #[tokio::test]
+    async fn snapshot_readiness_streams_dirty_state_and_detects_body_corruption() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let snapshots = tempfile::tempdir()?;
+        let identity = NodeIdentity::generate_genesis().public();
+        let database =
+            Database::open_backend(directory.path(), usize::MAX, Duration::ZERO, identity)?;
+        let (project, entry) = wal_test_project_entry(1)?;
+        database.apply_mutation(&entry).await?;
+        let graph = database.0.state.read().projects[&project].graph.clone();
+        let body = graph.catalog().intern_property("body")?;
+        for id in 1..=64 {
+            graph.insert_node(NodeInput {
+                id: NodeId(id),
+                layer: Layer::Observed,
+                revision: 1,
+                labels: vec![],
+                properties: vec![(
+                    body,
+                    ScalarValue::String(
+                        format!("{id}:{}", "complete domain content ".repeat(8192)).into(),
+                    ),
+                )],
+            })?;
+        }
+        database.0.state.read().projects[&project]
+            .next_node_id
+            .advance(65);
+        let bytes = graph.resident_bytes();
+        database.standalone_snapshot(snapshots.path()).await?;
+        let path = standalone_snapshot_paths(snapshots.path()).remove(0);
+        for _ in 0..8 {
+            assert!(standalone_snapshot_is_complete(&path)?);
+        }
+        assert_eq!(graph.resident_bytes(), bytes);
+        let (mut file, manifest, _) = open_database_checkpoint(&path)?;
+        assert!(manifest.state_checksum.is_some());
+        let position = file.stream_position()?;
+        let mut altered_metadata = manifest.clone();
+        altered_metadata.included.index += 1;
+        assert_eq!(
+            verify_checkpoint_state_checksum(&mut file, &altered_metadata)
+                .unwrap_err()
+                .code,
+            ErrorCode::CorruptStorage
+        );
+        drop(file);
+        let (mut original, mut unsigned_manifest, _) = open_database_checkpoint(&path)?;
+        unsigned_manifest.state_checksum = None;
+        let older = snapshots
+            .path()
+            .join("snapshot-00000000000000000001-00000000000000000000.igdb");
+        let metadata = encode_database_value(&unsigned_manifest, "test existing checkpoint")?;
+        let mut output = BufWriter::new(File::create(&older)?);
+        output.write_all(&DATABASE_SNAPSHOT_MAGIC)?;
+        output.write_all(&(metadata.len() as u32).to_be_bytes())?;
+        output.write_all(&metadata)?;
+        std::io::copy(&mut (&mut original).take(manifest.state_bytes), &mut output)?;
+        output.flush()?;
+        drop(output);
+        assert!(!standalone_snapshot_is_complete(&older)?);
+        prune_standalone_snapshots(snapshots.path(), &path);
+        assert!(
+            older.exists(),
+            "existing recovery authority must remain available"
+        );
+        let mut writable = OpenOptions::new().read(true).write(true).open(&path)?;
+        writable.seek(SeekFrom::Start(position + manifest.state_bytes - 1))?;
+        let mut byte = [0];
+        writable.read_exact(&mut byte)?;
+        writable.seek(SeekFrom::Current(-1))?;
+        writable.write_all(&[byte[0] ^ 1])?;
+        drop(writable);
+        assert_eq!(
+            standalone_snapshot_is_complete(&path).unwrap_err().code,
+            ErrorCode::CorruptStorage
+        );
+        assert_eq!(graph.resident_bytes(), bytes);
+        let restored_directory = tempfile::tempdir()?;
+        let restored = Database::open_backend(
+            restored_directory.path(),
+            usize::MAX,
+            Duration::ZERO,
+            identity,
+        )?;
+        assert_eq!(
+            restored.standalone_recover(snapshots.path()).await?,
+            Some(Bookmark { term: 1, index: 1 })
+        );
+        assert_eq!(
+            restored.0.state.read().projects[&project]
+                .graph
+                .node_count(),
+            64
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn standalone_snapshot_retains_previous_replay_authority() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let snapshot_directory = tempfile::tempdir()?;
@@ -8891,7 +8593,8 @@ mod project_lifecycle_tests {
             NodeIdentity::generate_genesis().public(),
         )?;
         for index in 1..=3 {
-            database.0.state.write().applied = Bookmark { term: 1, index };
+            let (_, entry) = wal_test_project_entry(index)?;
+            database.apply_mutation(&entry).await?;
             database
                 .standalone_snapshot(snapshot_directory.path())
                 .await?;
@@ -8923,7 +8626,8 @@ mod project_lifecycle_tests {
             identity,
         )?;
         for index in 1..=2 {
-            database.0.state.write().applied = Bookmark { term: 1, index };
+            let (_, entry) = wal_test_project_entry(index)?;
+            database.apply_mutation(&entry).await?;
             database
                 .standalone_snapshot(snapshot_directory.path())
                 .await?;
@@ -8961,9 +8665,9 @@ mod project_lifecycle_tests {
             identity,
         )?;
         let project = ProjectId::random();
-        let mut project_state = ordered_graph_project(project, 1)?;
+        let project_state = ordered_graph_project(project, 1)?;
         {
-            let project_state = Arc::make_mut(&mut project_state);
+            let project_state = project_state.as_ref();
             let relationship_type = project_state
                 .graph
                 .catalog_mut()
@@ -8984,8 +8688,8 @@ mod project_lifecycle_tests {
                 revision: 3,
                 properties: Vec::new(),
             })?;
-            project_state.next_node_id = 3;
-            project_state.next_edge_id = 2;
+            project_state.next_node_id.set(3);
+            project_state.next_edge_id.set(2);
         }
         let bookmark = Bookmark { term: 1, index: 3 };
         let mut state = DatabaseState {
@@ -8994,30 +8698,49 @@ mod project_lifecycle_tests {
         };
         state
             .names
-            .insert(normalize_name(&project_state.display_name), project);
+            .insert(normalize_name(&project_state.display_name.get()), project);
         state.projects.insert(project, project_state);
-        validate_database_state(&state)?;
+        validate_database_checkpoint_metadata(&state)?;
 
-        let mut encoded = serde_json::to_value(&state)
-            .map_err(|error| Error::invalid_data(format!("test JSON encoding failed: {error}")))?;
-        let project_value = encoded
-            .get_mut("projects")
-            .and_then(serde_json::Value::as_object_mut)
-            .and_then(|projects| projects.values_mut().next())
-            .ok_or_else(|| Error::invalid_data("test checkpoint project is absent"))?;
-        let source_value = project_value
-            .get_mut("graph")
-            .and_then(|graph| graph.get_mut("edge_sources"))
-            .and_then(serde_json::Value::as_array_mut)
-            .and_then(|sources| sources.first_mut())
-            .ok_or_else(|| Error::invalid_data("test relationship source is absent"))?;
-        *source_value = serde_json::Value::from(u32::MAX);
-        let corrupt_state: DatabaseState = serde_json::from_value(encoded)
-            .map_err(|error| Error::invalid_data(format!("test JSON decoding failed: {error}")))?;
-        assert!(validate_database_state(&corrupt_state).is_err());
-
+        let mut encoded_bytes = Vec::new();
+        ciborium::ser::into_writer(&state, &mut encoded_bytes)
+            .map_err(|e| Error::internal(e.to_string()))?;
+        let mut encoded: ciborium::value::Value =
+            ciborium::de::from_reader(encoded_bytes.as_slice())
+                .map_err(|e| Error::internal(e.to_string()))?;
+        fn field<'a>(
+            value: &'a mut ciborium::value::Value,
+            key: &str,
+        ) -> Result<&'a mut ciborium::value::Value> {
+            let ciborium::value::Value::Map(entries) = value else {
+                return Err(Error::internal("corruption fixture expected map"));
+            };
+            entries
+                .iter_mut()
+                .find_map(|(name, value)| {
+                    matches!(name,ciborium::value::Value::Text(text) if text==key).then_some(value)
+                })
+                .ok_or_else(|| Error::internal(format!("corruption fixture missing {key}")))
+        }
+        let ciborium::value::Value::Map(projects) = field(&mut encoded, "projects")? else {
+            return Err(Error::internal("project fixture expected map"));
+        };
+        let project_value = &mut projects
+            .first_mut()
+            .ok_or_else(|| Error::internal("project fixture absent"))?
+            .1;
+        let ciborium::value::Value::Array(edges) = field(field(project_value, "graph")?, "edges")?
+        else {
+            return Err(Error::internal("edge fixture expected array"));
+        };
+        *field(
+            edges
+                .first_mut()
+                .ok_or_else(|| Error::internal("edge fixture absent"))?,
+            "source",
+        )? = ciborium::value::Value::Integer(u32::MAX.into());
         let snapshot_path = source_directory.path().join("corrupt.igdb");
-        let snapshot = write_unchecked_test_snapshot(&source, &corrupt_state, &snapshot_path)?;
+        let snapshot = write_unchecked_test_snapshot(&source, &encoded, bookmark, &snapshot_path)?;
         let restored_directory = tempfile::tempdir()?;
         let restored = Database::open_backend(
             restored_directory.path(),
@@ -9033,20 +8756,20 @@ mod project_lifecycle_tests {
         graph.validate_structure()
     }
 
-    /// Device rebinding keeps cold samples while advancing the exact count generation.
+    /// Publication keeps cold samples while advancing the exact canonical count revision.
     #[test]
     fn a_publication_keeps_the_statistics_samples() {
-        let mut project = ProjectState {
+        let project = ProjectState {
             id: ProjectId::random(),
-            display_name: "rebind".to_owned(),
-            graph: GraphStore::default().into(),
-            temporal: TemporalStore::default().into(),
-            predicate_versions: BTreeMap::new().into(),
-            indexes: IndexCatalog::default().into(),
-            next_node_id: 1,
-            next_edge_id: 1,
-            authority_revision: 1,
-            optimizer_statistics: OnceLock::new(),
+            display_name: ("rebind".to_owned()).into(),
+            graph: GraphStore::default(),
+            temporal: TemporalStore::default(),
+            predicate_versions: BTreeMap::new(),
+            indexes: IndexCatalog::default(),
+            next_node_id: (1).into(),
+            next_edge_id: (1).into(),
+            authority_revision: (1).into(),
+            optimizer_statistics: OnceLock::new().into(),
         };
         let mut collected = StatisticsSnapshot::collect_project(&project.graph, None, None);
         collected.graph_revision = 1;
@@ -9054,7 +8777,7 @@ mod project_lifecycle_tests {
         collected.index_generation = project.indexes.optimizer_generation();
         let _ = project.optimizer_statistics.set(Arc::new(collected));
 
-        refresh_optimizer_statistics(&mut project);
+        refresh_optimizer_statistics(&project);
         assert!(
             project.optimizer_statistics.get().is_some(),
             "publication must preserve the statistics cache"
@@ -9066,15 +8789,15 @@ mod project_lifecycle_tests {
         let project = ProjectId::random();
         let snapshot = ProjectState {
             id: project,
-            display_name: "result-policy-test".to_owned(),
-            graph: GraphStore::default().into(),
-            temporal: TemporalStore::default().into(),
-            predicate_versions: BTreeMap::new().into(),
-            indexes: IndexCatalog::default().into(),
-            next_node_id: 1,
-            next_edge_id: 1,
-            authority_revision: 1,
-            optimizer_statistics: OnceLock::new(),
+            display_name: ("result-policy-test".to_owned()).into(),
+            graph: GraphStore::default(),
+            temporal: TemporalStore::default(),
+            predicate_versions: BTreeMap::new(),
+            indexes: IndexCatalog::default(),
+            next_node_id: (1).into(),
+            next_edge_id: (1).into(),
+            authority_revision: (1).into(),
+            optimizer_statistics: OnceLock::new().into(),
         };
         let request = QueryRequest {
             request_id: Uuid::new_v4(),
@@ -9083,10 +8806,6 @@ mod project_lifecycle_tests {
             parameters: BTreeMap::new(),
             consistency: CommitAcknowledgement::Published,
             bookmark: None,
-            limits: QueryLimits {
-                rows: 1,
-                ..QueryLimits::default()
-            },
             cancellation: Default::default(),
             deadline: None,
             connection_id: ConnectionId::new(),
@@ -9099,7 +8818,8 @@ mod project_lifecycle_tests {
             2,
             full_capabilities(),
             None,
-            None,
+            &[],
+            &[],
             None,
         )?;
         let values = output
@@ -9119,15 +8839,15 @@ mod project_lifecycle_tests {
         let project = ProjectId::random();
         let snapshot = ProjectState {
             id: project,
-            display_name: "memory".to_owned(),
-            graph: GraphStore::default().into(),
-            temporal: TemporalStore::default().into(),
-            predicate_versions: BTreeMap::new().into(),
-            indexes: IndexCatalog::default().into(),
-            next_node_id: 1,
-            next_edge_id: 1,
-            authority_revision: 0,
-            optimizer_statistics: OnceLock::new(),
+            display_name: ("memory".to_owned()).into(),
+            graph: GraphStore::default(),
+            temporal: TemporalStore::default(),
+            predicate_versions: BTreeMap::new(),
+            indexes: IndexCatalog::default(),
+            next_node_id: (1).into(),
+            next_edge_id: (1).into(),
+            authority_revision: (0).into(),
+            optimizer_statistics: OnceLock::new().into(),
         };
         let mut parameters = BTreeMap::new();
         parameters.insert("subject".to_owned(), serde_json::json!("Ada Lovelace"));
@@ -9148,7 +8868,6 @@ mod project_lifecycle_tests {
             parameters,
             consistency: CommitAcknowledgement::Published,
             bookmark: None,
-            limits: QueryLimits::default(),
             cancellation: Default::default(),
             deadline: None,
             connection_id: ConnectionId::new(),
@@ -9160,7 +8879,8 @@ mod project_lifecycle_tests {
             2,
             full_capabilities(),
             None,
-            None,
+            &[],
+            &[],
             None,
         )?;
         // MERGE on an empty graph creates both entities and the typed relationship.
@@ -9191,7 +8911,7 @@ mod project_lifecycle_tests {
     fn grounded_observation_write_executes_and_links_by_id() -> Result<()> {
         // A pre-existing node the observation will be grounded to.
         let project = ProjectId::random();
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let person = graph.catalog_mut().intern_label("Person")?;
         let name = graph.catalog_mut().intern_property("name")?;
         graph.apply(GraphMutation::InsertNode(NodeInput {
@@ -9203,15 +8923,15 @@ mod project_lifecycle_tests {
         }))?;
         let snapshot = ProjectState {
             id: project,
-            display_name: "memory".to_owned(),
-            graph: graph.into(),
-            temporal: TemporalStore::default().into(),
-            predicate_versions: BTreeMap::new().into(),
-            indexes: IndexCatalog::default().into(),
-            next_node_id: 2,
-            next_edge_id: 1,
-            authority_revision: 1,
-            optimizer_statistics: OnceLock::new(),
+            display_name: ("memory".to_owned()).into(),
+            graph,
+            temporal: TemporalStore::default(),
+            predicate_versions: BTreeMap::new(),
+            indexes: IndexCatalog::default(),
+            next_node_id: (2).into(),
+            next_edge_id: (1).into(),
+            authority_revision: (1).into(),
+            optimizer_statistics: OnceLock::new().into(),
         };
         let mut parameters = BTreeMap::new();
         parameters.insert("name".to_owned(), serde_json::json!("What is Zorbex?"));
@@ -9229,7 +8949,6 @@ mod project_lifecycle_tests {
             parameters,
             consistency: CommitAcknowledgement::Published,
             bookmark: None,
-            limits: QueryLimits::default(),
             cancellation: Default::default(),
             deadline: None,
             connection_id: ConnectionId::new(),
@@ -9241,7 +8960,8 @@ mod project_lifecycle_tests {
             3,
             full_capabilities(),
             None,
-            None,
+            &[],
+            &[],
             None,
         )?;
         // The Observation node is created; the DERIVED_FROM edge links it to the existing node 1.
@@ -9269,22 +8989,22 @@ mod project_lifecycle_tests {
     }
 
     #[test]
-    fn knowledge_layer_lock_holds_on_the_transaction_staging_path() -> Result<()> {
+    fn knowledge_layer_lock_holds_on_the_transaction_validation_path() -> Result<()> {
         let project = ProjectId::random();
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let product = graph.catalog_mut().intern_label("Product")?;
         let name = graph.catalog_mut().intern_property("name")?;
         let current = ProjectState {
             id: project,
-            display_name: "knowledge-lock".to_owned(),
-            graph: graph.into(),
-            temporal: TemporalStore::default().into(),
-            predicate_versions: BTreeMap::new().into(),
-            indexes: IndexCatalog::default().into(),
-            next_node_id: 1,
-            next_edge_id: 1,
-            authority_revision: 0,
-            optimizer_statistics: OnceLock::new(),
+            display_name: ("knowledge-lock".to_owned()).into(),
+            graph,
+            temporal: TemporalStore::default(),
+            predicate_versions: BTreeMap::new(),
+            indexes: IndexCatalog::default(),
+            next_node_id: (1).into(),
+            next_edge_id: (1).into(),
+            authority_revision: (0).into(),
+            optimizer_statistics: OnceLock::new().into(),
         };
         // A KNOWLEDGE node without the reserved `name` is rejected at the durable write funnel.
         let anonymous = vec![GraphMutation::InsertNode(NodeInput {
@@ -9294,7 +9014,7 @@ mod project_lifecycle_tests {
             labels: vec![product],
             properties: vec![],
         })];
-        assert!(stage_transaction_project(&current, &anonymous, &[], &[], 0).is_err());
+        assert!(crate::graph::knowledge::validate_batch(&current.graph, &anonymous).is_err());
         // The very same shape on the OBSERVED layer is unconstrained business data.
         let observed = vec![GraphMutation::InsertNode(NodeInput {
             id: NodeId(1),
@@ -9303,7 +9023,7 @@ mod project_lifecycle_tests {
             labels: vec![product],
             properties: vec![],
         })];
-        stage_transaction_project(&current, &observed, &[], &[], 0)?;
+        crate::graph::knowledge::validate_batch(&current.graph, &observed)?;
         // A named KNOWLEDGE node is accepted and staged.
         let named = vec![GraphMutation::InsertNode(NodeInput {
             id: NodeId(1),
@@ -9312,9 +9032,13 @@ mod project_lifecycle_tests {
             labels: vec![product],
             properties: vec![(name, ScalarValue::String(Arc::from("Zorbex Q7")))],
         })];
-        let staged = stage_transaction_project(&current, &named, &[], &[], 0)?;
+        current.graph.validate_mutations(&named)?;
+        crate::graph::knowledge::validate_batch(&current.graph, &named)?;
+        for mutation in named {
+            current.graph.apply(mutation)?;
+        }
         assert_eq!(
-            staged
+            current
                 .graph
                 .node_count_in_layers(crate::graph::LayerMask::KNOWLEDGE),
             1
@@ -9325,26 +9049,24 @@ mod project_lifecycle_tests {
     fn transaction_resource(project: ProjectId, bookmark: Bookmark) -> Arc<TransactionResource> {
         let snapshot = Arc::new(ProjectState {
             id: project,
-            display_name: "transaction".to_owned(),
-            graph: GraphStore::default().into(),
-            temporal: TemporalStore::default().into(),
-            predicate_versions: BTreeMap::new().into(),
-            indexes: IndexCatalog::default().into(),
-            next_node_id: 1,
-            next_edge_id: 1,
-            authority_revision: 0,
-            optimizer_statistics: OnceLock::new(),
+            display_name: ("transaction".to_owned()).into(),
+            graph: GraphStore::default(),
+            temporal: TemporalStore::default(),
+            predicate_versions: BTreeMap::new(),
+            indexes: IndexCatalog::default(),
+            next_node_id: (1).into(),
+            next_edge_id: (1).into(),
+            authority_revision: (0).into(),
+            optimizer_statistics: OnceLock::new().into(),
         });
         Arc::new(TransactionResource {
             terminal: AtomicU8::new(0),
             lifecycle: Mutex::new(TransactionLifecycle::Active(TransactionState {
                 catalog: snapshot.graph.catalog().clone(),
                 working: Arc::clone(&snapshot),
-                snapshot,
-                execution: None,
                 bookmark,
                 consistency: CommitAcknowledgement::Published,
-                batches: crate::graph::PagedVec::default(),
+                batches: Vec::new(),
                 accounted_bytes: MIN_TRANSACTION_ACCOUNTED_BYTES,
             })),
         })
@@ -9354,7 +9076,7 @@ mod project_lifecycle_tests {
     fn surgical_transaction_batch_append_shares_prior_payloads_and_accounts_only_new_batch()
     -> Result<()> {
         for batches in [4_096, 32_768] {
-            let mut log = crate::graph::PagedVec::default();
+            let mut log = Vec::with_capacity(batches as usize + 1);
             for revision in 0..batches {
                 log.push(Arc::new(TransactionBatch {
                     dependencies: TransactionDependencies::default(),
@@ -9371,6 +9093,7 @@ mod project_lifecycle_tests {
                 }));
             }
             let original = log.clone();
+            let journal_allocation = log.as_ptr();
             let batch = Arc::new(TransactionBatch {
                 dependencies: TransactionDependencies::default(),
                 graph_mutations: vec![],
@@ -9386,7 +9109,11 @@ mod project_lifecycle_tests {
                 &log[batches as usize - 1]
             ));
             assert_eq!(original.len(), batches as usize);
-            assert!(log.detached_page_bytes_from(&original) <= 16 * 1024);
+            assert_eq!(
+                journal_allocation,
+                log.as_ptr(),
+                "appending one intent does not copy retained payloads or allocate a graph version"
+            );
         }
         Ok(())
     }
@@ -9413,8 +9140,8 @@ mod project_lifecycle_tests {
             batches: Arc::new(Mutex::new(vec![])),
         }));
         let project = ProjectId::random();
-        let mut state = ordered_graph_project(project, 1)?;
-        let indexes = &mut Arc::make_mut(&mut state).indexes;
+        let state = ordered_graph_project(project, 1)?;
+        let indexes = &state.indexes;
         indexes.initialize_semantic(profile.clone())?;
         let coordinates = profile.quantize(&[1.0, 0.0])?;
         for entity_id in 0..1024 {
@@ -9443,15 +9170,16 @@ mod project_lifecycle_tests {
         }
         assert!(indexes.semantic_rebuild_needed());
         database.0.state.write().projects.insert(project, state);
+        database.publish_reader_registry(&database.0.state.read());
         let before = database.bookmark();
         // No runtime is bound: an attempted cold-build WAL command would fail this call.
-        database.ensure_automatic_semantic(project)?;
+        database.initialize_automatic_semantic(project)?;
         assert_eq!(database.bookmark(), before);
         Ok(())
     }
 
     fn ordered_graph_project(id: ProjectId, revision: u64) -> Result<Arc<ProjectState>> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let property = graph.catalog_mut().intern_property("value")?;
         graph.apply(GraphMutation::InsertNode(crate::graph::NodeInput {
             id: crate::NodeId(1),
@@ -9462,16 +9190,94 @@ mod project_lifecycle_tests {
         }))?;
         Ok(Arc::new(ProjectState {
             id,
-            display_name: id.to_string(),
-            graph: graph.into(),
-            temporal: TemporalStore::default().into(),
-            predicate_versions: BTreeMap::new().into(),
-            indexes: IndexCatalog::default().into(),
-            next_node_id: 2,
-            next_edge_id: 1,
-            authority_revision: revision,
-            optimizer_statistics: OnceLock::new(),
+            display_name: (id.to_string()).into(),
+            graph,
+            temporal: TemporalStore::default(),
+            predicate_versions: BTreeMap::new(),
+            indexes: IndexCatalog::default(),
+            next_node_id: (2).into(),
+            next_edge_id: (1).into(),
+            authority_revision: (revision).into(),
+            optimizer_statistics: OnceLock::new().into(),
         }))
+    }
+
+    #[test]
+    fn unchanged_project_publication_keeps_names_visible_to_parallel_readers() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::open_backend(
+            directory.path(),
+            2 * 1024 * 1024,
+            Duration::from_secs(1),
+            NodeIdentity::generate_genesis().public(),
+        )?;
+        let id = ProjectId::random();
+        let project = ordered_graph_project(id, 1)?;
+        project.display_name.set("stable".to_owned());
+        let body: Arc<str> = Arc::from("complete source ".repeat(131_072));
+        let property = project.graph.catalog_mut().intern_property("body")?;
+        project.graph.set_node_property(
+            NodeId(1),
+            property,
+            ScalarValue::String(Arc::clone(&body)),
+            2,
+        )?;
+        let bytes = project.graph.resident_bytes();
+        let owners = Arc::strong_count(&body);
+        database
+            .0
+            .state
+            .write()
+            .projects
+            .insert(id, Arc::clone(&project));
+        database.publish_reader_registry(&database.0.state.read());
+        let start = std::sync::Barrier::new(3);
+        std::thread::scope(|scope| -> Result<()> {
+            let readers = (0..2)
+                .map(|_| {
+                    scope.spawn(|| -> Result<()> {
+                        start.wait();
+                        for _ in 0..30_000 {
+                            assert_eq!(database.resolve_project_name("stable")?, id);
+                            let (live, _) = database.capture_canonical_project(id)?;
+                            assert!(Arc::ptr_eq(&live, &project));
+                        }
+                        Ok(())
+                    })
+                })
+                .collect::<Vec<_>>();
+            start.wait();
+            let state = database.0.state.read();
+            for iteration in 0..20_000 {
+                if iteration % 2 == 0 {
+                    database.publish_reader_project(&state, id);
+                } else {
+                    database.publish_reader_registry(&state);
+                }
+            }
+            for reader in readers {
+                reader
+                    .join()
+                    .map_err(|_| Error::internal("project reader panicked"))??;
+            }
+            Ok(())
+        })?;
+        assert_eq!(database.0.reader_projects.len(), 1);
+        assert_eq!(database.0.reader_names.len(), 1);
+        assert_eq!(project.graph.resident_bytes(), bytes);
+        assert_eq!(Arc::strong_count(&body), owners);
+        project.display_name.set("renamed".to_owned());
+        database.publish_reader_registry(&database.0.state.read());
+        assert_eq!(database.resolve_project_name("renamed")?, id);
+        assert!(database.resolve_project_name("stable").is_err());
+        assert_eq!(database.0.reader_names.len(), 1);
+        database.0.state.write().projects.remove(&id);
+        database.publish_reader_registry(&database.0.state.read());
+        assert!(database.resolve_project_name("renamed").is_err());
+        assert!(database.capture_canonical_project(id).is_err());
+        assert!(database.0.reader_projects.is_empty());
+        assert!(database.0.reader_names.is_empty());
+        Ok(())
     }
 
     fn ordered_graph_command(
@@ -9510,7 +9316,62 @@ mod project_lifecycle_tests {
     }
 
     #[test]
-    fn ordered_graph_overlay_pipelines_independent_projects_and_rejects_write_conflicts()
+    fn independent_creates_planned_together_apply_without_false_conflicts() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let segments = SegmentStore::open(directory.path(), 2 * 1024 * 1024)?;
+        let bookmark = Bookmark { term: 2, index: 10 };
+        let id = ProjectId::random();
+        let project = ordered_graph_project(id, bookmark.index)?;
+        let request: QueryRequest = serde_json::from_value(serde_json::json!({
+            "request_id": Uuid::new_v4(),
+            "query": "UNWIND range(1,32) AS value CREATE (n:Parallel) SET n.value=value RETURN count(*)"
+        })).map_err(|error| Error::internal(error.to_string()))?;
+        let mut commands = Vec::new();
+        for _ in 0..3 {
+            let output =
+                execute_on_project(&project, &request, bookmark, 11, full_capabilities(), None)?;
+            assert!(output.dependencies.predicates.is_empty());
+            let mutation = DatabaseMutation::Graph {
+                project: id,
+                validation: MutationValidation {
+                    snapshot: bookmark,
+                    dependencies: output.dependencies,
+                },
+                graph: output.graph_mutations,
+                temporal: Vec::new(),
+                vectors: Vec::new(),
+                administrative: None,
+            };
+            commands.push(WriteCommand {
+                kind: MutationKind::Graph,
+                project_id: Some(id),
+                request_id: Some(Uuid::new_v4()),
+                commit_time_millis: 1,
+                payload: encode_database_value(&mutation, "independent create test")?,
+            });
+        }
+        let mut state = DatabaseState {
+            applied: bookmark,
+            ..DatabaseState::default()
+        };
+        state.projects.insert(id, project.clone());
+        for (index, command) in commands.iter().enumerate() {
+            apply_canonical_test_command(
+                &mut state,
+                command,
+                Bookmark {
+                    term: 2,
+                    index: 11 + index as u64,
+                },
+                &segments,
+            )?;
+        }
+        assert_eq!(project.graph.node_count(), 97);
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_sequential_preflight_accepts_independent_projects_and_rejects_conflicts()
     -> Result<()> {
         let directory = tempfile::tempdir()?;
         let segments = SegmentStore::open(directory.path(), 2 * 1024 * 1024)?;
@@ -9527,37 +9388,177 @@ mod project_lifecycle_tests {
         state
             .projects
             .insert(second_project, ordered_graph_project(second_project, 10)?);
-
-        let (first_command, first_mutation) = ordered_graph_command(first_project, snapshot, 11)?;
-        let first = stage_ordered_database_command(
-            &state,
-            &first_command,
-            first_mutation,
+        let (first, _) = ordered_graph_command(first_project, snapshot, 11)?;
+        apply_canonical_test_command(
+            &mut state,
+            &first,
             Bookmark { term: 3, index: 11 },
             &segments,
         )?;
-        let (second_command, second_mutation) =
-            ordered_graph_command(second_project, snapshot, 12)?;
-        let second = stage_ordered_database_command(
-            &first,
-            &second_command,
-            second_mutation,
+        let (second, _) = ordered_graph_command(second_project, snapshot, 12)?;
+        apply_canonical_test_command(
+            &mut state,
+            &second,
             Bookmark { term: 3, index: 12 },
             &segments,
         )?;
-        assert_eq!(second.applied.index, 12);
+        assert_eq!(state.applied.index, 12);
+        let (conflict, _) = ordered_graph_command(first_project, snapshot, 13)?;
+        let error =
+            validate_resolved_database_command(&state, &conflict, Bookmark { term: 3, index: 13 })
+                .expect_err("stale entity revision accepted");
+        assert_eq!(error.code, ErrorCode::TransactionConflict);
+        assert_eq!(
+            state.projects[&first_project]
+                .graph
+                .node(NodeId(1))
+                .and_then(|n| n.property(crate::types::PropertyId(0))),
+            Some(ScalarValue::Integer(11))
+        );
+        Ok(())
+    }
 
-        let (conflicting_command, conflicting_mutation) =
-            ordered_graph_command(first_project, snapshot, 13)?;
-        let conflict = stage_ordered_database_command(
-            &first,
-            &conflicting_command,
-            conflicting_mutation,
-            Bookmark { term: 3, index: 12 },
+    #[test]
+    fn canonical_integer_aggregate_predicates_fence_derived_writes_per_project() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let segments = SegmentStore::open(directory.path(), 2 * 1024 * 1024)?;
+        let bookmark = Bookmark { term: 2, index: 10 };
+        let project_id = ProjectId::random();
+        let unrelated_id = ProjectId::random();
+        let project = ordered_graph_project(project_id, bookmark.index)?;
+        let label = project.graph.catalog_mut().intern_label("Node")?;
+        project.graph.apply(GraphMutation::AddNodeLabels {
+            node: NodeId(1),
+            labels: vec![label],
+            revision: bookmark.index,
+        })?;
+        let mut state = DatabaseState {
+            applied: bookmark,
+            ..DatabaseState::default()
+        };
+        state.projects.insert(project_id, Arc::clone(&project));
+        state.projects.insert(
+            unrelated_id,
+            ordered_graph_project(unrelated_id, bookmark.index)?,
+        );
+        assert!(project.predicate_versions.is_empty());
+        let request = QueryRequest {
+            request_id: Uuid::new_v4(),
+            project_id: Some(project_id),
+            query: "MATCH (n:Node) WHERE n.value >= 0 AND n.value < 2 \
+                    RETURN count(n) AS count, sum(n.value) AS total"
+                .to_owned(),
+            parameters: BTreeMap::new(),
+            consistency: CommitAcknowledgement::Published,
+            bookmark: None,
+            cancellation: Default::default(),
+            deadline: None,
+            connection_id: ConnectionId::new(),
+        };
+        let output = execute_on_project(
+            &project,
+            &request,
+            bookmark,
+            bookmark.index + 1,
+            full_capabilities(),
+            None,
+        )?;
+        let values = output
+            .result
+            .batches
+            .iter()
+            .flat_map(|batch| &batch.columns)
+            .map(|column| (column.name.as_str(), column.values.as_slice()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            values.get("count").copied(),
+            Some([ResultValue::Scalar(ScalarValue::Integer(1))].as_slice())
+        );
+        assert_eq!(
+            values.get("total").copied(),
+            Some([ResultValue::Scalar(ScalarValue::Integer(0))].as_slice())
+        );
+        assert!(
+            output.dependencies.entities.is_empty(),
+            "integer scans must use bounded predicate fencing instead of per-row entities"
+        );
+        assert!(!output.dependencies.predicates.is_empty());
+        assert!(
+            output
+                .dependencies
+                .predicates
+                .values()
+                .all(|revision| *revision == bookmark.index)
+        );
+        validate_dependencies(&output.dependencies, &project, bookmark.index)?;
+
+        let derived_value = match (values.get("count").copied(), values.get("total").copied()) {
+            (
+                Some([ResultValue::Scalar(ScalarValue::Integer(count))]),
+                Some([ResultValue::Scalar(ScalarValue::Integer(total))]),
+            ) => count
+                .checked_add(*total)
+                .ok_or_else(|| Error::internal("aggregate fixture overflow"))?,
+            _ => {
+                return Err(Error::internal(
+                    "aggregate fixture returned non-integer results",
+                ));
+            }
+        };
+        let (mut derived_write, mut derived_mutation) =
+            ordered_graph_command(project_id, bookmark, derived_value)?;
+        let DatabaseMutation::Graph { validation, .. } = &mut derived_mutation else {
+            return Err(Error::internal(
+                "aggregate fixture expected a graph command",
+            ));
+        };
+        validation.dependencies = output.dependencies;
+        validation
+            .dependencies
+            .write_targets
+            .insert(crate::cypher::EntityDependency::Node(NodeId(1)));
+        derived_write.payload =
+            encode_database_value(&derived_mutation, "aggregate-derived test mutation")?;
+
+        let (unrelated_write, _) = ordered_graph_command(unrelated_id, bookmark, 11)?;
+        apply_canonical_test_command(
+            &mut state,
+            &unrelated_write,
+            Bookmark { term: 2, index: 11 },
             &segments,
+        )?;
+        assert_eq!(project.authority_revision.get(), bookmark.index);
+        validate_resolved_database_command(
+            &state,
+            &derived_write,
+            Bookmark { term: 2, index: 12 },
+        )?;
+
+        let (intervening_write, _) = ordered_graph_command(project_id, bookmark, 12)?;
+        apply_canonical_test_command(
+            &mut state,
+            &intervening_write,
+            Bookmark { term: 2, index: 12 },
+            &segments,
+        )?;
+        assert_eq!(project.authority_revision.get(), 12);
+        assert!(project.predicate_versions.is_empty());
+        let error = validate_resolved_database_command(
+            &state,
+            &derived_write,
+            Bookmark { term: 2, index: 13 },
         )
-        .expect_err("two writes from one entity revision both entered the ordered overlay");
-        assert_eq!(conflict.code, ErrorCode::TransactionConflict);
+        .expect_err("a stale aggregate-derived write bypassed the project predicate fence");
+        assert_eq!(error.code, ErrorCode::TransactionConflict);
+        assert_eq!(error.message, "transaction predicate changed");
+        assert_eq!(
+            project
+                .graph
+                .node(NodeId(1))
+                .and_then(|node| node.property(crate::types::PropertyId(0))),
+            Some(ScalarValue::Integer(12)),
+            "rejected derived write must leave the intervening canonical value intact"
+        );
         Ok(())
     }
 
@@ -9580,17 +9581,15 @@ mod project_lifecycle_tests {
                 .projects
                 .insert(project, ordered_graph_project(project, snapshot.index)?);
         }
+        database.publish_reader_registry(&database.0.state.read());
         let (command, _) = ordered_graph_command(project, snapshot, 11)?;
         let reservation = database.reserve_command(&command, committed).await?;
-        let staged_project = database
-            .0
-            .ordered_overlay
-            .lock()
-            .states
-            .get(&committed.index)
-            .and_then(|state| state.projects.get(&project))
-            .cloned()
-            .ok_or_else(|| Error::internal("graph reservation did not stage its project"))?;
+        let retained = database.0.state.read().projects[&project].graph.clone();
+        assert_eq!(
+            retained.revision(),
+            snapshot.index,
+            "reservation must not mutate canonical rows"
+        );
         let entry = MutationEntry::new(
             committed.term,
             committed.index,
@@ -9603,15 +9602,38 @@ mod project_lifecycle_tests {
         let shared_entry = entry.clone();
         assert_eq!(entry.payload().as_ptr(), shared_entry.payload().as_ptr());
 
+        let (different_command, _) = ordered_graph_command(project, snapshot, 12)?;
+        let different_entry = MutationEntry::new(
+            committed.term,
+            committed.index,
+            different_command.kind,
+            different_command.project_id,
+            different_command.request_id,
+            different_command.commit_time_millis,
+            different_command.payload,
+        )?;
+        let mismatch = database
+            .apply_mutation(&different_entry)
+            .await
+            .expect_err("a different mutation must not reuse the reserved command's preflight");
+        assert_eq!(mismatch.code, ErrorCode::CorruptStorage);
+        assert_eq!(retained.revision(), snapshot.index);
+
         let applied = database.apply_mutation(&entry).await?;
         assert!(!applied.duplicate);
-        assert!(database.0.ordered_overlay.lock().states.is_empty());
         let state = database.0.state.read();
         let canonical_project = state
             .projects
             .get(&project)
             .ok_or_else(|| Error::internal("committed graph project disappeared"))?;
-        assert!(Arc::ptr_eq(canonical_project, &staged_project));
+        assert_eq!(retained.revision(), committed.index);
+        assert_eq!(
+            canonical_project
+                .graph
+                .node(NodeId(1))
+                .and_then(|n| n.property(crate::types::PropertyId(0))),
+            Some(ScalarValue::Integer(11))
+        );
         drop(state);
         database
             .complete_command_reservation(reservation, CommandReservationOutcome::Applied)
@@ -9620,7 +9642,8 @@ mod project_lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn older_host_views_remain_fenced_across_multiple_publications() -> Result<()> {
+    async fn retained_canonical_handles_observe_multiple_publications_without_generations()
+    -> Result<()> {
         let directory = tempfile::tempdir()?;
         let database = Database::open_backend(
             directory.path(),
@@ -9630,31 +9653,17 @@ mod project_lifecycle_tests {
         )?;
         let project = ProjectId::random();
         let initial = Bookmark { term: 1, index: 1 };
-        let mut initial_state = ordered_graph_project(project, 1)?;
-        let mirror = Arc::make_mut(&mut initial_state)
-            .graph
-            .catalog_mut()
-            .intern_property("mirror")?;
-        Arc::make_mut(&mut initial_state).graph.set_node_property(
-            crate::NodeId(1),
-            mirror,
-            ScalarValue::Integer(11),
-            1,
-        )?;
         {
             let mut state = database.0.state.write();
-            state.projects.insert(project, initial_state);
+            state
+                .projects
+                .insert(project, ordered_graph_project(project, 1)?);
             state.applied = initial;
         }
-        #[cfg(all(feature = "accelerator", target_os = "macos"))]
-        database.bind_execution_backend(Box::new(crate::gpu::MetalBackend::new(
-            0,
-            64 * 1024 * 1024,
-            0,
-        )?))?;
-        let retained = database.capture_project_execution(project)?.0;
-        for index in 2..=3 {
-            let (mut command, mut mutation) = ordered_graph_command(
+        database.publish_reader_registry(&database.0.state.read());
+        let retained = database.capture_canonical_project(project)?.0;
+        for index in 2..=4 {
+            let (command, _) = ordered_graph_command(
                 project,
                 Bookmark {
                     term: 1,
@@ -9662,14 +9671,6 @@ mod project_lifecycle_tests {
                 },
                 index as i64,
             )?;
-            if index == 3 {
-                if let DatabaseMutation::Graph { graph, .. } = &mut mutation {
-                    if let GraphMutation::SetNodeProperty { property, .. } = &mut graph[0] {
-                        *property = mirror;
-                    }
-                }
-                command.payload = encode_database_value(&mutation, "older host view test")?;
-            }
             let entry = MutationEntry::new(
                 1,
                 index,
@@ -9680,47 +9681,24 @@ mod project_lifecycle_tests {
                 command.payload,
             )?;
             database.apply_mutation(&entry).await?;
-            let state = database.0.state.read();
-            assert_eq!(Arc::strong_count(&state.projects[&project]), 1);
-            assert_eq!(database.0.retired_project_views.lock()[&project].len(), 1);
-            assert!(
-                database.0.retired_project_views.lock()[&project][0]
-                    .upgrade()
-                    .is_some_and(|view| Arc::ptr_eq(&view, &retained))
+            assert_eq!(
+                retained
+                    .graph
+                    .node(NodeId(1))
+                    .and_then(|n| n.property(crate::types::PropertyId(0))),
+                Some(ScalarValue::Integer(index as i64))
             );
+            assert_eq!(retained.graph.revision(), index);
+            assert!(Arc::ptr_eq(
+                &retained,
+                &database.capture_canonical_project(project)?.0
+            ));
         }
-        assert_eq!(retained.graph.revision(), 1);
-        assert_eq!(
-            retained
-                .graph
-                .node(crate::NodeId(1))
-                .and_then(|node| node.property(mirror)),
-            Some(ScalarValue::Integer(11))
-        );
-        drop(retained);
-        let (command, _) = ordered_graph_command(project, Bookmark { term: 1, index: 3 }, 4)?;
-        let entry = MutationEntry::new(
-            1,
-            4,
-            command.kind,
-            command.project_id,
-            command.request_id,
-            command.commit_time_millis,
-            command.payload,
-        )?;
-        database.apply_mutation(&entry).await?;
-        assert!(
-            !database
-                .0
-                .retired_project_views
-                .lock()
-                .contains_key(&project)
-        );
         Ok(())
     }
 
     #[tokio::test]
-    async fn ordered_graph_reservations_publish_their_exact_batched_generations() -> Result<()> {
+    async fn ordered_graph_reservations_publish_their_exact_committed_rows() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let database = Database::open_backend(
             directory.path(),
@@ -9743,6 +9721,7 @@ mod project_lifecycle_tests {
                 ordered_graph_project(second_project, snapshot.index)?,
             );
         }
+        database.publish_reader_registry(&database.0.state.read());
         let (first_command, _) = ordered_graph_command(first_project, snapshot, 11)?;
         let (second_command, _) = ordered_graph_command(second_project, snapshot, 12)?;
         let first_position = Bookmark { term: 3, index: 11 };
@@ -9750,10 +9729,7 @@ mod project_lifecycle_tests {
         let first_reservation = database
             .reserve_command(&first_command, first_position)
             .await?;
-        let second_reservation = database
-            .reserve_command(&second_command, second_position)
-            .await?;
-        assert_eq!(database.0.ordered_overlay.lock().states.len(), 2);
+        assert_eq!(database.0.ordered_overlay.lock().reservations.len(), 1);
         let first_entry = MutationEntry::new(
             first_position.term,
             first_position.index,
@@ -9770,18 +9746,19 @@ mod project_lifecycle_tests {
             second_command.project_id,
             second_command.request_id,
             second_command.commit_time_millis,
-            second_command.payload,
+            second_command.payload.clone(),
         )?;
 
         database.apply_mutation(&first_entry).await?;
         assert_eq!(database.0.state.read().applied, first_position);
-        assert_eq!(database.0.ordered_overlay.lock().states.len(), 1);
-        database.apply_mutation(&second_entry).await?;
-        assert_eq!(database.0.state.read().applied, second_position);
-        assert!(database.0.ordered_overlay.lock().states.is_empty());
         database
             .complete_command_reservation(first_reservation, CommandReservationOutcome::Applied)
             .await?;
+        let second_reservation = database
+            .reserve_command(&second_command, second_position)
+            .await?;
+        database.apply_mutation(&second_entry).await?;
+        assert_eq!(database.0.state.read().applied, second_position);
         database
             .complete_command_reservation(second_reservation, CommandReservationOutcome::Applied)
             .await?;
@@ -9802,52 +9779,40 @@ mod project_lifecycle_tests {
         state
             .projects
             .insert(project, ordered_graph_project(project, 10)?);
-
-        let (command, mutation) = ordered_graph_command(project, snapshot, 11)?;
-        let first = stage_ordered_database_command(
-            &state,
+        let (command, _) = ordered_graph_command(project, snapshot, 11)?;
+        apply_canonical_test_command(
+            &mut state,
             &command,
-            mutation.clone(),
             Bookmark { term: 3, index: 11 },
             &segments,
         )?;
-
-        // Reusing a request ID for a different mutation — the fixed-id seeding pattern an external
-        // /api/query client can fall into — is a typed error, never a silent success with no write.
-        let (mut reused_command, reused_mutation) =
-            ordered_graph_command(project, Bookmark { term: 3, index: 11 }, 12)?;
-        reused_command.request_id = command.request_id;
-        let reuse = stage_ordered_database_command(
-            &first,
-            &reused_command,
-            reused_mutation,
-            Bookmark { term: 3, index: 12 },
-            &segments,
-        )
-        .expect_err("a reused request ID with a different mutation entered the overlay");
-        assert_eq!(reuse.code, ErrorCode::ProtocolViolation);
-        assert!(
-            reuse.message.contains("idempotency key"),
-            "the error must teach the request-ID contract: {}",
-            reuse.message
-        );
-
-        // The identical planned command replays: the recorded response is returned, the position
-        // advances, and the mutation is not applied a second time.
-        let replay = stage_ordered_database_command(
-            &first,
+        let retained = state.projects[&project].graph.clone();
+        let response = state.last_response.clone();
+        let (mut reused, _) = ordered_graph_command(project, Bookmark { term: 3, index: 11 }, 12)?;
+        reused.request_id = command.request_id;
+        let error =
+            validate_resolved_database_command(&state, &reused, Bookmark { term: 3, index: 12 })
+                .expect_err("different mutation reused request ID");
+        assert_eq!(error.code, ErrorCode::ProtocolViolation);
+        assert!(error.message.contains("idempotency key"));
+        apply_canonical_test_command(
+            &mut state,
             &command,
-            mutation,
             Bookmark { term: 3, index: 12 },
             &segments,
         )?;
-        assert_eq!(replay.applied.index, 12);
-        assert_eq!(*replay.last_response, *first.last_response);
-        let first_project = first.projects.get(&project).expect("staged project");
-        let replay_project = replay.projects.get(&project).expect("replayed project");
-        assert!(
-            Arc::ptr_eq(first_project, replay_project),
-            "a replay must return the recorded response without touching project state"
+        assert_eq!(state.applied.index, 12);
+        assert_eq!(*state.last_response, *response);
+        assert_eq!(
+            retained
+                .node(NodeId(1))
+                .and_then(|n| n.property(crate::types::PropertyId(0))),
+            Some(ScalarValue::Integer(11))
+        );
+        assert_eq!(
+            retained.revision(),
+            11,
+            "identical replay did not mutate canonical rows"
         );
         Ok(())
     }
@@ -9876,7 +9841,7 @@ mod project_lifecycle_tests {
             }],
         };
         let staged = {
-            let mut state = database.0.state.write();
+            let state = database.0.state.write();
             state.broker.apply(
                 BrokerCommand::CreateTopic {
                     project,
@@ -9961,6 +9926,7 @@ mod project_lifecycle_tests {
                 &database.0.segments,
             )?;
         }
+        database.publish_reader_registry(&database.0.state.read());
 
         let state_path = source_directory.path().join("database.snapshot");
         let snapshot = build_database_snapshot_file(&database, bookmark, &state_path)?;
@@ -10073,6 +10039,7 @@ mod project_lifecycle_tests {
                 &database.0.segments,
             )?;
         }
+        database.publish_reader_registry(&database.0.state.read());
 
         assert_eq!(
             database
@@ -10109,7 +10076,7 @@ mod project_lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn standalone_broker_publish_consumes_its_once_materialized_generation() -> Result<()> {
+    async fn standalone_broker_publish_consumes_its_once_materialized_payload() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let database = Database::open_backend(
             directory.path(),
@@ -10137,6 +10104,7 @@ mod project_lifecycle_tests {
                 &database.0.segments,
             )?;
         }
+        database.publish_reader_registry(&database.0.state.read());
         let mutation = DatabaseMutation::Broker {
             command: BrokerCommand::PublishKafkaBatch {
                 project,
@@ -10161,15 +10129,11 @@ mod project_lifecycle_tests {
         };
         let committed = Bookmark { term: 2, index: 11 };
         let reservation = database.reserve_command(&command, committed).await?;
-        let staged = database
-            .0
-            .ordered_overlay
-            .lock()
-            .states
-            .get(&committed.index)
-            .cloned()
-            .ok_or_else(|| Error::internal("broker reservation did not stage its generation"))?;
-        assert_eq!(staged.broker.payload_segments().len(), 1);
+        let retained = database.0.state.read().broker.clone();
+        assert!(
+            retained.payload_segments().is_empty(),
+            "reservation must not publish broker rows"
+        );
 
         let entry = MutationEntry::new(
             committed.term,
@@ -10183,7 +10147,11 @@ mod project_lifecycle_tests {
         let applied = database.apply_mutation(&entry).await?;
         assert!(!applied.duplicate);
         let state = database.0.state.read();
-        assert!(state.broker.shared_with(&staged.broker));
+        assert_eq!(
+            retained.payload_segments().len(),
+            1,
+            "retained broker handle sees canonical publication"
+        );
         assert_eq!(state.broker.payload_segments().len(), 1);
         drop(state);
         database
@@ -10221,6 +10189,7 @@ mod project_lifecycle_tests {
                 &database.0.segments,
             )?;
         }
+        database.publish_reader_registry(&database.0.state.read());
         let mutation = DatabaseMutation::Broker {
             command: BrokerCommand::PublishKafkaBatch {
                 project,
@@ -10247,19 +10216,19 @@ mod project_lifecycle_tests {
             .reserve_command(&command, Bookmark { term: 2, index: 11 })
             .await?;
         assert!(!reservation.may_release_after_append());
-        assert_eq!(database.0.pending_broker_segments.lock().len(), 1);
+        let retained = database.0.pending_broker_segments.lock().len();
+        assert!(database.0.state.read().broker.payload_segments().is_empty());
         database
             .complete_command_reservation(reservation, CommandReservationOutcome::Rejected)
             .await?;
         assert!(database.0.pending_broker_segments.lock().is_empty());
-        assert_eq!(database.0.retired_broker_segments.lock().len(), 1);
+        assert_eq!(database.0.retired_broker_segments.lock().len(), retained);
         Ok(())
     }
 
     #[test]
     fn transaction_registry_bounds_bytes_shares_pins_and_expires_without_traffic() -> Result<()> {
         let registry = TransactionAdmissionRegistry::new(1_024)?;
-        registry.set_device_limit(100)?;
         let project = ProjectId::random();
         let bookmark = Bookmark { term: 4, index: 9 };
         let leader = ProcessId::random();
@@ -10275,11 +10244,9 @@ mod project_lifecycle_tests {
         let second = transaction_resource(project, bookmark);
         let deadline = Instant::now() + Duration::from_secs(1);
         let pin = TransactionPinKey { project, bookmark };
-        registry.register(first_id, connection, 256, pin, 80, deadline, fence, &first)?;
-        registry.register(
-            second_id, connection, 256, pin, 80, deadline, fence, &second,
-        )?;
-        assert_eq!(registry.usage(), (2, 512, 80));
+        registry.register(first_id, connection, 256, pin, deadline, fence, &first)?;
+        registry.register(second_id, connection, 256, pin, deadline, fence, &second)?;
+        assert_eq!(registry.usage(), (2, 512, 1));
         registry.resize(first_id, 700)?;
         let error = registry
             .resize(second_id, 700)
@@ -10300,283 +10267,110 @@ mod project_lifecycle_tests {
     }
 
     #[test]
-    fn project_capture_keeps_host_and_resident_generations_atomic_during_publication() -> Result<()>
-    {
-        let directory = tempfile::tempdir()?;
-        let database = Database::open_backend(
-            directory.path(),
-            4 * 1024 * 1024,
-            Duration::from_secs(1),
-            NodeIdentity::generate_genesis().public(),
-        )?;
-        let project = ProjectId::random();
-        let initial = Bookmark { term: 1, index: 1 };
-        {
-            let mut state = database.0.state.write();
-            let mut project_state = ordered_graph_project(project, 1)?;
-            Arc::make_mut(&mut project_state)
-                .graph
-                .apply(GraphMutation::InsertNode(crate::graph::NodeInput {
-                    id: crate::NodeId(2),
-                    layer: crate::Layer::Observed,
-                    revision: 1,
-                    labels: Vec::new(),
-                    properties: Vec::new(),
-                }))?;
-            state.projects.insert(project, project_state);
-            state.applied = initial;
-        }
-        database.bind_execution_backend(Box::new(crate::gpu::CpuBackend::new(
-            64 * 1024 * 1024,
-            1024 * 1024,
-        )))?;
-
-        let (initial_snapshot, initial_bookmark, initial_execution) =
-            database.capture_project_execution(project)?;
-        assert_eq!(initial_bookmark, initial);
-        let initial_execution = initial_execution
-            .ok_or_else(|| Error::internal("captured resident generation is absent"))?;
-
-        let start = Arc::new(std::sync::Barrier::new(2));
-        let writer_database = database.clone();
-        let writer_start = Arc::clone(&start);
+    fn canonical_reads_progress_while_writer_is_paused_between_record_changes() -> Result<()> {
+        let project = ordered_graph_project(ProjectId::random(), 1)?;
+        let graph = project.graph.clone();
+        let property = graph
+            .catalog()
+            .property("value")
+            .ok_or_else(|| Error::internal("value absent"))?;
+        graph.insert_node(NodeInput {
+            id: NodeId(2),
+            layer: Layer::Observed,
+            revision: 1,
+            labels: vec![],
+            properties: vec![(property, ScalarValue::Integer(0))],
+        })?;
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer_graph = graph.clone();
         let writer = std::thread::spawn(move || -> Result<()> {
-            writer_start.wait();
-            for index in 2_u64..=128 {
-                let bookmark = Bookmark { term: 1, index };
-                let mut execution = writer_database.0.execution.write();
-                let mut state = writer_database.0.state.write();
-                let mut staged = state.clone();
-                let project_state = Arc::make_mut(
-                    staged
-                        .projects
-                        .get_mut(&project)
-                        .ok_or_else(|| Error::internal("test project disappeared"))?,
-                );
-                let property = project_state
-                    .graph
-                    .catalog()
-                    .property("value")
-                    .ok_or_else(|| Error::internal("test property disappeared"))?;
-                let mutation = GraphMutation::SetNodeProperty {
-                    node: crate::NodeId(1),
-                    property,
-                    value: ScalarValue::Integer(index as i64),
-                    revision: index,
-                };
-                project_state
-                    .indexes
-                    .before_graph_apply(&project_state.graph, &mutation)?;
-                project_state.graph.apply(mutation.clone())?;
-                project_state
-                    .indexes
-                    .after_graph_apply(&project_state.graph, &mutation)?;
-                staged.applied = bookmark;
-                {
-                    publish_execution_state(
-                        &mut execution,
-                        &mut staged,
-                        DeviceImpact::Project {
-                            project,
-                            temporal: Vec::new(),
-                            vectors: Vec::new(),
-                            invalidate_derived: true,
-                        },
-                        bookmark,
-                    )?;
-                }
-                *state = staged;
-                std::thread::yield_now();
-            }
-            Ok(())
+            writer_graph.set_node_property(NodeId(1), property, ScalarValue::Integer(1), 2)?;
+            published_tx
+                .send(())
+                .map_err(|e| Error::internal(e.to_string()))?;
+            release_rx
+                .recv_timeout(Duration::from_secs(2))
+                .map_err(|e| Error::internal(e.to_string()))?;
+            writer_graph.set_node_property(NodeId(2), property, ScalarValue::Integer(1), 2)
         });
-
-        start.wait();
-        for _ in 0..512 {
-            let (snapshot, bookmark, execution) = database.capture_project_execution(project)?;
-            let execution = execution
-                .ok_or_else(|| Error::internal("captured resident generation is absent"))?;
-            assert_eq!(execution.resident_bookmark(project), Some(bookmark));
-            assert_eq!(
-                execution.resident_graph_revision(project),
-                Some(snapshot.graph.revision())
-            );
-            std::thread::yield_now();
-        }
+        published_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|e| Error::internal(e.to_string()))?;
+        assert_eq!(
+            graph.node(NodeId(1)).and_then(|n| n.property(property)),
+            Some(ScalarValue::Integer(1))
+        );
+        assert_eq!(
+            graph.node(NodeId(2)).and_then(|n| n.property(property)),
+            Some(ScalarValue::Integer(0)),
+            "selected mixed multi-record visibility"
+        );
+        release_tx
+            .send(())
+            .map_err(|e| Error::internal(e.to_string()))?;
         writer
             .join()
-            .map_err(|_| Error::internal("generation publication thread panicked"))??;
-
-        assert_eq!(initial_execution.resident_bookmark(project), Some(initial));
+            .map_err(|_| Error::internal("canonical writer panicked"))??;
         assert_eq!(
-            initial_execution.resident_graph_revision(project),
-            Some(initial_snapshot.graph.revision())
+            project
+                .graph
+                .node(NodeId(2))
+                .and_then(|n| n.property(property)),
+            Some(ScalarValue::Integer(1))
         );
-        assert_eq!(initial_snapshot.graph.revision(), 1);
-        assert_eq!(database.bookmark().index, 128);
         Ok(())
     }
 
     #[test]
-    fn transaction_overlay_advances_its_pinned_resident_graph_without_advancing_snapshot_bookmark()
-    -> Result<()> {
+    fn transaction_journal_reads_pending_rows_without_mutating_canonical_store() -> Result<()> {
         let project = ProjectId::random();
         let bookmark = Bookmark { term: 3, index: 7 };
-        let snapshot = ordered_graph_project(project, bookmark.index)?;
-        let mut backend = crate::gpu::CpuBackend::new(64 * 1024 * 1024, 1024 * 1024);
-        backend.admit_project(ResidentProjectImage::build(
-            project,
-            bookmark,
-            &snapshot.graph,
-            &snapshot.temporal,
-            &snapshot.indexes,
-        )?)?;
-        let pinned = backend.pin_project(project)?;
-
+        let snapshot = ordered_graph_project(project, 7)?;
         let label = crate::types::LabelId(snapshot.graph.catalog().next_label_id());
         let mutations = vec![
             GraphMutation::DeclareLabel {
                 name: "Pending".to_owned(),
                 id: label,
             },
-            GraphMutation::InsertNode(crate::graph::NodeInput {
-                id: crate::NodeId(2),
-                layer: crate::Layer::Observed,
-                revision: bookmark.index + 1,
+            GraphMutation::InsertNode(NodeInput {
+                id: NodeId(2),
+                layer: Layer::Observed,
+                revision: 8,
                 labels: vec![label],
-                properties: Vec::new(),
+                properties: vec![],
             }),
         ];
-        let staged = stage_transaction_project(&snapshot, &mutations, &[], &[], 0)?;
-        let staged_execution = stage_transaction_execution(
-            Some(pinned.as_ref()),
-            project,
+        let request:QueryRequest=serde_json::from_value(serde_json::json!({"request_id":Uuid::new_v4(),"project_id":project,"query":"MATCH (n) RETURN count(n)"})).map_err(|e|Error::internal(e.to_string()))?;
+        let output = execute_on_project_inner(
+            &snapshot,
+            &request,
             bookmark,
-            &staged,
-            true,
+            8,
+            full_capabilities(),
+            None,
+            &mutations,
             &[],
-            &[],
-        )?
-        .ok_or_else(|| Error::internal("transaction resident generation is absent"))?;
-
-        let cancellation = tokio_util::sync::CancellationToken::new();
+            None,
+        )?;
         assert_eq!(
-            pinned
-                .scan_nodes(
-                    project,
-                    None,
-                    crate::graph::LayerMask::default(),
-                    &cancellation
-                )?
-                .len(),
-            1
+            output.result.batches[0].columns[0].values[0],
+            ResultValue::Scalar(ScalarValue::Integer(2))
         );
+        assert_eq!(snapshot.graph.node_count(), 1);
+        assert!(snapshot.graph.catalog().label("Pending").is_none());
+        assert_eq!(snapshot.graph.revision(), 7);
+        drop(mutations);
         assert_eq!(
-            staged_execution
-                .scan_nodes(
-                    project,
-                    None,
-                    crate::graph::LayerMask::default(),
-                    &cancellation
-                )?
-                .len(),
-            2
-        );
-        assert_eq!(staged_execution.resident_bookmark(project), Some(bookmark));
-        assert_eq!(
-            staged_execution.resident_graph_revision(project),
-            Some(staged.graph.revision())
-        );
-        assert_eq!(
-            pinned.resident_graph_revision(project),
-            Some(bookmark.index)
+            snapshot.graph.node_count(),
+            1,
+            "rollback drops journal intents only"
         );
         Ok(())
     }
 
     #[test]
-    fn direct_scalar_read_progresses_while_resident_publication_waits() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let database = Database::open_backend(
-            directory.path(),
-            4 * 1024 * 1024,
-            Duration::from_secs(1),
-            NodeIdentity::generate_genesis().public(),
-        )?;
-        let project = ProjectId::random();
-        {
-            let mut state = database.0.state.write();
-            let snapshot = ordered_graph_project(project, 1)?;
-            for (query, direct) in [
-                ("MATCH (n) RETURN n.value", true),
-                ("MATCH (n) WHERE n.value = $v RETURN n.value", true),
-                ("MATCH (n) RETURN sum(n.value)", false),
-                ("OPTIONAL MATCH (n) RETURN n.value", false),
-                ("MATCH (n)-[r]->(m) RETURN n.value", false),
-                ("MATCH (n) RETURN n.value ORDER BY n.value", false),
-            ] {
-                assert_eq!(
-                    QueryEngine.uses_direct_node_scan(bind(
-                        parse(query)?,
-                        snapshot.graph.catalog(),
-                        full_capabilities(),
-                    )?)?,
-                    direct,
-                    "{query}"
-                );
-            }
-            state.projects.insert(project, snapshot);
-            state.applied = Bookmark { term: 1, index: 1 };
-        }
-        // Exercise the Metal lock route without executing a device command. Physical Metal
-        // suites separately verify that direct reads use the canonical shared allocations.
-        let _ = database
-            .0
-            .selected_backend
-            .set(crate::gpu::BackendKind::Metal);
-        let request = QueryRequest {
-            request_id: Uuid::new_v4(),
-            project_id: Some(project),
-            query: "MATCH (n) RETURN n.value".to_owned(),
-            parameters: BTreeMap::new(),
-            consistency: CommitAcknowledgement::Published,
-            bookmark: None,
-            limits: QueryLimits::default(),
-            cancellation: Default::default(),
-            deadline: None,
-            connection_id: ConnectionId::new(),
-        };
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| -> Result<()> {
-            let execution = database.0.execution.write();
-            let reader = scope.spawn(|| -> Result<()> {
-                database.execute_autocommit(request, &mut |event| {
-                    if matches!(event, QueryStreamEvent::Batch { .. }) {
-                        assert!(database.0.state.try_write().is_none());
-                        done_tx
-                            .send(())
-                            .map_err(|e| Error::internal(e.to_string()))?;
-                    }
-                    Ok(())
-                })
-            });
-            let progressed = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
-            // Release before joining even on failure, so the regression reports a failure
-            // instead of leaving a blocked test thread behind.
-            drop(execution);
-            reader
-                .join()
-                .map_err(|_| Error::internal("reader panicked"))??;
-            assert!(
-                progressed,
-                "direct read waited for resident publication access"
-            );
-            Ok(())
-        })
-    }
-
-    #[test]
-    fn ordinary_stream_holds_current_state_until_readback_finishes() -> Result<()> {
+    fn canonical_query_progresses_while_publication_metadata_writer_is_paused() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let database = Database::open_backend(
             directory.path(),
@@ -10592,6 +10386,52 @@ mod project_lifecycle_tests {
                 .insert(project, ordered_graph_project(project, 1)?);
             state.applied = Bookmark { term: 1, index: 1 };
         }
+        database.publish_reader_registry(&database.0.state.read());
+        let request:QueryRequest=serde_json::from_value(serde_json::json!({"request_id":Uuid::new_v4(),"project_id":project,"query":"MATCH (n) RETURN n.value"})).map_err(|e|Error::internal(e.to_string()))?;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| -> Result<()> {
+            let writer = database.0.state.write();
+            let reader = scope.spawn(|| {
+                database.execute_autocommit(request, &mut |event| {
+                    if matches!(event, QueryStreamEvent::Batch { .. }) {
+                        done_tx
+                            .send(())
+                            .map_err(|e| Error::internal(e.to_string()))?;
+                    }
+                    Ok(())
+                })
+            });
+            let progressed = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+            drop(writer);
+            reader
+                .join()
+                .map_err(|_| Error::internal("reader panicked"))??;
+            assert!(
+                progressed,
+                "canonical query waited for publication metadata writer"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn paused_stream_readback_does_not_hold_publication_writer() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::open_backend(
+            directory.path(),
+            4 * 1024 * 1024,
+            Duration::from_secs(1),
+            NodeIdentity::generate_genesis().public(),
+        )?;
+        let project = ProjectId::random();
+        {
+            let mut state = database.0.state.write();
+            state
+                .projects
+                .insert(project, ordered_graph_project(project, 1)?);
+            state.applied = Bookmark { term: 1, index: 1 };
+        }
+        database.publish_reader_registry(&database.0.state.read());
         let request = QueryRequest {
             request_id: Uuid::new_v4(),
             project_id: Some(project),
@@ -10599,7 +10439,6 @@ mod project_lifecycle_tests {
             parameters: BTreeMap::new(),
             consistency: CommitAcknowledgement::Published,
             bookmark: None,
-            limits: QueryLimits::default(),
             cancellation: Default::default(),
             deadline: None,
             connection_id: ConnectionId::new(),
@@ -10612,7 +10451,7 @@ mod project_lifecycle_tests {
             let reader = scope.spawn(move || {
                 read_database.execute_autocommit(request, &mut |event| {
                     if matches!(event, QueryStreamEvent::Batch { .. }) {
-                        assert!(read_database.0.state.try_write().is_none());
+                        assert!(read_database.0.state.try_write().is_some());
                         entered_tx
                             .send(())
                             .map_err(|error| Error::internal(error.to_string()))?;
@@ -10629,9 +10468,10 @@ mod project_lifecycle_tests {
             let writer = scope.spawn(|| {
                 let mut state = database.0.state.write();
                 state.applied = Bookmark { term: 1, index: 2 };
+                database.publish_reader_registry(&state);
                 done_tx.send(())
             });
-            let waited = done_rx.recv_timeout(Duration::from_millis(20)).is_err();
+            let progressed = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
             resume_tx
                 .send(())
                 .map_err(|error| Error::internal(error.to_string()))?;
@@ -10642,7 +10482,10 @@ mod project_lifecycle_tests {
                 .join()
                 .map_err(|_| Error::internal("writer panicked"))?
                 .map_err(|error| Error::internal(error.to_string()))?;
-            assert!(waited, "writer published while query readback was paused");
+            assert!(
+                progressed,
+                "paused query readback blocked publication writer"
+            );
             assert_eq!(database.bookmark().index, 2);
             Ok(())
         })
@@ -10666,6 +10509,7 @@ mod project_lifecycle_tests {
                 .insert(project, ordered_graph_project(project, 11)?);
             state.applied = captured;
         }
+        database.publish_reader_registry(&database.0.state.read());
         let request = Uuid::new_v4();
         let mut events = Vec::new();
         database.show_projects(
@@ -10705,6 +10549,7 @@ mod project_lifecycle_tests {
                 .insert(project, ordered_graph_project(project, 1)?);
             state.applied = Bookmark { term: 1, index: 1 };
         }
+        database.publish_reader_registry(&database.0.state.read());
         let request = |statement: Option<&str>| QueryRequest {
             request_id: Uuid::new_v4(),
             project_id: Some(project),
@@ -10716,7 +10561,6 @@ mod project_lifecycle_tests {
                 .unwrap_or_default(),
             consistency: CommitAcknowledgement::Published,
             bookmark: None,
-            limits: QueryLimits::default(),
             cancellation: Default::default(),
             deadline: None,
             connection_id: ConnectionId::new(),
@@ -10742,9 +10586,8 @@ mod project_lifecycle_tests {
     }
 
     #[test]
-    fn transaction_registry_fences_sequencer_change_and_releases_device_pin() -> Result<()> {
+    fn transaction_registry_fences_sequencer_change_and_releases_shared_handles() -> Result<()> {
         let registry = TransactionAdmissionRegistry::new(1_024)?;
-        registry.set_device_limit(64)?;
         let project = ProjectId::random();
         let bookmark = Bookmark { term: 2, index: 3 };
         let leader = ProcessId::random();
@@ -10754,7 +10597,6 @@ mod project_lifecycle_tests {
             ConnectionId::new(),
             256,
             TransactionPinKey { project, bookmark },
-            64,
             Instant::now() + Duration::from_secs(1),
             TransactionFence {
                 sequencer: leader,
@@ -10777,7 +10619,6 @@ mod project_lifecycle_tests {
         let registry = Arc::new(TransactionAdmissionRegistry::new(
             (MAX_OPEN_TRANSACTIONS_PER_CONNECTION + 1) * MIN_TRANSACTION_ACCOUNTED_BYTES,
         )?);
-        registry.set_device_limit(1)?;
         let connection = ConnectionId::new();
         let project = ProjectId::random();
         let bookmark = Bookmark { term: 1, index: 1 };
@@ -10799,7 +10640,6 @@ mod project_lifecycle_tests {
                             connection,
                             MIN_TRANSACTION_ACCOUNTED_BYTES,
                             TransactionPinKey { project, bookmark },
-                            1,
                             Instant::now() + Duration::from_secs(1),
                             TransactionFence {
                                 sequencer: leader,
@@ -10828,6 +10668,53 @@ mod project_lifecycle_tests {
             registry.finish(id);
         }
         assert_eq!(registry.usage(), (0, 0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_intent_hash_matches_existing_bytes_for_dirty_and_temporal_journals() -> Result<()> {
+        let project = ProjectId::random();
+        let (_, mut graph) = ordered_graph_command(project, Bookmark { term: 2, index: 10 }, 42)?;
+        let DatabaseMutation::Graph { graph: rows, .. } = &mut graph else {
+            return Err(Error::internal("expected graph hash fixture"));
+        };
+        let GraphMutation::SetNodeProperty { value, .. } = &mut rows[0] else {
+            return Err(Error::internal("expected property hash fixture"));
+        };
+        *value = ScalarValue::String(Arc::from("é漢字\n\0".repeat(40_000)));
+        let mut temporal_graph = graph.clone();
+        let DatabaseMutation::Graph { temporal, .. } = &mut temporal_graph else {
+            return Err(Error::internal("expected temporal hash fixture"));
+        };
+        temporal.push(PersistedTemporalMutation {
+            entity_kind: crate::types::EntityKind::Node,
+            target: 0,
+            sample: crate::graph::TemporalSample {
+                entity_id: 1,
+                property: crate::types::PropertyId(0),
+                event_time_nanos: 123_456,
+                sequence_index: 11,
+                value: ScalarValue::Integer(42),
+            },
+            uses_commit_time: true,
+        });
+        let broker = DatabaseMutation::Broker {
+            command: BrokerCommand::Retain {
+                project,
+                resolved_time_ms: 999,
+            },
+        };
+        for mutation in [&graph, &temporal_graph, &broker] {
+            let mut normalized = mutation.clone();
+            resolve_sequencer_values(&mut normalized, 0)?;
+            let bytes = encode_database_value(&normalized, "reference intent bytes")?;
+            let mut reference = blake3::Hasher::new_derive_key("irongraph.request-intent.v1");
+            reference.update(&bytes);
+            assert_eq!(
+                request_intent_digest(mutation)?,
+                *reference.finalize().as_bytes()
+            );
+        }
         Ok(())
     }
 
@@ -10879,86 +10766,80 @@ mod project_lifecycle_tests {
     }
 
     #[test]
-    fn project_generation_detaches_only_mutated_subsystem_root() -> Result<()> {
-        let project = ProjectId::random();
-        let published = ProjectState {
-            id: project,
-            display_name: "cow".to_owned(),
-            graph: GraphStore::default().into(),
-            temporal: TemporalStore::default().into(),
-            predicate_versions: BTreeMap::new().into(),
-            indexes: IndexCatalog::default().into(),
-            next_node_id: 1,
-            next_edge_id: 1,
-            authority_revision: 0,
-            optimizer_statistics: OnceLock::new(),
-        };
-        let mut staged = published.clone();
-        assert!(published.graph.shared_with(&staged.graph));
-        assert!(published.temporal.shared_with(&staged.temporal));
-        assert!(published.indexes.shared_with(&staged.indexes));
+    fn canonical_shared_handles_never_detach_on_mutation() -> Result<()> {
+        let project = ordered_graph_project(ProjectId::random(), 1)?;
+        let handle = project.graph.clone();
+        let label = handle.catalog_mut().intern_label("Shared")?;
+        handle.add_node_labels(NodeId(1), vec![label], 2)?;
+        assert_eq!(project.graph.catalog().label("Shared"), Some(label));
         assert!(
-            published
-                .predicate_versions
-                .shared_with(&staged.predicate_versions)
+            project
+                .graph
+                .node(NodeId(1))
+                .ok_or_else(|| Error::internal("node absent"))?
+                .labels()
+                .contains(&label)
         );
-        staged.graph.catalog_mut().intern_label("OnlyStaged")?;
-        assert!(!published.graph.shared_with(&staged.graph));
-        assert!(published.temporal.shared_with(&staged.temporal));
-        assert!(published.indexes.shared_with(&staged.indexes));
-        assert!(
-            published
-                .predicate_versions
-                .shared_with(&staged.predicate_versions)
+        let property = handle
+            .catalog()
+            .property("value")
+            .ok_or_else(|| Error::internal("property absent"))?;
+        project
+            .graph
+            .set_node_property(NodeId(1), property, ScalarValue::Integer(42), 3)?;
+        assert_eq!(
+            handle.node(NodeId(1)).and_then(|n| n.property(property)),
+            Some(ScalarValue::Integer(42))
         );
-        assert!(published.graph.catalog().label("OnlyStaged").is_none());
         Ok(())
     }
 
     #[test]
-    fn failed_staged_graph_batch_cannot_mutate_published_generation() -> Result<()> {
-        let project = ProjectId::random();
-        let mut published = DatabaseState::default();
-        apply_mutation(
-            &mut published,
-            DatabaseMutation::CreateProject {
-                id: project,
-                display_name: "atomic".to_owned(),
+    fn failed_pure_batch_validation_never_changes_canonical_rows_or_schema() -> Result<()> {
+        let graph = GraphStore::default();
+        let label = crate::types::LabelId(0);
+        let batch = vec![
+            GraphMutation::DeclareLabel {
+                name: "Pending".to_owned(),
+                id: label,
             },
-            Bookmark { term: 1, index: 1 },
-            1,
-            None,
-        )?;
-        let mut staged = published.clone();
-        let graph = staged
-            .projects
-            .get_mut(&project)
-            .ok_or_else(|| Error::internal("staged project missing"))?;
-        let graph = Arc::make_mut(graph);
-        let label = graph.graph.catalog_mut().intern_label("Row")?;
-        graph.graph.insert_node(crate::graph::NodeInput {
-            id: crate::NodeId(1),
-            layer: crate::Layer::Observed,
-            revision: 2,
-            labels: vec![label],
-            properties: Vec::new(),
-        })?;
-        let error = graph
-            .graph
-            .insert_node(crate::graph::NodeInput {
-                id: crate::NodeId(1),
-                layer: crate::Layer::Observed,
-                revision: 2,
+            GraphMutation::InsertNode(NodeInput {
+                id: NodeId(1),
+                layer: Layer::Observed,
+                revision: 1,
                 labels: vec![label],
-                properties: Vec::new(),
-            })
-            .expect_err("duplicate staged insert must fail");
-        assert_eq!(error.code, ErrorCode::TransactionConflict);
-        let canonical = published
-            .projects
-            .get(&project)
-            .ok_or_else(|| Error::internal("published project missing"))?;
-        assert_eq!(canonical.graph.node_count(), 0);
+                properties: vec![],
+            }),
+            GraphMutation::InsertNode(NodeInput {
+                id: NodeId(1),
+                layer: Layer::Observed,
+                revision: 1,
+                labels: vec![label],
+                properties: vec![],
+            }),
+        ];
+        assert!(graph.validate_mutations(&batch).is_err());
+        assert_eq!(graph.node_count(), 0);
+        assert!(graph.catalog().label("Pending").is_none());
+        assert_eq!(graph.revision(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn committed_response_above_former_byte_quota_is_accepted() -> Result<()> {
+        let mut state = DatabaseState {
+            applied: Bookmark { term: 1, index: 1 },
+            ..DatabaseState::default()
+        };
+        let request_id = Uuid::new_v4();
+        let response = vec![b'x'; 17 * 1024 * 1024];
+        retain_request_result(&mut state, request_id, [1; 32], response)?;
+        prune_request_results(&mut state)?;
+        assert_eq!(
+            state.request_results[&request_id].response.len(),
+            17 * 1024 * 1024
+        );
+        assert_eq!(state.request_result_bytes, 17 * 1024 * 1024);
         Ok(())
     }
 
@@ -10983,12 +10864,10 @@ mod project_lifecycle_tests {
         };
         validate_sequencer_mutation(&state, &empty_drop, bookmark, 1)?;
 
-        let project_state = Arc::make_mut(
-            state
-                .projects
-                .get_mut(&project)
-                .ok_or_else(|| Error::internal("project missing"))?,
-        );
+        let project_state = state
+            .projects
+            .get(&project)
+            .ok_or_else(|| Error::internal("project missing"))?;
         let label = project_state.graph.catalog_mut().intern_label("Data")?;
         project_state
             .graph
@@ -11026,7 +10905,7 @@ mod project_lifecycle_tests {
     fn surgical_statistics_survive_hundreds_of_transaction_statements_and_preserve_results()
     -> Result<()> {
         let project_id = ProjectId::random();
-        let mut project = (*ordered_graph_project(project_id, 1)?).clone();
+        let project = (*ordered_graph_project(project_id, 1)?).clone();
         let value = project
             .graph
             .catalog()
@@ -11074,7 +10953,11 @@ mod project_lifecycle_tests {
                     revision,
                 });
             }
-            project = stage_transaction_project(&project, &mutations, &[], &[], 0)?;
+            project.graph.validate_mutations(&mutations)?;
+            for mutation in mutations {
+                project.graph.apply(mutation)?;
+            }
+            refresh_optimizer_statistics(&project);
             let statistics = project
                 .optimizer_statistics
                 .get()
@@ -11090,52 +10973,22 @@ mod project_lifecycle_tests {
                 statistics.label_count(changed, LayerMask::ALL),
                 u64::from(revision >= 256)
             );
-            assert_eq!(project.graph.device_delta(revision)?.nodes.len(), 1);
+            assert_eq!(project.graph.node_count(), 4096);
         }
-        let first_statement = project.clone();
-        project = stage_transaction_project(
-            &project,
-            &[GraphMutation::SetNodeProperty {
-                node: NodeId(2),
-                property: value,
-                value: ScalarValue::Integer(9_999_999),
-                revision: 520,
-            }],
-            &[],
-            &[],
-            0,
-        )?;
-        assert_eq!(project.graph.device_delta(520)?.nodes.len(), 1);
-        assert_eq!(project.graph.device_delta(520)?.nodes[0].dense, 1);
-        assert_eq!(first_statement.graph.device_delta(520)?.nodes[0].dense, 0);
+        project
+            .graph
+            .set_node_property(NodeId(2), value, ScalarValue::Integer(9_999_999), 520)?;
+        refresh_optimizer_statistics(&project);
         assert_eq!(
-            pinned
-                .optimizer_statistics
-                .get()
-                .expect("pinned statistics")
-                .graph_revision,
-            2
-        );
-        assert_eq!(
-            pinned
-                .graph
-                .node(NodeId(1))
-                .and_then(|node| node.property(value)),
-            Some(ScalarValue::Integer(0))
+            pinned.graph.node(NodeId(1)).and_then(|n| n.property(value)),
+            Some(ScalarValue::Integer(520)),
+            "shared handle observes canonical row updates"
         );
         let bookmark = Bookmark {
             term: 1,
             index: 520,
         };
-        let mut backend = crate::gpu::CpuBackend::new(64 * 1024 * 1024, 0);
-        backend.admit_project(ResidentProjectImage::build(
-            project_id,
-            bookmark,
-            &project.graph,
-            &project.temporal,
-            &project.indexes,
-        )?)?;
-        for execution in [None, Some(&backend as &dyn ExecutionBackend)] {
+        {
             for (query, expected) in [
                 (
                     "MATCH (n:Data) WHERE n.value = 520 RETURN count(n) AS count",
@@ -11153,7 +11006,6 @@ mod project_lifecycle_tests {
                     parameters: BTreeMap::new(),
                     consistency: CommitAcknowledgement::Published,
                     bookmark: None,
-                    limits: QueryLimits::default(),
                     cancellation: Default::default(),
                     deadline: None,
                     connection_id: ConnectionId::new(),
@@ -11165,7 +11017,6 @@ mod project_lifecycle_tests {
                     521,
                     full_capabilities(),
                     None,
-                    execution,
                 )?;
                 let values = output
                     .result
@@ -11193,17 +11044,17 @@ mod project_lifecycle_tests {
     #[test]
     fn optimizer_statistics_advance_counts_without_rebuilding_samples() -> Result<()> {
         let project = ProjectId::random();
-        let mut project_state = ProjectState {
+        let project_state = ProjectState {
             id: project,
-            display_name: "statistics".to_owned(),
-            graph: GraphStore::default().into(),
-            temporal: TemporalStore::default().into(),
-            predicate_versions: BTreeMap::new().into(),
-            indexes: IndexCatalog::default().into(),
-            next_node_id: 1,
-            next_edge_id: 1,
-            authority_revision: 0,
-            optimizer_statistics: OnceLock::new(),
+            display_name: ("statistics".to_owned()).into(),
+            graph: GraphStore::default(),
+            temporal: TemporalStore::default(),
+            predicate_versions: BTreeMap::new(),
+            indexes: IndexCatalog::default(),
+            next_node_id: (1).into(),
+            next_edge_id: (1).into(),
+            authority_revision: (0).into(),
+            optimizer_statistics: OnceLock::new().into(),
         };
         project_state
             .optimizer_statistics
@@ -11219,14 +11070,14 @@ mod project_lifecycle_tests {
                 labels: vec![label],
                 properties: Vec::new(),
             }))?;
-        refresh_optimizer_statistics(&mut project_state);
+        refresh_optimizer_statistics(&project_state);
         let first = project_state
             .optimizer_statistics
             .get()
             .expect("current statistics");
         assert_eq!(first.node_count(LayerMask::ALL), 1);
         assert_eq!(first.sampled_graph_revision, Some(0));
-        let pinned = Arc::clone(first);
+        let pinned = Arc::clone(&first);
         project_state
             .graph
             .apply(GraphMutation::InsertNode(crate::graph::NodeInput {
@@ -11236,7 +11087,7 @@ mod project_lifecycle_tests {
                 labels: vec![label],
                 properties: Vec::new(),
             }))?;
-        refresh_optimizer_statistics(&mut project_state);
+        refresh_optimizer_statistics(&project_state);
         let current = project_state
             .optimizer_statistics
             .get()
@@ -11249,7 +11100,7 @@ mod project_lifecycle_tests {
     }
 
     #[test]
-    fn automatic_storage_seal_preserves_pinned_project() -> Result<()> {
+    fn canonical_checkpoint_and_borrowed_payloads_survive_replacement_churn() -> Result<()> {
         let project = ProjectId::random();
         let mut state = DatabaseState::default();
         apply_mutation(
@@ -11269,12 +11120,10 @@ mod project_lifecycle_tests {
             ScalarValue::String(Arc::from("b".repeat(1_024))),
         )])?);
         let (label, property) = {
-            let project_state = Arc::make_mut(
-                state
-                    .projects
-                    .get_mut(&project)
-                    .ok_or_else(|| Error::internal("test project is missing"))?,
-            );
+            let project_state = state
+                .projects
+                .get(&project)
+                .ok_or_else(|| Error::internal("test project is missing"))?;
             let label = project_state.graph.catalog_mut().intern_label("Document")?;
             let property = project_state
                 .graph
@@ -11298,13 +11147,10 @@ mod project_lifecycle_tests {
                 .ok_or_else(|| Error::internal("test project is missing"))?,
         );
 
-        let mut staged = state.clone();
-        let staged_project = Arc::make_mut(
-            staged
-                .projects
-                .get_mut(&project)
-                .ok_or_else(|| Error::internal("staged project is missing"))?,
-        );
+        let staged_project = state
+            .projects
+            .get(&project)
+            .ok_or_else(|| Error::internal("canonical project is missing"))?;
         for revision in 3..=96 {
             staged_project.graph.apply(GraphMutation::SetNodeProperty {
                 node: crate::NodeId(1),
@@ -11322,7 +11168,14 @@ mod project_lifecycle_tests {
                 .graph
                 .node(crate::NodeId(1))
                 .and_then(|node| node.property(property)),
-            Some(original)
+            Some(replacement.clone())
+        );
+        assert_eq!(
+            original,
+            ScalarValue::List(DocumentList::new(vec![DocumentItem::Scalar(
+                ScalarValue::String(Arc::from("a".repeat(1024)))
+            )])?),
+            "previously borrowed value remains memory safe"
         );
         assert_eq!(
             staged_project
@@ -11332,7 +11185,7 @@ mod project_lifecycle_tests {
             Some(replacement)
         );
         let mut checkpoint = Vec::new();
-        ciborium::ser::into_writer(&staged, &mut checkpoint)
+        ciborium::ser::into_writer(&state, &mut checkpoint)
             .map_err(|error| Error::internal(format!("test encoding failed: {error}")))?;
         let restored: DatabaseState = ciborium::de::from_reader(checkpoint.as_slice())
             .map_err(|error| Error::internal(format!("test decoding failed: {error}")))?;
@@ -11371,12 +11224,10 @@ mod project_lifecycle_tests {
             1,
             None,
         )?;
-        let project_state = Arc::make_mut(
-            state
-                .projects
-                .get_mut(&project)
-                .ok_or_else(|| Error::internal("project disappeared"))?,
-        );
+        let project_state = state
+            .projects
+            .get(&project)
+            .ok_or_else(|| Error::internal("project disappeared"))?;
         let label = project_state.graph.catalog_mut().intern_label("Document")?;
         project_state.graph.insert_node(crate::graph::NodeInput {
             id: crate::NodeId(1),
@@ -11422,30 +11273,32 @@ mod project_lifecycle_tests {
                 .projects
                 .get(&project)
                 .and_then(|project| project.indexes.profile()),
-            Some(&profile)
+            Some(Arc::new(profile))
         );
         Ok(())
     }
 
-    #[test]
-    fn document_embedding_delta_batches_complete_text_without_scanning_unrelated_rows() -> Result<()>
-    {
+    #[tokio::test]
+    async fn document_embedding_delta_batches_complete_text_without_scanning_unrelated_rows()
+    -> Result<()> {
+        use crate::server::embedding_jobs::{
+            DurableEmbeddingWorker, EmbeddingCallbacks, EmbeddingJob, EmbeddingOwner,
+            EmbeddingWork, SemanticTextChunk,
+        };
         let project_id = ProjectId::random();
-        let mut project = Arc::unwrap_or_clone(ordered_graph_project(project_id, 1)?);
+        let project = ordered_graph_project(project_id, 1)?;
         let document = project.graph.catalog_mut().intern_label("Document")?;
         let unrelated = project.graph.catalog_mut().intern_label("Unrelated")?;
         let body = project.graph.catalog_mut().intern_property("body")?;
         let vector = project.graph.catalog_mut().intern_property("embedding")?;
-        for id in 1_000..1_400 {
-            project.graph.insert_node(crate::graph::NodeInput {
-                id: crate::NodeId(id),
-                layer: crate::Layer::Observed,
+        let source: Arc<str> = Arc::from("unrelated complete content ".repeat(4096));
+        for id in 1000..1400 {
+            project.graph.insert_node(NodeInput {
+                id: NodeId(id),
+                layer: Layer::Observed,
                 revision: id,
                 labels: vec![unrelated],
-                properties: vec![(
-                    body,
-                    ScalarValue::String(Arc::from("unrelated ".repeat(4_096))),
-                )],
+                properties: vec![(body, ScalarValue::String(source.clone()))],
             })?;
         }
         let profile = crate::graph::EmbeddingProfile::new(
@@ -11466,39 +11319,96 @@ mod project_lifecycle_tests {
                 model: "default".to_owned(),
             },
             profile.clone(),
-            Vec::new(),
+            vec![],
         )?;
-        let batches = Arc::new(Mutex::new(Vec::new()));
-        let embedding = WindowEmbedding {
-            profile,
-            batches: Arc::clone(&batches),
-        };
-        let mutation = GraphMutation::InsertNode(crate::graph::NodeInput {
-            id: crate::NodeId(2_000),
-            layer: crate::Layer::Knowledge,
-            revision: 2_000,
+        project.graph.insert_node(NodeInput {
+            id: NodeId(2000),
+            layer: Layer::Observed,
+            revision: 2000,
             labels: vec![document],
             properties: vec![(body, ScalarValue::String(Arc::from("head interior tail")))],
+        })?;
+        let batches = Arc::new(Mutex::new(vec![]));
+        let encoder = Arc::new(WindowEmbedding {
+            profile,
+            batches: batches.clone(),
         });
-
-        let resolved =
-            resolve_embedding_mutations(&project, &[], &[mutation], Some(&embedding), 2_001)?;
-        assert_eq!(batches.lock().as_slice(), &[vec!["head", "tail"]]);
-        let [
-            ResolvedVectorMutation::Upsert {
-                entity_id,
-                coordinates,
-                ..
+        let load_project = project.clone();
+        let publish_project = project.clone();
+        let pending = std::sync::atomic::AtomicBool::new(true);
+        let queue = DurableEmbeddingWorker::start(
+            Arc::new(move |_| {
+                Ok(pending
+                    .swap(false, Ordering::AcqRel)
+                    .then_some(EmbeddingJob {
+                        owner: EmbeddingOwner {
+                            project: project_id,
+                            kind: crate::types::EntityKind::Node,
+                            entity_id: 2000,
+                        },
+                        revision: 2000,
+                    }))
+            }),
+            EmbeddingCallbacks {
+                load: Arc::new(move |job, _| {
+                    assert_eq!(job.owner.entity_id, 2000);
+                    let text = load_project
+                        .graph
+                        .node(NodeId(job.owner.entity_id))
+                        .and_then(|n| n.property(body))
+                        .and_then(|v| match v {
+                            ScalarValue::String(s) => Some(s),
+                            _ => None,
+                        });
+                    Ok(Some(EmbeddingWork {
+                        encoder: encoder.clone(),
+                        chunks: vec![SemanticTextChunk {
+                            property: vector,
+                            text,
+                        }],
+                        is_current: None,
+                    }))
+                }),
+                publish: Arc::new(move |_, vectors, _| {
+                    for mutation in vectors {
+                        publish_project
+                            .indexes
+                            .apply_vector_mutation_from_graph(&publish_project.graph, &mutation)?;
+                    }
+                    Ok(true)
+                }),
+                failed: Arc::new(|_, error| panic!("unexpected delta queue failure: {error}")),
             },
-        ] = resolved.as_slice()
-        else {
-            return Err(Error::internal(
-                "document delta did not produce one vector row",
-            ));
-        };
-        assert_eq!(*entity_id, 2_000);
+        )?;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !queue.is_idle() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .map_err(|_| Error::internal("document delta queue timed out"))?;
+        assert_eq!(batches.lock().as_slice(), &[vec!["head", "tail"]]);
+        let (exact, _) = project
+            .indexes
+            .vector_search_source("documents")
+            .ok_or_else(|| Error::internal("document vector source absent"))?;
+        let coordinates = exact
+            .vector_for(2000)
+            .ok_or_else(|| Error::internal("document vector absent"))?;
         assert_eq!(coordinates.len(), 2);
-        assert!(coordinates.iter().all(|coordinate| *coordinate != 0));
+        assert!(coordinates.iter().all(|v| *v > 0.0));
+        assert_eq!(exact.len(), 1);
+        for id in 1000..1400 {
+            let Some(ScalarValue::String(retained)) = project
+                .graph
+                .node(NodeId(id))
+                .and_then(|n| n.property(body))
+            else {
+                return Err(Error::internal("unrelated source absent"));
+            };
+            assert!(Arc::ptr_eq(&source, &retained));
+        }
+        queue.shutdown().await?;
         Ok(())
     }
 
@@ -11570,138 +11480,71 @@ mod project_lifecycle_tests {
     }
 
     #[test]
-    fn republish_resident_project_restores_a_stale_image_off_the_write_path() -> Result<()> {
+    fn canonical_captures_need_no_image_republication_after_writes() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let database = Database::open_backend(
             directory.path(),
-            64 * 1024 * 1024,
+            4 * 1024 * 1024,
             Duration::from_secs(1),
             NodeIdentity::generate_genesis().public(),
         )?;
         let project = ProjectId::random();
-        let initial = Bookmark { term: 1, index: 1 };
         {
             let mut state = database.0.state.write();
-            let mut project_state = ordered_graph_project(project, 1)?;
-            Arc::make_mut(&mut project_state)
-                .graph
-                .apply(GraphMutation::InsertNode(crate::graph::NodeInput {
-                    id: crate::NodeId(2),
-                    layer: crate::Layer::Observed,
-                    revision: 1,
-                    labels: Vec::new(),
-                    properties: Vec::new(),
-                }))?;
-            state.projects.insert(project, project_state);
-            state.applied = initial;
+            state
+                .projects
+                .insert(project, ordered_graph_project(project, 1)?);
+            state.applied = Bookmark { term: 1, index: 1 };
         }
-        database.bind_execution_backend(Box::new(crate::gpu::CpuBackend::new(
-            64 * 1024 * 1024,
-            1024 * 1024,
-        )))?;
-        // Publish the initial image so the resident is fresh at revision 1 / bookmark 1.
-        {
-            let mut execution = database.0.execution.write();
-            let mut state = database.0.state.write();
-            let mut staged = state.clone();
-            publish_execution_state(
-                &mut execution,
-                &mut staged,
-                DeviceImpact::Create(project),
-                initial,
-            )?;
-            *state = staged;
-        }
-        assert!(
-            database.capture_project_execution(project)?.2.is_some(),
-            "resident image should be fresh immediately after publication"
-        );
-
-        // Simulate a deferred write: mutate the host graph and advance the applied bookmark WITHOUT
-        // publishing to the device, exactly as the write path does for a graph past the ceiling.
-        let advanced = Bookmark { term: 1, index: 2 };
-        let new_revision = {
-            let mut state = database.0.state.write();
-            let project_state = Arc::make_mut(
-                state
-                    .projects
-                    .get_mut(&project)
-                    .ok_or_else(|| Error::internal("test project disappeared"))?,
-            );
-            let property = project_state
-                .graph
-                .catalog()
-                .property("value")
-                .ok_or_else(|| Error::internal("test property disappeared"))?;
-            let mutation = GraphMutation::SetNodeProperty {
-                node: crate::NodeId(1),
-                property,
-                value: ScalarValue::Integer(42),
-                revision: 2,
-            };
-            project_state
-                .indexes
-                .before_graph_apply(&project_state.graph, &mutation)?;
-            project_state.graph.apply(mutation.clone())?;
-            project_state
-                .indexes
-                .after_graph_apply(&project_state.graph, &mutation)?;
-            let revision = project_state.graph.revision();
-            state.applied = advanced;
-            revision
-        };
-
-        // The resident image now lags, so reads route to the host (no pinned device generation).
-        assert!(
-            database.capture_project_execution(project)?.2.is_none(),
-            "a lagging resident image must route reads to the host"
-        );
-
-        // Republish off the write path: rebuild and reinstall the image, then the device serves reads
-        // again at the advanced bookmark.
-        assert!(database.republish_resident_project(project, new_revision)?);
-        let (snapshot, bookmark, execution) = database.capture_project_execution(project)?;
-        assert_eq!(bookmark, advanced);
-        let execution = execution
-            .ok_or_else(|| Error::internal("resident image is still stale after republish"))?;
-        assert_eq!(execution.resident_bookmark(project), Some(advanced));
+        database.publish_reader_registry(&database.0.state.read());
+        let (live, _) = database.capture_canonical_project(project)?;
+        let property = live
+            .graph
+            .catalog()
+            .property("value")
+            .ok_or_else(|| Error::internal("value absent"))?;
+        live.graph
+            .set_node_property(NodeId(1), property, ScalarValue::Integer(42), 2)?;
+        let (current, _) = database.capture_canonical_project(project)?;
+        assert!(Arc::ptr_eq(&live, &current));
         assert_eq!(
-            execution.resident_graph_revision(project),
-            Some(snapshot.graph.revision())
+            current
+                .graph
+                .node(NodeId(1))
+                .and_then(|n| n.property(property)),
+            Some(ScalarValue::Integer(42))
         );
+        assert_eq!(live.graph.revision(), 2);
         Ok(())
     }
 
     #[test]
-    fn device_publication_deferral_tracks_changed_rows_not_graph_size() -> Result<()> {
-        fn deferred_with_unrelated_rows(unrelated: u64, changed: u64) -> Result<bool> {
-            let mut graph = GraphStore::default();
+    fn canonical_property_delta_keeps_unrelated_large_source_allocations() -> Result<()> {
+        for unrelated in [40, 400] {
+            let graph = GraphStore::default();
+            let body = graph.catalog_mut().intern_property("body")?;
+            let value = graph.catalog_mut().intern_property("value")?;
+            let source: Arc<str> = Arc::from("complete unrelated payload ".repeat(4096));
             for id in 1..=unrelated {
                 graph.insert_node(NodeInput {
                     id: NodeId(id),
                     layer: Layer::Observed,
                     revision: 1,
-                    labels: Vec::new(),
-                    properties: Vec::new(),
+                    labels: vec![],
+                    properties: vec![(body, ScalarValue::String(source.clone()))],
                 })?;
             }
-            let revision = 2;
-            for offset in 0..changed {
-                graph.insert_node(NodeInput {
-                    id: NodeId(unrelated + offset + 1),
-                    layer: Layer::Observed,
-                    revision,
-                    labels: Vec::new(),
-                    properties: Vec::new(),
-                })?;
+            graph.set_node_property(NodeId(1), value, ScalarValue::Integer(7), 2)?;
+            for id in 2..=unrelated {
+                let Some(ScalarValue::String(retained)) =
+                    graph.node(NodeId(id)).and_then(|n| n.property(body))
+                else {
+                    return Err(Error::internal("unrelated body disappeared"));
+                };
+                assert!(Arc::ptr_eq(&source, &retained));
             }
-            Ok(should_defer_device_publish(&graph))
+            assert_eq!(graph.node_count(), unrelated as usize);
         }
-
-        assert!(!deferred_with_unrelated_rows(40, 1)?);
-        assert!(!deferred_with_unrelated_rows(400, 1)?);
-        assert!(deferred_with_unrelated_rows(40, 2)?);
-        assert!(deferred_with_unrelated_rows(400, 2)?);
         Ok(())
     }
 
@@ -11722,6 +11565,7 @@ mod project_lifecycle_tests {
                 .insert(project, ordered_graph_project(project, 1)?);
             state.applied = Bookmark { term: 1, index: 1 };
         }
+        database.publish_reader_registry(&database.0.state.read());
         let revision = {
             let state = database.0.state.read();
             let project_state = state

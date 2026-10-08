@@ -3,7 +3,10 @@
 //! Owner text is complete; only the identifying name copied into a relationship is bounded.
 //! The mutation overlay reads changed owners and their adjacency, never the unrelated corpus.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use crate::{
     DocumentItem, EdgeId, GraphMutation, GraphStore, LabelId, NodeId, PropertyId,
@@ -33,6 +36,19 @@ pub fn semantic_texts(graph: &GraphStore) -> Result<SemanticTextBatch> {
     )
 }
 
+/// Render one canonical owner only when an embedding worker needs its input.
+pub fn semantic_owner_text(
+    graph: &GraphStore,
+    kind: crate::types::EntityKind,
+    entity_id: u64,
+) -> Result<Option<String>> {
+    let overlay = Overlay::new(graph, &[], &[]);
+    match kind {
+        crate::types::EntityKind::Node => overlay.node_text(NodeId(entity_id)),
+        crate::types::EntityKind::Relationship => overlay.edge_text(EdgeId(entity_id)),
+    }
+}
+
 /// Describes current mutations against the state after earlier mutations in a transaction.
 /// Changes to endpoint names/labels also refresh incident relationship descriptions. Deleted
 /// owners produce tombstones, including relationships removed by a detached node deletion.
@@ -41,6 +57,16 @@ pub fn semantic_text_delta(
     prior: &[GraphMutation],
     current: &[GraphMutation],
 ) -> Result<SemanticTextBatch> {
+    let (nodes, edges) = semantic_affected_owners(graph, prior, current)?;
+    Overlay::new(graph, prior, current).render(nodes, edges)
+}
+
+/// Bounded identity-only work selection; it never materializes owner text.
+pub fn semantic_affected_owners(
+    graph: &GraphStore,
+    prior: &[GraphMutation],
+    current: &[GraphMutation],
+) -> Result<(BTreeSet<NodeId>, BTreeSet<EdgeId>)> {
     let overlay = Overlay::new(graph, prior, current);
     let mut nodes = BTreeSet::new();
     let mut edges = BTreeSet::new();
@@ -54,11 +80,14 @@ pub fn semantic_text_delta(
             GraphMutation::SetNodeProperty { node, property, .. } => {
                 if overlay
                     .property_name(*property)
-                    .is_some_and(meaningful_field)
+                    .is_some_and(|name| meaningful_field(&name))
                 {
                     nodes.insert(*node);
                 }
-                if overlay.property_name(*property).is_some_and(identity_field) {
+                if overlay
+                    .property_name(*property)
+                    .is_some_and(|name| identity_field(&name))
+                {
                     endpoints.insert(*node);
                 }
             }
@@ -74,7 +103,7 @@ pub fn semantic_text_delta(
             GraphMutation::SetEdgeProperty { edge, property, .. } => {
                 if overlay
                     .property_name(*property)
-                    .is_some_and(meaningful_field)
+                    .is_some_and(|name| meaningful_field(&name))
                 {
                     edges.insert(*edge);
                 }
@@ -98,7 +127,7 @@ pub fn semantic_text_delta(
             }
         }
     }
-    overlay.render(nodes, edges)
+    Ok((nodes, edges))
 }
 
 struct Overlay<'a> {
@@ -161,16 +190,16 @@ impl<'a> Overlay<'a> {
         overlay
     }
 
-    fn property_name(&self, id: PropertyId) -> Option<&str> {
+    fn property_name(&self, id: PropertyId) -> Option<Arc<str>> {
         self.properties
             .get(&id)
-            .copied()
+            .map(|name| Arc::from(*name))
             .or_else(|| self.graph.catalog().property_name(id))
     }
 
     fn property_allowed(&self, id: PropertyId, identity: bool) -> bool {
         self.property_name(id)
-            .is_some_and(|name| meaningful_field(name) && (!identity || identity_field(name)))
+            .is_some_and(|name| meaningful_field(&name) && (!identity || identity_field(&name)))
     }
 
     fn node(&self, id: NodeId, identity: bool) -> Option<NodeText> {
@@ -230,7 +259,7 @@ impl<'a> Overlay<'a> {
             .filter_map(|label| {
                 self.labels
                     .get(label)
-                    .copied()
+                    .map(|name| Arc::from(*name))
                     .or_else(|| self.graph.catalog().label_name(*label))
             })
             .collect();
@@ -239,7 +268,7 @@ impl<'a> Overlay<'a> {
         } else {
             labels
                 .into_iter()
-                .map(readable_name)
+                .map(|name| readable_name(&name))
                 .collect::<Vec<_>>()
                 .join(", ")
         }
@@ -262,7 +291,9 @@ impl<'a> Overlay<'a> {
                 if meaningful_string(&value) {
                     text.push_str("; ");
                     text.push_str(&readable_name(
-                        self.property_name(property).unwrap_or("name"),
+                        &self
+                            .property_name(property)
+                            .unwrap_or_else(|| Arc::from("name")),
                     ));
                     text.push_str(": ");
                     // A relationship borrows an identifying excerpt, not an owner's full content.
@@ -326,10 +357,10 @@ impl<'a> Overlay<'a> {
         let kind = self
             .types
             .get(&kind)
-            .copied()
+            .map(|name| Arc::from(*name))
             .or_else(|| self.graph.catalog().relationship_type_name(kind))
-            .unwrap_or("Relationship");
-        let mut text = format!("({source}) — {} → ({target})", readable_name(kind));
+            .unwrap_or_else(|| Arc::from("Relationship"));
+        let mut text = format!("({source}) — {} → ({target})", readable_name(&kind));
         self.append_properties(&mut text, properties)?;
         Ok(Some(text))
     }
@@ -345,7 +376,7 @@ impl<'a> Overlay<'a> {
             .filter_map(|(id, value)| self.property_name(id).map(|name| (name, value)))
             .collect();
         for (name, value) in properties {
-            append_value(text, name, value)?;
+            append_value(text, &name, value)?;
         }
         Ok(())
     }

@@ -15,7 +15,7 @@ use irongraph::{
 use tokio_util::sync::CancellationToken;
 
 fn graph() -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let label = graph.catalog_mut().intern_label("N")?;
     let relationship_type = graph.catalog_mut().intern_relationship_type("T")?;
     for id in [1, 2] {

@@ -17,6 +17,10 @@ use super::{
     persistent::{PagedVec, PersistentMap},
 };
 
+#[path = "concurrent_temporal.rs"]
+mod concurrent_temporal;
+pub use concurrent_temporal::TemporalStore;
+
 /// Declared scalar type of a temporal property.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TemporalType {
@@ -298,6 +302,8 @@ struct TemporalColumn {
     current: PersistentMap<usize>,
 }
 
+// Retained exclusively for the inactive graph image implementation.
+#[allow(dead_code)]
 impl TemporalColumn {
     fn with_property(property: PropertyId) -> Self {
         Self {
@@ -647,6 +653,8 @@ struct MaterializedRollup {
     bucket_overrides: PersistentMap<RollupBucket>,
 }
 
+// Retained exclusively for the inactive graph image implementation.
+#[allow(dead_code)]
 impl MaterializedRollup {
     #[must_use]
     fn bucket(&self, entity_id: u64, start_nanos: i64) -> Option<&RollupBucket> {
@@ -703,7 +711,7 @@ impl RollupBucket {
 
 /// Separate node/relationship temporal families sharing one implementation.
 #[derive(Clone, Debug, Default, Serialize)]
-pub struct TemporalStore {
+pub struct InactiveTemporalStore {
     declarations: Arc<BTreeMap<(u8, u64, PropertyId), TemporalDeclaration>>,
     columns: BTreeMap<(u8, u64, PropertyId), Arc<TemporalColumn>>,
     rollups: BTreeMap<String, Arc<MaterializedRollup>>,
@@ -716,7 +724,7 @@ struct PersistedTemporalStore {
     rollups: BTreeMap<String, Arc<MaterializedRollup>>,
 }
 
-impl<'de> Deserialize<'de> for TemporalStore {
+impl<'de> Deserialize<'de> for InactiveTemporalStore {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -734,7 +742,9 @@ impl<'de> Deserialize<'de> for TemporalStore {
     }
 }
 
-impl TemporalStore {
+// The active database uses concurrent_temporal::TemporalStore.
+#[allow(dead_code)]
+impl InactiveTemporalStore {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.declarations.is_empty() && self.columns.is_empty() && self.rollups.is_empty()
@@ -1849,6 +1859,7 @@ fn rebuild_current(column: &mut TemporalColumn) {
     }
 }
 
+#[allow(dead_code)] // Inactive graph image bucket addressing.
 fn rollup_bucket_key(entity_id: u64, start_nanos: i64) -> u128 {
     (u128::from(entity_id) << 64) | u128::from((start_nanos as u64) ^ (1_u64 << 63))
 }
@@ -1859,6 +1870,7 @@ fn rollup_bucket_parts(key: u128) -> (u64, i64) {
     (entity_id, start_nanos)
 }
 
+#[allow(dead_code)] // Inactive graph image rollup mutation.
 fn add_sample_to_rollup(rollup: &mut MaterializedRollup, sample: &TemporalSample) -> Result<()> {
     let end = sample.event_time_nanos.checked_add(1).ok_or_else(|| {
         Error::new(
@@ -2086,6 +2098,7 @@ fn days_in_month(year: i32, month: u32) -> Result<u32> {
 mod tests {
     use ordered_float::OrderedFloat;
 
+    use super::InactiveTemporalStore as TemporalStore;
     use super::*;
 
     fn sample(property: PropertyId, time: i64, revision: u64, value: f64) -> TemporalSample {

@@ -138,7 +138,7 @@ fn list_and_scalar_index_type_errors_remain_distinct() -> Result<()> {
 
 #[test]
 fn dynamic_entity_index_reads_node_and_relationship_properties() -> Result<()> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let name = graph.catalog_mut().intern_property("name")?;
     let weight = graph.catalog_mut().intern_property("weight")?;
     let relationship_type = graph.catalog_mut().intern_relationship_type("R")?;
@@ -213,7 +213,7 @@ fn dynamic_entity_index_reads_node_and_relationship_properties() -> Result<()> {
 
 /// One node carrying two same-length property names, used to exercise dynamic property access.
 fn graph_with_two_properties() -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let label = graph.catalog_mut().intern_label("Entity")?;
     let name = graph.catalog_mut().intern_property("name")?;
     let kind = graph.catalog_mut().intern_property("type")?;

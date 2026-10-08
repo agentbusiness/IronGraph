@@ -1,19 +1,19 @@
 import type { QueryResult } from '../types';
 import { runQuery } from './api';
-import { EMPTY_RESULT, applyQueryEvent } from './queryResult';
+import { QueryResultCollector } from './queryResult';
 
-/** Run one bounded statement and fold its stream into the same result shape as Query. */
+/** Run one statement and collect its complete stream into the same result shape as Query. */
 export async function executeQuery(
   query: string,
   projectId?: string,
   parameters: Record<string, unknown> = {},
   signal?: AbortSignal,
 ): Promise<QueryResult> {
-  let result = EMPTY_RESULT;
+  const result = new QueryResultCollector();
   for await (const event of runQuery({ query, projectId, parameters, signal })) {
     if (event.type === 'error') throw new Error(event.message);
-    result = applyQueryEvent(result, event);
-    if (event.type === 'summary') return result;
+    result.append(event);
+    if (event.type === 'summary') return result.finish();
   }
   throw new Error('The query ended before IronGraph returned a summary.');
 }

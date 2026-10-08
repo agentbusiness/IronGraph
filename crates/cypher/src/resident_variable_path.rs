@@ -7012,9 +7012,7 @@ mod tests {
             ResidentExecutionObligation, ResidentObligationKind, ResidentObligationScope,
             ResidentProjectImage, ResidentVariablePathInput,
         },
-        graph::{
-            EdgeInput, GraphStore, IndexCatalog, NodeInput, StatisticsSnapshot, TemporalStore,
-        },
+        graph::{EdgeInput, GraphStore, IndexCatalog, NodeInput, StatisticsSnapshot},
     };
 
     use super::{
@@ -7038,7 +7036,7 @@ mod tests {
     const PROJECT: ProjectId = ProjectId(uuid::Uuid::nil());
 
     fn fixture_graph() -> Result<GraphStore> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         for label in [
             "A", "Artist", "B", "Blue", "C", "End", "Green", "Single", "Start", "TheLabel", "X",
             "Y",
@@ -7126,7 +7124,7 @@ mod tests {
 
     #[test]
     fn return6_path_aggregations_lower_to_sealed_final_relations() -> Result<()> {
-        let mut graph = fixture_graph()?;
+        let graph = fixture_graph()?;
         graph.catalog_mut().intern_label("L")?;
         graph.catalog_mut().intern_label("T")?;
         graph.catalog_mut().intern_relationship_type("R")?;
@@ -7404,7 +7402,7 @@ mod tests {
 
     #[test]
     fn mixed_type_order_is_one_sealed_variable_path_command() -> Result<()> {
-        let mut graph = fixture_graph()?;
+        let graph = fixture_graph()?;
         graph.catalog_mut().intern_label("N")?;
         let ascending = compile_optimized_query(
             "MATCH p = (n:N)-[r:REL]->() \
@@ -7553,7 +7551,7 @@ mod tests {
 
     #[test]
     fn return_order_by2_grouped_node_paths_by_length_is_one_sealed_relation() -> Result<()> {
-        let mut graph = fixture_graph()?;
+        let graph = fixture_graph()?;
         let relationship_type = graph
             .catalog()
             .relationship_type("REL")
@@ -7610,8 +7608,8 @@ mod tests {
         let image = ResidentProjectImage::build(
             PROJECT,
             bookmark,
-            &graph,
-            &TemporalStore::default(),
+            &crate::legacy_graph_fixture(&graph)?,
+            &crate::graph::legacy::TemporalStore::default(),
             &IndexCatalog::default(),
         )?;
         let mut cpu = CpuBackend::new(512 * 1024 * 1024, 64 * 1024 * 1024);
@@ -7651,7 +7649,7 @@ mod tests {
 
     #[test]
     fn with6_relationship_group_keys_and_bound_rematches_are_executable_identities() -> Result<()> {
-        let mut graph = fixture_graph()?;
+        let graph = fixture_graph()?;
         let x = graph.catalog().label("X").expect("X label");
         let relationship_type = graph
             .catalog()
@@ -7719,7 +7717,7 @@ mod tests {
 
     #[test]
     fn with_skip_limit2_singleton_label_source_erases_only_identity_window() -> Result<()> {
-        let mut graph = fixture_graph()?;
+        let graph = fixture_graph()?;
         let a = graph.catalog().label("A").expect("A label");
         graph.insert_node(NodeInput {
             id: NodeId(1),
@@ -7760,7 +7758,7 @@ mod tests {
 
     #[test]
     fn with_skip_limit1_dependency_join_is_one_sealed_cpu_relation() -> Result<()> {
-        let mut graph = fixture_graph()?;
+        let graph = fixture_graph()?;
         let name = graph.catalog().property("name").expect("name property");
         let id = graph.catalog().property("id").expect("id property");
         let num = graph.catalog_mut().intern_property("num")?;
@@ -7812,8 +7810,8 @@ mod tests {
         backend.admit_project(ResidentProjectImage::build(
             PROJECT,
             bookmark,
-            &graph,
-            &TemporalStore::default(),
+            &crate::legacy_graph_fixture(&graph)?,
+            &crate::graph::legacy::TemporalStore::default(),
             &IndexCatalog::default(),
         )?)?;
         let pinned = backend.pin_project(PROJECT)?;
@@ -7842,7 +7840,7 @@ mod tests {
 
     #[test]
     fn return_order_by2_singleton_path_erases_only_distinct_and_order_identities() -> Result<()> {
-        let mut graph = fixture_graph()?;
+        let graph = fixture_graph()?;
         let relationship_type = graph
             .catalog()
             .relationship_type("T")
@@ -8935,7 +8933,7 @@ mod tests {
 
     #[test]
     fn match6_14_mixed_directed_and_undirected_path_keeps_exact_trails() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let start = graph.catalog_mut().intern_label("Start")?;
         let end = graph.catalog_mut().intern_label("End")?;
         let connected = graph
@@ -8994,8 +8992,8 @@ mod tests {
         let image = ResidentProjectImage::build(
             PROJECT,
             bookmark,
-            &graph,
-            &TemporalStore::default(),
+            &crate::legacy_graph_fixture(&graph)?,
+            &crate::graph::legacy::TemporalStore::default(),
             &IndexCatalog::default(),
         )?;
         let mut cpu = CpuBackend::new(512 * 1024 * 1024, 64 * 1024 * 1024);

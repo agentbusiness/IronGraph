@@ -40,6 +40,11 @@ standalone-snapshots/
 # Performance and profiling output
 perf.data*
 flamegraph.svg
+/performance-results/cpu-canonical/
+/performance-results/cpu-recovery/
+/performance-results/public-query/
+/.unlazy/
+/performance-results/
 
 # Editor and operating-system files
 .DS_Store

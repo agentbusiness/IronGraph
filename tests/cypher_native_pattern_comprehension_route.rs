@@ -96,7 +96,7 @@ struct Fixture {
 }
 
 fn fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let a = graph.catalog_mut().intern_label("A")?;
     let b = graph.catalog_mut().intern_label("B")?;
     let t = graph.catalog_mut().intern_relationship_type("T")?;
@@ -152,7 +152,7 @@ fn fixture() -> Result<Fixture> {
 }
 
 fn exact_tck_pattern2_08_fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let a = graph.catalog_mut().intern_label("A")?;
     let b = graph.catalog_mut().intern_label("B")?;
     let c = graph.catalog_mut().intern_label("C")?;
@@ -191,7 +191,7 @@ fn exact_tck_pattern2_08_fixture() -> Result<Fixture> {
 }
 
 fn exact_tck_pattern2_09_fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let a = graph.catalog_mut().intern_label("A")?;
     let b = graph.catalog_mut().intern_label("B")?;
     let relationship_type = graph.catalog_mut().intern_relationship_type("T")?;
@@ -224,7 +224,7 @@ fn exact_tck_pattern2_09_fixture() -> Result<Fixture> {
 }
 
 fn exact_tck_pattern2_07_fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let x = graph.catalog_mut().intern_label("X")?;
     let y = graph.catalog_mut().intern_label("Y")?;
     let relationship_type = graph.catalog_mut().intern_relationship_type("T")?;
@@ -273,7 +273,7 @@ fn exact_tck_pattern2_07_fixture() -> Result<Fixture> {
 }
 
 fn exact_tck_pattern2_11_fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let relationship_type = graph.catalog_mut().intern_relationship_type("T")?;
     let time = graph.catalog_mut().intern_property("time")?;
     for (id, value) in [(NodeId(1), 20), (NodeId(2), 10)] {
@@ -305,7 +305,7 @@ fn exact_tck_pattern2_11_fixture() -> Result<Fixture> {
 }
 
 fn resident_image(fixture: &Fixture) -> Result<ResidentProjectImage> {
-    ResidentProjectImage::build(
+    super::legacy_resident_build(
         fixture.project,
         fixture.bookmark,
         &fixture.graph,
@@ -1000,7 +1000,7 @@ fn neighboring_pattern_comprehensions_fail_closed_without_any_backend_work() -> 
 
 #[test]
 fn stale_resident_generation_is_rejected_before_variable_path_dispatch() -> Result<()> {
-    let mut fixture = fixture()?;
+    let fixture = fixture()?;
     let backend = ObservedBackend::new(cpu_backend(&fixture)?);
     let observations = backend.observations();
     fixture.graph.insert_node(NodeInput {

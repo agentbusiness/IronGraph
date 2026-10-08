@@ -640,7 +640,7 @@ fn run_strict_merge9_dynamic_case(case: Case, backend: StrictMerge9Backend) -> R
 
 fn empty_merge9_cpu_backend() -> Result<CpuBackend> {
     let graph = GraphStore::default();
-    let image = ResidentProjectImage::build(
+    let image = super::legacy_resident_build(
         PROJECT,
         Bookmark {
             term: 79,
@@ -670,7 +670,7 @@ fn strict_cpu_merge9_1_and_2_use_scheduled_dynamic_node_merges() -> Result<()> {
 fn real_metal_merge9_1_and_2_use_scheduled_dynamic_node_merges() -> Result<()> {
     for case in &CASES[..2] {
         let graph = GraphStore::default();
-        let image = ResidentProjectImage::build(
+        let image = super::legacy_resident_build(
             PROJECT,
             Bookmark {
                 term: 79,
@@ -694,7 +694,7 @@ fn strict_cpu_merge9_3_uses_the_complete_native_ordered_mutation() -> Result<()>
         term: 79,
         index: graph.revision(),
     };
-    let image = ResidentProjectImage::build(
+    let image = super::legacy_resident_build(
         PROJECT,
         bookmark,
         &graph,
@@ -752,7 +752,7 @@ fn merge9_4_graph_and_backend() -> Result<(GraphStore, CpuBackend)> {
     let mut graph = GraphStore::default();
     let setup = execute(&graph, "CREATE (:A {num: 42})")?;
     apply_output(&mut graph, &setup)?;
-    let image = ResidentProjectImage::build(
+    let image = super::legacy_resident_build(
         PROJECT,
         Bookmark {
             term: 79,

@@ -68,7 +68,7 @@ fn context<'a>(
 }
 
 fn fixture_graph(setup_queries: &[&str]) -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     for setup in setup_queries {
         let output = QueryEngine.execute(setup, &mut context(&graph, None, false))?;
         assert!(output.temporal_mutations.is_empty());
@@ -82,7 +82,7 @@ fn fixture_graph(setup_queries: &[&str]) -> Result<GraphStore> {
 fn execute_strict_cpu(graph: &GraphStore, query: &str) -> Result<ExecutionOutput> {
     let mut backend = CpuBackend::new(MEMORY_LIMIT_BYTES, RESERVED_BYTES);
     backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-        graph.snapshot()?,
+        super::legacy_fixture_snapshot(&graph)?,
     ))])?;
     QueryEngine.execute(query, &mut context(graph, Some(&backend), true))
 }

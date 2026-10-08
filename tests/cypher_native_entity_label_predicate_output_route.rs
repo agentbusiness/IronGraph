@@ -261,7 +261,7 @@ fn fixture(case: Case) -> Result<GraphStore> {
 }
 
 fn resident_image(graph: &GraphStore) -> Result<ResidentProjectImage> {
-    ResidentProjectImage::build(
+    super::legacy_resident_build(
         PROJECT,
         Bookmark {
             term: 71,

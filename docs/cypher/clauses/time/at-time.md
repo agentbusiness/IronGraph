@@ -1,6 +1,6 @@
 # `AT TIME`
 
-> Runs the whole query against the graph as it stood at a past instant.
+> Reads declared temporal properties at a chosen event time.
 
 | | |
 | --- | --- |
@@ -11,9 +11,9 @@
 
 ## What it does
 
-`AT TIME` sits ahead of the query body, beside `USE` and `USE LAYER`, and moves the entire query to a chosen instant. Every declared temporal property read anywhere in that query returns the value in effect then, rather than its current one.
+`AT TIME` sits ahead of the query body, beside `USE` and `USE LAYER`, and selects an event time for declared temporal properties. Every declared temporal property read anywhere in that query returns the sample in effect then.
 
-It is a property of the query, not of a clause. There is no way to read two different instants in one statement, which is deliberate: a single query always describes one consistent moment.
+The selected event time applies throughout the statement. It does not freeze the graph: parallel reads still use current nodes, relationships and ordinary properties and may observe concurrent changes.
 
 ## How it behaves
 
@@ -21,10 +21,10 @@ IronGraph separates two clocks. **Event time** is when something happened in the
 
 A declared temporal property has two distinct reads that are easy to confuse.
 
-- Reading it in an ordinary query returns the **canonical** value: whatever an ordinary `SET` last wrote. Writes made with `AT TIME` do not touch it.
-- Reading it under `AT TIME`, or through `HISTORY`, returns the **temporal** value: the sample in effect at that instant.
+- Reading it in an ordinary query returns the **current sample**: the latest retained sample in event-time order.
+- Reading it under `AT TIME` returns the sample in effect at the selected instant. `HISTORY` returns the samples in its requested range.
 
-The two can differ, and on the `trust` dataset they do: `reputation` was written entirely through backdated samples, so its canonical value is still the `0.0` set at load while its temporal value follows the real 2010-2016 curve.
+Current and historical samples can differ. On the `trust` dataset, backdated `reputation` samples describe the real 2010-2016 timeline.
 
 Before an entity's first sample, its temporal value is `null` — not its eventual first value, and not an error. A time-travelling query therefore reports genuine absence for entities that did not yet have the property, which is what makes counting them meaningful.
 
@@ -36,7 +36,7 @@ Use it to answer "what did we believe then": reproducing a past report, auditing
 
 ## How it differs from its neighbours
 
-`AT TIME` gives one instant's value per entity and keeps the ordinary row shape. `HISTORY` gives every sample in a range as its own row, which changes the row grain. Use `AT TIME` for a snapshot and `HISTORY` for a trajectory.
+`AT TIME` gives one instant's value per entity and keeps the ordinary row shape. `HISTORY` gives every sample in a range as its own row, which changes the row grain. Use `AT TIME` for an event-time value and `HISTORY` for a trajectory.
 
 `AT TIME` also appears in a second, unrelated position: attached to a `SET` item it stamps a written sample rather than choosing a read instant. See [`SET … AT TIME`](../../statements/temporal/set-at-time.md).
 
@@ -89,16 +89,16 @@ accounts_in_the_graph | rated_by_2012 | mean_reputation | lowest | highest
 
 ## Where it earns its place
 
-- Reproducing a report exactly as it read on a past date.
+- Reporting declared temporal values at a past event time.
 - Auditing a decision against what was known when it was taken.
-- Counting when entities entered a dataset, without a created-at field.
+- Counting which entities had a temporal sample by a chosen event time.
 
 ## Limitations and trade-offs
 
 - Only declared temporal properties travel in time. Node existence, labels, relationships and ordinary properties are always read as they are now.
 - One instant per query. Comparing two moments takes two queries, or a `HISTORY` range.
 - A read before an entity's first sample is `null`. Aggregates skip those rows, which is usually right and occasionally surprising.
-- The canonical value of the property is a different value and is unaffected.
+- Concurrent writes may change retained samples while a query runs; `AT TIME` does not provide snapshot isolation.
 
 ## See also
 

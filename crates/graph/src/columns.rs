@@ -1140,7 +1140,7 @@ fn property_list_scalar_kind(value: &ScalarValue) -> Result<PropertyListScalarKi
     }
 }
 
-fn validate_property_value_shape(value: &ScalarValue) -> Result<()> {
+pub fn validate_property_value_shape(value: &ScalarValue) -> Result<()> {
     match value {
         ScalarValue::List(value) => {
             let mut element_kind = None;
@@ -1182,7 +1182,7 @@ fn mixed_payload_len(value: &ScalarValue) -> usize {
     }
 }
 
-fn mixed_payload(value: &ScalarValue) -> Result<Option<Vec<u8>>> {
+pub(crate) fn mixed_payload(value: &ScalarValue) -> Result<Option<Vec<u8>>> {
     let mut payload = Vec::new();
     match value {
         ScalarValue::Null => return Ok(None),
@@ -1267,7 +1267,7 @@ fn mixed_exact<const N: usize>(payload: &[u8], message: &'static str) -> Result<
     payload.try_into().map_err(|_| mixed_corrupt(message))
 }
 
-fn mixed_value(payload: &[u8]) -> Result<ScalarValue> {
+pub(crate) fn mixed_value(payload: &[u8]) -> Result<ScalarValue> {
     let (tag, payload) = payload
         .split_first()
         .ok_or_else(|| mixed_corrupt("mixed property payload is empty"))?;

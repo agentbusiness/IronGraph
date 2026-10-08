@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
 };
 
+use super::concurrent::{CanonicalMap, CanonicalSet, Counter, Edit, Position};
 use rayon::prelude::*;
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
@@ -16,10 +17,9 @@ use crate::storage::ConnectionId;
 use crate::{
     Bookmark, CommitAcknowledgement, Error, ProjectId, Result,
     engine::ApplicationWait,
-    graph::{PagedVec, PersistentMap, stable_id_key},
+    graph::stable_id_key,
     storage::{
-        CowArc, SegmentDescriptor, SegmentFamily, SegmentRecord, SegmentRecordLocation,
-        SegmentStore,
+        SegmentDescriptor, SegmentFamily, SegmentRecord, SegmentRecordLocation, SegmentStore,
     },
     types::{MessageId, StreamId},
 };
@@ -133,9 +133,9 @@ struct BrokerPayloadSegment {
     descriptor: SegmentDescriptor,
     live_records: u32,
     #[serde(default)]
-    shared_amqp_ingress: Option<IngressMetadata>,
+    shared_amqp_ingress: Option<Arc<IngressMetadata>>,
     #[serde(default)]
-    shared_kafka_ingress: Option<IngressMetadata>,
+    shared_kafka_ingress: Option<Arc<IngressMetadata>>,
     /// Conservative protocol/accounting charge for an ingress envelope stored once here rather
     /// than repeated inside every raw payload record. Older snapshots recompute a zero default.
     #[serde(default)]
@@ -326,7 +326,7 @@ impl RetentionPolicy {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Topic {
-    partitions: Vec<StreamId>,
+    partitions: Arc<[StreamId]>,
     retention: RetentionPolicy,
 }
 
@@ -390,7 +390,7 @@ struct StreamReference {
 
 struct PendingDelivery {
     offset: u64,
-    stored: StoredPayloadRecord,
+    stored: Arc<StoredPayloadRecord>,
     redelivered: bool,
     death_count: u32,
     exchange: Option<String>,
@@ -398,12 +398,7 @@ struct PendingDelivery {
 }
 
 #[derive(Clone, Debug, Default)]
-struct MessageTable {
-    first_id: u64,
-    values: PagedVec<Option<StoredPayloadRecord>>,
-    live: usize,
-}
-
+struct MessageTable(CanonicalMap<u64, StoredPayloadRecord>);
 fn broker_map_id(key: u128) -> Option<u64> {
     if key > 0 && key <= u128::from(u64::MAX) {
         return Some(key as u64);
@@ -412,462 +407,294 @@ fn broker_map_id(key: u128) -> Option<u64> {
         .then_some((key >> 64) as u64)
         .filter(|id| *id != 0)
 }
-
-fn broker_map_is_valid<V>(map: &PersistentMap<V>) -> bool {
-    let mut ids = BTreeSet::new();
-    map.iter()
-        .all(|(key, _)| broker_map_id(key).is_some_and(|id| ids.insert(id)))
-}
-
-impl Serialize for MessageTable {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut map = serializer.serialize_map(Some(self.live))?;
-        for (id, record) in self.iter() {
-            map.serialize_entry(&stable_id_key(id.0), record)?;
-        }
-        map.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for MessageTable {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct MessageTableVisitor;
-
-        impl<'de> Visitor<'de> for MessageTableVisitor {
-            type Value = MessageTable;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a broker message numeric-key map")
+macro_rules! numeric_table_serde {
+    ($name:ident,$value:ty) => {
+        impl Serialize for $name {
+            fn serialize<S: Serializer>(
+                &self,
+                serializer: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                let mut map = serializer.serialize_map(Some(self.0.len()))?;
+                for (id, value) in self.0.iter() {
+                    map.serialize_entry(&stable_id_key(id), value.as_ref())?;
+                }
+                map.end()
             }
-
-            fn visit_map<A>(self, mut entries: A) -> std::result::Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut ordered = BTreeMap::<u64, StoredPayloadRecord>::new();
-                while let Some((key, value)) = entries.next_entry::<u128, StoredPayloadRecord>()? {
-                    let id = broker_map_id(key).ok_or_else(|| {
-                        serde::de::Error::custom(
-                            "broker message table key exceeds the canonical ID domain",
-                        )
-                    })?;
-                    if ordered.insert(id, value).is_some() {
-                        return Err(serde::de::Error::custom(
-                            "broker message table repeats a logical message ID",
-                        ));
+        }
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(
+                deserializer: D,
+            ) -> std::result::Result<Self, D::Error> {
+                struct TableVisitor;
+                impl<'de> Visitor<'de> for TableVisitor {
+                    type Value = $name;
+                    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        f.write_str("broker numeric-key map")
+                    }
+                    fn visit_map<A: MapAccess<'de>>(
+                        self,
+                        mut entries: A,
+                    ) -> std::result::Result<Self::Value, A::Error> {
+                        let values = CanonicalMap::default();
+                        while let Some((key, value)) = entries.next_entry::<u128, $value>()? {
+                            let id = broker_map_id(key).ok_or_else(|| {
+                                serde::de::Error::custom("invalid broker numeric key")
+                            })?;
+                            if values.insert(id, value).is_some() {
+                                return Err(serde::de::Error::custom("duplicate broker ID"));
+                            }
+                        }
+                        Ok($name(values))
                     }
                 }
-                let Some((&first_id, _)) = ordered.first_key_value() else {
-                    return Ok(MessageTable::default());
-                };
-                let last_id = *ordered
-                    .last_key_value()
-                    .map(|(id, _)| id)
-                    .ok_or_else(|| serde::de::Error::custom("broker message table disappeared"))?;
-                let span = last_id
-                    .checked_sub(first_id)
-                    .and_then(|span| span.checked_add(1))
-                    .and_then(|span| usize::try_from(span).ok())
-                    .ok_or_else(|| {
-                        serde::de::Error::custom("broker message table span exceeds host capacity")
-                    })?;
-                let live = ordered.len();
-                let mut values = PagedVec::default();
-                for offset in 0..span {
-                    let id = first_id + offset as u64;
-                    values.push(ordered.remove(&id));
-                }
-                Ok(MessageTable {
-                    first_id,
-                    values,
-                    live,
-                })
+                deserializer.deserialize_map(TableVisitor)
             }
         }
-
-        deserializer.deserialize_map(MessageTableVisitor)
-    }
+    };
 }
-
+numeric_table_serde!(MessageTable, StoredPayloadRecord);
 impl MessageTable {
     #[cfg(test)]
     fn shared_with(&self, other: &Self) -> bool {
-        self.first_id == other.first_id
-            && self.live == other.live
-            && self.values.detached_page_bytes_from(&other.values) == 0
+        self.0.shared_with(&other.0)
     }
-
-    fn get(&self, id: &MessageId) -> Option<&StoredPayloadRecord> {
-        let index = usize::try_from(id.0.checked_sub(self.first_id)?).ok()?;
-        self.values.get(index)?.as_ref()
+    fn get(&self, id: &MessageId) -> Option<Arc<StoredPayloadRecord>> {
+        self.0.get(&id.0)
     }
-
     fn insert(
-        &mut self,
+        &self,
         id: MessageId,
-        record: StoredPayloadRecord,
-    ) -> Result<Option<StoredPayloadRecord>> {
-        if self.values.is_empty() {
-            self.first_id = id.0;
+        value: StoredPayloadRecord,
+    ) -> Result<Option<Arc<StoredPayloadRecord>>> {
+        if self.0.contains_key(&id.0) {
+            return Err(Error::internal("broker message append is not monotonic"));
         }
-        let expected = self
-            .first_id
-            .checked_add(self.values.len() as u64)
-            .ok_or_else(|| Error::internal("broker message table ID span exhausted"))?;
-        if id.0 != expected {
-            return Err(Error::internal(
-                "broker message table append is not monotonic",
-            ));
-        }
-        self.values.push(Some(record));
-        self.live = self
-            .live
-            .checked_add(1)
-            .ok_or_else(|| Error::internal("broker message table live count exhausted"))?;
-        Ok(None)
+        Ok(self.0.insert(id.0, value))
     }
-
-    fn remove(&mut self, id: &MessageId) -> Option<StoredPayloadRecord> {
-        let index = usize::try_from(id.0.checked_sub(self.first_id)?).ok()?;
-        let removed = self.values.get_mut(index)?.take()?;
-        self.live = self.live.saturating_sub(1);
-        loop {
-            let first_leaf = self.values.first_leaf_len();
-            if first_leaf == 0 || self.values.iter().take(first_leaf).any(Option::is_some) {
-                break;
-            }
-            let discarded = self.values.discard_prefix_leaves(first_leaf);
-            self.first_id = self.first_id.saturating_add(discarded as u64);
-        }
-        Some(removed)
+    fn remove(&self, id: &MessageId) -> Option<Arc<StoredPayloadRecord>> {
+        self.0.remove(&id.0)
     }
-
-    fn iter(&self) -> impl Iterator<Item = (MessageId, &StoredPayloadRecord)> {
-        self.values
-            .iter()
-            .enumerate()
-            .filter_map(|(index, record)| {
-                record
-                    .as_ref()
-                    .map(|record| (MessageId(self.first_id + index as u64), record))
-            })
+    fn iter(&self) -> impl Iterator<Item = (MessageId, Arc<StoredPayloadRecord>)> {
+        self.0.iter().map(|(id, value)| (MessageId(id), value))
     }
-
-    fn keys(&self) -> impl Iterator<Item = MessageId> + '_ {
-        self.iter().map(|(id, _)| id)
+    fn keys(&self) -> impl Iterator<Item = MessageId> {
+        self.0.keys().map(MessageId)
     }
-
-    fn last_key_value(&self) -> Option<(MessageId, &StoredPayloadRecord)> {
-        self.iter().last()
-    }
-
-    const fn len(&self) -> usize {
-        self.live
-    }
-}
-
-#[derive(Clone, Debug, Default, Serialize)]
-struct PayloadSegmentTable(PersistentMap<Arc<BrokerPayloadSegment>>);
-
-impl<'de> Deserialize<'de> for PayloadSegmentTable {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let map = PersistentMap::deserialize(deserializer)?;
-        if !broker_map_is_valid(&map) {
-            return Err(serde::de::Error::custom(
-                "broker payload segment key exceeds the canonical ID domain",
-            ));
-        }
-        Ok(Self(map))
-    }
-}
-
-impl PayloadSegmentTable {
-    fn get(&self, id: u64) -> Option<&Arc<BrokerPayloadSegment>> {
+    fn last_key_value(&self) -> Option<(MessageId, Arc<StoredPayloadRecord>)> {
         self.0
-            .get(stable_id_key(id))
-            .or_else(|| self.0.get(u128::from(id)))
+            .last_key_value()
+            .map(|(id, value)| (MessageId(id), value))
     }
-
-    fn get_mut(&mut self, id: u64) -> Option<&mut Arc<BrokerPayloadSegment>> {
-        let key = if self.0.contains_key(stable_id_key(id)) {
-            stable_id_key(id)
-        } else {
-            u128::from(id)
-        };
-        self.0.get_mut(key)
-    }
-
-    fn insert(
-        &mut self,
-        id: u64,
-        segment: Arc<BrokerPayloadSegment>,
-    ) -> Option<Arc<BrokerPayloadSegment>> {
-        self.0.insert_cow(stable_id_key(id), segment)
-    }
-
-    fn remove(&mut self, id: u64) -> Option<Arc<BrokerPayloadSegment>> {
-        self.0
-            .remove(stable_id_key(id))
-            .or_else(|| self.0.remove(u128::from(id)))
-    }
-
-    fn iter(&self) -> impl Iterator<Item = (u64, &Arc<BrokerPayloadSegment>)> {
-        self.0
-            .iter()
-            .filter_map(|(id, segment)| broker_map_id(id).map(|id| (id, segment)))
-    }
-
-    const fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.0.len()
     }
 }
-
-#[derive(Clone, Debug, Default, Serialize)]
-struct StreamTable(PersistentMap<Arc<StreamState>>);
-
-impl<'de> Deserialize<'de> for StreamTable {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let map = PersistentMap::deserialize(deserializer)?;
-        if !broker_map_is_valid(&map) {
-            return Err(serde::de::Error::custom(
-                "broker stream table key exceeds the canonical ID domain",
-            ));
-        }
-        Ok(Self(map))
+#[derive(Clone, Debug, Default)]
+struct PayloadSegmentTable(CanonicalMap<u64, BrokerPayloadSegment>);
+numeric_table_serde!(PayloadSegmentTable, BrokerPayloadSegment);
+impl PayloadSegmentTable {
+    fn get(&self, id: u64) -> Option<Arc<BrokerPayloadSegment>> {
+        self.0.get(&id)
+    }
+    fn get_mut(&self, id: u64) -> Option<Edit<'_, u64, BrokerPayloadSegment>> {
+        self.0.get_mut(&id)
+    }
+    fn insert(
+        &self,
+        id: u64,
+        value: Arc<BrokerPayloadSegment>,
+    ) -> Option<Arc<BrokerPayloadSegment>> {
+        self.0.insert(
+            id,
+            Arc::try_unwrap(value).unwrap_or_else(|value| (*value).clone()),
+        )
+    }
+    fn remove(&self, id: u64) -> Option<Arc<BrokerPayloadSegment>> {
+        self.0.remove(&id)
+    }
+    fn iter(&self) -> impl Iterator<Item = (u64, Arc<BrokerPayloadSegment>)> {
+        self.0.iter()
+    }
+    fn len(&self) -> usize {
+        self.0.len()
     }
 }
-
+#[derive(Clone, Debug, Default)]
+struct StreamTable(CanonicalMap<u64, StreamState>);
+numeric_table_serde!(StreamTable, StreamState);
 impl StreamTable {
     #[cfg(test)]
     fn shared_with(&self, other: &Self) -> bool {
         self.0.shared_with(&other.0)
     }
-
-    fn get(&self, id: &StreamId) -> Option<&Arc<StreamState>> {
-        self.0
-            .get(stable_id_key(id.0))
-            .or_else(|| self.0.get(u128::from(id.0)))
+    fn get(&self, id: &StreamId) -> Option<Arc<StreamState>> {
+        self.0.get(&id.0)
     }
-
-    fn get_mut(&mut self, id: &StreamId) -> Option<&mut Arc<StreamState>> {
-        let key = if self.0.contains_key(stable_id_key(id.0)) {
-            stable_id_key(id.0)
-        } else {
-            u128::from(id.0)
-        };
-        self.0.get_mut(key)
+    fn get_mut(&self, id: &StreamId) -> Option<Edit<'_, u64, StreamState>> {
+        self.0.get_mut(&id.0)
     }
-
-    fn insert(&mut self, id: StreamId, state: Arc<StreamState>) -> Option<Arc<StreamState>> {
-        self.0.insert_cow(stable_id_key(id.0), state)
+    fn insert(&self, id: StreamId, value: Arc<StreamState>) -> Option<Arc<StreamState>> {
+        self.0.insert(
+            id.0,
+            Arc::try_unwrap(value).unwrap_or_else(|value| (*value).clone()),
+        )
     }
-
-    fn remove(&mut self, id: &StreamId) -> Option<Arc<StreamState>> {
-        self.0
-            .remove(stable_id_key(id.0))
-            .or_else(|| self.0.remove(u128::from(id.0)))
+    fn remove(&self, id: &StreamId) -> Option<Arc<StreamState>> {
+        self.0.remove(&id.0)
     }
-
     fn contains_key(&self, id: &StreamId) -> bool {
-        self.0.contains_key(stable_id_key(id.0)) || self.0.contains_key(u128::from(id.0))
+        self.0.contains_key(&id.0)
     }
-
-    fn iter(&self) -> impl Iterator<Item = (StreamId, &Arc<StreamState>)> {
+    fn iter(&self) -> impl Iterator<Item = (StreamId, Arc<StreamState>)> {
+        self.0.iter().map(|(id, value)| (StreamId(id), value))
+    }
+    fn last_key_value(&self) -> Option<(StreamId, Arc<StreamState>)> {
         self.0
-            .iter()
-            .filter_map(|(id, state)| broker_map_id(id).map(|id| (StreamId(id), state)))
+            .last_key_value()
+            .map(|(id, value)| (StreamId(id), value))
     }
-
-    fn last_key_value(&self) -> Option<(StreamId, &Arc<StreamState>)> {
-        self.iter().last()
+    fn retain(&self, mut keep: impl FnMut(&StreamId, &StreamState) -> bool) {
+        self.0.retain(|id, value| keep(&StreamId(*id), value));
     }
-
-    fn retain(&mut self, mut keep: impl FnMut(&StreamId, &Arc<StreamState>) -> bool) {
-        let remove = self
-            .iter()
-            .filter_map(|(id, state)| (!keep(&id, state)).then_some(id))
-            .collect::<Vec<_>>();
-        for id in remove {
-            let _ = self.remove(&id);
-        }
-    }
-
-    const fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.0.len()
     }
 }
-
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 struct StreamRecords {
-    values: PagedVec<StreamReference>,
-    head: usize,
+    values: CanonicalMap<usize, StreamReference>,
+    head: Position,
+    tail: Position,
 }
-
 impl StreamRecords {
-    #[cfg(test)]
-    fn detached_page_bytes_from(&self, previous: &Self) -> usize {
-        self.values.detached_page_bytes_from(&previous.values)
-    }
-
     fn len(&self) -> usize {
-        self.values.len().saturating_sub(self.head)
+        self.tail.get().saturating_sub(self.head.get())
     }
-
-    fn iter(&self) -> StreamRecordsIter<'_> {
+    fn iter(&self) -> StreamRecordsIter {
         StreamRecordsIter {
-            records: self,
-            front: self.head,
-            back: self.values.len(),
+            records: self.clone(),
+            front: self.head.get(),
+            back: self.tail.get(),
         }
     }
-
-    fn front(&self) -> Option<&StreamReference> {
-        self.values.get(self.head)
-    }
-
-    fn push_back(&mut self, reference: StreamReference) {
-        self.values.push(reference);
-    }
-
-    fn pop_front(&mut self) -> Option<StreamReference> {
-        let value = self.values.get(self.head)?.clone();
-        self.head = self.head.saturating_add(1);
-        let first_leaf = self.values.first_leaf_len();
-        if first_leaf != 0 && self.head >= first_leaf {
-            let removed = self.values.discard_prefix_leaves(self.head);
-            self.head = self.head.saturating_sub(removed);
+    fn iter_from_offset(&self, base: u64, offset: u64) -> StreamRecordsIter {
+        let relative = usize::try_from(offset.saturating_sub(base)).unwrap_or(usize::MAX);
+        StreamRecordsIter {
+            records: self.clone(),
+            front: self.head.get().saturating_add(relative),
+            back: self.tail.get(),
         }
+    }
+    fn front(&self) -> Option<Arc<StreamReference>> {
+        self.values.get(&self.head.get())
+    }
+    fn push_back(&self, reference: StreamReference) {
+        let position = self.tail.get();
+        self.values.insert(position, reference);
+        self.tail.set(position + 1);
+    }
+    fn pop_front(&self) -> Option<Arc<StreamReference>> {
+        let position = self.head.get();
+        let value = self.values.remove(&position)?;
+        self.head.set(position + 1);
         Some(value)
     }
-
-    fn get_by_offset(&self, base_offset: u64, offset: u64) -> Option<&StreamReference> {
+    fn get_by_offset(&self, base_offset: u64, offset: u64) -> Option<Arc<StreamReference>> {
         let relative = usize::try_from(offset.checked_sub(base_offset)?).ok()?;
-        self.values.get(self.head.checked_add(relative)?)
+        self.values.get(&self.head.get().checked_add(relative)?)
     }
-
-    fn get_mut_by_offset(&mut self, base_offset: u64, offset: u64) -> Option<&mut StreamReference> {
+    fn get_mut_by_offset(
+        &self,
+        base_offset: u64,
+        offset: u64,
+    ) -> Option<Edit<'_, usize, StreamReference>> {
         let relative = usize::try_from(offset.checked_sub(base_offset)?).ok()?;
-        self.values.get_mut(self.head.checked_add(relative)?)
+        self.values.get_mut(&self.head.get().checked_add(relative)?)
     }
-
-    /// Mutable access by position from the live front, for callers that walk the whole stream
-    /// without knowing its base offset.
-    fn get_mut_relative(&mut self, relative: usize) -> Option<&mut StreamReference> {
-        self.values.get_mut(self.head.checked_add(relative)?)
+    fn get_mut_relative(&self, relative: usize) -> Option<Edit<'_, usize, StreamReference>> {
+        self.values.get_mut(&self.head.get().checked_add(relative)?)
+    }
+    fn clear(&self) {
+        self.values.clear();
+        self.head.set(self.tail.get());
     }
 }
-
-impl fmt::Debug for StreamRecords {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_list().entries(self.iter()).finish()
-    }
-}
-
-struct StreamRecordsIter<'a> {
-    records: &'a StreamRecords,
+struct StreamRecordsIter {
+    records: StreamRecords,
     front: usize,
     back: usize,
 }
-
-impl<'a> Iterator for StreamRecordsIter<'a> {
-    type Item = &'a StreamReference;
-
+impl Iterator for StreamRecordsIter {
+    type Item = Arc<StreamReference>;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.front >= self.back {
-            return None;
-        }
-        let value = self.records.values.get(self.front);
-        self.front = self.front.saturating_add(1);
-        value
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.back.saturating_sub(self.front);
-        (remaining, Some(remaining))
-    }
-}
-
-impl DoubleEndedIterator for StreamRecordsIter<'_> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.front >= self.back {
-            return None;
-        }
-        self.back = self.back.saturating_sub(1);
-        self.records.values.get(self.back)
-    }
-}
-
-impl ExactSizeIterator for StreamRecordsIter<'_> {}
-
-impl<'a> IntoIterator for &'a StreamRecords {
-    type Item = &'a StreamReference;
-    type IntoIter = StreamRecordsIter<'a>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
-    }
-}
-
-impl Serialize for StreamRecords {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut sequence = serializer.serialize_seq(Some(self.len()))?;
-        for reference in self.iter() {
-            sequence.serialize_element(reference)?;
-        }
-        sequence.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for StreamRecords {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct StreamRecordsVisitor;
-
-        impl<'de> Visitor<'de> for StreamRecordsVisitor {
-            type Value = StreamRecords;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a sequence of broker stream references")
+        while self.front < self.back {
+            let position = self.front;
+            self.front += 1;
+            if let Some(value) = self.records.values.get(&position) {
+                return Some(value);
             }
-
-            fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                let mut records = StreamRecords::default();
-                while let Some(reference) = sequence.next_element::<StreamReference>()? {
+        }
+        None
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.back.saturating_sub(self.front)))
+    }
+}
+impl DoubleEndedIterator for StreamRecordsIter {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        while self.front < self.back {
+            self.back -= 1;
+            if let Some(value) = self.records.values.get(&self.back) {
+                return Some(value);
+            }
+        }
+        None
+    }
+}
+impl Serialize for StreamRecords {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(self.len()))?;
+        for value in self.iter() {
+            seq.serialize_element(value.as_ref())?;
+        }
+        seq.end()
+    }
+}
+impl<'de> Deserialize<'de> for StreamRecords {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct RecordsVisitor;
+        impl<'de> Visitor<'de> for RecordsVisitor {
+            type Value = StreamRecords;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("stream references")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let records = StreamRecords::default();
+                while let Some(reference) = sequence.next_element()? {
                     records.push_back(reference);
                 }
                 Ok(records)
             }
         }
-
-        deserializer.deserialize_seq(StreamRecordsVisitor)
+        d.deserialize_seq(RecordsVisitor)
+    }
+}
+impl IntoIterator for &StreamRecords {
+    type Item = Arc<StreamReference>;
+    type IntoIter = StreamRecordsIter;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct StreamState {
-    base_offset: u64,
-    next_offset: u64,
-    retained_bytes: u64,
+    base_offset: Counter,
+    next_offset: Counter,
+    retained_bytes: Counter,
     records: StreamRecords,
 }
 
@@ -876,16 +703,16 @@ struct StreamState {
 struct GroupState {
     generation: i32,
     leader: String,
-    members: BTreeMap<String, GroupMember>,
+    members: CanonicalMap<String, GroupMember>,
     protocol: String,
-    assignments: BTreeMap<String, Vec<u8>>,
-    offsets: BTreeMap<(String, i32), u64>,
+    assignments: CanonicalMap<String, Vec<u8>>,
+    offsets: CanonicalMap<(String, i32), u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GroupMember {
-    protocols: BTreeMap<String, Vec<u8>>,
+    protocols: Arc<BTreeMap<String, Vec<u8>>>,
     session_timeout_ms: u32,
     last_heartbeat_ms: i64,
 }
@@ -1239,10 +1066,7 @@ pub trait BrokerCoordinator: Send + Sync {
         group: &str,
         generation: i32,
     ) -> Result<Option<String>> {
-        Ok(self
-            .snapshot()?
-            .group_leader(project, group, generation)
-            .map(str::to_owned))
+        Ok(self.snapshot()?.group_leader(project, group, generation))
     }
     fn group_assignment(
         &self,
@@ -1404,28 +1228,71 @@ impl BrokerCoordinator for ConnectionBrokerCoordinator {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct CanonicalBindings(CanonicalMap<(ProjectId, String, String, String), Binding>);
+impl CanonicalBindings {
+    fn iter(&self) -> impl Iterator<Item = ((ProjectId, String), Arc<Binding>)> {
+        self.0
+            .iter()
+            .map(|((project, exchange, _, _), binding)| ((project, exchange), binding))
+    }
+    fn push(&self, (key, value): ((ProjectId, String), Binding)) {
+        self.0.insert(
+            (key.0, key.1, value.queue.clone(), value.routing_key.clone()),
+            value,
+        );
+    }
+    fn retain(&self, mut keep: impl FnMut(&((ProjectId, String), &Binding)) -> bool) {
+        self.0.retain(|(project, exchange, _, _), binding| {
+            keep(&((*project, exchange.clone()), binding))
+        });
+    }
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+impl Serialize for CanonicalBindings {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(self.len()))?;
+        for (key, value) in self.iter() {
+            seq.serialize_element(&(key, value.as_ref()))?;
+        }
+        seq.end()
+    }
+}
+impl<'de> Deserialize<'de> for CanonicalBindings {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let values = Vec::<((ProjectId, String), Binding)>::deserialize(d)?;
+        let bindings = Self::default();
+        for value in values {
+            bindings.push(value);
+        }
+        Ok(bindings)
+    }
+}
+
 /// Deterministic canonical broker state applied from committed log entries.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BrokerStateMachine {
-    next_message_id: u64,
-    next_stream_id: u64,
-    next_payload_segment_id: u64,
+    next_message_id: Counter,
+    next_stream_id: Counter,
+    next_payload_segment_id: Counter,
     payloads: MessageTable,
     payload_segments: PayloadSegmentTable,
-    topics: CowArc<BTreeMap<(ProjectId, String), Topic>>,
-    exchanges: CowArc<BTreeMap<(ProjectId, String), Exchange>>,
-    queues: CowArc<BTreeMap<(ProjectId, String), Queue>>,
-    bindings: CowArc<Vec<((ProjectId, String), Binding)>>,
+    topics: CanonicalMap<(ProjectId, String), Topic>,
+    exchanges: CanonicalMap<(ProjectId, String), Exchange>,
+    queues: CanonicalMap<(ProjectId, String), Queue>,
+    bindings: CanonicalBindings,
     streams: StreamTable,
-    groups: CowArc<BTreeMap<(ProjectId, String), Arc<GroupState>>>,
+    groups: CanonicalMap<(ProjectId, String), GroupState>,
     #[serde(default)]
-    delivery_leases: CowArc<BTreeMap<(ProjectId, Uuid), i64>>,
+    delivery_leases: CanonicalMap<(ProjectId, Uuid), i64>,
     /// Consumers currently attached to each queue, carrying the connection that owns them.
     /// Registration has to be canonical rather than connection-local: `queue.delete` if-unused,
     /// auto-delete queues and exclusive queues are all defined in terms of who is consuming, and
     /// no connection can observe another connection's consumers.
     #[serde(default)]
-    queue_consumers: CowArc<BTreeMap<(ProjectId, String), BTreeSet<(Uuid, u64)>>>,
+    queue_consumers: CanonicalMap<(ProjectId, String), CanonicalSet<(Uuid, u64)>>,
 }
 
 impl BrokerStateMachine {
@@ -1434,11 +1301,11 @@ impl BrokerStateMachine {
     #[must_use]
     pub fn projects_with_state(&self) -> BTreeSet<ProjectId> {
         let mut projects = BTreeSet::new();
-        projects.extend(self.topics.keys().map(|(project, _)| *project));
-        projects.extend(self.exchanges.keys().map(|(project, _)| *project));
-        projects.extend(self.queues.keys().map(|(project, _)| *project));
-        projects.extend(self.groups.keys().map(|(project, _)| *project));
-        projects.extend(self.delivery_leases.keys().map(|(project, _)| *project));
+        projects.extend(self.topics.keys().map(|(project, _)| project));
+        projects.extend(self.exchanges.keys().map(|(project, _)| project));
+        projects.extend(self.queues.keys().map(|(project, _)| project));
+        projects.extend(self.groups.keys().map(|(project, _)| project));
+        projects.extend(self.delivery_leases.keys().map(|(project, _)| project));
         projects.extend(
             self.payload_segments
                 .iter()
@@ -1453,32 +1320,32 @@ impl BrokerStateMachine {
         !self
             .topics
             .keys()
-            .any(|(candidate, _)| *candidate == project)
+            .any(|(candidate, _)| candidate == project)
             && !self
                 .exchanges
                 .keys()
-                .any(|(candidate, _)| *candidate == project)
+                .any(|(candidate, _)| candidate == project)
             && !self
                 .queues
                 .keys()
-                .any(|(candidate, _)| *candidate == project)
+                .any(|(candidate, _)| candidate == project)
             && !self
                 .bindings
                 .iter()
-                .any(|((candidate, _), _)| *candidate == project)
+                .any(|((candidate, _), _)| candidate == project)
             && !self
                 .groups
                 .keys()
-                .any(|(candidate, _)| *candidate == project)
+                .any(|(candidate, _)| candidate == project)
             && !self
                 .delivery_leases
                 .keys()
-                .any(|(candidate, _)| *candidate == project)
+                .any(|(candidate, _)| candidate == project)
     }
 
     /// Removes all canonical broker state owned by one dropped project. Content-addressed
     /// payload files may remain unreferenced until storage compaction.
-    pub(crate) fn drop_project(&mut self, project: ProjectId) -> Result<()> {
+    pub(crate) fn drop_project(&self, project: ProjectId) -> Result<()> {
         let mut removed_streams = BTreeSet::new();
         self.topics.retain(|(candidate, _), topic| {
             if *candidate == project {
@@ -1521,16 +1388,16 @@ impl BrokerStateMachine {
         if self
             .payloads
             .last_key_value()
-            .is_some_and(|(id, _)| id.0 > self.next_message_id)
+            .is_some_and(|(id, _)| id.0 > self.next_message_id.get())
             || self
                 .streams
                 .last_key_value()
-                .is_some_and(|(id, _)| id.0 > self.next_stream_id)
+                .is_some_and(|(id, _)| id.0 > self.next_stream_id.get())
             || self
                 .payload_segments
                 .iter()
                 .last()
-                .is_some_and(|(id, _)| id > self.next_payload_segment_id)
+                .is_some_and(|(id, _)| id > self.next_payload_segment_id.get())
         {
             return Err(Error::new(
                 crate::ErrorCode::CorruptStorage,
@@ -1538,7 +1405,7 @@ impl BrokerStateMachine {
             ));
         }
         let mut stream_projects = BTreeMap::<StreamId, ProjectId>::new();
-        for ((project, _), topic) in &*self.topics {
+        for ((project, _), topic) in &self.topics {
             if topic.partitions.is_empty()
                 || topic.partitions.len() > 4_096
                 || topic.retention.validate().is_err()
@@ -1548,8 +1415,8 @@ impl BrokerStateMachine {
                     "broker topic partition set is invalid",
                 ));
             }
-            for stream in &topic.partitions {
-                if stream_projects.insert(*stream, *project).is_some() {
+            for stream in topic.partitions.iter() {
+                if stream_projects.insert(*stream, project).is_some() {
                     return Err(Error::new(
                         crate::ErrorCode::CorruptStorage,
                         "broker stream is assigned more than once",
@@ -1557,14 +1424,14 @@ impl BrokerStateMachine {
                 }
             }
         }
-        for ((project, _), queue) in &*self.queues {
+        for ((project, _), queue) in &self.queues {
             if queue.retention.validate().is_err() {
                 return Err(Error::new(
                     crate::ErrorCode::CorruptStorage,
                     "broker queue retention policy is invalid",
                 ));
             }
-            if stream_projects.insert(queue.stream, *project).is_some() {
+            if stream_projects.insert(queue.stream, project).is_some() {
                 return Err(Error::new(
                     crate::ErrorCode::CorruptStorage,
                     "broker queue stream is assigned more than once",
@@ -1586,13 +1453,13 @@ impl BrokerStateMachine {
         let mut live_segment_records = BTreeMap::<u64, u32>::new();
         let mut live_delivery_leases = BTreeSet::new();
         for (stream_id, stream) in self.streams.iter() {
-            if stream.base_offset > stream.next_offset {
+            if stream.base_offset.get() > stream.next_offset.get() {
                 return Err(Error::new(
                     crate::ErrorCode::CorruptStorage,
                     "broker stream cursor moved backwards",
                 ));
             }
-            let mut expected = stream.base_offset;
+            let mut expected = stream.base_offset.get();
             let mut retained_bytes = 0_u64;
             let project = stream_projects.get(&stream_id).ok_or_else(|| {
                 Error::new(
@@ -1651,7 +1518,7 @@ impl BrokerStateMachine {
                     })?;
                 }
                 retained_bytes = retained_bytes
-                    .checked_add(self.accounted_payload_bytes(payload)?)
+                    .checked_add(self.accounted_payload_bytes(&payload)?)
                     .ok_or_else(|| {
                         Error::new(
                             crate::ErrorCode::CorruptStorage,
@@ -1668,7 +1535,8 @@ impl BrokerStateMachine {
                     live_delivery_leases.insert((*project, owner));
                 }
             }
-            if expected != stream.next_offset || retained_bytes != stream.retained_bytes {
+            if expected != stream.next_offset.get() || retained_bytes != stream.retained_bytes.get()
+            {
                 return Err(Error::new(
                     crate::ErrorCode::CorruptStorage,
                     "broker stream cursor or retained byte accounting is invalid",
@@ -1696,22 +1564,16 @@ impl BrokerStateMachine {
                 "broker payload segment table differs from live messages",
             ));
         }
-        if self
-            .delivery_leases
-            .keys()
-            .copied()
-            .collect::<BTreeSet<_>>()
-            != live_delivery_leases
-        {
+        if self.delivery_leases.keys().collect::<BTreeSet<_>>() != live_delivery_leases {
             return Err(Error::new(
                 crate::ErrorCode::CorruptStorage,
                 "broker delivery lease set differs from unacknowledged deliveries",
             ));
         }
-        for ((project, exchange), binding) in &*self.bindings {
+        for ((project, exchange), binding) in self.bindings.iter() {
             if binding.exchange != *exchange
-                || !self.exchanges.contains_key(&(*project, exchange.clone()))
-                || !self.queues.contains_key(&(*project, binding.queue.clone()))
+                || !self.exchanges.contains_key(&(project, exchange.clone()))
+                || !self.queues.contains_key(&(project, binding.queue.clone()))
             {
                 return Err(Error::new(
                     crate::ErrorCode::CorruptStorage,
@@ -1719,20 +1581,22 @@ impl BrokerStateMachine {
                 ));
             }
         }
-        for ((project, _), group) in &*self.groups {
+        for ((project, _), group) in &self.groups {
             if group.generation < 0
                 || (!group.members.is_empty()
                     && (!group.members.contains_key(&group.leader)
-                        || select_group_protocol(&group.members).map_err(|_| {
-                            Error::new(
-                                crate::ErrorCode::CorruptStorage,
-                                "broker consumer group has no common protocol",
-                            )
-                        })? != group.protocol))
+                        || select_group_protocol(&group.members.iter().collect()).map_err(
+                            |_| {
+                                Error::new(
+                                    crate::ErrorCode::CorruptStorage,
+                                    "broker consumer group has no common protocol",
+                                )
+                            },
+                        )? != group.protocol))
                 || group
                     .assignments
                     .keys()
-                    .any(|member| !group.members.contains_key(member))
+                    .any(|member| !group.members.contains_key(&member))
             {
                 return Err(Error::new(
                     crate::ErrorCode::CorruptStorage,
@@ -1740,14 +1604,14 @@ impl BrokerStateMachine {
                 ));
             }
             for ((topic, partition), offset) in &group.offsets {
-                let stream = self.partition_stream(*project, topic, *partition)?;
+                let stream = self.partition_stream(project, &topic, partition)?;
                 let state = self.streams.get(&stream).ok_or_else(|| {
                     Error::new(
                         crate::ErrorCode::CorruptStorage,
                         "broker committed offset stream is missing",
                     )
                 })?;
-                if *offset > state.next_offset {
+                if *offset > state.next_offset.get() {
                     return Err(Error::new(
                         crate::ErrorCode::CorruptStorage,
                         "broker committed offset exceeds the log end",
@@ -1782,6 +1646,7 @@ impl BrokerStateMachine {
                     }
                 } else {
                     self.next_stream_id
+                        .get()
                         .checked_add(u64::from(*partitions))
                         .ok_or_else(|| Error::internal("stream ID exhausted"))?;
                 }
@@ -1852,6 +1717,7 @@ impl BrokerStateMachine {
                         return Err(Error::invalid_data("passive queue does not exist"));
                     }
                     self.next_stream_id
+                        .get()
                         .checked_add(1)
                         .ok_or_else(|| Error::internal("stream ID exhausted"))?;
                 }
@@ -2014,6 +1880,7 @@ impl BrokerStateMachine {
                         .get(&stream)
                         .ok_or_else(|| Error::internal("topic partition stream is missing"))?
                         .next_offset
+                        .get()
                 {
                     return Err(Error::invalid_data(
                         "committed offset exceeds the partition log end",
@@ -2048,23 +1915,23 @@ impl BrokerStateMachine {
                 valid_name(member)?;
                 validate_group_member(*session_timeout_ms, protocols)?;
                 if let Some(state) = self.groups.get(&(*project, group.clone())) {
-                    let mut candidate = state.members.clone();
+                    let mut candidate = state.members.iter().collect::<BTreeMap<_, _>>();
                     candidate.retain(|_, member| {
                         resolved_time_ms.saturating_sub(member.last_heartbeat_ms)
                             < i64::from(member.session_timeout_ms)
                     });
                     candidate.insert(
                         member.clone(),
-                        GroupMember {
-                            protocols: protocols.clone(),
+                        Arc::new(GroupMember {
+                            protocols: Arc::new(protocols.clone()),
                             session_timeout_ms: *session_timeout_ms,
                             last_heartbeat_ms: 0,
-                        },
+                        }),
                     );
                     select_group_protocol(&candidate)?;
                     if !state.members.contains_key(member)
                         || state.members.get(member).is_some_and(|existing| {
-                            existing.protocols != *protocols
+                            existing.protocols.as_ref() != protocols
                                 || existing.session_timeout_ms != *session_timeout_ms
                         })
                     {
@@ -2200,7 +2067,7 @@ impl BrokerStateMachine {
                     .streams
                     .get(&queue.stream)
                     .ok_or_else(|| Error::internal("queue stream is missing"))?;
-                let start = self.resolve_offset(stream, *offset)?;
+                let start = self.resolve_offset(&stream, *offset)?;
                 let mut response_bytes = 0_usize;
                 let mut records = 0_u32;
                 for reference in stream
@@ -2222,7 +2089,7 @@ impl BrokerStateMachine {
                         .ok_or_else(|| Error::internal("broker payload is missing"))?;
                     let next_response_bytes = response_bytes
                         .checked_add(
-                            usize::try_from(self.accounted_payload_bytes(payload)?).map_err(
+                            usize::try_from(self.accounted_payload_bytes(&payload)?).map_err(
                                 |_| Error::internal("broker delivery length exceeds this platform"),
                             )?,
                         )
@@ -2252,15 +2119,15 @@ impl BrokerStateMachine {
                     .topics
                     .iter()
                     .filter(|((id, _), _)| id == project)
-                    .flat_map(|(_, topic)| &topic.partitions)
+                    .flat_map(|(_, topic)| topic.partitions.iter().copied().collect::<Vec<_>>())
                     .chain(
                         self.queues
                             .iter()
                             .filter(|((id, _), _)| id == project)
-                            .map(|(_, queue)| &queue.stream),
+                            .map(|(_, queue)| queue.stream),
                     )
                 {
-                    if !self.streams.contains_key(stream) {
+                    if !self.streams.contains_key(&stream) {
                         return Err(Error::internal("retention stream is missing"));
                     }
                 }
@@ -2271,6 +2138,7 @@ impl BrokerStateMachine {
 
     fn validate_stream_appends(&self, streams: &[StreamId], count: u64) -> Result<()> {
         self.next_message_id
+            .get()
             .checked_add(count)
             .ok_or_else(|| Error::internal("message ID exhausted"))?;
         for stream in streams {
@@ -2278,6 +2146,7 @@ impl BrokerStateMachine {
                 .get(stream)
                 .ok_or_else(|| Error::internal("broker stream does not exist"))?
                 .next_offset
+                .get()
                 .checked_add(count)
                 .ok_or_else(|| Error::internal("broker offset exhausted"))?;
         }
@@ -2372,7 +2241,7 @@ impl BrokerStateMachine {
             .queues
             .get(&(project, queue.to_owned()))
             .ok_or_else(|| Error::invalid_data("queue does not exist"))?;
-        let Some(exchange) = queue_record.dead_letter_exchange.as_deref() else {
+        let Some(ref exchange) = queue_record.dead_letter_exchange.as_deref() else {
             return Ok(());
         };
         let routing = queue_record
@@ -2405,17 +2274,15 @@ impl BrokerStateMachine {
                 .get(&target)
                 .ok_or_else(|| Error::internal("dead-letter stream is missing"))?
                 .next_offset
+                .get()
                 .checked_add(appends)
                 .ok_or_else(|| Error::internal("dead-letter offset exhausted"))?;
         }
         Ok(())
     }
 
-    pub fn apply(
-        &mut self,
-        command: BrokerCommand,
-        segments: &SegmentStore,
-    ) -> Result<BrokerReply> {
+    pub fn apply(&self, command: BrokerCommand, segments: &SegmentStore) -> Result<BrokerReply> {
+        self.validate_command(&command)?;
         match command {
             BrokerCommand::CreateTopic {
                 project,
@@ -2445,7 +2312,7 @@ impl BrokerStateMachine {
                 self.topics.insert(
                     key,
                     Topic {
-                        partitions: streams,
+                        partitions: streams.into(),
                         retention,
                     },
                 );
@@ -2457,7 +2324,7 @@ impl BrokerStateMachine {
                 retention,
             } => {
                 retention.validate()?;
-                let topic = self
+                let mut topic = self
                     .topics
                     .get_mut(&(project, name))
                     .ok_or_else(|| Error::invalid_data("topic does not exist"))?;
@@ -2477,12 +2344,11 @@ impl BrokerStateMachine {
                     .filter_map(|stream| self.streams.get(stream))
                     .flat_map(|stream| stream.records.iter().map(|record| record.message))
                     .collect::<BTreeSet<_>>();
-                for stream in topic.partitions {
-                    self.streams.remove(&stream);
+                for stream in topic.partitions.iter() {
+                    self.streams.remove(stream);
                 }
-                for ((group_project, _), group) in &mut *self.groups {
-                    let group = Arc::make_mut(group);
-                    if *group_project == project {
+                for ((group_project, _), group) in &self.groups {
+                    if group_project == project {
                         group.offsets.retain(|(topic, _), _| topic != &name);
                         group.assignments.clear();
                     }
@@ -2499,17 +2365,17 @@ impl BrokerStateMachine {
                     .clone();
                 let mut removed = BTreeSet::new();
                 let mut count = 0_u64;
-                for stream_id in partitions {
-                    let stream = self
+                for stream_id in partitions.iter() {
+                    let mut stream = self
                         .streams
-                        .get_mut(&stream_id)
+                        .get_mut(stream_id)
                         .ok_or_else(|| Error::internal("topic partition stream is missing"))?;
-                    let stream = Arc::make_mut(stream);
+                    let stream = &mut *stream;
                     count = count.saturating_add(stream.records.len() as u64);
                     removed.extend(stream.records.iter().map(|record| record.message));
-                    stream.records = StreamRecords::default();
-                    stream.base_offset = stream.next_offset;
-                    stream.retained_bytes = 0;
+                    stream.records.clear();
+                    stream.base_offset.set(stream.next_offset.get());
+                    stream.retained_bytes.set(0);
                 }
                 self.reclaim_payload_candidates(project, &removed)?;
                 Ok(BrokerReply::MessagesDiscarded {
@@ -2600,7 +2466,7 @@ impl BrokerStateMachine {
                 retention,
             } => {
                 retention.validate()?;
-                let queue = self
+                let mut queue = self
                     .queues
                     .get_mut(&(project, name))
                     .ok_or_else(|| Error::invalid_data("queue does not exist"))?;
@@ -2660,8 +2526,7 @@ impl BrokerStateMachine {
                     .queue_consumers
                     .iter()
                     .filter(|((candidate, _), consumers)| {
-                        *candidate == project
-                            && consumers.iter().any(|(holder, _)| *holder == owner)
+                        *candidate == project && consumers.iter().any(|(holder, _)| holder == owner)
                     })
                     .map(|(key, _)| key.1.clone())
                     .collect::<Vec<_>>();
@@ -2847,11 +2712,11 @@ impl BrokerStateMachine {
                 member,
             } => {
                 self.partition_stream(project, &topic, partition)?;
-                let state = self
+                let mut state = self
                     .groups
                     .get_mut(&(project, group))
                     .ok_or_else(|| Error::invalid_data("consumer group does not exist"))?;
-                let state = Arc::make_mut(state);
+                let state = &mut *state;
                 match (generation, member) {
                     (Some(generation), Some(member))
                         if generation == state.generation
@@ -2879,19 +2744,20 @@ impl BrokerStateMachine {
                 valid_name(&member)?;
                 validate_group_member(session_timeout_ms, &protocols)?;
                 self.expire_group_members(project, resolved_time_ms)?;
-                let state = self.groups.entry((project, group)).or_insert_with(|| {
-                    Arc::new(GroupState {
+                let mut state = self
+                    .groups
+                    .entry((project, group))
+                    .or_insert_with(|| GroupState {
                         generation: 0,
                         leader: member.clone(),
-                        members: BTreeMap::new(),
+                        members: CanonicalMap::default(),
                         protocol: String::new(),
-                        assignments: BTreeMap::new(),
-                        offsets: BTreeMap::new(),
-                    })
-                });
-                let state = Arc::make_mut(state);
+                        assignments: CanonicalMap::default(),
+                        offsets: CanonicalMap::default(),
+                    });
+                let state = &mut *state;
                 let replacement = GroupMember {
-                    protocols,
+                    protocols: Arc::new(protocols),
                     session_timeout_ms,
                     last_heartbeat_ms: resolved_time_ms,
                 };
@@ -2900,7 +2766,7 @@ impl BrokerStateMachine {
                         || existing.session_timeout_ms != replacement.session_timeout_ms
                 });
                 state.members.insert(member, replacement);
-                let selected_protocol = select_group_protocol(&state.members)?;
+                let selected_protocol = select_group_protocol(&state.members.iter().collect())?;
                 if changed || state.protocol != selected_protocol {
                     state.protocol = selected_protocol;
                     state.generation = state
@@ -2909,7 +2775,7 @@ impl BrokerStateMachine {
                         .ok_or_else(|| Error::internal("group generation exhausted"))?;
                     state.assignments.clear();
                 }
-                Ok(group_reply(state))
+                Ok(group_reply(&state))
             }
             BrokerCommand::SyncGroup {
                 project,
@@ -2918,11 +2784,11 @@ impl BrokerStateMachine {
                 assignments,
             } => {
                 let group_name = group;
-                let state = self
+                let mut state = self
                     .groups
                     .get_mut(&(project, group_name.clone()))
                     .ok_or_else(|| Error::invalid_data("consumer group does not exist"))?;
-                let state = Arc::make_mut(state);
+                let state = &mut *state;
                 if state.generation != generation {
                     return Err(Error::new(
                         crate::ErrorCode::TransactionConflict,
@@ -2939,43 +2805,48 @@ impl BrokerStateMachine {
                             "group sync must install one assignment per member",
                         ));
                     }
-                    state.assignments = assignments;
+                    state.assignments.clear();
+                    for (member, assignment) in assignments {
+                        state.assignments.insert(member, assignment);
+                    }
                 }
                 // The leader proposed an assignment from partition counts alone. Replace it with
                 // one weighted by real lag, which is the whole point of balancing here rather than
                 // in the client: only the broker can see the partitions a consumer does not own.
                 // Every publication applies this deterministically over canonical state, so
                 // they all install the same bytes.
-                let group = Arc::clone(
-                    self.groups
-                        .get(&(project, group_name.clone()))
-                        .ok_or_else(|| Error::internal("group disappeared during sync"))?,
-                );
+                let group = self
+                    .groups
+                    .get(&(project, group_name.clone()))
+                    .ok_or_else(|| Error::internal("group disappeared during sync"))?;
                 if let Some(balanced) = self.rebalanced_assignment(project, &group) {
-                    let state = self
+                    let mut state = self
                         .groups
                         .get_mut(&(project, group_name))
                         .ok_or_else(|| Error::internal("group disappeared during sync"))?;
-                    let state = Arc::make_mut(state);
-                    state.assignments = balanced;
-                    return Ok(group_reply(state));
+                    let state = &mut *state;
+                    state.assignments.clear();
+                    for (member, assignment) in balanced {
+                        state.assignments.insert(member, assignment);
+                    }
+                    return Ok(group_reply(&state));
                 }
                 let state = self
                     .groups
                     .get(&(project, group_name))
                     .ok_or_else(|| Error::internal("group disappeared during sync"))?;
-                Ok(group_reply(state))
+                Ok(group_reply(&state))
             }
             BrokerCommand::LeaveGroup {
                 project,
                 group,
                 member,
             } => {
-                let state = self
+                let mut state = self
                     .groups
                     .get_mut(&(project, group))
                     .ok_or_else(|| Error::invalid_data("consumer group does not exist"))?;
-                let state = Arc::make_mut(state);
+                let state = &mut *state;
                 if state.members.remove(&member).is_some() {
                     state.assignments.clear();
                     state.generation = state
@@ -2983,10 +2854,10 @@ impl BrokerStateMachine {
                         .checked_add(1)
                         .ok_or_else(|| Error::internal("group generation exhausted"))?;
                     if state.leader == member {
-                        state.leader = state.members.keys().next().cloned().unwrap_or_default();
+                        state.leader = state.members.keys().min().unwrap_or_default();
                     }
                 }
-                Ok(group_reply(state))
+                Ok(group_reply(&state))
             }
             BrokerCommand::HeartbeatGroup {
                 project,
@@ -2996,18 +2867,18 @@ impl BrokerStateMachine {
                 resolved_time_ms,
             } => {
                 self.expire_group_members(project, resolved_time_ms)?;
-                let state = self
+                let mut state = self
                     .groups
                     .get_mut(&(project, group))
                     .ok_or_else(|| Error::invalid_data("consumer group does not exist"))?;
-                let state = Arc::make_mut(state);
+                let state = &mut *state;
                 if state.generation != generation {
                     return Err(Error::new(
                         crate::ErrorCode::TransactionConflict,
                         "consumer group generation changed",
                     ));
                 }
-                let member = state.members.get_mut(&member).ok_or_else(|| {
+                let mut member = state.members.get_mut(&member).ok_or_else(|| {
                     Error::new(
                         crate::ErrorCode::TransactionConflict,
                         "consumer group member is unknown",
@@ -3129,7 +3000,8 @@ impl BrokerStateMachine {
             .streams
             .get(&stream)
             .ok_or_else(|| Error::internal("partition stream is absent"))?
-            .next_offset;
+            .next_offset
+            .get();
         let pending = self.fetch_stream_records_with_bounds(
             stream,
             read.offset,
@@ -3206,20 +3078,20 @@ impl BrokerStateMachine {
             .streams
             .get(&queue_record.stream)
             .ok_or_else(|| Error::internal("queue stream is missing"))?;
-        let start = self.resolve_offset(stream, offset)?;
+        let start = self.resolve_offset(&stream, offset)?;
         let mut visible_bytes = 0_usize;
         let mut pending = Vec::new();
         for reference in stream
             .records
-            .iter()
-            .filter(|reference| reference.offset >= start)
+            .iter_from_offset(stream.base_offset.get(), start)
             .take(maximum)
         {
-            let stored = self
-                .payloads
-                .get(&reference.message)
-                .cloned()
-                .ok_or_else(|| Error::internal("broker payload is missing"))?;
+            let stored = self.payloads.get(&reference.message).ok_or_else(|| {
+                Error::new(
+                    crate::ErrorCode::RetentionExpired,
+                    "broker payload was retired during the read",
+                )
+            })?;
             let next_visible_bytes = visible_bytes
                 .checked_add(
                     usize::try_from(self.accounted_payload_bytes(&stored)?).map_err(|_| {
@@ -3251,7 +3123,7 @@ impl BrokerStateMachine {
     }
 
     pub fn fetch_queue(
-        &mut self,
+        &self,
         project: ProjectId,
         queue: &str,
         offset: StreamOffset,
@@ -3265,20 +3137,18 @@ impl BrokerStateMachine {
         let queue_record = self
             .queues
             .get(&(project, queue.to_owned()))
-            .cloned()
             .ok_or_else(|| Error::invalid_data("queue does not exist"))?;
         let stream = self
             .streams
             .get(&queue_record.stream)
             .ok_or_else(|| Error::internal("queue stream is missing"))?;
-        let start = self.resolve_offset(stream, offset)?;
+        let start = self.resolve_offset(&stream, offset)?;
         let mut pending = Vec::new();
         let mut selected = BTreeMap::new();
         let mut visible_bytes = 0_usize;
         for reference in stream
             .records
-            .iter()
-            .filter(|record| record.offset >= start)
+            .iter_from_offset(stream.base_offset.get(), start)
         {
             if pending.len() >= maximum {
                 break;
@@ -3287,11 +3157,12 @@ impl BrokerStateMachine {
             {
                 continue;
             }
-            let stored = self
-                .payloads
-                .get(&reference.message)
-                .cloned()
-                .ok_or_else(|| Error::internal("broker payload is missing"))?;
+            let stored = self.payloads.get(&reference.message).ok_or_else(|| {
+                Error::new(
+                    crate::ErrorCode::RetentionExpired,
+                    "broker payload was retired during the read",
+                )
+            })?;
             let next_visible_bytes = visible_bytes
                 .checked_add(
                     usize::try_from(self.accounted_payload_bytes(&stored)?).map_err(|_| {
@@ -3361,14 +3232,14 @@ impl BrokerStateMachine {
                         .ok_or_else(|| Error::internal("delivery lease deadline overflow"))?,
                 )
             };
-            let stream = self
+            let mut stream = self
                 .streams
                 .get_mut(&queue_record.stream)
                 .ok_or_else(|| Error::internal("queue stream disappeared"))?;
-            let stream = Arc::make_mut(stream);
-            let base_offset = stream.base_offset;
+            let stream = &mut *stream;
+            let base_offset = stream.base_offset.get();
             for (offset, tag) in &selected {
-                let reference = stream
+                let mut reference = stream
                     .records
                     .get_mut_by_offset(base_offset, *offset)
                     .ok_or_else(|| Error::internal("selected delivery offset disappeared"))?;
@@ -3394,11 +3265,14 @@ impl BrokerStateMachine {
 
     #[must_use]
     pub fn topic_metadata(&self, project: ProjectId) -> Vec<(String, usize)> {
-        self.topics
+        let mut metadata = self
+            .topics
             .iter()
             .filter(|((id, _), _)| *id == project)
-            .map(|((_, name), topic)| (name.clone(), topic.partitions.len()))
-            .collect()
+            .map(|((_, name), topic)| (name, topic.partitions.len()))
+            .collect::<Vec<_>>();
+        metadata.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        metadata
     }
 
     #[must_use]
@@ -3417,13 +3291,14 @@ impl BrokerStateMachine {
                         Some(TopicMetrics {
                             name: name.clone(),
                             partition: u16::try_from(partition).ok()?,
-                            base_offset: stream.base_offset,
-                            next_offset: stream.next_offset,
+                            base_offset: stream.base_offset.get(),
+                            next_offset: stream.next_offset.get(),
                             record_count: stream.records.len() as u64,
-                            retained_bytes: stream.retained_bytes,
+                            retained_bytes: stream.retained_bytes.get(),
                             retention_ms: topic.retention.max_age_ms,
                         })
                     })
+                    .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         metrics.sort_by(|left, right| {
@@ -3441,14 +3316,14 @@ impl BrokerStateMachine {
             .iter()
             .filter(|((candidate, _), _)| *candidate == project)
             .filter_map(|((_, name), queue)| {
-                let info = self.queue_info(project, name)?;
+                let info = self.queue_info(project, &name)?;
                 let stream = self.streams.get(&queue.stream)?;
                 Some(QueueMetrics {
                     name: name.clone(),
                     kind: queue.kind,
                     message_count: info.message_count,
                     available_count: info.available_count,
-                    retained_bytes: stream.retained_bytes,
+                    retained_bytes: stream.retained_bytes.get(),
                     retention_ms: queue.retention.max_age_ms,
                 })
             })
@@ -3483,12 +3358,12 @@ impl BrokerStateMachine {
     #[must_use]
     pub fn consumer_lag_metrics(&self, project: ProjectId) -> Vec<ConsumerLagMetrics> {
         let mut metrics = Vec::new();
-        for ((candidate, group), state) in &*self.groups {
-            if *candidate != project {
+        for ((candidate, group), state) in &self.groups {
+            if candidate != project {
                 continue;
             }
             for ((topic, partition), committed_offset) in &state.offsets {
-                let Ok(stream_id) = self.partition_stream(project, topic, *partition) else {
+                let Ok(stream_id) = self.partition_stream(project, &topic, partition) else {
                     continue;
                 };
                 let Some(stream) = self.streams.get(&stream_id) else {
@@ -3497,10 +3372,10 @@ impl BrokerStateMachine {
                 metrics.push(ConsumerLagMetrics {
                     group: group.clone(),
                     topic: topic.clone(),
-                    partition: *partition,
+                    partition,
                     committed_offset: *committed_offset,
-                    next_offset: stream.next_offset,
-                    lag: stream.next_offset.saturating_sub(*committed_offset),
+                    next_offset: stream.next_offset.get(),
+                    lag: stream.next_offset.get().saturating_sub(*committed_offset),
                 });
             }
         }
@@ -3522,7 +3397,12 @@ impl BrokerStateMachine {
     ) -> Option<u64> {
         self.groups
             .get(&(project, group.to_owned()))
-            .and_then(|state| state.offsets.get(&(topic.to_owned(), partition)).copied())
+            .and_then(|state| {
+                state
+                    .offsets
+                    .get(&(topic.to_owned(), partition))
+                    .map(|offset| *offset)
+            })
     }
 
     pub fn list_offset(
@@ -3544,10 +3424,10 @@ impl BrokerStateMachine {
                 .and_then(|reference| self.payloads.get(&reference.message))
                 .and_then(|payload| payload.kafka_time_ms)
                 .unwrap_or(-1);
-            return Ok(Some((stream.base_offset, record_time)));
+            return Ok(Some((stream.base_offset.get(), record_time)));
         }
         if timestamp == -1 {
-            return Ok(Some((stream.next_offset, -1)));
+            return Ok(Some((stream.next_offset.get(), -1)));
         }
         if timestamp < 0 {
             return Ok(None);
@@ -3575,8 +3455,8 @@ impl BrokerStateMachine {
     }
 
     #[must_use]
-    pub(crate) const fn message_cursor(&self) -> u64 {
-        self.next_message_id
+    pub(crate) fn message_cursor(&self) -> u64 {
+        self.next_message_id.get()
     }
 
     #[must_use]
@@ -3584,15 +3464,15 @@ impl BrokerStateMachine {
         &self,
         previous_cursor: u64,
     ) -> Option<SegmentDescriptor> {
-        (self.next_message_id > previous_cursor)
-            .then(|| self.payloads.get(&MessageId(self.next_message_id)))
+        (self.next_message_id.get() > previous_cursor)
+            .then(|| self.payloads.get(&MessageId(self.next_message_id.get())))
             .flatten()
             .and_then(|payload| self.payload_segments.get(payload.segment))
             .map(|segment| segment.descriptor.clone())
     }
 
     pub(crate) fn validate_payload_segments(&self, segments: &SegmentStore) -> Result<()> {
-        let mut grouped = BTreeMap::<u64, Vec<StoredPayloadRecord>>::new();
+        let mut grouped = BTreeMap::<u64, Vec<Arc<StoredPayloadRecord>>>::new();
         for (id, payload) in self.payloads.iter() {
             let segment = self.payload_segments.get(payload.segment).ok_or_else(|| {
                 Error::new(
@@ -3657,7 +3537,7 @@ impl BrokerStateMachine {
                     })?;
                 previous_location = Some(stored.location);
                 let record = segments.read_record_at(&segment.descriptor, stored.location)?;
-                let payload = materialize_stored_payload(&record, &stored, segment)?;
+                let payload = materialize_stored_payload(&record, &stored, &segment)?;
                 validate_loaded_payload(&stored, &segment.descriptor, &payload)?;
             }
         }
@@ -3702,6 +3582,7 @@ impl BrokerStateMachine {
                         .ok_or_else(|| Error::internal("message ID exhausted"))?;
                     let id = MessageId(
                         self.next_message_id
+                            .get()
                             .checked_add(increment)
                             .ok_or_else(|| Error::internal("message ID exhausted"))?,
                     );
@@ -3732,6 +3613,7 @@ impl BrokerStateMachine {
             {
                 let id = MessageId(
                     self.next_message_id
+                        .get()
                         .checked_add(1)
                         .ok_or_else(|| Error::internal("message ID exhausted"))?,
                 );
@@ -3792,6 +3674,7 @@ impl BrokerStateMachine {
                             Ok(PendingPayloadRecord {
                                 id: MessageId(
                                     self.next_message_id
+                                        .get()
                                         .checked_add(increment)
                                         .ok_or_else(|| Error::internal("message ID exhausted"))?,
                                 ),
@@ -3849,6 +3732,7 @@ impl BrokerStateMachine {
                             Ok(PendingPayloadRecord {
                                 id: MessageId(
                                     self.next_message_id
+                                        .get()
                                         .checked_add(increment)
                                         .ok_or_else(|| Error::internal("message ID exhausted"))?,
                                 ),
@@ -3957,19 +3841,20 @@ impl BrokerStateMachine {
         self.groups
             .get(&(project, group.to_owned()))
             .filter(|state| state.generation == generation && state.members.contains_key(member))
-            .and_then(|state| state.assignments.get(member).cloned())
+            .and_then(|state| state.assignments.get(member))
+            .map(|assignment| (*assignment).clone())
     }
 
     #[must_use]
-    pub fn group_leader(&self, project: ProjectId, group: &str, generation: i32) -> Option<&str> {
+    pub fn group_leader(&self, project: ProjectId, group: &str, generation: i32) -> Option<String> {
         self.groups
             .get(&(project, group.to_owned()))
             .filter(|state| state.generation == generation)
-            .map(|state| state.leader.as_str())
+            .map(|state| state.leader.clone())
     }
 
     fn publish_kafka_batch(
-        &mut self,
+        &self,
         project: ProjectId,
         topic: String,
         partition: i32,
@@ -3985,7 +3870,8 @@ impl BrokerStateMachine {
             .streams
             .get(&stream)
             .ok_or_else(|| Error::internal("Kafka partition stream is missing"))?
-            .next_offset;
+            .next_offset
+            .get();
         self.validate_stream_appends(&[stream], records.len() as u64)?;
         if kafka_batch_can_share_ingress(&records) {
             return self.publish_raw_kafka_batch(
@@ -4019,6 +3905,7 @@ impl BrokerStateMachine {
                 Ok(PendingPayloadRecord {
                     id: MessageId(
                         self.next_message_id
+                            .get()
                             .checked_add(increment)
                             .ok_or_else(|| Error::internal("message ID exhausted"))?,
                     ),
@@ -4062,7 +3949,7 @@ impl BrokerStateMachine {
     }
 
     fn publish_raw_kafka_batch(
-        &mut self,
+        &self,
         project: ProjectId,
         stream: StreamId,
         first_offset: u64,
@@ -4089,6 +3976,7 @@ impl BrokerStateMachine {
         for ((record, location), checksum) in records.into_iter().zip(locations).zip(checksums) {
             let id = MessageId(
                 self.next_message_id
+                    .get()
                     .checked_add(1)
                     .ok_or_else(|| Error::internal("message ID exhausted"))?,
             );
@@ -4119,7 +4007,7 @@ impl BrokerStateMachine {
     }
 
     fn publish_amqp(
-        &mut self,
+        &self,
         project: ProjectId,
         exchange: String,
         routing_key: String,
@@ -4144,7 +4032,7 @@ impl BrokerStateMachine {
                 .iter()
                 .filter(|((binding_project, binding_exchange), binding)| {
                     *binding_project == project
-                        && *binding_exchange == exchange
+                        && *binding_exchange == *exchange
                         && route_matches(declaration.kind, &binding.routing_key, &routing_key)
                 })
                 .filter_map(|(_, binding)| {
@@ -4171,6 +4059,7 @@ impl BrokerStateMachine {
         };
         let id = MessageId(
             self.next_message_id
+                .get()
                 .checked_add(1)
                 .ok_or_else(|| Error::internal("message ID exhausted"))?,
         );
@@ -4211,7 +4100,7 @@ impl BrokerStateMachine {
 
     #[allow(clippy::too_many_arguments)]
     fn publish_amqp_uniform_batch(
-        &mut self,
+        &self,
         project: ProjectId,
         resolved_time_ms: i64,
         exchange: String,
@@ -4255,6 +4144,7 @@ impl BrokerStateMachine {
                 Ok(PendingPayloadRecord {
                     id: MessageId(
                         self.next_message_id
+                            .get()
                             .checked_add(increment)
                             .ok_or_else(|| Error::internal("message ID exhausted"))?,
                     ),
@@ -4293,7 +4183,7 @@ impl BrokerStateMachine {
     }
 
     fn publish_amqp_batch(
-        &mut self,
+        &self,
         project: ProjectId,
         resolved_time_ms: i64,
         records: Vec<AmqpBatchRecord>,
@@ -4342,6 +4232,7 @@ impl BrokerStateMachine {
                 Ok(PendingPayloadRecord {
                     id: MessageId(
                         self.next_message_id
+                            .get()
                             .checked_add(increment)
                             .ok_or_else(|| Error::internal("message ID exhausted"))?,
                     ),
@@ -4399,7 +4290,7 @@ impl BrokerStateMachine {
     }
 
     fn allocate_message_in_segment(
-        &mut self,
+        &self,
         id: MessageId,
         timestamp_ms: i64,
         ingress: &IngressMetadata,
@@ -4426,7 +4317,7 @@ impl BrokerStateMachine {
     }
 
     fn allocate_stored_message_in_segment(
-        &mut self,
+        &self,
         id: MessageId,
         timestamp_ms: i64,
         payload_len: usize,
@@ -4443,6 +4334,7 @@ impl BrokerStateMachine {
         }
         let next_message_id = self
             .next_message_id
+            .get()
             .checked_add(1)
             .ok_or_else(|| Error::internal("message ID exhausted"))?;
         if id != MessageId(next_message_id) {
@@ -4467,7 +4359,7 @@ impl BrokerStateMachine {
                 "broker payload record extent differs from its segment",
             ));
         }
-        self.next_message_id = next_message_id;
+        self.next_message_id.set(next_message_id);
         if self
             .payloads
             .insert(
@@ -4491,7 +4383,7 @@ impl BrokerStateMachine {
     }
 
     fn allocate_payload_segment(
-        &mut self,
+        &self,
         descriptor: SegmentDescriptor,
         live_records: u32,
         shared_amqp_ingress: Option<IngressMetadata>,
@@ -4505,7 +4397,7 @@ impl BrokerStateMachine {
     }
 
     fn allocate_payload_segment_with_shared_ingress(
-        &mut self,
+        &self,
         descriptor: SegmentDescriptor,
         live_records: u32,
         shared_amqp_ingress: Option<IngressMetadata>,
@@ -4520,11 +4412,13 @@ impl BrokerStateMachine {
             .as_ref()
             .or(shared_kafka_ingress.as_ref())
             .map_or(0, ingress_accounted_bytes);
-        self.next_payload_segment_id = self
-            .next_payload_segment_id
-            .checked_add(1)
-            .ok_or_else(|| Error::internal("broker payload segment ID exhausted"))?;
-        let id = self.next_payload_segment_id;
+        self.next_payload_segment_id.set(
+            self.next_payload_segment_id
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| Error::internal("broker payload segment ID exhausted"))?,
+        );
+        let id = self.next_payload_segment_id.get();
         if self
             .payload_segments
             .insert(
@@ -4533,8 +4427,8 @@ impl BrokerStateMachine {
                     id,
                     descriptor,
                     live_records,
-                    shared_amqp_ingress,
-                    shared_kafka_ingress,
+                    shared_amqp_ingress: shared_amqp_ingress.map(Arc::new),
+                    shared_kafka_ingress: shared_kafka_ingress.map(Arc::new),
                     shared_ingress_bytes,
                 }),
             )
@@ -4548,8 +4442,8 @@ impl BrokerStateMachine {
     fn accounted_payload_bytes(&self, payload: &StoredPayloadRecord) -> Result<u64> {
         let segment = self.payload_segments.get(payload.segment).ok_or_else(|| {
             Error::new(
-                crate::ErrorCode::CorruptStorage,
-                "broker payload segment table is incomplete",
+                crate::ErrorCode::RetentionExpired,
+                "broker payload segment was retired during the read",
             )
         })?;
         let shared_ingress_bytes = if segment.shared_ingress_bytes != 0 {
@@ -4560,7 +4454,7 @@ impl BrokerStateMachine {
                 .shared_amqp_ingress
                 .as_ref()
                 .or(segment.shared_kafka_ingress.as_ref())
-                .map_or(0, ingress_accounted_bytes)
+                .map_or(0, |ingress| ingress_accounted_bytes(ingress))
         };
         payload
             .retained_bytes
@@ -4568,23 +4462,25 @@ impl BrokerStateMachine {
             .ok_or_else(|| Error::internal("broker accounted byte length overflow"))
     }
 
-    fn allocate_stream(&mut self) -> Result<StreamId> {
-        self.next_stream_id = self
-            .next_stream_id
-            .checked_add(1)
-            .ok_or_else(|| Error::internal("stream ID exhausted"))?;
-        let id = StreamId(self.next_stream_id);
+    fn allocate_stream(&self) -> Result<StreamId> {
+        self.next_stream_id.set(
+            self.next_stream_id
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| Error::internal("stream ID exhausted"))?,
+        );
+        let id = StreamId(self.next_stream_id.get());
         self.streams.insert(id, Arc::new(StreamState::default()));
         Ok(id)
     }
 
     #[cfg(test)]
-    fn append_reference(&mut self, stream: StreamId, message: MessageId) -> Result<u64> {
+    fn append_reference(&self, stream: StreamId, message: MessageId) -> Result<u64> {
         self.append_reference_with_route(stream, message, None, None, 0)
     }
 
     fn append_initial_references_batch(
-        &mut self,
+        &self,
         stream: StreamId,
         messages: &[MessageId],
     ) -> Result<u64> {
@@ -4602,7 +4498,7 @@ impl BrokerStateMachine {
                         .shared_amqp_ingress
                         .as_ref()
                         .or(segment.shared_kafka_ingress.as_ref())
-                        .map_or(0, ingress_accounted_bytes)
+                        .map_or(0, |ingress| ingress_accounted_bytes(ingress))
                 }
             })
             .unwrap_or(0);
@@ -4617,7 +4513,7 @@ impl BrokerStateMachine {
                     .checked_add(common_shared_ingress_bytes)
                     .ok_or_else(|| Error::internal("broker accounted byte length overflow"))?
             } else {
-                self.accounted_payload_bytes(payload)?
+                self.accounted_payload_bytes(&payload)?
             };
             total
                 .checked_add(bytes)
@@ -4625,17 +4521,18 @@ impl BrokerStateMachine {
         })?;
         let count = u64::try_from(messages.len())
             .map_err(|_| Error::internal("broker batch length exceeds u64"))?;
-        let state = self
+        let mut state = self
             .streams
             .get_mut(&stream)
             .ok_or_else(|| Error::internal("broker stream does not exist"))?;
-        let state = Arc::make_mut(state);
-        let first_offset = state.next_offset;
+        let state = &mut *state;
+        let first_offset = state.next_offset.get();
         let next_offset = first_offset
             .checked_add(count)
             .ok_or_else(|| Error::internal("broker offset exhausted"))?;
         let next_retained_bytes = state
             .retained_bytes
+            .get()
             .checked_add(retained_bytes)
             .ok_or_else(|| Error::internal("broker retained byte accounting overflow"))?;
         for (index, message) in messages.iter().copied().enumerate() {
@@ -4651,13 +4548,13 @@ impl BrokerStateMachine {
                 current_routing_key: None,
             });
         }
-        state.next_offset = next_offset;
-        state.retained_bytes = next_retained_bytes;
+        state.next_offset.set(next_offset);
+        state.retained_bytes.set(next_retained_bytes);
         Ok(first_offset)
     }
 
     fn append_reference_with_route(
-        &mut self,
+        &self,
         stream: StreamId,
         message: MessageId,
         current_exchange: Option<String>,
@@ -4667,23 +4564,29 @@ impl BrokerStateMachine {
         let retained_bytes = self
             .payloads
             .get(&message)
-            .map(|record| self.accounted_payload_bytes(record))
+            .map(|record| self.accounted_payload_bytes(&record))
             .transpose()?
             .unwrap_or(0);
-        let state = self
+        let mut state = self
             .streams
             .get_mut(&stream)
             .ok_or_else(|| Error::internal("broker stream does not exist"))?;
-        let state = Arc::make_mut(state);
-        let offset = state.next_offset;
-        state.next_offset = state
-            .next_offset
-            .checked_add(1)
-            .ok_or_else(|| Error::internal("broker offset exhausted"))?;
-        state.retained_bytes = state
-            .retained_bytes
-            .checked_add(retained_bytes)
-            .ok_or_else(|| Error::internal("broker retained byte accounting overflow"))?;
+        let state = &mut *state;
+        let offset = state.next_offset.get();
+        state.next_offset.set(
+            state
+                .next_offset
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| Error::internal("broker offset exhausted"))?,
+        );
+        state.retained_bytes.set(
+            state
+                .retained_bytes
+                .get()
+                .checked_add(retained_bytes)
+                .ok_or_else(|| Error::internal("broker retained byte accounting overflow"))?,
+        );
         state.records.push_back(StreamReference {
             offset,
             message,
@@ -4744,7 +4647,7 @@ impl BrokerStateMachine {
         offset: u64,
         maximum_bytes: usize,
         include_settled: bool,
-    ) -> Result<Vec<(u64, StoredPayloadRecord)>> {
+    ) -> Result<Vec<(u64, Arc<StoredPayloadRecord>)>> {
         self.fetch_stream_records_with_bounds(stream, offset, maximum_bytes, include_settled, None)
     }
 
@@ -4755,12 +4658,12 @@ impl BrokerStateMachine {
         maximum_bytes: usize,
         include_settled: bool,
         maximum_records: Option<usize>,
-    ) -> Result<Vec<(u64, StoredPayloadRecord)>> {
+    ) -> Result<Vec<(u64, Arc<StoredPayloadRecord>)>> {
         let state = self
             .streams
             .get(&stream)
             .ok_or_else(|| Error::invalid_data("stream does not exist"))?;
-        if offset < state.base_offset {
+        if offset < state.base_offset.get() {
             return Err(Error::new(
                 crate::ErrorCode::RetentionExpired,
                 "requested offset was retained",
@@ -4770,8 +4673,7 @@ impl BrokerStateMachine {
         let mut pending = Vec::new();
         for reference in state
             .records
-            .iter()
-            .filter(|record| record.offset >= offset)
+            .iter_from_offset(state.base_offset.get(), offset)
         {
             if maximum_records.is_some_and(|maximum| pending.len() >= maximum) {
                 break;
@@ -4784,11 +4686,13 @@ impl BrokerStateMachine {
             {
                 continue;
             }
-            let stored = self
-                .payloads
-                .get(&reference.message)
-                .ok_or_else(|| Error::internal("broker payload is missing"))?;
-            let visible_bytes = usize::try_from(self.accounted_payload_bytes(stored)?)
+            let stored = self.payloads.get(&reference.message).ok_or_else(|| {
+                Error::new(
+                    crate::ErrorCode::RetentionExpired,
+                    "broker payload was retired during the read",
+                )
+            })?;
+            let visible_bytes = usize::try_from(self.accounted_payload_bytes(&stored)?)
                 .map_err(|_| Error::internal("broker record length exceeds this platform"))?;
             if bytes.saturating_add(visible_bytes) > maximum_bytes
                 && (!pending.is_empty() || maximum_records.is_some())
@@ -4809,10 +4713,10 @@ impl BrokerStateMachine {
 
     fn resolve_offset(&self, stream: &StreamState, offset: StreamOffset) -> Result<u64> {
         Ok(match offset {
-            StreamOffset::First => stream.base_offset,
-            StreamOffset::Last => stream.next_offset.saturating_sub(1),
+            StreamOffset::First => stream.base_offset.get(),
+            StreamOffset::Last => stream.next_offset.get().saturating_sub(1),
             StreamOffset::Absolute(value) => {
-                if value < stream.base_offset {
+                if value < stream.base_offset.get() {
                     return Err(Error::new(
                         crate::ErrorCode::RetentionExpired,
                         "stream offset was retained",
@@ -4828,13 +4732,13 @@ impl BrokerStateMachine {
                         .get(&reference.message)
                         .is_some_and(|payload| payload.resolved_time_ms >= timestamp)
                 })
-                .map_or(stream.next_offset, |reference| reference.offset),
-            StreamOffset::Next => stream.next_offset,
+                .map_or(stream.next_offset.get(), |reference| reference.offset),
+            StreamOffset::Next => stream.next_offset.get(),
         })
     }
 
     fn settle(
-        &mut self,
+        &self,
         project: ProjectId,
         queue: &str,
         owner: Uuid,
@@ -4847,7 +4751,6 @@ impl BrokerStateMachine {
         let queue_record = self
             .queues
             .get(&(project, queue.to_owned()))
-            .cloned()
             .ok_or_else(|| Error::invalid_data("queue does not exist"))?;
         if queue_record.kind != QueueKind::Classic {
             return Err(Error::invalid_data(
@@ -4856,11 +4759,11 @@ impl BrokerStateMachine {
         }
         let mut dead_letters = Vec::new();
         let matched = {
-            let stream = self
+            let mut stream = self
                 .streams
                 .get_mut(&queue_record.stream)
                 .ok_or_else(|| Error::internal("queue stream is missing"))?;
-            let stream = Arc::make_mut(stream);
+            let stream = &mut *stream;
             let offsets = if multiple {
                 stream
                     .records
@@ -4884,7 +4787,7 @@ impl BrokerStateMachine {
                     .and_then(|offset| {
                         stream
                             .records
-                            .get_by_offset(stream.base_offset, offset)
+                            .get_by_offset(stream.base_offset.get(), offset)
                             .filter(|reference| {
                                 matches!(
                                     reference.delivery,
@@ -4901,9 +4804,9 @@ impl BrokerStateMachine {
                     })
                     .unwrap_or_default()
             };
-            let base_offset = stream.base_offset;
+            let base_offset = stream.base_offset.get();
             for offset in &offsets {
-                let reference = stream
+                let mut reference = stream
                     .records
                     .get_mut_by_offset(base_offset, *offset)
                     .ok_or_else(|| Error::internal("settled delivery offset disappeared"))?;
@@ -4927,10 +4830,13 @@ impl BrokerStateMachine {
         }
         self.remove_delivery_lease_if_idle(project, owner);
         if !dead_letters.is_empty() {
-            let Some(exchange) = queue_record.dead_letter_exchange else {
+            let Some(ref exchange) = queue_record.dead_letter_exchange else {
                 return Ok(());
             };
-            let routing = queue_record.dead_letter_routing_key.unwrap_or_default();
+            let routing = queue_record
+                .dead_letter_routing_key
+                .clone()
+                .unwrap_or_default();
             let targets = if exchange.is_empty() {
                 self.queues
                     .get(&(project, routing.clone()))
@@ -4945,7 +4851,7 @@ impl BrokerStateMachine {
                     .iter()
                     .filter(|((binding_project, binding_exchange), binding)| {
                         *binding_project == project
-                            && *binding_exchange == exchange
+                            && *binding_exchange == *exchange
                             && route_matches(declaration.kind, &binding.routing_key, &routing)
                     })
                     .filter_map(|(_, binding)| {
@@ -4971,7 +4877,7 @@ impl BrokerStateMachine {
     }
 
     fn renew_delivery_lease(
-        &mut self,
+        &self,
         project: ProjectId,
         owner: Uuid,
         resolved_time_ms: i64,
@@ -4990,19 +4896,19 @@ impl BrokerStateMachine {
         Ok(())
     }
 
-    fn release_delivery_lease(&mut self, project: ProjectId, owner: Uuid) {
+    fn release_delivery_lease(&self, project: ProjectId, owner: Uuid) {
         let streams = self
             .queues
             .iter()
             .filter_map(|((candidate, _), queue)| {
-                (*candidate == project && queue.kind == QueueKind::Classic).then_some(queue.stream)
+                (candidate == project && queue.kind == QueueKind::Classic).then_some(queue.stream)
             })
             .collect::<Vec<_>>();
         for stream in streams {
-            let Some(stream) = self.streams.get_mut(&stream) else {
+            let Some(mut stream) = self.streams.get_mut(&stream) else {
                 continue;
             };
-            let stream = Arc::make_mut(stream);
+            let stream = &mut *stream;
             let offsets = stream
                 .records
                 .iter()
@@ -5017,9 +4923,9 @@ impl BrokerStateMachine {
                     .then_some(reference.offset)
                 })
                 .collect::<Vec<_>>();
-            let base_offset = stream.base_offset;
+            let base_offset = stream.base_offset.get();
             for offset in offsets {
-                if let Some(reference) = stream.records.get_mut_by_offset(base_offset, offset) {
+                if let Some(mut reference) = stream.records.get_mut_by_offset(base_offset, offset) {
                     reference.delivery = DeliveryState::Ready;
                     reference.redelivered = true;
                 }
@@ -5028,12 +4934,12 @@ impl BrokerStateMachine {
         self.delivery_leases.remove(&(project, owner));
     }
 
-    fn expire_delivery_leases(&mut self, project: ProjectId, resolved_time_ms: i64) {
+    fn expire_delivery_leases(&self, project: ProjectId, resolved_time_ms: i64) {
         let expired = self
             .delivery_leases
             .iter()
             .filter_map(|((candidate, owner), deadline)| {
-                (*candidate == project && *deadline <= resolved_time_ms).then_some(*owner)
+                (candidate == project && *deadline <= resolved_time_ms).then_some(owner)
             })
             .collect::<Vec<_>>();
         for owner in expired {
@@ -5041,7 +4947,7 @@ impl BrokerStateMachine {
         }
     }
 
-    fn remove_delivery_lease_if_idle(&mut self, project: ProjectId, owner: Uuid) {
+    fn remove_delivery_lease_if_idle(&self, project: ProjectId, owner: Uuid) {
         if !self.owner_has_unacked(project, owner) {
             self.delivery_leases.remove(&(project, owner));
         }
@@ -5054,7 +4960,7 @@ impl BrokerStateMachine {
                 *candidate == project && queue.kind == QueueKind::Classic
             })
             .filter_map(|(_, queue)| self.streams.get(&queue.stream))
-            .flat_map(|stream| &stream.records)
+            .flat_map(|stream| stream.records.iter())
             .any(|reference| {
                 matches!(
                     reference.delivery,
@@ -5067,20 +4973,20 @@ impl BrokerStateMachine {
     }
 
     fn retain(
-        &mut self,
+        &self,
         project: ProjectId,
         resolved_time_ms: i64,
     ) -> Result<(u64, BTreeSet<MessageId>)> {
         let mut policies = HashMap::new();
-        for ((id, _), topic) in &*self.topics {
-            if *id == project {
-                for stream in &topic.partitions {
+        for ((id, _), topic) in &self.topics {
+            if id == project {
+                for stream in topic.partitions.iter() {
                     policies.insert(*stream, topic.retention);
                 }
             }
         }
-        for ((id, _), queue) in &*self.queues {
-            if *id == project {
+        for ((id, _), queue) in &self.queues {
+            if id == project {
                 policies.insert(queue.stream, queue.retention);
             }
         }
@@ -5090,7 +4996,7 @@ impl BrokerStateMachine {
                 .streams
                 .get(&stream_id)
                 .ok_or_else(|| Error::internal("retention stream is missing"))?;
-            let mut retained_bytes = state.retained_bytes;
+            let mut retained_bytes = state.retained_bytes.get();
             let mut remove = 0_usize;
             for front in &state.records {
                 // An active classic delivery remains canonical until its owner settles it or the
@@ -5119,37 +5025,43 @@ impl BrokerStateMachine {
                     break;
                 }
                 retained_bytes =
-                    retained_bytes.saturating_sub(self.accounted_payload_bytes(payload)?);
+                    retained_bytes.saturating_sub(self.accounted_payload_bytes(&payload)?);
                 remove = remove.saturating_add(1);
             }
             if remove != 0 {
-                plan.push((stream_id, remove, state.retained_bytes - retained_bytes));
+                plan.push((
+                    stream_id,
+                    remove,
+                    state.retained_bytes.get() - retained_bytes,
+                ));
             }
         }
 
         let mut removed = 0u64;
         let mut candidates = BTreeSet::new();
         for (stream_id, count, removed_bytes) in plan {
-            let state = self
+            let mut state = self
                 .streams
                 .get_mut(&stream_id)
                 .ok_or_else(|| Error::internal("retention stream is missing"))?;
-            let state = Arc::make_mut(state);
+            let state = &mut *state;
             for _ in 0..count {
                 let reference = state
                     .records
                     .pop_front()
                     .ok_or_else(|| Error::internal("retention plan exceeds stream length"))?;
-                state.base_offset = reference.offset.saturating_add(1);
+                state.base_offset.set(reference.offset.saturating_add(1));
                 candidates.insert(reference.message);
                 removed = removed.saturating_add(1);
             }
-            state.retained_bytes = state.retained_bytes.saturating_sub(removed_bytes);
+            state
+                .retained_bytes
+                .set(state.retained_bytes.get().saturating_sub(removed_bytes));
         }
         Ok((removed, candidates))
     }
 
-    fn expire_group_members(&mut self, project: ProjectId, resolved_time_ms: i64) -> Result<()> {
+    fn expire_group_members(&self, project: ProjectId, resolved_time_ms: i64) -> Result<()> {
         let changed = self
             .groups
             .iter()
@@ -5166,11 +5078,11 @@ impl BrokerStateMachine {
             })
             .collect::<Vec<_>>();
         for key in changed {
-            let state = self
+            let mut state = self
                 .groups
                 .get_mut(&key)
                 .ok_or_else(|| Error::internal("expiring consumer group disappeared"))?;
-            let state = Arc::make_mut(state);
+            let state = &mut *state;
             state.members.retain(|_, member| {
                 resolved_time_ms.saturating_sub(member.last_heartbeat_ms)
                     < i64::from(member.session_timeout_ms)
@@ -5181,12 +5093,12 @@ impl BrokerStateMachine {
                 .ok_or_else(|| Error::internal("group generation exhausted"))?;
             state.assignments.clear();
             if !state.members.contains_key(&state.leader) {
-                state.leader = state.members.keys().next().cloned().unwrap_or_default();
+                state.leader = state.members.keys().min().unwrap_or_default();
             }
             state.protocol = if state.members.is_empty() {
                 String::new()
             } else {
-                select_group_protocol(&state.members)?
+                select_group_protocol(&state.members.iter().collect())?
             };
         }
         Ok(())
@@ -5218,11 +5130,11 @@ impl BrokerStateMachine {
                 let committed = group
                     .offsets
                     .get(&(topic.clone(), partition))
-                    .copied()
-                    .unwrap_or(state.base_offset);
+                    .map(|offset| *offset)
+                    .unwrap_or(state.base_offset.get());
                 lag.insert(
                     (topic.clone(), partition),
-                    state.next_offset.saturating_sub(committed),
+                    state.next_offset.get().saturating_sub(committed),
                 );
             }
         }
@@ -5274,7 +5186,7 @@ impl BrokerStateMachine {
 
     /// Removes a queue together with everything that references it: its stream, its bindings, its
     /// consumer registrations, and the payloads it was the last holder of.
-    fn drop_queue(&mut self, project: ProjectId, name: &str) -> Result<()> {
+    fn drop_queue(&self, project: ProjectId, name: &str) -> Result<()> {
         let key = (project, name.to_owned());
         let Some(queue) = self.queues.remove(&key) else {
             return Ok(());
@@ -5350,15 +5262,15 @@ impl BrokerStateMachine {
     /// for the ordinary retention trim. Records are only ever removed from the front of a stream,
     /// so a purge cannot physically drop a ready record that sits behind an unsettled one; marking
     /// it settled is what makes the purge observable, and reclamation follows on the next trim.
-    fn discard_ready_records(&mut self, project: ProjectId, stream: StreamId) -> Result<u32> {
+    fn discard_ready_records(&self, project: ProjectId, stream: StreamId) -> Result<u32> {
         let _ = project;
-        let Some(state) = self.streams.get_mut(&stream) else {
+        let Some(mut state) = self.streams.get_mut(&stream) else {
             return Ok(0);
         };
-        let state = Arc::make_mut(state);
+        let state = &mut *state;
         let mut discarded = 0u32;
         for index in 0..state.records.len() {
-            let Some(record) = state.records.get_mut_relative(index) else {
+            let Some(mut record) = state.records.get_mut_relative(index) else {
                 break;
             };
             if matches!(record.delivery, DeliveryState::Ready) {
@@ -5370,7 +5282,7 @@ impl BrokerStateMachine {
     }
 
     fn reclaim_payload_candidates(
-        &mut self,
+        &self,
         project: ProjectId,
         candidates: &BTreeSet<MessageId>,
     ) -> Result<()> {
@@ -5381,7 +5293,7 @@ impl BrokerStateMachine {
             .topics
             .iter()
             .filter(|((candidate, _), _)| *candidate == project)
-            .flat_map(|(_, topic)| topic.partitions.iter().copied())
+            .flat_map(|(_, topic)| topic.partitions.iter().copied().collect::<Vec<_>>())
             .chain(
                 self.queues
                     .iter()
@@ -5401,16 +5313,16 @@ impl BrokerStateMachine {
         Ok(())
     }
 
-    fn remove_payload(&mut self, message: MessageId) -> Result<()> {
+    fn remove_payload(&self, message: MessageId) -> Result<()> {
         let Some(payload) = self.payloads.remove(&message) else {
             return Ok(());
         };
         let remove_segment = {
-            let segment = self
+            let mut segment = self
                 .payload_segments
                 .get_mut(payload.segment)
                 .ok_or_else(|| Error::internal("broker payload segment is missing"))?;
-            let segment = Arc::make_mut(segment);
+            let segment = &mut *segment;
             segment.live_records = segment
                 .live_records
                 .checked_sub(1)
@@ -5655,7 +5567,7 @@ fn decode_payload_segment_record(encoded: &[u8]) -> Result<PayloadSegmentRecord>
 
 fn load_payloads(
     payload_segments: &PayloadSegmentTable,
-    stored: impl IntoIterator<Item = StoredPayloadRecord>,
+    stored: impl IntoIterator<Item = Arc<StoredPayloadRecord>>,
     segments: &SegmentStore,
 ) -> Result<BTreeMap<MessageId, Arc<PayloadRecord>>> {
     let mut requested = Vec::new();
@@ -5673,12 +5585,12 @@ fn load_payloads(
     for stored in requested {
         let segment = payload_segments.get(stored.segment).ok_or_else(|| {
             Error::new(
-                crate::ErrorCode::CorruptStorage,
-                "broker payload segment table is incomplete",
+                crate::ErrorCode::RetentionExpired,
+                "broker payload segment was retired during the read",
             )
         })?;
         let record = segments.read_record_at(&segment.descriptor, stored.location)?;
-        let payload = materialize_stored_payload(&record, &stored, segment)?;
+        let payload = materialize_stored_payload(&record, &stored, &segment)?;
         validate_loaded_payload(&stored, &segment.descriptor, &payload)?;
         if loaded
             .insert(
@@ -5722,7 +5634,7 @@ fn materialize_stored_payload(
                     "raw AMQP payload segment is missing its shared ingress metadata",
                 )
             })?;
-            if !matches!(ingress, IngressMetadata::Amqp { .. }) {
+            if !matches!(ingress.as_ref(), IngressMetadata::Amqp { .. }) {
                 return Err(Error::new(
                     crate::ErrorCode::CorruptStorage,
                     "raw AMQP payload segment carries non-AMQP ingress metadata",
@@ -5737,7 +5649,7 @@ fn materialize_stored_payload(
                 })?,
                 id: stored.id,
                 resolved_time_ms: stored.resolved_time_ms,
-                ingress,
+                ingress: (*ingress).clone(),
                 payload: record.payload.clone(),
                 checksum: stored.checksum,
             })
@@ -5754,7 +5666,7 @@ fn materialize_stored_payload(
                 headers,
                 value_is_null,
                 ..
-            } = ingress
+            } = ingress.as_ref()
             else {
                 return Err(Error::new(
                     crate::ErrorCode::CorruptStorage,
@@ -5795,7 +5707,7 @@ fn materialize_stored_payload(
 
 fn unique_payload_descriptors(
     payload_segments: &PayloadSegmentTable,
-    stored: impl IntoIterator<Item = StoredPayloadRecord>,
+    stored: impl IntoIterator<Item = Arc<StoredPayloadRecord>>,
 ) -> Result<Vec<SegmentDescriptor>> {
     stored
         .into_iter()
@@ -6149,7 +6061,7 @@ fn validate_group_member(
     Ok(())
 }
 
-fn select_group_protocol(members: &BTreeMap<String, GroupMember>) -> Result<String> {
+fn select_group_protocol(members: &BTreeMap<String, Arc<GroupMember>>) -> Result<String> {
     let mut members = members.values();
     let first = members
         .next()
@@ -6303,10 +6215,12 @@ fn group_reply(state: &GroupState) -> BrokerReply {
             )
         })
         .collect();
+    let mut members = state.members.keys().collect::<Vec<_>>();
+    members.sort_unstable();
     BrokerReply::Group {
         generation: state.generation,
         leader: state.leader.clone(),
-        members: state.members.keys().cloned().collect(),
+        members,
         protocol: state.protocol.clone(),
         metadata,
     }
@@ -6702,7 +6616,7 @@ mod tests {
     #[test]
     fn fanout_binding_accepts_empty_routing_key() -> Result<()> {
         let project = ProjectId::random();
-        let mut broker = BrokerStateMachine::default();
+        let broker = BrokerStateMachine::default();
         let directory = tempfile::tempdir()?;
         let segments = SegmentStore::open(directory.path(), 1024 * 1024)?;
         broker.apply(
@@ -6752,7 +6666,7 @@ mod tests {
         let retained = ProjectId::random();
         let directory = tempfile::tempdir()?;
         let segments = SegmentStore::open(directory.path(), 1024 * 1024)?;
-        let mut broker = BrokerStateMachine::default();
+        let broker = BrokerStateMachine::default();
         for (project, name) in [(removed, "removed"), (retained, "retained")] {
             broker.apply(
                 BrokerCommand::CreateTopic {
@@ -6784,7 +6698,7 @@ mod tests {
         let project = ProjectId::random();
         let directory = tempfile::tempdir()?;
         let segments = SegmentStore::open(directory.path(), 2 * 1024 * 1024)?;
-        let mut broker = BrokerStateMachine::default();
+        let broker = BrokerStateMachine::default();
         broker.apply(
             BrokerCommand::CreateTopic {
                 project,
@@ -6878,7 +6792,7 @@ mod tests {
         let project = ProjectId::random();
         let directory = tempfile::tempdir()?;
         let segments = SegmentStore::open(directory.path(), 2 * 1024 * 1024)?;
-        let mut broker = BrokerStateMachine::default();
+        let broker = BrokerStateMachine::default();
         broker.apply(
             BrokerCommand::CreateTopic {
                 project,
@@ -6936,7 +6850,7 @@ mod tests {
         let project = ProjectId::random();
         let directory = tempfile::tempdir()?;
         let segments = SegmentStore::open(directory.path(), 4 * 1024 * 1024)?;
-        let mut broker = BrokerStateMachine::default();
+        let broker = BrokerStateMachine::default();
         broker.apply(
             BrokerCommand::CreateTopic {
                 project,
@@ -7042,7 +6956,7 @@ mod tests {
         let project = ProjectId::random();
         let directory = tempfile::tempdir()?;
         let segments = SegmentStore::open(directory.path(), 4 * 1024 * 1024)?;
-        let mut broker = BrokerStateMachine::default();
+        let broker = BrokerStateMachine::default();
         broker.apply(
             BrokerCommand::CreateTopic {
                 project,
@@ -7093,7 +7007,7 @@ mod tests {
         let duplicate_extents = broker
             .payloads
             .iter()
-            .skip(1)
+            .filter(|(id, _)| id.0 != 1)
             .map(|(_, stored)| (stored.segment, stored.location))
             .collect::<Vec<_>>();
         assert_eq!(duplicate_extents.len(), 400);
@@ -7134,7 +7048,7 @@ mod tests {
         let project = ProjectId::random();
         let directory = tempfile::tempdir()?;
         let segments = SegmentStore::open(directory.path(), 4 * 1024 * 1024)?;
-        let mut broker = BrokerStateMachine::default();
+        let broker = BrokerStateMachine::default();
         broker.apply(
             BrokerCommand::CreateTopic {
                 project,
@@ -7177,7 +7091,7 @@ mod tests {
         let project = ProjectId::random();
         let directory = tempfile::tempdir()?;
         let segments = SegmentStore::open(directory.path(), 4 * 1024 * 1024)?;
-        let mut broker = BrokerStateMachine::default();
+        let broker = BrokerStateMachine::default();
         broker.apply(
             BrokerCommand::CreateExchange {
                 project,
@@ -7251,11 +7165,128 @@ mod tests {
     }
 
     #[test]
-    fn broker_clone_shares_canonical_families_and_detaches_only_mutated_roots() -> Result<()> {
+    fn metadata_and_bounded_stream_reads_finish_while_writer_is_paused() -> Result<()> {
         let project = ProjectId::random();
         let directory = tempfile::tempdir()?;
         let segments = SegmentStore::open(directory.path(), 1024 * 1024)?;
-        let mut broker = BrokerStateMachine::default();
+        let broker = BrokerStateMachine::default();
+        broker.apply(
+            BrokerCommand::CreateTopic {
+                project,
+                name: "events".into(),
+                partitions: 1,
+                retention: RetentionPolicy {
+                    max_age_ms: None,
+                    max_bytes: None,
+                },
+            },
+            &segments,
+        )?;
+        broker.apply(
+            BrokerCommand::PublishKafkaBatch {
+                project,
+                topic: "events".into(),
+                partition: 0,
+                resolved_time_ms: 1,
+                records: vec![KafkaBatchRecord {
+                    create_time_ms: None,
+                    key: None,
+                    headers: BTreeMap::new(),
+                    payload: b"canonical".to_vec(),
+                    value_is_null: false,
+                }],
+            },
+            &segments,
+        )?;
+        let alias = broker.clone();
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| -> Result<()> {
+            let writer_broker = &broker;
+            let writer = scope.spawn(move || -> Result<()> {
+                let mut topic = writer_broker
+                    .topics
+                    .get_mut(&(project, "events".into()))
+                    .ok_or_else(|| Error::internal("missing topic"))?;
+                topic.retention.max_bytes = Some(4096);
+                paused_tx
+                    .send(())
+                    .map_err(|_| Error::internal("pause channel closed"))?;
+                resume_rx
+                    .recv()
+                    .map_err(|_| Error::internal("resume channel closed"))?;
+                Ok(())
+            });
+            paused_rx
+                .recv()
+                .map_err(|_| Error::internal("writer did not pause"))?;
+            let reader = scope.spawn(|| {
+                let result = (|| -> Result<()> {
+                    assert_eq!(alias.topic_metadata(project), vec![("events".into(), 1)]);
+                    let (_, rows) = alias.fetch_partition_bounded(
+                        &PartitionRead {
+                            project,
+                            topic: "events",
+                            partition: 0,
+                            offset: 0,
+                            maximum_bytes: 1024,
+                            maximum_records: 1,
+                        },
+                        &segments,
+                    )?;
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0].1.payload.as_ref(), b"canonical");
+                    Ok(())
+                })();
+                let _ = read_tx.send(result);
+            });
+            let result = read_rx.recv_timeout(std::time::Duration::from_secs(2));
+            let _ = resume_tx.send(());
+            writer
+                .join()
+                .map_err(|_| Error::internal("writer panicked"))??;
+            reader
+                .join()
+                .map_err(|_| Error::internal("reader panicked"))?;
+            result.map_err(|_| Error::internal("reader waited for paused writer"))??;
+            Ok(())
+        })?;
+        assert_eq!(alias.topic_metrics(project)[0].retention_ms, None);
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_stream_iterator_starts_at_requested_offset_without_materializing_unrelated_rows() {
+        let records = StreamRecords::default();
+        for offset in 0..100_000 {
+            records.push_back(StreamReference {
+                offset,
+                message: MessageId(1),
+                delivery: DeliveryState::Ready,
+                redelivered: false,
+                death_count: 0,
+                current_exchange: None,
+                current_routing_key: None,
+            });
+        }
+        let mut read = records.iter_from_offset(0, 99_990);
+        assert_eq!(read.front, 99_990);
+        assert_eq!(read.next().map(|record| record.offset), Some(99_990));
+        assert_eq!(read.front, 99_991);
+        let alias = records.clone();
+        assert!(alias.values.shared_with(&records.values));
+        records.clear();
+        assert_eq!(alias.len(), 0);
+        assert!(read.next().is_none());
+    }
+
+    #[test]
+    fn broker_clone_shares_canonical_identity_after_mutation() -> Result<()> {
+        let project = ProjectId::random();
+        let directory = tempfile::tempdir()?;
+        let segments = SegmentStore::open(directory.path(), 1024 * 1024)?;
+        let broker = BrokerStateMachine::default();
         broker.apply(
             BrokerCommand::CreateTopic {
                 project,
@@ -7290,13 +7321,13 @@ mod tests {
             },
             &segments,
         )?;
-        assert!(!published.payloads.shared_with(&broker.payloads));
-        assert!(!published.streams.shared_with(&broker.streams));
+        assert!(published.payloads.shared_with(&broker.payloads));
+        assert!(published.streams.shared_with(&broker.streams));
         assert!(published.topics.shared_with(&broker.topics));
         assert!(published.groups.shared_with(&broker.groups));
         assert_eq!(
             published.list_offset(project, "events", 0, -1)?,
-            Some((0, -1))
+            Some((1, -1))
         );
         assert_eq!(broker.list_offset(project, "events", 0, -1)?, Some((1, -1)));
 
@@ -7315,11 +7346,11 @@ mod tests {
     }
 
     #[test]
-    fn single_delivery_and_ack_detach_only_the_target_reference_page() -> Result<()> {
+    fn single_delivery_and_ack_mutate_only_canonical_reference_cell() -> Result<()> {
         let project = ProjectId::random();
         let directory = tempfile::tempdir()?;
         let segments = SegmentStore::open(directory.path(), 2 * 1024 * 1024)?;
-        let mut broker = BrokerStateMachine::default();
+        let broker = BrokerStateMachine::default();
         broker.apply(
             BrokerCommand::CreateQueue {
                 project,
@@ -7391,7 +7422,7 @@ mod tests {
             .get(&stream)
             .ok_or_else(|| Error::internal("delivered stream disappeared"))?
             .records;
-        assert!(delivered_records.detached_page_bytes_from(before_records) <= 16 * 1024);
+        assert!(delivered_records.values.shared_with(&before_records.values));
 
         let before_ack = broker.clone();
         broker.apply(
@@ -7415,7 +7446,7 @@ mod tests {
             .get(&stream)
             .ok_or_else(|| Error::internal("acked stream disappeared"))?
             .records;
-        assert!(acked_records.detached_page_bytes_from(before_ack_records) <= 16 * 1024);
+        assert!(acked_records.values.shared_with(&before_ack_records.values));
         Ok(())
     }
 
@@ -7424,7 +7455,7 @@ mod tests {
         let project = ProjectId::random();
         let directory = tempfile::tempdir()?;
         let segments = SegmentStore::open(directory.path(), 1024 * 1024)?;
-        let mut broker = BrokerStateMachine::default();
+        let broker = BrokerStateMachine::default();
         let protocols = BTreeMap::from([("range".to_owned(), b"metadata".to_vec())]);
         let first = broker.apply(
             BrokerCommand::JoinGroup {
@@ -7480,7 +7511,7 @@ mod tests {
         let project = ProjectId::random();
         let directory = tempfile::tempdir()?;
         let segments = SegmentStore::open(directory.path(), 2 * 1024 * 1024)?;
-        let mut broker = BrokerStateMachine::default();
+        let broker = BrokerStateMachine::default();
         let owner = Uuid::new_v4();
         broker.apply(
             BrokerCommand::CreateExchange {
@@ -7626,7 +7657,7 @@ mod tests {
         let project = ProjectId::random();
         let directory = tempfile::tempdir()?;
         let segments = SegmentStore::open(directory.path(), 2 * 1024 * 1024)?;
-        let mut broker = BrokerStateMachine::default();
+        let broker = BrokerStateMachine::default();
         broker.apply(
             BrokerCommand::CreateQueue {
                 project,
@@ -7782,7 +7813,7 @@ mod tests {
         let project = ProjectId::random();
         let directory = tempfile::tempdir()?;
         let segments = SegmentStore::open(directory.path(), 2 * 1024 * 1024)?;
-        let mut broker = BrokerStateMachine::default();
+        let broker = BrokerStateMachine::default();
         broker.apply(
             BrokerCommand::CreateQueue {
                 project,
@@ -7882,7 +7913,7 @@ mod tests {
         let project = ProjectId::random();
         let directory = tempfile::tempdir()?;
         let segments = SegmentStore::open(directory.path(), 2 * 1024 * 1024)?;
-        let mut broker = BrokerStateMachine::default();
+        let broker = BrokerStateMachine::default();
         broker.apply(
             BrokerCommand::CreateQueue {
                 project,
@@ -7936,7 +7967,7 @@ mod tests {
         let project = ProjectId::random();
         let directory = tempfile::tempdir()?;
         let segments = SegmentStore::open(directory.path(), 32 * 1024 * 1024)?;
-        let mut broker = BrokerStateMachine::default();
+        let broker = BrokerStateMachine::default();
         broker.apply(
             BrokerCommand::CreateQueue {
                 project,
@@ -7992,7 +8023,7 @@ mod tests {
         let project = ProjectId::random();
         let directory = tempfile::tempdir()?;
         let segments = SegmentStore::open(directory.path(), 2 * 1024 * 1024)?;
-        let mut broker = BrokerStateMachine::default();
+        let broker = BrokerStateMachine::default();
         broker.apply(
             BrokerCommand::CreateTopic {
                 project,
@@ -8042,7 +8073,7 @@ mod tests {
         let project = ProjectId::random();
         let directory = tempfile::tempdir()?;
         let segments = SegmentStore::open(directory.path(), 2 * 1024 * 1024)?;
-        let mut broker = BrokerStateMachine::default();
+        let broker = BrokerStateMachine::default();
         broker.apply(
             BrokerCommand::CreateTopic {
                 project,
@@ -8092,7 +8123,7 @@ mod tests {
         let project = ProjectId::random();
         let directory = tempfile::tempdir()?;
         let segments = SegmentStore::open(directory.path(), 2 * 1024 * 1024)?;
-        let mut broker = BrokerStateMachine::default();
+        let broker = BrokerStateMachine::default();
         broker.apply(
             BrokerCommand::CreateQueue {
                 project,
@@ -8130,7 +8161,7 @@ mod tests {
             .payloads
             .get(&MessageId(2))
             .ok_or_else(|| Error::internal("published payload is missing"))?;
-        let single_record_bytes = broker.accounted_payload_bytes(single_record)?;
+        let single_record_bytes = broker.accounted_payload_bytes(&single_record)?;
         broker
             .queues
             .get_mut(&(project, "stream".to_owned()))

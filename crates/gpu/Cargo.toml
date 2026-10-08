@@ -10,6 +10,7 @@ default = ["accelerator"]
 accelerator = ["dep:candle-core", "dep:candle-metal-kernels", "dep:objc2-metal", "dep:block2", "irongraph-graph/accelerator"]
 metal = ["accelerator"]
 cuda = ["accelerator", "candle-core/cuda"]
+legacy-graph = ["accelerator"]
 
 [dependencies]
 irongraph-types = { path = "../types" }

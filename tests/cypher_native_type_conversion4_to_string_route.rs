@@ -92,7 +92,7 @@ struct StrictToStringBackend {
 impl StrictToStringBackend {
     fn new(graph: &GraphStore) -> Result<Self> {
         let mut inner = CpuBackend::new(MEMORY_LIMIT_BYTES, RESERVED_BYTES);
-        inner.admit_project(ResidentProjectImage::build(
+        inner.admit_project(super::legacy_resident_build(
             PROJECT,
             bookmark(graph),
             graph,

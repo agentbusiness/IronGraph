@@ -880,7 +880,7 @@ fn context<'a>(
 }
 
 fn fixture_graph(source: &SourceCase) -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     for setup in &source.setup_queries {
         let output = QueryEngine.execute(setup, &mut context(&graph, None, false))?;
         if !output.temporal_mutations.is_empty() {
@@ -1339,7 +1339,7 @@ fn execute_strict_case(
 ) -> Result<()> {
     let graph = fixture_graph(source)?;
     backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-        graph.snapshot()?,
+        super::legacy_fixture_snapshot(&graph)?,
     ))])?;
     let calls = backend.calls();
     let before = calls.snapshot();
@@ -1513,7 +1513,7 @@ fn execute_exact_observed_source(
 ) -> Result<()> {
     let graph = fixture_graph(source)?;
     backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-        graph.snapshot()?,
+        super::legacy_fixture_snapshot(&graph)?,
     ))])?;
     let calls = backend.calls();
     let before = calls.snapshot();
@@ -1878,7 +1878,7 @@ fn cpu_quantifier_result_cannot_masquerade_as_metal() -> Result<()> {
     let graph = GraphStore::default();
     let mut backend = ObservedBackend::cpu_masquerading_as_metal();
     backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-        graph.snapshot()?,
+        super::legacy_fixture_snapshot(&graph)?,
     ))])?;
     let output = QueryEngine.execute(
         "RETURN any(x IN [true, false] WHERE x) AS result",

@@ -69,7 +69,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Result<Self> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let movie = graph.catalog_mut().intern_label("Movie")?;
         let watched = graph.catalog_mut().intern_property("watched")?;
         let rating = graph.catalog_mut().intern_property("rating")?;
@@ -102,7 +102,7 @@ impl Fixture {
     }
 
     fn image(&self) -> Result<ResidentProjectImage> {
-        ResidentProjectImage::build(
+        super::legacy_resident_build(
             PROJECT,
             bookmark(&self.graph),
             &self.graph,

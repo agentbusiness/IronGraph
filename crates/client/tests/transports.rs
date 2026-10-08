@@ -6,7 +6,7 @@ use std::{
 };
 
 use axum::{Json, Router, http::header, response::IntoResponse, routing::post};
-use irongraph_client::{Query, RemoteClient};
+use irongraph_client::{Query, QueryResult, RemoteClient};
 use irongraph_server::protocol::{
     BatchColumn, BoltServer, QueryColumn, QueryExecutor, QueryRequest, QueryStatistics,
     QueryStreamEvent, QueryTransaction, TypedValue,
@@ -16,27 +16,67 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 struct StaticExecutor;
-struct StaticTransaction;
 
-impl QueryTransaction for StaticTransaction {
-    fn run(
-        &mut self,
-        request: QueryRequest,
-        emit: &mut dyn FnMut(QueryStreamEvent) -> Result<()>,
-    ) -> Result<()> {
-        for event in result_events(request.request_id) {
-            emit(event)?;
-        }
-        Ok(())
+#[test]
+fn incremental_result_moves_dirty_values_and_rejects_misaligned_batches() {
+    let bodies = [
+        "東京 ✈ café".repeat(32768),
+        "different complete body".repeat(16384),
+    ];
+    let pointers = bodies.each_ref().map(|body| body.as_ptr());
+    let mut result = QueryResult::default();
+    result
+        .append_event(QueryStreamEvent::Batch {
+            request_id: Uuid::nil(),
+            sequence: 0,
+            row_count: 2,
+            columns: vec![
+                BatchColumn {
+                    name: "body".into(),
+                    value_type: "STRING".into(),
+                    values: bodies.into_iter().map(TypedValue::String).collect(),
+                },
+                BatchColumn {
+                    name: "value".into(),
+                    value_type: "INTEGER".into(),
+                    values: vec![
+                        TypedValue::Integer("41".into()),
+                        TypedValue::Integer("42".into()),
+                    ],
+                },
+            ],
+        })
+        .unwrap();
+    for (index, pointer) in pointers.into_iter().enumerate() {
+        let TypedValue::String(body) = &result.rows[index][0] else {
+            panic!("body type changed")
+        };
+        assert_eq!(
+            body.as_ptr(),
+            pointer,
+            "result assembly cloned the complete body"
+        );
+        assert_eq!(result.rows[index].len(), 2);
     }
-
-    fn commit(self: Box<Self>) -> Result<Bookmark> {
-        Ok(Bookmark { term: 1, index: 1 })
-    }
-
-    fn rollback(self: Box<Self>) -> Result<()> {
-        Ok(())
-    }
+    assert!(
+        result
+            .append_event(QueryStreamEvent::Batch {
+                request_id: Uuid::nil(),
+                sequence: 1,
+                row_count: 2,
+                columns: vec![BatchColumn {
+                    name: "bad".into(),
+                    value_type: "STRING".into(),
+                    values: vec![TypedValue::String("only one row".into())]
+                }],
+            })
+            .is_err()
+    );
+    assert_eq!(
+        result.rows.len(),
+        2,
+        "malformed input partially appended rows"
+    );
 }
 
 impl QueryExecutor for StaticExecutor {
@@ -57,7 +97,10 @@ impl QueryExecutor for StaticExecutor {
         _bookmark: Option<Bookmark>,
         _consistency: CommitAcknowledgement,
     ) -> Result<Box<dyn QueryTransaction>> {
-        Ok(Box::new(StaticTransaction))
+        Err(irongraph_types::Error::new(
+            irongraph_types::ErrorCode::QueryType,
+            "this executor accepts autocommit queries only",
+        ))
     }
 }
 

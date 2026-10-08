@@ -58,9 +58,20 @@ const NETWORK_TIMEOUT: Duration = Duration::from_secs(60);
 #[derive(Clone, Debug, Default)]
 pub struct ProgressSink {
     written: Arc<AtomicU64>,
+    cancellation: tokio_util::sync::CancellationToken,
 }
 
 impl ProgressSink {
+    fn check(&self) -> Result<()> {
+        if self.cancellation.is_cancelled() {
+            return Err(Error::new(
+                ErrorCode::Cancelled,
+                "model installation was cancelled",
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(test)]
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -76,12 +87,36 @@ impl ProgressSink {
         self.written.store(bytes, Ordering::Relaxed);
     }
 
-    /// Bytes written toward the current artifact so far. Consumed by the server's readiness
-    /// progress reporting; `allow(dead_code)` covers the interval before that reader is wired.
+    /// Bytes written toward the current artifact so far.
     #[must_use]
-    #[allow(dead_code)]
     pub fn written(&self) -> u64 {
         self.written.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ModelInstallProgress {
+    model: ProgressSink,
+    config: ProgressSink,
+    tokenizer: ProgressSink,
+}
+
+impl ModelInstallProgress {
+    pub fn cancel(&self) {
+        self.model.cancellation.cancel();
+        self.config.cancellation.cancel();
+        self.tokenizer.cancellation.cancel();
+    }
+    #[must_use]
+    pub fn written(&self) -> u64 {
+        self.model.written() + self.config.written() + self.tokenizer.written()
+    }
+
+    #[must_use]
+    pub const fn total_bytes(&self) -> u64 {
+        DEFAULT_EMBEDDING_MODEL_BYTES
+            + DEFAULT_EMBEDDING_CONFIG_BYTES
+            + DEFAULT_EMBEDDING_TOKENIZER_BYTES
     }
 }
 
@@ -116,14 +151,32 @@ const DEFAULT_EMBEDDING_TOKENIZER_ARTIFACT: PinnedArtifact = PinnedArtifact {
 
 /// Returns the exact pinned first embedding encoder, installing every required file when absent.
 pub fn ensure_default_embedding_model() -> Result<EmbeddingModelArtifacts> {
+    ensure_default_embedding_model_with_progress(&ModelInstallProgress::default())
+}
+
+pub fn ensure_default_embedding_model_with_progress(
+    progress: &ModelInstallProgress,
+) -> Result<EmbeddingModelArtifacts> {
     let directory = private_artifact_root()?
         .join(".irongraph")
         .join("models")
         .join("nvidia-llama-nemotron-embed-1b-v2")
         .join(DEFAULT_EMBEDDING_REVISION);
-    let model_safetensors = install_pinned(&directory, &DEFAULT_EMBEDDING_MODEL_ARTIFACT)?;
-    let model_config_json = install_pinned(&directory, &DEFAULT_EMBEDDING_CONFIG_ARTIFACT)?;
-    let tokenizer_json = install_pinned(&directory, &DEFAULT_EMBEDDING_TOKENIZER_ARTIFACT)?;
+    let model_safetensors = install_pinned_tracked(
+        &directory,
+        &DEFAULT_EMBEDDING_MODEL_ARTIFACT,
+        &progress.model,
+    )?;
+    let model_config_json = install_pinned_tracked(
+        &directory,
+        &DEFAULT_EMBEDDING_CONFIG_ARTIFACT,
+        &progress.config,
+    )?;
+    let tokenizer_json = install_pinned_tracked(
+        &directory,
+        &DEFAULT_EMBEDDING_TOKENIZER_ARTIFACT,
+        &progress.tokenizer,
+    )?;
     let profile = EmbeddingProfile::new(
         DEFAULT_EMBEDDING_MODEL_SHA256,
         encoder_hash(
@@ -157,25 +210,31 @@ fn private_artifact_root() -> Result<PathBuf> {
         .ok_or_else(|| embedding_unavailable("the current user has no absolute home directory"))
 }
 
-fn install_pinned(directory: &Path, artifact: &PinnedArtifact) -> Result<PathBuf> {
-    install_pinned_tracked(directory, artifact, &ProgressSink::new())
-}
-
 fn install_pinned_tracked(
     directory: &Path,
     artifact: &PinnedArtifact,
     sink: &ProgressSink,
 ) -> Result<PathBuf> {
+    sink.check()?;
     ensure_private_hierarchy(directory)?;
     let lock_path = directory.join(".install.lock");
     let lock = open_private_rw(&lock_path, false)?;
-    lock.lock()
-        .map_err(|error| embedding_io("acquiring the model installation lock", error))?;
+    loop {
+        sink.check()?;
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(10)),
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(embedding_io("acquiring the model installation lock", error));
+            }
+        }
+    }
 
     let final_path = directory.join(artifact.file_name);
     if final_path.exists() {
         if verify_exact(&final_path, artifact).is_ok() {
             set_private_file_mode(&final_path)?;
+            sink.set(artifact.exact_bytes);
             return Ok(final_path);
         }
         quarantine_invalid(&final_path)?;
@@ -270,6 +329,7 @@ fn download_from(
         .map_err(|error| embedding_unavailable(format!("pinned model URL is invalid: {error}")))?;
     let mut response = None;
     for _ in 0..=MAX_REDIRECTS {
+        sink.check()?;
         require_https(&url)?;
         let current = open_https(&url, existing)?;
         if matches!(current.status, 301 | 302 | 303 | 307 | 308) {
@@ -553,6 +613,7 @@ fn copy_exact<R: Read>(
     let mut copied = 0_u64;
     let mut buffer = [0_u8; 1024 * 1024];
     while remaining > 0 {
+        sink.check()?;
         let limit = usize::try_from(remaining.min(buffer.len() as u64))
             .map_err(|_| embedding_unavailable("model body length exceeds this platform"))?;
         let read = reader
@@ -586,6 +647,7 @@ fn copy_to_eof<R: Read>(
     let mut copied = 0_u64;
     let mut buffer = [0_u8; 1024 * 1024];
     loop {
+        sink.check()?;
         let read = reader
             .read(&mut buffer)
             .map_err(|error| embedding_io("reading the model body", error))?;
@@ -616,6 +678,7 @@ fn copy_chunked<R: BufRead>(
 ) -> Result<u64> {
     let mut copied = 0_u64;
     loop {
+        sink.check()?;
         let mut consumed = 0;
         let line = read_header_line(reader, &mut consumed)?;
         let size = line
@@ -958,6 +1021,90 @@ mod tests {
             .read_to_end(&mut written)
             .map_err(crate::Error::from)?;
         assert_eq!(written, body);
+        Ok(())
+    }
+
+    #[test]
+    fn cached_installation_reports_verified_bytes_without_download() -> crate::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("tiny.bin");
+        let bytes = b"a previously downloaded verified artifact";
+        std::fs::write(&path, bytes)?;
+        let artifact = PinnedArtifact {
+            url: "https://example.invalid/tiny.bin",
+            file_name: "tiny.bin",
+            exact_bytes: bytes.len() as u64,
+            sha256: Sha256::digest(bytes).into(),
+        };
+        let sink = ProgressSink::new();
+        assert_eq!(
+            super::install_pinned_tracked(directory.path(), &artifact, &sink)?,
+            path
+        );
+        assert_eq!(sink.written(), bytes.len() as u64);
+        let progress = super::ModelInstallProgress::default();
+        progress.model.set(123);
+        progress.config.set(456);
+        progress.tokenizer.set(789);
+        assert_eq!(progress.written(), 1368);
+        assert_eq!(
+            progress.total_bytes(),
+            DEFAULT_EMBEDDING_MODEL_BYTES
+                + DEFAULT_EMBEDDING_CONFIG_BYTES
+                + DEFAULT_EMBEDDING_TOKENIZER_BYTES
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_installation_releases_a_waiting_lock_and_preserves_partial_bytes()
+    -> crate::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let lock = open_private_rw(&directory.path().join(".install.lock"), false)?;
+        lock.lock()?;
+        let progress = super::ModelInstallProgress::default();
+        let observed = progress.clone();
+        let path = directory.path().to_owned();
+        let (started, entered) = std::sync::mpsc::channel();
+        let (completed, outcome) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let result = super::install_pinned_tracked(
+                &path,
+                &super::DEFAULT_EMBEDDING_CONFIG_ARTIFACT,
+                &observed.config,
+            );
+            completed.send(result).unwrap();
+        });
+        entered
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        progress.cancel();
+        let result = outcome.recv_timeout(std::time::Duration::from_secs(2));
+        drop(lock);
+        worker.join().unwrap();
+        assert_eq!(
+            result.unwrap().unwrap_err().code,
+            crate::ErrorCode::Cancelled
+        );
+        let mut destination = tempfile::tempfile()?;
+        destination.write_all(b"existing prefix")?;
+        let mut hasher = Sha256::new();
+        let mut source = b"unused bytes".as_slice();
+        assert_eq!(
+            copy_exact(
+                &mut source,
+                &mut destination,
+                &mut hasher,
+                12,
+                &progress.model
+            )
+            .unwrap_err()
+            .code,
+            crate::ErrorCode::Cancelled
+        );
+        assert_eq!(destination.metadata()?.len(), 15);
         Ok(())
     }
 

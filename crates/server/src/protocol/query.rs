@@ -1,7 +1,6 @@
-use std::{collections::BTreeMap, sync::Arc, time::Instant};
+use std::{collections::BTreeMap, time::Instant};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -19,8 +18,6 @@ pub struct QueryRequest {
     #[serde(default)]
     pub consistency: CommitAcknowledgement,
     pub bookmark: Option<Bookmark>,
-    #[serde(default)]
-    pub limits: QueryLimits,
     /// In-process cancellation is assigned by the transport and never deserialized from a client.
     #[serde(skip, default)]
     pub cancellation: CancellationToken,
@@ -35,170 +32,10 @@ pub struct QueryRequest {
 
 impl QueryRequest {
     pub fn validate(&self) -> Result<()> {
-        if self.query.trim().is_empty() || self.query.len() > 4 * 1024 * 1024 {
-            return Err(crate::Error::invalid_data(
-                "query is empty or exceeds 4 MiB",
-            ));
-        }
-        if self.parameters.len() > 16_384 {
-            return Err(crate::Error::invalid_data("query has too many parameters"));
-        }
-        let parameter_bytes = serde_json::to_vec(&self.parameters).map_err(|error| {
-            crate::Error::invalid_data(format!("parameter encoding failed: {error}"))
-        })?;
-        if parameter_bytes.len() > 16 * 1024 * 1024 {
-            return Err(crate::Error::invalid_data("query parameters exceed 16 MiB"));
-        }
-        self.limits.validate()
-    }
-}
-
-const QUERY_ADMISSION_BYTE_QUANTUM: usize = 64 * 1024;
-
-/// Bounds transport workers that outlive their HTTP handler while streaming results. The byte
-/// semaphore accounts decoded query text and parameters before a blocking executor is spawned.
-pub(crate) struct QueryIngressAdmission {
-    requests: Arc<Semaphore>,
-    byte_units: Arc<Semaphore>,
-    retry_after_ms: u64,
-}
-
-impl QueryIngressAdmission {
-    pub(crate) fn new(maximum_requests: usize, maximum_bytes: usize) -> Result<Self> {
-        let units = maximum_bytes
-            .checked_add(QUERY_ADMISSION_BYTE_QUANTUM - 1)
-            .map(|bytes| bytes / QUERY_ADMISSION_BYTE_QUANTUM)
-            .and_then(|units| u32::try_from(units).ok())
-            .ok_or_else(|| crate::Error::invalid_data("query admission byte limit is invalid"))?;
-        if maximum_requests == 0 || units == 0 {
-            return Err(crate::Error::invalid_data(
-                "query admission limits must be positive",
-            ));
-        }
-        Ok(Self {
-            requests: Arc::new(Semaphore::new(maximum_requests)),
-            byte_units: Arc::new(Semaphore::new(units as usize)),
-            retry_after_ms: 25,
-        })
-    }
-
-    pub(crate) fn try_admit(&self, request: &QueryRequest) -> Result<QueryIngressPermit> {
-        request.validate()?;
-        let parameter_bytes = serde_json::to_vec(&request.parameters)
-            .map_err(|error| {
-                crate::Error::invalid_data(format!("parameter encoding failed: {error}"))
-            })?
-            .len();
-        let bytes = request
-            .query
-            .len()
-            .checked_add(parameter_bytes)
-            .and_then(|bytes| bytes.checked_add(256))
-            .ok_or_else(|| crate::Error::invalid_data("query admission byte size overflow"))?;
-        let units = bytes
-            .checked_add(QUERY_ADMISSION_BYTE_QUANTUM - 1)
-            .map(|bytes| bytes / QUERY_ADMISSION_BYTE_QUANTUM)
-            .and_then(|units| u32::try_from(units).ok())
-            .ok_or_else(|| crate::Error::invalid_data("query admission byte units overflow"))?
-            .max(1);
-        let request_permit = Arc::clone(&self.requests)
-            .try_acquire_owned()
-            .map_err(|_| self.full("query request admission is full"))?;
-        let byte_permit = Arc::clone(&self.byte_units)
-            .try_acquire_many_owned(units)
-            .map_err(|_| self.full("query byte admission is full"))?;
-        Ok(QueryIngressPermit {
-            _request: request_permit,
-            _bytes: byte_permit,
-        })
-    }
-
-    fn full(&self, message: &'static str) -> crate::Error {
-        crate::Error::retryable(
-            crate::ErrorCode::WriteAdmissionFull,
-            message,
-            Some(self.retry_after_ms),
-        )
-    }
-}
-
-pub(crate) struct QueryIngressPermit {
-    _request: OwnedSemaphorePermit,
-    _bytes: OwnedSemaphorePermit,
-}
-
-const UNBOUNDED_QUERY_RESULT_LIMIT: u64 = u64::MAX;
-
-const fn unbounded_query_result_limit() -> u64 {
-    UNBOUNDED_QUERY_RESULT_LIMIT
-}
-
-fn query_result_limit_is_unbounded(limit: &u64) -> bool {
-    *limit == UNBOUNDED_QUERY_RESULT_LIMIT
-}
-
-/// Optional response limits supplied by the caller. An omitted field is unbounded; the transport
-/// and database do not replace it with a server policy. Explicit limits apply only to emitted
-/// result events and never become query-planning or intermediate-relation bounds.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct QueryLimits {
-    #[serde(
-        default = "unbounded_query_result_limit",
-        skip_serializing_if = "query_result_limit_is_unbounded"
-    )]
-    pub rows: u64,
-    #[serde(
-        default = "unbounded_query_result_limit",
-        skip_serializing_if = "query_result_limit_is_unbounded"
-    )]
-    pub bytes: u64,
-    #[serde(
-        default = "unbounded_query_result_limit",
-        skip_serializing_if = "query_result_limit_is_unbounded"
-    )]
-    pub nodes: u64,
-    #[serde(
-        default = "unbounded_query_result_limit",
-        skip_serializing_if = "query_result_limit_is_unbounded"
-    )]
-    pub edges: u64,
-}
-
-impl Default for QueryLimits {
-    fn default() -> Self {
-        Self {
-            rows: UNBOUNDED_QUERY_RESULT_LIMIT,
-            bytes: UNBOUNDED_QUERY_RESULT_LIMIT,
-            nodes: UNBOUNDED_QUERY_RESULT_LIMIT,
-            edges: UNBOUNDED_QUERY_RESULT_LIMIT,
-        }
-    }
-}
-
-impl QueryLimits {
-    pub fn validate(&self) -> Result<()> {
-        if self.rows == 0 || self.bytes == 0 || self.nodes == 0 || self.edges == 0 {
-            return Err(crate::Error::invalid_data(
-                "query result limits must be non-zero",
-            ));
+        if self.query.trim().is_empty() {
+            return Err(crate::Error::invalid_data("query is empty"));
         }
         Ok(())
-    }
-
-    /// Applies the operator's ceiling on top of whatever the client asked for.
-    ///
-    /// A client may leave a result limit unset, which means unbounded, so a single query could
-    /// materialize an arbitrarily large result on the server before anything noticed. The
-    /// `--max-result-bytes` option exists to bound exactly that, but nothing read it, so the knob
-    /// was advertised and inert. Clamping here keeps the client's own limit authoritative whenever
-    /// it is stricter and applies the operator's otherwise.
-    #[must_use]
-    pub fn clamped_to_server_policy(mut self, maximum_result_bytes: u64) -> Self {
-        if maximum_result_bytes != UNBOUNDED_QUERY_RESULT_LIMIT {
-            self.bytes = self.bytes.min(maximum_result_bytes);
-        }
-        self
     }
 }
 
@@ -296,12 +133,12 @@ pub struct QueryStatistics {
     /// Almost every read on this engine finishes inside one, so on its own it reports `0`.
     pub elapsed_ms: u64,
     /// The same measurement at the resolution the engine actually works at. Filled by
-    /// [`QueryResultBudget::settle`], which holds the only clock that spans a whole request.
+    /// [`QueryResultStatistics::settle`], which holds the clock spanning a whole request.
     #[serde(default)]
     pub elapsed_us: u64,
     pub rows: u64,
-    /// Node and relationship *values carried by the result* — the accounting the byte and entity
-    /// budgets are enforced against. A node appearing in three rows counts three times, so this is
+    /// Node and relationship values carried by the result. A node appearing in three rows counts
+    /// three times, so this is
     /// not the number of distinct entities a viewer would draw, and the two disagree on purpose.
     pub nodes: u64,
     pub edges: u64,
@@ -342,27 +179,22 @@ pub enum QueryStreamEvent {
     },
 }
 
-/// Per-request result accounting shared by every query transport. The executor emits through this
-/// guard before a protocol adapter can buffer or encode an event.
-pub(crate) struct QueryResultBudget {
-    limits: QueryLimits,
+/// Per-request result statistics shared by every query transport, without output quotas.
+pub(crate) struct QueryResultStatistics {
     rows: u64,
-    bytes: u64,
     nodes: u64,
     edges: u64,
-    /// When this request started. The guard already spans exactly the work worth timing — it is
+    /// When this request started. The accounting spans exactly the work worth timing — it is
     /// constructed before the statement runs and observes the terminal summary — so the clock
     /// lives here rather than being threaded through every transport separately.
     started: Instant,
 }
 
-impl QueryResultBudget {
+impl QueryResultStatistics {
     #[must_use]
-    pub(crate) fn new(limits: QueryLimits) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            limits,
             rows: 0,
-            bytes: 0,
             nodes: 0,
             edges: 0,
             started: Instant::now(),
@@ -388,23 +220,6 @@ impl QueryResultBudget {
     }
 
     pub(crate) fn observe(&mut self, event: &QueryStreamEvent) -> Result<()> {
-        let encoded_bytes = serde_json::to_vec(event)
-            .map_err(|error| crate::Error::internal(format!("result encoding failed: {error}")))?
-            .len()
-            .checked_add(1)
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or_else(|| {
-                crate::Error::new(
-                    crate::ErrorCode::ResultBudgetExceeded,
-                    "query result byte accounting overflow",
-                )
-            })?;
-        let bytes = self.bytes.checked_add(encoded_bytes).ok_or_else(|| {
-            crate::Error::new(
-                crate::ErrorCode::ResultBudgetExceeded,
-                "query result byte accounting overflow",
-            )
-        })?;
         let (batch_rows, batch_nodes, batch_edges) = match event {
             QueryStreamEvent::Batch {
                 row_count, columns, ..
@@ -451,26 +266,11 @@ impl QueryResultBudget {
                 "query relationship accounting overflow",
             )
         })?;
-        enforce_explicit_result_limit("rows", rows, self.limits.rows)?;
-        enforce_explicit_result_limit("bytes", bytes, self.limits.bytes)?;
-        enforce_explicit_result_limit("nodes", nodes, self.limits.nodes)?;
-        enforce_explicit_result_limit("relationships", edges, self.limits.edges)?;
         self.rows = rows;
-        self.bytes = bytes;
         self.nodes = nodes;
         self.edges = edges;
         Ok(())
     }
-}
-
-fn enforce_explicit_result_limit(kind: &str, observed: u64, limit: u64) -> Result<()> {
-    if limit != UNBOUNDED_QUERY_RESULT_LIMIT && observed > limit {
-        return Err(crate::Error::new(
-            crate::ErrorCode::ResultBudgetExceeded,
-            format!("query result exceeds the caller's {kind} limit ({observed}/{limit})"),
-        ));
-    }
-    Ok(())
 }
 
 fn typed_graph_counts(value: &TypedValue) -> Result<(u64, u64)> {
@@ -623,8 +423,8 @@ pub trait QueryExecutor: Send + Sync {
     }
 }
 
-/// Serializable explicit transaction used by Bolt. Implementations pin and release snapshots on
-/// every terminal path.
+/// Explicit transaction used by Bolt. Reads use the live canonical store and may observe
+/// overlapping writes. Implementations release transaction resources on every terminal path.
 pub trait QueryTransaction: Send {
     fn run(
         &mut self,
@@ -650,23 +450,22 @@ mod tests {
     }
 
     #[test]
-    fn query_limits_default_to_unbounded_and_omit_synthetic_limits_from_json() {
-        let limits = QueryLimits::default();
-        assert_eq!(limits.rows, u64::MAX);
-        assert_eq!(limits.bytes, u64::MAX);
-        assert_eq!(limits.nodes, u64::MAX);
-        assert_eq!(limits.edges, u64::MAX);
-        assert_eq!(serde_json::to_value(limits).unwrap(), serde_json::json!({}));
-
-        let decoded: QueryLimits = serde_json::from_value(serde_json::json!({})).unwrap();
-        assert_eq!(decoded.rows, u64::MAX);
-        assert_eq!(decoded.bytes, u64::MAX);
-        assert_eq!(decoded.nodes, u64::MAX);
-        assert_eq!(decoded.edges, u64::MAX);
+    fn query_requests_have_no_result_quota_fields() {
+        let mut value = serde_json::json!({"request_id":Uuid::nil(), "query":"RETURN 1"});
+        let request: QueryRequest = serde_json::from_value(value.clone()).unwrap();
+        request.validate().unwrap();
+        assert!(
+            serde_json::to_value(request)
+                .unwrap()
+                .get("limits")
+                .is_none()
+        );
+        value["limits"] = serde_json::json!({"bytes":1});
+        assert!(serde_json::from_value::<QueryRequest>(value).is_err());
     }
 
     #[test]
-    fn default_result_budget_crosses_former_server_clamps() {
+    fn result_statistics_cross_former_server_clamps() {
         let request_id = Uuid::nil();
         let event = QueryStreamEvent::Batch {
             request_id,
@@ -678,15 +477,13 @@ mod tests {
                 values: vec![node("1")],
             }],
         };
-        let mut budget = QueryResultBudget::new(QueryLimits::default());
+        let mut budget = QueryResultStatistics::new();
         budget.rows = 1_000_000;
-        budget.bytes = 64 * 1024 * 1024;
         budget.nodes = 100_000;
         budget.edges = 250_000;
 
         budget.observe(&event).unwrap();
         assert_eq!(budget.rows, 1_000_001);
-        assert!(budget.bytes > 64 * 1024 * 1024);
         assert_eq!(budget.nodes, 100_001);
         assert_eq!(budget.edges, 250_000);
     }
@@ -694,7 +491,9 @@ mod tests {
     #[test]
     fn a_summary_carries_the_time_it_took_and_the_graph_it_carried() {
         let request_id = Uuid::nil();
-        let mut budget = QueryResultBudget::new(QueryLimits::default());
+        let mut budget = QueryResultStatistics::new();
+        // Give the clock a known interval; a real submicrosecond request may round to zero.
+        budget.started = Instant::now() - std::time::Duration::from_millis(5);
         budget
             .observe(&QueryStreamEvent::Batch {
                 request_id,
@@ -720,17 +519,14 @@ mod tests {
             truncation_reason: None,
         };
         budget.observe(&summary).unwrap();
+        let before_settle = budget.started.elapsed().as_micros() as u64;
         budget.settle(&mut summary);
+        let after_settle = budget.started.elapsed().as_micros() as u64;
 
         let QueryStreamEvent::Summary { statistics, .. } = &summary else {
             panic!("summary");
         };
-        // Not asserted as a bound on how fast the engine is — only that the field is now a
-        // measurement rather than a default. A request that reaches here has run.
-        assert!(
-            statistics.elapsed_us > 0,
-            "elapsed_us stayed at its default: {statistics:?}"
-        );
+        assert!((before_settle..=after_settle).contains(&statistics.elapsed_us));
         assert!(statistics.elapsed_us >= statistics.elapsed_ms * 1_000);
         assert_eq!(statistics.nodes, 2);
         assert_eq!(statistics.edges, 0);
@@ -740,59 +536,20 @@ mod tests {
     #[test]
     fn a_summary_that_never_met_the_budget_reports_no_measurement() {
         // Nothing settles an event that is not terminal, and a summary the guard never saw keeps
-        // its defaults — a client reading `elapsed_us == 0` is reading "not measured".
+        // its defaults. Zero also represents a measured duration below one microsecond.
         let mut batch = QueryStreamEvent::Batch {
             request_id: Uuid::nil(),
             sequence: 0,
             row_count: 0,
             columns: Vec::new(),
         };
-        let budget = QueryResultBudget::new(QueryLimits::default());
+        let budget = QueryResultStatistics::new();
         budget.settle(&mut batch);
         assert!(matches!(batch, QueryStreamEvent::Batch { .. }));
     }
 
     #[test]
-    fn the_server_ceiling_applies_only_when_it_is_stricter_than_the_caller() {
-        let unbounded = QueryLimits::default();
-        assert_eq!(unbounded.bytes, UNBOUNDED_QUERY_RESULT_LIMIT);
-
-        // An omitted client limit means unbounded, which is the case the operator ceiling exists
-        // to bound: without it a single query could materialize an arbitrarily large result.
-        let clamped = QueryLimits::default().clamped_to_server_policy(1_024);
-        assert_eq!(clamped.bytes, 1_024);
-
-        // A stricter client limit stays authoritative.
-        let strict = QueryLimits {
-            bytes: 512,
-            ..QueryLimits::default()
-        }
-        .clamped_to_server_policy(1_024);
-        assert_eq!(strict.bytes, 512);
-
-        // A looser client limit is cut down to the operator ceiling.
-        let loose = QueryLimits {
-            bytes: 8_192,
-            ..QueryLimits::default()
-        }
-        .clamped_to_server_policy(1_024);
-        assert_eq!(loose.bytes, 1_024);
-
-        // An operator who disables the ceiling changes nothing, and the other budgets are never
-        // touched by this policy.
-        let disabled = QueryLimits {
-            bytes: 8_192,
-            ..QueryLimits::default()
-        }
-        .clamped_to_server_policy(UNBOUNDED_QUERY_RESULT_LIMIT);
-        assert_eq!(disabled.bytes, 8_192);
-        assert_eq!(clamped.rows, UNBOUNDED_QUERY_RESULT_LIMIT);
-        assert_eq!(clamped.nodes, UNBOUNDED_QUERY_RESULT_LIMIT);
-        assert_eq!(clamped.edges, UNBOUNDED_QUERY_RESULT_LIMIT);
-    }
-
-    #[test]
-    fn result_budget_preserves_explicit_caller_limits() {
+    fn nested_result_statistics_do_not_reject_graph_values() {
         let request_id = Uuid::nil();
         let event = QueryStreamEvent::Batch {
             request_id,
@@ -804,63 +561,9 @@ mod tests {
                 values: vec![TypedValue::List(vec![node("1"), node("2")])],
             }],
         };
-        let mut node_limited = QueryResultBudget::new(QueryLimits {
-            rows: 1,
-            bytes: 1 << 20,
-            nodes: 1,
-            edges: 1,
-        });
-        assert_eq!(
-            node_limited.observe(&event).err().map(|error| error.code),
-            Some(crate::ErrorCode::ResultBudgetExceeded)
-        );
-
-        let mut byte_limited = QueryResultBudget::new(QueryLimits {
-            rows: 1,
-            bytes: 1,
-            nodes: 10,
-            edges: 10,
-        });
-        assert_eq!(
-            byte_limited.observe(&event).err().map(|error| error.code),
-            Some(crate::ErrorCode::ResultBudgetExceeded)
-        );
-    }
-
-    #[test]
-    fn ingress_admission_holds_request_and_byte_permits_until_worker_completion() {
-        let admission = QueryIngressAdmission::new(1, QUERY_ADMISSION_BYTE_QUANTUM).unwrap();
-        let request = QueryRequest {
-            request_id: Uuid::new_v4(),
-            project_id: Some(ProjectId::random()),
-            query: "RETURN 1".to_owned(),
-            parameters: BTreeMap::new(),
-            consistency: CommitAcknowledgement::Published,
-            bookmark: None,
-            limits: QueryLimits::default(),
-            cancellation: CancellationToken::new(),
-            deadline: None,
-            connection_id: ConnectionId::new(),
-        };
-        let permit = admission.try_admit(&request).unwrap();
-        assert_eq!(
-            admission.try_admit(&request).err().map(|error| error.code),
-            Some(crate::ErrorCode::WriteAdmissionFull)
-        );
-        drop(permit);
-        assert!(admission.try_admit(&request).is_ok());
-
-        let byte_limited = QueryIngressAdmission::new(2, QUERY_ADMISSION_BYTE_QUANTUM).unwrap();
-        let oversized = QueryRequest {
-            query: "x".repeat(QUERY_ADMISSION_BYTE_QUANTUM),
-            ..request
-        };
-        assert_eq!(
-            byte_limited
-                .try_admit(&oversized)
-                .err()
-                .map(|error| error.code),
-            Some(crate::ErrorCode::WriteAdmissionFull)
-        );
+        let mut statistics = QueryResultStatistics::new();
+        statistics.observe(&event).unwrap();
+        assert_eq!(statistics.rows, 1);
+        assert_eq!(statistics.nodes, 2);
     }
 }

@@ -985,7 +985,7 @@ impl Fixture {
     }
 
     fn from_rows(rows: Vec<(&'static str, Vec<(&'static str, ScalarValue)>)>) -> Result<Self> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let mut labels = BTreeMap::new();
         let mut properties = BTreeMap::new();
         for (label, row_properties) in &rows {
@@ -1068,7 +1068,7 @@ impl Fixture {
     }
 
     fn image(&self) -> Result<ResidentProjectImage> {
-        ResidentProjectImage::build(
+        super::legacy_resident_build(
             PROJECT,
             self.bookmark,
             &self.graph,

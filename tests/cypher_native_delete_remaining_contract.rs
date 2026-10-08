@@ -373,7 +373,7 @@ fn apply_mutations(graph: &mut GraphStore, mutations: &[GraphMutation]) -> Resul
 }
 
 fn resident_image(graph: &GraphStore) -> Result<ResidentProjectImage> {
-    ResidentProjectImage::build(
+    super::legacy_resident_build(
         PROJECT,
         Bookmark {
             term: 71,

@@ -16,7 +16,6 @@ const IDENTITY_FILE: &str = "node-identity.bin";
 const WRITE_DIRECTORY: &str = "write";
 const DATABASE_DIRECTORY: &str = "database";
 const PROCESS_LOCK_FILE: &str = ".node-process.lock";
-const MAX_STARTUP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Complete inputs for starting or recovering the first database node.
 #[derive(Clone, Debug)]
@@ -176,9 +175,6 @@ pub fn load_existing_node_identity(root: impl AsRef<Path>) -> Result<Option<Node
 }
 
 fn validate_options(options: &SingleNodeBootstrapConfig) -> Result<()> {
-    if options.startup_timeout.is_zero() || options.startup_timeout > MAX_STARTUP_TIMEOUT {
-        return Err(Error::invalid_data("invalid one-node bootstrap options"));
-    }
     options.storage_limits.validate()?;
     Ok(())
 }

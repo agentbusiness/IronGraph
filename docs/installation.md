@@ -24,7 +24,8 @@ the standalone launcher and executable. Reserve storage for the database, snapsh
 An embedding-enabled first start also needs access to the official artifact source for your IronGraph
 release, or encoder artifacts preprovisioned by your administrator. Reserve the release-specific
 multi-gigabyte storage budget before startup. Artifact installation, verification, device loading,
-and warm-up make the first start longer than later starts.
+and warm-up make the first start longer than later starts. The web console shows model download
+progress and loading stages while startup prepares the encoder, then opens automatically.
 
 Python embedding requires Python 3.9 or later. The native Node.js SDK requires Node.js 20.17 or
 later. Available operating-system and processor builds depend on the current distribution.
@@ -64,8 +65,8 @@ To stop, run `npx irongraph stop`. Restart with the same start command to reopen
 data. Background mode does not install an operating-system service or start after a reboot.
 
 Use `npx irongraph start` without `--background` for foreground execution. Keep that terminal
-open, and press `Ctrl+C` to stop cleanly. Add `--execution-backend cpu` to select CPU explicitly,
-or `--execution-backend metal` to select Metal on a supported Mac.
+open, and press `Ctrl+C` to stop cleanly. Graph execution uses the CPU. Add
+`--embedding-backend metal` to select Metal text inference on a supported Mac.
 
 ## Choose the local data directory
 
@@ -128,7 +129,7 @@ Expected result:
 | IronGraph is ready |
 
 If the web application opens but the query does not complete, check the startup log for device
-admission or encoder warm-up errors before changing listener settings.
+storage or encoder warm-up errors before changing listener settings.
 
 ## Configure a production connection boundary
 
@@ -145,8 +146,8 @@ part of the remote protocol boundary, not an optional application convention.
 Use the following readiness sequence in production:
 
 1. Confirm that the database directory is writable and on persistent storage.
-2. Confirm that the selected CPU, Metal, or CUDA backend is available.
-3. Wait for project and index admission to complete.
+2. Confirm that host memory can hold the graph and its indexes.
+3. Wait for project recovery and required index initialization to complete.
 4. Wait for the enabled local text encoder to load and warm.
 5. Verify a Cypher query over the intended mutually authenticated client path.
 6. Verify that a clean shutdown completes before replacing or stopping the host.
@@ -167,7 +168,7 @@ provided with your IronGraph release.
 | --- | --- |
 | The web address does not open | Confirm that startup completed, the configured HTTP address is correct, and another process is not using the port. |
 | Startup cannot prepare text embedding | Confirm access to the official artifact source or preprovisioned encoder artifacts, available storage, and selected-device capacity. |
-| A project fails device admission | Confirm that the selected device can hold the project, its indexes, and the enabled text encoder together; otherwise use a larger device or the CPU backend. |
+| The text encoder fails to load | Confirm that the selected inference device has enough memory and is supported by the installed package. Graph execution uses host memory. |
 | The data directory is rejected | Use an absolute, writable directory that is not open in another IronGraph process. |
 | Mutual TLS succeeds but a query is denied | Confirm that the certificate is provisioned for the requested project, protocol, operation, and graph layers. |
 | A remote client version cannot connect | Use a protocol and client version listed as supported in the IronGraph release information. |

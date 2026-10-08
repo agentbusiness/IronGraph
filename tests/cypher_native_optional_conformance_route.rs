@@ -409,7 +409,7 @@ fn execute_generic_oracle(query: &str, graph: &GraphStore) -> Result<ExecutionOu
 }
 
 fn resident_image(graph: &GraphStore) -> Result<ResidentProjectImage> {
-    ResidentProjectImage::build(
+    super::legacy_resident_build(
         PROJECT,
         Bookmark {
             term: 41,

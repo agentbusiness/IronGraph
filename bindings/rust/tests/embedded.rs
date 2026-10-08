@@ -1,5 +1,6 @@
 use irongraph_sdk::{
-    EmbeddedDatabase, EmbeddedOptions, EmbeddingPolicy, ExecutionDevice, Query, RemoteClient,
+    EmbeddedDatabase, EmbeddedOptions, EmbeddingDevice, EmbeddingPolicy, ExecutionDevice, Query,
+    RemoteClient,
 };
 
 #[test]
@@ -80,16 +81,28 @@ fn remote_connections_preserve_loopback_boundary() {
 fn automatic_semantic_native_and_remote() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let device = match std::env::var("IRONGRAPH_QUALIFY_DEVICE").as_deref() {
-        Ok("metal") => ExecutionDevice::Metal(0),
-        Ok("cuda") => ExecutionDevice::Cuda(0),
-        _ => ExecutionDevice::Cpu,
+        Ok("metal") => EmbeddingDevice::Metal(0),
+        Ok("cuda") => EmbeddingDevice::Cuda(0),
+        _ => EmbeddingDevice::Cpu,
     };
     let database = EmbeddedDatabase::open(
-        EmbeddedOptions::new(directory.path()).with_execution_device(device),
+        EmbeddedOptions::new(directory.path())
+            .with_execution_device(ExecutionDevice::Cpu)
+            .with_embedding_device(device),
     )?;
     database.query(Query::new("CREATE PROJECT semantic"))?;
     database.query(Query::new("USE semantic CREATE (p:Person {name:'Ada'}), (t:Task {title:'Arrange lessons'}), (t)-[:ASSIGNED_TO {description:'guitar music tuition'}]->(p)"))?;
-    let result = database.query(Query::new("USE semantic SEARCH entity IN (EMBEDDING INDEX graph_semantic FOR TEXT 'guitar music tuition' LIMIT 10) SCORE AS score RETURN entity, score"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let result = loop {
+        let result = database.query(Query::new("USE semantic SEARCH entity IN (EMBEDDING INDEX graph_semantic FOR TEXT 'guitar music tuition' LIMIT 10) SCORE AS score RETURN entity, score"))?;
+        if result.rows.len() == 3 {
+            break result;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("asynchronous embeddings did not finish".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
     assert_eq!(result.rows.len(), 3);
     assert_eq!(result.rows[0][0]["type"], "relationship");
     assert!(

@@ -5,17 +5,19 @@
 // enforceable instead of switched off globally.
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use std::{collections::BTreeMap, sync::Arc, time::Instant};
+use std::{collections::BTreeMap, time::Instant};
 
 use irongraph::{
     Bookmark, EdgeId, Error, ErrorCode, Layer, NodeId, ProjectId, Result, ScalarValue,
     cypher::{BindCapabilities, ExecutionContext, ExecutionOutput, QueryEngine, ResultValue},
-    gpu::{CpuBackend, ExecutionBackend},
+    gpu::ExecutionBackend,
     graph::{EdgeInput, GraphStore, NodeInput},
 };
 use tokio_util::sync::CancellationToken;
 
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 const MEMORY_LIMIT: usize = 128 * 1024 * 1024;
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 const RESERVED_MEMORY: usize = 1024 * 1024;
 
 fn context<'a>(
@@ -58,18 +60,8 @@ fn context<'a>(
     }
 }
 
-fn cpu_backend(graph: &GraphStore) -> Result<CpuBackend> {
-    let mut backend = CpuBackend::new(MEMORY_LIMIT, RESERVED_MEMORY);
-    backend.admit_graph(Arc::new(graph.snapshot()?))?;
-    Ok(backend)
-}
-
 fn execute_cpu(graph: &GraphStore, query: &str, max_rows: usize) -> Result<ExecutionOutput> {
-    let backend = cpu_backend(graph)?;
-    QueryEngine.execute(
-        query,
-        &mut context(graph, Some(&backend), max_rows, BTreeMap::new()),
-    )
+    QueryEngine.execute(query, &mut context(graph, None, max_rows, BTreeMap::new()))
 }
 
 fn schema_names(output: &ExecutionOutput) -> Vec<String> {
@@ -131,7 +123,7 @@ fn empty_pipelines_retain_logical_projection_and_star_schemas() -> Result<()> {
 }
 
 fn self_loop_fixture(parallel_loops: usize) -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let single = graph.catalog_mut().intern_label("Single")?;
     let a = graph.catalog_mut().intern_label("A")?;
     let b = graph.catalog_mut().intern_label("B")?;
@@ -350,7 +342,7 @@ fn merge_null_preflight_is_runtime_and_skips_row_dependent_or_volatile_values() 
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn merge_null_preflight_precedes_unadmitted_metal_execution() -> Result<()> {

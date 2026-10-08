@@ -47,7 +47,7 @@ fn context(graph: &GraphStore) -> ExecutionContext<'_> {
 }
 
 fn fixture() -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let name = graph.catalog_mut().intern_property("name")?;
     for (id, label, value) in [(1, "A", "A"), (2, "B", "B"), (3, "C", "C")] {
         let label = graph.catalog_mut().intern_label(label)?;
@@ -75,7 +75,7 @@ fn fixture() -> Result<GraphStore> {
 }
 
 fn parallel_fixture() -> Result<GraphStore> {
-    let mut graph = fixture()?;
+    let graph = fixture()?;
     let relationship_type = graph.catalog_mut().intern_relationship_type("R")?;
     graph.insert_edge(EdgeInput {
         id: EdgeId(11),

@@ -232,7 +232,7 @@ struct Fixture {
 
 impl Fixture {
     fn official(case: TckCase) -> Result<Self> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let relationship_type = graph.catalog_mut().intern_relationship_type("R")?;
         let num = graph.catalog_mut().intern_property("num")?;
         let name = graph.catalog_mut().intern_property("name")?;
@@ -293,7 +293,7 @@ impl Fixture {
     }
 
     fn no_op_relationship_properties() -> Result<Self> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let relationship_type = graph.catalog_mut().intern_relationship_type("R")?;
         let other_relationship_type = graph.catalog_mut().intern_relationship_type("OTHER_R")?;
         let num = graph.catalog_mut().intern_property("num")?;
@@ -340,7 +340,7 @@ impl Fixture {
     }
 
     fn image(&self) -> Result<ResidentProjectImage> {
-        ResidentProjectImage::build(
+        super::legacy_resident_build(
             PROJECT,
             self.bookmark,
             &self.graph,

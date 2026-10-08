@@ -76,8 +76,8 @@ can leave fewer rows, while later traversals can produce multiple rows per match
 vector of the required dimensions. Larger scores rank first; the interpretation depends on the
 index's similarity. A score is not a confidence percentage or a guarantee of relevance.
 
-Vector search runs on the selected execution device. GPU-backed instances keep admitted indexes
-resident on that device. CPU is an explicit execution backend. Device capacity and model availability
+Vector search runs on the CPU. Local text inference uses an independently selected device and
+runs asynchronously. Host capacity and model availability
 remain requirements.
 
 Next, run [`SHOW INDEXES`](../../statements/indexes/show-indexes.md) to inspect availability if a search

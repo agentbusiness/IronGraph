@@ -1,6 +1,6 @@
 # IronGraph documentation
 
-IronGraph is a GPU-first, single-node graph database for applications that need a local graph,
+IronGraph is a CPU, single-node graph database for applications that need a local graph,
 Cypher access, and predictable ownership of their data. Run it as a standalone database or embed it
 in a Rust, Python, or Node.js process.
 
@@ -32,9 +32,10 @@ you describe graph patterns instead of writing traversal code.
 One of three semantic layers within a project: `OBSERVED`, `KNOWLEDGE`, or `WORKSPACE`. The first two
 form the default read view. `WORKSPACE` is included only when a query requests it explicitly.
 
-**Execution device**  
-The CPU, Metal device, or CUDA device selected for the database process. A process uses one device.
-GPU-backed deployments keep admitted project data and derived indexes resident on that device.
+**Inference device**
+
+The CPU, Metal device, or CUDA device selected for local text embedding. Graph storage and execution
+always use one shared CPU graph; inference is selected independently.
 
 ## Supported access modes
 

@@ -298,7 +298,7 @@ fn node_name(depth: usize, position: usize) -> String {
 }
 
 fn fixture(shape: GraphShape) -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let labels = ["A", "B", "C", "D", "E"]
         .into_iter()
         .map(|name| graph.catalog_mut().intern_label(name))
@@ -360,7 +360,7 @@ fn fixture(shape: GraphShape) -> Result<Fixture> {
 }
 
 fn resident_image(fixture: &Fixture) -> Result<ResidentProjectImage> {
-    ResidentProjectImage::build(
+    super::legacy_resident_build(
         fixture.project,
         fixture.bookmark,
         &fixture.graph,

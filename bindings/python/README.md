@@ -1,6 +1,6 @@
 # IronGraph for Python
 
-**Python access to a GPU-first temporal graph database with built-in streaming and queues.**
+**Python access to a CPU graph database with built-in streaming and queues.**
 
 Use Cypher to query graph structure, search text and vectors, inspect property history, and
 administer the database. Built-in Kafka-compatible Streams and AMQP-compatible Queues handle event
@@ -9,12 +9,9 @@ API/Bolt clients for Python. IronGraph is open-source software released under th
 
 ## Performance at a glance
 
-- **0.834 µs graph count** at 2 million nodes on Metal — sub-microsecond at scale.
-- **12× faster indexed range count** on Metal than CPU: 1.61 ms versus 19.38 ms.
-- **7.5× faster k-core analysis** on Metal than CPU: 326 ms versus 2,430 ms.
-
-Median results from five runs on an Apple M5 Pro with 2 million nodes and 8 million
-relationships. See [more performance results](https://irongraph.tech/).
+Graph queries execute on the CPU against one shared canonical graph. Local text inference can
+use Metal or CUDA independently. Measure complete queries separately from individual graph operations;
+latency depends on the workload, graph size, indexes, and host.
 
 ## Database capabilities
 
@@ -83,12 +80,35 @@ Expected output: `Graphs connect facts.` The context manager closes the database
 text document persists. Run the example again to update the same text document.
 
 The example selects CPU across native release targets and keeps automatic text embedding
-enabled. Select `device="metal"` on a supported Mac to use Metal acceleration.
+enabled. Select `embedding_device="metal"` on a supported Mac to accelerate text inference.
 
 Next, declare an embedding index on the text document body and use `MATCH … SEARCH … RETURN` to
 combine vector retrieval with graph filters. The same `query` method supports text document updates,
 indexes, temporal data, graph algorithms, and topic, queue, exchange, and binding administration.
 Text documents are ordinary graph nodes; their complete text remains on the owning node.
+
+## Use an async application
+
+Use the async methods in an asyncio application. Concurrent calls share the same embedded
+database and graph, and database work runs outside the event loop.
+
+```python
+import asyncio
+from irongraph import EmbeddedDatabase
+
+async def main():
+    database = await EmbeddedDatabase.open_async("./irongraph-data", device="cpu")
+    async with database:
+        await database.query_async("CREATE PROJECT IF NOT EXISTS notes")
+        result = await database.query_async("USE notes MATCH (n) RETURN count(n)")
+        print(len(result["rows"]))
+
+asyncio.run(main())
+```
+
+Expected output: `1`. The async context manager closes the database. Async variants also cover streaming, status,
+cancellation, snapshots, and flushing. Concurrent data calls wait asynchronously for an
+available worker without a configurable operation quota.
 
 ## Operate the database
 
@@ -97,9 +117,9 @@ has `OBSERVED`, `KNOWLEDGE`, and `WORKSPACE` layers for source facts, curated fa
 data. Transactions, asynchronous write-ahead logging, recovery, and snapshots apply to embedded
 data as they do in a standalone instance.
 
-One process uses one execution device and one active embedded instance. CPU is the reference
-backend, Metal is the primary local accelerator, and CUDA requires a CUDA-enabled release.
-GPU admission rejects project graphs and derived indexes that do not fit in device memory.
+One process uses one shared CPU graph and one active embedded instance. Text inference selects
+its CPU, Metal, or CUDA device independently; CUDA requires a CUDA-enabled release. Parallel reads
+do not wait for writers and may observe mixed values during a multi-record write.
 Keep the database open for the application's lifetime. IronGraph embeds text locally and does
 not run generative language models.
 

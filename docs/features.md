@@ -1,7 +1,7 @@
 # Features
 
 IronGraph brings graph storage, Cypher, analytics, vector search, and compatible event protocols
-into one GPU-first, single-node database. This page highlights the supported capabilities and the
+into one CPU, single-node database. This page highlights the supported capabilities and the
 operating boundaries that accompany them.
 
 ## Cypher-native graph development
@@ -30,14 +30,14 @@ Every project can distinguish:
 Queries can read one layer or a combined view and can select the write layer. The default read view
 includes `OBSERVED` and `KNOWLEDGE`; `WORKSPACE` remains explicit.
 
-## GPU-first execution with a CPU reference
+## Shared CPU graph and asynchronous text inference
 
-IronGraph selects one execution device per process. Metal is the primary local accelerator, CUDA is
-an optional build target, and CPU is the complete reference backend.
+Graph queries, algorithms, indexes, and vector retrieval execute on the CPU against one canonical
+graph. Parallel readers do not wait for writers. A read overlapping a multi-record write may observe
+a mixture of earlier and later values.
 
-GPU-backed processes keep each admitted project graph and its derived indexes resident. If the graph
-does not fit, IronGraph reports admission failure instead of silently paging or truncating canonical
-rows. This makes device capacity an explicit deployment decision.
+Text inference runs asynchronously on an independently selected CPU, Metal, or CUDA device, subject
+to packaged support. New source records are readable while their embeddings are being generated.
 
 ## Indexes and constraints
 
@@ -102,8 +102,7 @@ RETURN entity, score
 ```
 
 The query returns up to ten nodes and relationships ordered by descending similarity score.
-Vector retrieval runs on the selected execution device; GPU-backed instances use their selected
-GPU, and CPU instances use the CPU backend.
+Vector retrieval runs on the CPU; text inference can use an independently selected GPU.
 
 A document is an ordinary graph node:
 
@@ -211,10 +210,10 @@ model or administration API.
 IronGraph is designed around explicit constraints:
 
 - one process on one node;
-- one selected CPU, Metal, or CUDA device;
+- CPU graph execution and one independently selected text inference device;
 - one canonical WAL and snapshot path;
 - no implicit default project;
-- no silent GPU paging or canonical-row truncation; and
+- one canonical graph in shared host memory; and
 - mutual TLS for every remote Query API, Bolt, Streams, or Queues connection.
 
 These boundaries are part of the product model and should be reflected in application lifecycle,

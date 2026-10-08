@@ -8,22 +8,20 @@ use std::{
 };
 
 use axum::{
-    Json, Router,
+    Router,
     body::Body,
     extract::{ConnectInfo, DefaultBodyLimit, State},
-    http::{HeaderValue, header},
-    response::Response,
+    http::{HeaderMap, HeaderValue, Request, StatusCode, header},
+    response::{IntoResponse, Response},
     routing::post,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
-    sync::{OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
 };
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use tokio_util::sync::CancellationToken;
-use tower::limit::ConcurrencyLimitLayer;
 
 use crate::storage::ConnectionId;
 use crate::{
@@ -35,8 +33,7 @@ use crate::{
     cypher::{Clause, Statement, parse},
     engine::{LayerScope, OperationScope, ProtocolScope, certificate_public_key_fingerprint},
     protocol::{
-        BoltServer, QueryExecutor, QueryIngressAdmission, QueryRequest, QueryStreamEvent,
-        QueryTransaction, ndjson_channel,
+        BoltServer, QueryExecutor, QueryRequest, QueryStreamEvent, QueryTransaction, ndjson_channel,
     },
 };
 
@@ -52,7 +49,6 @@ pub(super) struct RemotePeer {
 
 pub(super) struct RemoteIo {
     stream: Pin<Box<TlsStream<TcpStream>>>,
-    _permit: OwnedSemaphorePermit,
 }
 
 impl AsyncRead for RemoteIo {
@@ -94,8 +90,6 @@ pub(super) struct AuthenticatedTlsListener {
     acceptor: TlsAcceptor,
     database: Database,
     protocol: ProtocolScope,
-    handshake_timeout: Duration,
-    permits: Arc<Semaphore>,
     handshakes: JoinSet<Result<(RemoteIo, RemotePeer)>>,
 }
 
@@ -105,19 +99,12 @@ impl AuthenticatedTlsListener {
         tls: Arc<rustls::ServerConfig>,
         database: Database,
         protocol: ProtocolScope,
-        handshake_timeout: Duration,
-        maximum_connections: usize,
     ) -> Result<Self> {
-        if handshake_timeout.is_zero() || maximum_connections == 0 {
-            return Err(Error::invalid_data("invalid remote listener limits"));
-        }
         Ok(Self {
             listener: TcpListener::bind(address).await?,
             acceptor: TlsAcceptor::from(tls),
             database,
             protocol,
-            handshake_timeout,
-            permits: Arc::new(Semaphore::new(maximum_connections)),
             handshakes: JoinSet::new(),
         })
     }
@@ -128,21 +115,15 @@ impl AuthenticatedTlsListener {
                 accepted = self.listener.accept() => {
                     match accepted {
                         Ok((stream, address)) => {
-                            let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
-                                drop(stream);
-                                continue;
-                            };
                             if stream.set_nodelay(true).is_err() {
                                 continue;
                             }
                             let acceptor = self.acceptor.clone();
                             let database = self.database.clone();
                             let protocol = self.protocol;
-                            let timeout = self.handshake_timeout;
                             self.handshakes.spawn(async move {
-                                let stream = tokio::time::timeout(timeout, acceptor.accept(stream))
+                                let stream = acceptor.accept(stream)
                                     .await
-                                    .map_err(|_| Error::retryable(ErrorCode::DeadlineExceeded, "remote TLS handshake timed out", None))?
                                     .map_err(|error| Error::new(ErrorCode::AuthenticationFailed, error.to_string()))?;
                                 let certificate = stream
                                     .get_ref()
@@ -155,7 +136,6 @@ impl AuthenticatedTlsListener {
                                 Ok((
                                     RemoteIo {
                                         stream: Box::pin(stream),
-                                        _permit: permit,
                                     },
                                     RemotePeer {
                                         _address: address,
@@ -216,7 +196,6 @@ impl<'a>
 #[derive(Clone)]
 struct RemoteQueryState {
     database: Database,
-    query_admission: Arc<QueryIngressAdmission>,
 }
 
 pub(super) async fn run_remote_query(
@@ -237,38 +216,49 @@ pub(super) async fn run_remote_query(
 fn remote_query_application(database: Database) -> Result<Router> {
     Ok(Router::new()
         .route("/api/query", post(remote_query))
-        .layer(DefaultBodyLimit::max(24 * 1024 * 1024))
-        .layer(ConcurrencyLimitLayer::new(256))
-        .with_state(RemoteQueryState {
-            database,
-            query_admission: Arc::new(QueryIngressAdmission::new(256, 256 * 1024 * 1024)?),
-        }))
+        .layer(DefaultBodyLimit::disable())
+        .with_state(RemoteQueryState { database }))
 }
 
 async fn remote_query(
     ConnectInfo(peer): ConnectInfo<RemotePeer>,
     State(state): State<RemoteQueryState>,
-    Json(mut request): Json<QueryRequest>,
+    headers: HeaderMap,
+    request: Request<Body>,
 ) -> Response {
-    request.cancellation = CancellationToken::new();
-    request.deadline = Some(std::time::Instant::now() + Duration::from_secs(120));
-    request.connection_id = peer.connection_id;
-    let ingress = match state.query_admission.try_admit(&request) {
-        Ok(permit) => permit,
+    let json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .and_then(|value| value.trim().split_once('/'))
+        .is_some_and(|(kind, subtype)| {
+            kind.eq_ignore_ascii_case("application")
+                && subtype
+                    .rsplit('+')
+                    .next()
+                    .is_some_and(|suffix| suffix.eq_ignore_ascii_case("json"))
+        });
+    if !json {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
+    let body = match axum::body::to_bytes(request.into_body(), usize::MAX).await {
+        Ok(body) => body,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    let decoded = tokio::task::spawn_blocking(move || {
+        axum::Json::<QueryRequest>::from_bytes(&body).map(|axum::Json(request)| request)
+    })
+    .await;
+    let mut request = match decoded {
+        Ok(Ok(request)) => request,
+        Ok(Err(error)) => return error.into_response(),
         Err(error) => {
-            let (sender, body) = ndjson_channel::<QueryStreamEvent>(1);
-            let _ = sender
-                .send(QueryStreamEvent::Error {
-                    request_id: request.request_id,
-                    code: error.code,
-                    message: error.message.to_string(),
-                    retryable: error.retryable,
-                    retry_after_ms: error.retry_after_ms,
-                })
-                .await;
-            return ndjson_response(body.into_body());
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
         }
     };
+    request.cancellation = CancellationToken::new();
+    request.deadline = None;
+    request.connection_id = peer.connection_id;
     let cancellation = request.cancellation.clone();
     let request_id = request.request_id;
     let executor = match ScopedQueryExecutor::new(
@@ -299,7 +289,6 @@ async fn remote_query(
         cancellation.cancel();
     });
     tokio::task::spawn_blocking(move || {
-        let _ingress = ingress;
         if let Err(error) = executor.execute(request, &mut |event| sender.blocking_send(event)) {
             let _ = sender.blocking_send(QueryStreamEvent::Error {
                 request_id,
@@ -987,7 +976,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capacity_and_authentication_failures_do_not_stop_the_listener() -> Result<()> {
+    async fn authentication_failures_do_not_stop_the_listener() -> Result<()> {
         let (_directory, database) = test_database()?;
         let listener = AuthenticatedTlsListener::bind(
             "127.0.0.1:0"
@@ -996,8 +985,6 @@ mod tests {
             test_server_tls()?,
             database,
             ProtocolScope::BOLT,
-            Duration::from_millis(100),
-            1,
         )
         .await;
         let mut listener = match listener {
@@ -1012,17 +999,12 @@ mod tests {
             Err(error) => return Err(error),
         };
         let address = listener.listener.local_addr()?;
-        let held = Arc::clone(&listener.permits)
-            .acquire_owned()
-            .await
-            .map_err(|error| Error::internal(error.to_string()))?;
         let accept = tokio::spawn(async move { listener.accept_authenticated().await });
 
         let first = TcpStream::connect(address).await?;
         drop(first);
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(!accept.is_finished());
-        drop(held);
 
         for _ in 0..2 {
             let mut invalid = TcpStream::connect(address).await?;

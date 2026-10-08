@@ -58,7 +58,7 @@ fn one_value<'a>(output: &'a ExecutionOutput, name: &str) -> Result<&'a ResultVa
 }
 
 fn merge_fixture(existing_relationship: bool) -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let a = graph.catalog_mut().intern_label("A")?;
     let b = graph.catalog_mut().intern_label("B")?;
     let relationship_type = graph.catalog_mut().intern_relationship_type("TYPE")?;
@@ -100,7 +100,7 @@ fn merge_fixture(existing_relationship: bool) -> Result<GraphStore> {
 }
 
 fn relationship_source_fixture() -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let a = graph.catalog_mut().intern_label("A")?;
     let b = graph.catalog_mut().intern_label("B")?;
     let source = graph.catalog_mut().intern_relationship_type("SOURCE")?;

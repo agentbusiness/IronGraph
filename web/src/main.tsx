@@ -2,6 +2,7 @@ import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import App from './App';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { StartupGate } from './components/StartupGate';
 import { applyStoredTheme } from './hooks/useTheme';
 // The design's two voices, bundled so the console reads the same on every machine. The stylesheet
 // names them with system fallbacks, so a build without these files still opens — in a worse hand.
@@ -25,6 +26,6 @@ if (!root) throw new Error('Application root is missing.');
 
 createRoot(root).render(
   <StrictMode>
-    <ErrorBoundary><App /></ErrorBoundary>
+    <ErrorBoundary><StartupGate><App /></StartupGate></ErrorBoundary>
   </StrictMode>,
 );

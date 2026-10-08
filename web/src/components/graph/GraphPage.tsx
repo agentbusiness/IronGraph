@@ -11,7 +11,7 @@ import {
 } from '../../lib/projectQuery';
 import {
   EMPTY_RESULT,
-  applyQueryEvent,
+  QueryResultCollector,
   deriveCompletionSchema,
   mergeCompletionSchema,
   mergeGraphValues,
@@ -254,6 +254,8 @@ export function GraphPage({ project, draft, onSidebarClose, onProjectsChanged }:
     }
 
     let mutated = false;
+    const collected = new QueryResultCollector();
+    let answer: QueryResult | undefined;
     try {
       for await (const event of runQuery({ projectId: project?.id, query: submitted, signal: controller.signal })) {
         if (serial !== runSerial.current) return;
@@ -266,12 +268,12 @@ export function GraphPage({ project, draft, onSidebarClose, onProjectsChanged }:
           const updates = event.statistics?.updates;
           mutated = typeof updates === 'number' && updates > 0;
         }
-        setResult((current) => applyQueryEvent(current, event));
+        collected.append(event);
       }
-      setResult((current) => {
-        setSchema((currentSchema) => mergeCompletionSchema(currentSchema, deriveCompletionSchema(current)));
-        return current;
-      });
+      const completed = collected.finish();
+      answer = completed;
+      setResult(completed);
+      setSchema((currentSchema) => mergeCompletionSchema(currentSchema, deriveCompletionSchema(completed)));
       if (isProjectCatalogQuery(submitted)) {
         await onProjectsChanged();
       }
@@ -283,6 +285,7 @@ export function GraphPage({ project, draft, onSidebarClose, onProjectsChanged }:
         if (counts && serial === runSerial.current) setCensus(counts);
       }
     } catch (cause) {
+      if (serial === runSerial.current && !answer) setResult(collected.finish());
       if (!(cause instanceof DOMException && cause.name === 'AbortError')) setError(errorMessage(cause));
     } finally {
       if (serial === runSerial.current) {

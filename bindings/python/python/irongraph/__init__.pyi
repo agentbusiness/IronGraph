@@ -2,14 +2,39 @@ from os import PathLike
 from typing import Any, Dict, Literal, Optional, Union
 
 class EmbeddedDatabase:
+    @classmethod
+    async def open_async(
+        cls, data_dir: Union[str, PathLike[str]], *,
+        device: Literal["auto", "cpu"] = "auto", device_ordinal: int = 0,
+        load_embeddings: bool = True, budgets: Optional[Dict[str, Any]] = None,
+        embedding_device: Literal["auto", "cpu", "metal", "cuda"] = "auto",
+        embedding_device_ordinal: int = 0,
+    ) -> EmbeddedDatabase: ...
+    async def query_async(
+        self, cypher: str, *, project_id: Optional[str] = None,
+        parameters: Optional[Dict[str, Any]] = None,
+        query_options: Optional[Dict[str, Any]] = None,
+        operation_options: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]: ...
+    async def stream_append_async(self, request: Dict[str, Any], *, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]: ...
+    async def stream_fetch_async(self, request: Dict[str, Any], *, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]: ...
+    async def status_async(self) -> Dict[str, Any]: ...
+    async def cancel_async(self, operation_id: str) -> bool: ...
+    async def snapshot_async(self) -> Dict[str, Any]: ...
+    async def flush_async(self) -> None: ...
+    async def close_async(self) -> None: ...
+    async def __aenter__(self) -> EmbeddedDatabase: ...
+    async def __aexit__(self, exception_type: object, exception: object, traceback: object) -> bool: ...
     def __init__(
         self,
         data_dir: Union[str, PathLike[str]],
         *,
-        device: Literal["auto", "cpu", "metal", "cuda"] = "auto",
+        device: Literal["auto", "cpu"] = "auto",
         device_ordinal: int = 0,
         load_embeddings: bool = True,
         budgets: Optional[Dict[str, Any]] = None,
+        embedding_device: Literal["auto", "cpu", "metal", "cuda"] = "auto",
+        embedding_device_ordinal: int = 0,
     ) -> None: ...
     def query(
         self,

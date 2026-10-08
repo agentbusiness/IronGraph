@@ -17,7 +17,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Instant};
 use irongraph::{
     Bookmark, Layer, NodeId, ProjectId, Result, ScalarValue,
     cypher::{BindCapabilities, ExecutionContext, QueryEngine, ResultValue},
-    gpu::{CpuBackend, ExecutionBackend, ResidentProjectImage},
+    gpu::{CpuBackend, ExecutionBackend},
     graph::{GraphStore, IndexCatalog, NodeInput, TemporalStore},
 };
 use tokio_util::sync::CancellationToken;
@@ -28,7 +28,7 @@ const BOOKMARK: Bookmark = Bookmark { term: 1, index: 64 };
 /// Twelve readings across three stations, so an inner grouping has several groups and an outer one
 /// has something to count.
 fn station_graph() -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let reading = graph.catalog_mut().intern_label("Reading")?;
     let station = graph.catalog_mut().intern_property("station")?;
     let celsius = graph.catalog_mut().intern_property("celsius")?;
@@ -57,7 +57,7 @@ fn station_graph() -> Result<GraphStore> {
 
 fn admitted_backend(graph: &GraphStore, temporal: &TemporalStore) -> Result<CpuBackend> {
     let image =
-        ResidentProjectImage::build(PROJECT, BOOKMARK, graph, temporal, &IndexCatalog::default())?;
+        super::legacy_resident_build(PROJECT, BOOKMARK, graph, temporal, &IndexCatalog::default())?;
     let mut backend = CpuBackend::new(64 * 1024 * 1024, 1024 * 1024);
     backend.admit_project(image)?;
     Ok(backend)

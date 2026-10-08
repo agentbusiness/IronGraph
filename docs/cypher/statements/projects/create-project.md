@@ -74,7 +74,7 @@ visible_here | origins
 
 - No query reads across projects. Combining two means reading both and joining in the client.
 - There is no implicit default project; a graph query without `USE` has nothing to run against.
-- Every project admitted to an accelerator holds its own resident copy, so project count is a capacity decision.
+- Every project uses the canonical CPU graph storage; plan host memory for its rows and indexes.
 
 ## See also
 

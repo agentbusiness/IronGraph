@@ -1,6 +1,6 @@
 # IronGraph
 
-**A GPU-first temporal graph database with built-in streaming and queues.**
+**A CPU graph database with built-in streaming and queues.**
 
 Use Cypher to query graph structure, search text and vectors, inspect property history, and
 administer the database. Built-in Kafka-compatible Streams and AMQP-compatible Queues handle event
@@ -9,12 +9,9 @@ built-in web console. IronGraph is open-source software released under the Apach
 
 ## Performance at a glance
 
-- **0.834 µs graph count** at 2 million nodes on Metal — sub-microsecond at scale.
-- **12× faster indexed range count** on Metal than CPU: 1.61 ms versus 19.38 ms.
-- **7.5× faster k-core analysis** on Metal than CPU: 326 ms versus 2,430 ms.
-
-Median results from five runs on an Apple M5 Pro with 2 million nodes and 8 million
-relationships. See [more performance results](https://irongraph.tech/).
+Graph queries execute on the CPU against one shared canonical graph. Local text inference can
+use Metal or CUDA independently. Measure complete queries separately from individual graph operations;
+latency depends on the workload, graph size, indexes, and host.
 
 ## Start the database and open the web console
 
@@ -49,8 +46,8 @@ npx irongraph logs
 npx irongraph status
 ```
 
-The process chooses its execution backend automatically. To explicitly use CPU, add
-`--execution-backend cpu`; on a supported Mac, use `--execution-backend metal`. To run in the
+Graph execution uses the CPU. Text inference selects its device independently; on a supported
+Mac, use `--embedding-backend metal`. To run in the
 foreground with live terminal output, use `npx irongraph start` without `--background`.
 
 ### 3. Open the web console
@@ -156,9 +153,9 @@ A project is an isolated graph with its own schema and indexes. `OBSERVED` holds
 `KNOWLEDGE` holds curated facts, and `WORKSPACE` holds provisional working data. There is no
 implicit default project.
 
-CPU is the reference backend, Metal is the primary local accelerator, and CUDA is an optional
-build target. GPU execution keeps admitted project graphs and their derived indexes resident
-on the selected device.
+Graph queries, algorithms, indexes, and vector retrieval use one shared CPU graph. Text inference
+runs asynchronously on an independently selected CPU, Metal, or CUDA device. Parallel readers do
+not wait for writers and may observe mixed values during a multi-record write.
 
 ## Choose your package
 
@@ -216,12 +213,11 @@ the example again to update and read the same text document. Next, declare an em
 text property and use `MATCH … SEARCH … RETURN` to combine retrieval with graph context.
 
 The example selects CPU so the same code works across native release targets, while automatic
-text embedding stays enabled. Select `device="metal"` on a supported Mac to use Metal acceleration.
+text embedding stays enabled. Select `embedding_device="metal"` on a supported Mac to accelerate text inference.
 
 ## Deploy deliberately
 
-Each database process selects one execution device. GPU admission fails explicitly when project
-data and indexes do not fit; canonical graph data is never silently paged or truncated. One
+Each database process uses one shared CPU graph and independently selects its text inference device. One
 embedded instance owns its directory exclusively. Keep it open for your application's lifetime
 and close it during orderly shutdown.
 

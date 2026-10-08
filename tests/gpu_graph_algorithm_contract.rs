@@ -8,6 +8,7 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+use irongraph::graph::legacy::{GraphStore, TemporalStore};
 use std::{
     collections::BTreeMap,
     sync::{
@@ -17,6 +18,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use super::canonical_fixture;
+use irongraph::graph::GraphStore as CanonicalGraphStore;
 use irongraph::{
     Bookmark, EdgeId, Error, ErrorCode, Layer, NodeId, ProjectId, Result, ScalarValue,
     cypher::{BindCapabilities, ExecutionContext, ExecutionOutput, QueryEngine, ResultValue},
@@ -28,16 +31,14 @@ use irongraph::{
         ResidentSortRequest, ResidentSortResult, ResidentVectorQuery, ResidentVectorResult,
         ScratchReservation,
     },
-    graph::{
-        EdgeInput, GraphMutation, GraphStore, IndexCatalog, LayerMask, NodeInput, TemporalStore,
-    },
+    graph::{EdgeInput, GraphMutation, IndexCatalog, LayerMask, NodeInput},
     types::{LabelId, PropertyId},
 };
 use tokio_util::sync::CancellationToken;
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 use irongraph::gpu::{MetalBackend, ResidentGraphProcedure};
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 use irongraph::graph::{Csr, PageRankConfig, bfs, page_rank};
 
 const PROJECT: ProjectId = ProjectId(uuid::Uuid::nil());
@@ -101,7 +102,7 @@ fn adversarial_graph() -> Result<GraphStore> {
 /// deterministic matching partition is `{100, 102}` and `{101, 103}`; a monotone-ID shortcut
 /// collapses all four nodes and loses positive modularity. Parallel and reverse relationships must
 /// still collapse to the same unweighted undirected topology.
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn louvain_higher_id_move_graph() -> Result<GraphStore> {
     let mut graph = GraphStore::default();
     let vertex = graph.catalog_mut().intern_label("Vertex")?;
@@ -136,7 +137,7 @@ fn louvain_higher_id_move_graph() -> Result<GraphStore> {
     Ok(graph)
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn randomized_louvain_graph(seed: u64) -> Result<GraphStore> {
     let node_count = 9 + usize::try_from(seed % 12).unwrap();
     let mut graph = GraphStore::default();
@@ -189,7 +190,7 @@ fn randomized_louvain_graph(seed: u64) -> Result<GraphStore> {
     Ok(graph)
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn randomized_components_metrics_graph(seed: u64) -> Result<GraphStore> {
     const PER_LAYER: usize = 18;
     let mut graph = GraphStore::default();
@@ -266,7 +267,7 @@ fn randomized_components_metrics_graph(seed: u64) -> Result<GraphStore> {
     Ok(graph)
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn randomized_path_graph(seed: u64) -> Result<(GraphStore, [u64; 4])> {
     const NODES_PER_LAYER: usize = 8;
     let mut graph = GraphStore::default();
@@ -346,7 +347,7 @@ fn randomized_path_graph(seed: u64) -> Result<(GraphStore, [u64; 4])> {
     ))
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn high_degree_star_graph(leaf_count: usize) -> Result<GraphStore> {
     let mut graph = GraphStore::default();
     let vertex = graph.catalog_mut().intern_label("PowerLawVertex")?;
@@ -379,7 +380,7 @@ fn high_degree_star_graph(leaf_count: usize) -> Result<GraphStore> {
     Ok(graph)
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn exact_path_graph() -> Result<GraphStore> {
     let mut graph = GraphStore::default();
     let vertex = graph.catalog_mut().intern_label("Vertex")?;
@@ -499,7 +500,7 @@ fn image(graph: &GraphStore) -> Result<ResidentProjectImage> {
 }
 
 fn context<'a>(
-    graph: &'a GraphStore,
+    graph: &'a CanonicalGraphStore,
     backend: Option<&'a dyn ExecutionBackend>,
 ) -> ExecutionContext<'a> {
     ExecutionContext {
@@ -578,23 +579,25 @@ fn execute(
     backend: Option<&dyn ExecutionBackend>,
     query: &str,
 ) -> Result<ExecutionOutput> {
-    let mut execution_context = context(graph, backend);
+    let canonical = canonical_fixture(graph)?;
+    let mut execution_context = context(&canonical, backend);
     QueryEngine.execute(query, &mut execution_context)
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn execute_with_row_budget(
     graph: &GraphStore,
     backend: Option<&dyn ExecutionBackend>,
     query: &str,
     max_result_rows: usize,
 ) -> Result<ExecutionOutput> {
-    let mut execution_context = context(graph, backend);
+    let canonical = canonical_fixture(graph)?;
+    let mut execution_context = context(&canonical, backend);
     execution_context.max_result_rows = max_result_rows;
     QueryEngine.execute(query, &mut execution_context)
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn assert_exact_differential(
     graph: &GraphStore,
     accelerator: &dyn ExecutionBackend,
@@ -607,7 +610,7 @@ fn assert_exact_differential(
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn assert_pagerank_differential(
     graph: &GraphStore,
     accelerator: &dyn ExecutionBackend,
@@ -638,7 +641,7 @@ fn assert_pagerank_differential(
     Ok(device_rows)
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn assert_clustering_differential(
     graph: &GraphStore,
     accelerator: &dyn ExecutionBackend,
@@ -797,7 +800,8 @@ fn cpu_sparse_algorithm_contract_covers_parallel_self_loop_disconnected_and_laye
 fn graph_algorithm_cancellation_deadline_and_result_budgets_fail_before_output() -> Result<()> {
     let graph = adversarial_graph()?;
 
-    let mut cancelled = context(&graph, None);
+    let canonical = canonical_fixture(&graph)?;
+    let mut cancelled = context(&canonical, None);
     cancelled.cancellation.cancel();
     let error = QueryEngine
         .execute(
@@ -807,7 +811,8 @@ fn graph_algorithm_cancellation_deadline_and_result_budgets_fail_before_output()
         .expect_err("pre-cancelled graph algorithm must fail");
     assert_eq!(error.code, ErrorCode::Cancelled);
 
-    let mut expired = context(&graph, None);
+    let canonical = canonical_fixture(&graph)?;
+    let mut expired = context(&canonical, None);
     expired.deadline = Some(
         Instant::now()
             .checked_sub(Duration::from_millis(1))
@@ -834,7 +839,8 @@ fn graph_algorithm_cancellation_deadline_and_result_budgets_fail_before_output()
         "CALL graph.clusteringcoefficient() YIELD node RETURN node",
         "CALL graph.kcore() YIELD node RETURN node",
     ] {
-        let mut bounded = context(&graph, None);
+        let canonical = canonical_fixture(&graph)?;
+        let mut bounded = context(&canonical, None);
         bounded.max_result_rows = 3;
         let error = QueryEngine
             .execute(query, &mut bounded)
@@ -845,7 +851,8 @@ fn graph_algorithm_cancellation_deadline_and_result_budgets_fail_before_output()
         "CALL graph.shortestpath(10, 40) YIELD path RETURN path",
         "CALL graph.trianglecount() YIELD triangleCount RETURN triangleCount",
     ] {
-        let mut bounded = context(&graph, None);
+        let canonical = canonical_fixture(&graph)?;
+        let mut bounded = context(&canonical, None);
         bounded.max_result_rows = 0;
         let error = QueryEngine
             .execute(query, &mut bounded)
@@ -1174,7 +1181,8 @@ fn assert_direct_scan_channels(graph: &GraphStore, backend: &dyn ExecutionBacken
             (" SKIP 2 LIMIT 2", 2, 4),
             (" SKIP 10 LIMIT 2", 5, 5),
         ] {
-            let mut execution_context = context(graph, Some(backend));
+            let canonical = canonical_fixture(graph)?;
+            let mut execution_context = context(&canonical, Some(backend));
             execution_context.capabilities.require_native_execution = false;
             let actual = QueryEngine
                 .execute(&format!("{CHANNELS_QUERY}{suffix}"), &mut execution_context)?;
@@ -1188,7 +1196,8 @@ fn assert_direct_scan_channels(graph: &GraphStore, backend: &dyn ExecutionBacken
         }
     }
     for limit in [0, 2, 10] {
-        let mut execution_context = context(graph, Some(backend));
+        let canonical = canonical_fixture(graph)?;
+        let mut execution_context = context(&canonical, Some(backend));
         execution_context.capabilities.require_native_execution = false;
         execution_context.parameters.insert(
             "limit".to_owned(),
@@ -1205,7 +1214,8 @@ fn assert_direct_scan_channels(graph: &GraphStore, backend: &dyn ExecutionBacken
         (" LIMIT 1", vec![258]),
         (" SKIP 1 LIMIT 1", vec![260]),
     ] {
-        let mut execution_context = context(graph, Some(backend));
+        let canonical = canonical_fixture(graph)?;
+        let mut execution_context = context(&canonical, Some(backend));
         execution_context.capabilities.require_native_execution = false;
         let actual = QueryEngine.execute(
             &format!("USE LAYER WORKSPACE MATCH (c:Channel:Selected) RETURN id(c) AS id{suffix}"),
@@ -1220,7 +1230,8 @@ fn assert_direct_scan_channels(graph: &GraphStore, backend: &dyn ExecutionBacken
         );
     }
     for suffix in ["", " LIMIT 9223372036854775807"] {
-        let mut execution_context = context(graph, Some(backend));
+        let canonical = canonical_fixture(graph)?;
+        let mut execution_context = context(&canonical, Some(backend));
         execution_context.capabilities.require_native_execution = false;
         execution_context.max_result_rows = 4;
         let error = QueryEngine
@@ -1236,7 +1247,8 @@ fn assert_direct_scan_channels(graph: &GraphStore, backend: &dyn ExecutionBacken
         properties: Vec::new(),
     })];
     for suffix in ["", " LIMIT 9223372036854775807"] {
-        let mut execution_context = context(graph, Some(backend));
+        let canonical = canonical_fixture(graph)?;
+        let mut execution_context = context(&canonical, Some(backend));
         execution_context.capabilities.require_native_execution = false;
         execution_context.prior_graph_mutations = &prior;
         let actual =
@@ -1249,7 +1261,8 @@ fn assert_direct_scan_channels(graph: &GraphStore, backend: &dyn ExecutionBacken
         );
         assert_eq!(actual_rows.len(), 6);
     }
-    let mut cancelled = context(graph, Some(backend));
+    let canonical = canonical_fixture(graph)?;
+    let mut cancelled = context(&canonical, Some(backend));
     cancelled.capabilities.require_native_execution = false;
     cancelled.cancellation.cancel();
     assert_eq!(
@@ -1281,7 +1294,7 @@ fn direct_node_scan_channels_need_no_dummy_limit_on_an_accelerator() -> Result<(
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn real_metal_direct_node_scan_channels_need_no_dummy_limit() -> Result<()> {
@@ -1356,7 +1369,8 @@ fn assert_direct_filter_contacts(graph: &GraphStore, backend: &dyn ExecutionBack
                 (" SKIP 2 LIMIT 3", 2, 5),
                 (" LIMIT 0", 0, 0),
             ] {
-                let mut ctx = context(graph, Some(backend));
+                let canonical = canonical_fixture(graph)?;
+                let mut ctx = context(&canonical, Some(backend));
                 ctx.capabilities.require_native_execution = false;
                 ctx.parameters.insert(
                     "empty".to_owned(),
@@ -1399,7 +1413,8 @@ fn assert_direct_filter_contacts(graph: &GraphStore, backend: &dyn ExecutionBack
             1,
         ),
     ] {
-        let mut ctx = context(graph, Some(backend));
+        let canonical = canonical_fixture(graph)?;
+        let mut ctx = context(&canonical, Some(backend));
         ctx.capabilities.require_native_execution = false;
         ctx.max_result_rows = (end - start).max(1);
         let actual = QueryEngine.execute(&query, &mut ctx)?;
@@ -1414,7 +1429,8 @@ fn assert_direct_filter_contacts(graph: &GraphStore, backend: &dyn ExecutionBack
             ["card_id", "display", "value", "kind"]
         );
     }
-    let mut ctx = context(graph, Some(backend));
+    let canonical = canonical_fixture(graph)?;
+    let mut ctx = context(&canonical, Some(backend));
     ctx.capabilities.require_native_execution = false;
     ctx.max_result_rows = 365;
     let query = format!("MATCH (c:Contact) WHERE c.card_id <> '' {CONTACT_RETURN}");
@@ -1425,7 +1441,8 @@ fn assert_direct_filter_contacts(graph: &GraphStore, backend: &dyn ExecutionBack
             .code,
         ErrorCode::ResultBudgetExceeded
     );
-    let mut ctx = context(graph, Some(backend));
+    let canonical = canonical_fixture(graph)?;
+    let mut ctx = context(&canonical, Some(backend));
     ctx.capabilities.require_native_execution = false;
     ctx.max_result_rows = 2;
     ctx.parameters.insert(
@@ -1509,7 +1526,7 @@ fn direct_filter_contacts_do_not_enter_resident_preparation() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn real_metal_direct_filter_contacts_preserve_results() -> Result<()> {
@@ -1601,7 +1618,8 @@ fn active_accelerator_dispatches_every_graph_algorithm_without_host_fallback() -
         "accelerator execution must never reconstruct or traverse host adjacency"
     );
 
-    let mut stale = context(&graph, Some(&accelerator));
+    let canonical = canonical_fixture(&graph)?;
+    let mut stale = context(&canonical, Some(&accelerator));
     stale.bookmark.index = stale.bookmark.index.saturating_add(1);
     let error = QueryEngine
         .execute(
@@ -1628,7 +1646,8 @@ fn active_accelerator_dispatches_every_graph_algorithm_without_host_fallback() -
         labels: Vec::new(),
         properties: Vec::new(),
     })];
-    let mut overlaid = context(&graph, Some(&accelerator));
+    let canonical = canonical_fixture(&graph)?;
+    let mut overlaid = context(&canonical, Some(&accelerator));
     overlaid.prior_graph_mutations = &prior;
     let error = QueryEngine
         .execute(
@@ -1644,7 +1663,7 @@ fn active_accelerator_dispatches_every_graph_algorithm_without_host_fallback() -
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 #[allow(clippy::too_many_lines)]
@@ -1760,7 +1779,8 @@ fn real_metal_all_graph_algorithms_match_cpu_on_adversarial_sparse_graph() -> Re
         );
     }
 
-    let mut cancelled = context(&graph, Some(&metal));
+    let canonical = canonical_fixture(&graph)?;
+    let mut cancelled = context(&canonical, Some(&metal));
     cancelled.cancellation.cancel();
     let error = QueryEngine
         .execute(
@@ -1783,7 +1803,8 @@ fn real_metal_all_graph_algorithms_match_cpu_on_adversarial_sparse_graph() -> Re
         "CALL graph.clusteringcoefficient() YIELD node RETURN node",
         "CALL graph.kcore() YIELD node RETURN node",
     ] {
-        let mut bounded = context(&graph, Some(&metal));
+        let canonical = canonical_fixture(&graph)?;
+        let mut bounded = context(&canonical, Some(&metal));
         bounded.max_result_rows = 3;
         let error = QueryEngine
             .execute(query, &mut bounded)
@@ -1794,7 +1815,8 @@ fn real_metal_all_graph_algorithms_match_cpu_on_adversarial_sparse_graph() -> Re
         "CALL graph.shortestpath(10, 40) YIELD path RETURN path",
         "CALL graph.trianglecount() YIELD triangleCount RETURN triangleCount",
     ] {
-        let mut bounded = context(&graph, Some(&metal));
+        let canonical = canonical_fixture(&graph)?;
+        let mut bounded = context(&canonical, Some(&metal));
         bounded.max_result_rows = 0;
         let error = QueryEngine
             .execute(query, &mut bounded)
@@ -1804,7 +1826,7 @@ fn real_metal_all_graph_algorithms_match_cpu_on_adversarial_sparse_graph() -> Re
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn real_metal_scc_matches_cpu_across_random_directed_graphs() -> Result<()> {
@@ -1855,7 +1877,7 @@ fn real_metal_scc_matches_cpu_across_random_directed_graphs() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn real_metal_components_metrics_and_pagerank_match_seeded_layered_graphs_exactly() -> Result<()> {
@@ -1919,7 +1941,7 @@ fn real_metal_components_metrics_and_pagerank_match_seeded_layered_graphs_exactl
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "manual Apple-GPU sparse SCC throughput gate"]
 fn metal_scc_many_singleton_dag_performance_gate() -> Result<()> {
@@ -1963,13 +1985,15 @@ fn metal_scc_many_singleton_dag_performance_gate() -> Result<()> {
     let query = "CALL graph.scc() YIELD node, component\n\
                  RETURN id(node) AS id, component ORDER BY id";
 
-    let mut cpu_context = context(&graph, None);
+    let canonical = canonical_fixture(&graph)?;
+    let mut cpu_context = context(&canonical, None);
     cpu_context.max_result_rows = NODES + 1;
     cpu_context.deadline = Some(Instant::now() + Duration::from_mins(1));
     let cpu = QueryEngine.execute(query, &mut cpu_context)?;
 
     let started = Instant::now();
-    let mut metal_context = context(&graph, Some(&metal));
+    let canonical = canonical_fixture(&graph)?;
+    let mut metal_context = context(&canonical, Some(&metal));
     metal_context.max_result_rows = NODES + 1;
     metal_context.deadline = Some(Instant::now() + Duration::from_mins(1));
     let device = QueryEngine.execute(query, &mut metal_context)?;
@@ -1987,7 +2011,7 @@ fn metal_scc_many_singleton_dag_performance_gate() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "manual Apple-GPU long-cycle SCC throughput gate"]
 fn metal_scc_long_directed_cycle_performance_gate() -> Result<()> {
@@ -2020,14 +2044,16 @@ fn metal_scc_long_directed_cycle_performance_gate() -> Result<()> {
     }
     let query = "CALL graph.scc() YIELD node, component \
                  RETURN id(node) AS id, component ORDER BY id";
-    let mut cpu_context = context(&graph, None);
+    let canonical = canonical_fixture(&graph)?;
+    let mut cpu_context = context(&canonical, None);
     cpu_context.max_result_rows = NODES + 1;
     cpu_context.deadline = Some(Instant::now() + Duration::from_mins(1));
     let cpu = QueryEngine.execute(query, &mut cpu_context)?;
     let mut metal = MetalBackend::new(0, 512 * 1024 * 1024, RESERVED_BYTES)?;
     metal.admit_project(image(&graph)?)?;
     let started = Instant::now();
-    let mut metal_context = context(&graph, Some(&metal));
+    let canonical = canonical_fixture(&graph)?;
+    let mut metal_context = context(&canonical, Some(&metal));
     metal_context.max_result_rows = NODES + 1;
     metal_context.deadline = Some(Instant::now() + Duration::from_mins(1));
     let device = QueryEngine.execute(query, &mut metal_context)?;
@@ -2042,7 +2068,7 @@ fn metal_scc_long_directed_cycle_performance_gate() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "manual Apple-GPU WCC-chain and k-core-cascade throughput gate"]
 fn metal_wcc_chain_and_kcore_cascade_performance_gate() -> Result<()> {
@@ -2089,12 +2115,14 @@ fn metal_wcc_chain_and_kcore_cascade_performance_gate() -> Result<()> {
              RETURN id(node) AS id, core ORDER BY id",
         ),
     ] {
-        let mut cpu_context = context(&graph, None);
+        let canonical = canonical_fixture(&graph)?;
+        let mut cpu_context = context(&canonical, None);
         cpu_context.max_result_rows = NODES + 1;
         cpu_context.deadline = Some(Instant::now() + Duration::from_mins(1));
         let cpu = QueryEngine.execute(query, &mut cpu_context)?;
         let started = Instant::now();
-        let mut metal_context = context(&graph, Some(&metal));
+        let canonical = canonical_fixture(&graph)?;
+        let mut metal_context = context(&canonical, Some(&metal));
         metal_context.max_result_rows = NODES + 1;
         metal_context.deadline = Some(Instant::now() + Duration::from_mins(1));
         let device = QueryEngine.execute(query, &mut metal_context)?;
@@ -2110,7 +2138,7 @@ fn metal_wcc_chain_and_kcore_cascade_performance_gate() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn insert_metrics_edge(
     graph: &mut GraphStore,
     relationship_type: irongraph::types::RelationshipTypeId,
@@ -2132,7 +2160,7 @@ fn insert_metrics_edge(
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn power_law_metrics_graph() -> Result<(GraphStore, u64)> {
     const NODES: usize = 8_000;
     const HUBS: usize = 64;
@@ -2190,7 +2218,7 @@ fn power_law_metrics_graph() -> Result<(GraphStore, u64)> {
     Ok((graph, triangles))
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn dense_metrics_graph() -> Result<(GraphStore, u64)> {
     const GROUPS: usize = 8;
     const GROUP_SIZE: usize = 192;
@@ -2229,7 +2257,7 @@ fn dense_metrics_graph() -> Result<(GraphStore, u64)> {
     Ok((graph, triangles))
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn isolated_high_degree_triangle_row_graph(spokes_per_hub: usize) -> Result<GraphStore> {
     let node_count = 2_usize
         .checked_add(spokes_per_hub.checked_mul(2).ok_or_else(|| {
@@ -2285,7 +2313,7 @@ fn isolated_high_degree_triangle_row_graph(spokes_per_hub: usize) -> Result<Grap
     Ok(graph)
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn timed_metrics_queries(
     name: &str,
     graph: &GraphStore,
@@ -2334,7 +2362,7 @@ fn timed_metrics_queries(
     ))
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "manual Apple-GPU triangle/clustering throughput gate"]
 fn metal_triangle_clustering_power_law_and_dense_performance_gate() -> Result<()> {
@@ -2365,7 +2393,7 @@ fn metal_triangle_clustering_power_law_and_dense_performance_gate() -> Result<()
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "manual Apple-GPU high-degree triangle cancellation gate"]
 fn metal_triangle_single_high_degree_row_has_bounded_cancellation() -> Result<()> {
@@ -2419,7 +2447,7 @@ fn metal_triangle_single_high_degree_row_has_bounded_cancellation() -> Result<()
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "manual Apple-GPU direct-degree throughput gate"]
 fn metal_direct_degree_skew_performance_gate() -> Result<()> {
@@ -2453,7 +2481,7 @@ fn metal_direct_degree_skew_performance_gate() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn real_metal_exact_path_edge_cases_match_public_cypher_contract() -> Result<()> {
@@ -2537,7 +2565,7 @@ fn real_metal_exact_path_edge_cases_match_public_cypher_contract() -> Result<()>
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn real_metal_randomized_paths_match_cpu_and_repeat_through_public_cypher() -> Result<()> {
@@ -2597,7 +2625,7 @@ fn real_metal_randomized_paths_match_cpu_and_repeat_through_public_cypher() -> R
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn real_metal_adaptive_heap_dijkstra_matches_cpu_and_is_repeatable() -> Result<()> {
@@ -2616,7 +2644,7 @@ fn real_metal_adaptive_heap_dijkstra_matches_cpu_and_is_repeatable() -> Result<(
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn real_metal_persistent_bfs_unit_and_shortest_match_cpu_and_repeat() -> Result<()> {
@@ -2644,7 +2672,7 @@ fn real_metal_persistent_bfs_unit_and_shortest_match_cpu_and_repeat() -> Result<
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn real_metal_path_hub_rows_observe_active_cancellation_and_deadline_within_two_seconds()
@@ -2744,7 +2772,7 @@ fn real_metal_path_hub_rows_observe_active_cancellation_and_deadline_within_two_
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn real_metal_louvain_permits_beneficial_higher_id_moves_deterministically() -> Result<()> {
@@ -2768,7 +2796,7 @@ fn real_metal_louvain_permits_beneficial_higher_id_moves_deterministically() -> 
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn real_metal_louvain_randomized_exact_differential_and_repeatability() -> Result<()> {
@@ -2790,7 +2818,7 @@ fn real_metal_louvain_randomized_exact_differential_and_repeatability() -> Resul
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn real_metal_louvain_high_degree_power_law_and_dense_fallback_is_exact() -> Result<()> {
@@ -2833,7 +2861,7 @@ fn real_metal_louvain_high_degree_power_law_and_dense_fallback_is_exact() -> Res
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn real_metal_components_metrics_and_louvain_match_cpu_independently() -> Result<()> {
@@ -2863,7 +2891,7 @@ fn real_metal_components_metrics_and_louvain_match_cpu_independently() -> Result
     )
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn real_metal_empty_graph_degree_and_pagerank_match_cpu() -> Result<()> {
@@ -2885,7 +2913,7 @@ fn real_metal_empty_graph_degree_and_pagerank_match_cpu() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn real_metal_isolated_node_dijkstra_is_exact_and_honors_direct_budget() -> Result<()> {
@@ -2924,7 +2952,7 @@ fn real_metal_isolated_node_dijkstra_is_exact_and_honors_direct_budget() -> Resu
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn benchmark_environment_usize(name: &str, default: usize) -> Result<usize> {
     let Some(value) = std::env::var_os(name) else {
         return Ok(default);
@@ -2935,7 +2963,7 @@ fn benchmark_environment_usize(name: &str, default: usize) -> Result<usize> {
         .map_err(|error| Error::new(ErrorCode::QueryType, format!("invalid {name}: {error}")))
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn benchmark_environment_f64(name: &str) -> Result<Option<f64>> {
     let Some(value) = std::env::var_os(name) else {
         return Ok(None);
@@ -2953,7 +2981,7 @@ fn benchmark_environment_f64(name: &str) -> Result<Option<f64>> {
     Ok(Some(value))
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn benchmark_count_as_f64(value: usize, label: &str) -> Result<f64> {
     let exact = u32::try_from(value).map_err(|_| {
         Error::new(
@@ -2964,7 +2992,7 @@ fn benchmark_count_as_f64(value: usize, label: &str) -> Result<f64> {
     Ok(f64::from(exact))
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn sparse_ring_graph(node_count: usize, fanout: usize) -> Result<(GraphStore, Csr)> {
     if node_count < 2 || fanout == 0 || fanout >= node_count {
         return Err(Error::new(
@@ -3059,7 +3087,7 @@ fn sparse_ring_graph(node_count: usize, fanout: usize) -> Result<(GraphStore, Cs
     Ok((graph, Csr::build(node_count, &triples)?))
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn planted_louvain_graph(
     community_count: usize,
     nodes_per_community: usize,
@@ -3136,7 +3164,7 @@ fn planted_louvain_graph(
     Ok(graph)
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn weighted_re_relaxation_graph(node_count: usize) -> Result<(GraphStore, PropertyId)> {
     if node_count < 2 {
         return Err(Error::new(
@@ -3196,7 +3224,7 @@ fn weighted_re_relaxation_graph(node_count: usize) -> Result<(GraphStore, Proper
     Ok((graph, weight))
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn directed_chain_graph(node_count: usize) -> Result<GraphStore> {
     if node_count < 2 {
         return Err(Error::new(
@@ -3240,7 +3268,7 @@ fn directed_chain_graph(node_count: usize) -> Result<GraphStore> {
 }
 
 /// Manual high-diameter gate for exact ordered DFS and both forward/reverse shortest-path BFS.
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "manual real-Metal long-chain path throughput gate"]
 fn real_metal_long_chain_path_throughput() -> Result<()> {
@@ -3351,7 +3379,7 @@ fn real_metal_long_chain_path_throughput() -> Result<()> {
 /// Manual regression for the exact weighted frontier on a high-diameter graph with repeated
 /// distance improvements. This shape previously collapses a whole-graph Bellman-Ford pull toward
 /// O(VE); the production edge/node-tiled target pull should remain proportional to touched rows.
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "manual real-Metal exact weighted-path throughput gate"]
 fn real_metal_weighted_high_diameter_throughput() -> Result<()> {
@@ -3433,7 +3461,7 @@ fn real_metal_weighted_high_diameter_throughput() -> Result<()> {
 /// deduplication, every exact-gain local pass, deterministic proposal matching, coarsening, result
 /// transfer, and result encoding. Set `IRONGRAPH_GPU_BENCH_MIN_LOUVAIN_EDGES_PER_SECOND` or
 /// `IRONGRAPH_GPU_BENCH_MIN_LOUVAIN_SPEEDUP` to enforce machine-specific gates.
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "manual real-Metal Louvain throughput gate"]
 #[allow(clippy::too_many_lines)]
@@ -3566,7 +3594,7 @@ fn real_metal_louvain_throughput() -> Result<()> {
 /// `IRONGRAPH_GPU_BENCH_FANOUT`, `IRONGRAPH_GPU_BENCH_ITERATIONS`,
 /// `IRONGRAPH_GPU_BENCH_MEMORY_BYTES`, `IRONGRAPH_GPU_BENCH_MIN_BFS_EDGES_PER_SECOND`, and
 /// `IRONGRAPH_GPU_BENCH_MIN_PAGERANK_EDGES_PER_SECOND`.
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "manual real-Metal throughput gate; size and thresholds are environment-controlled"]
 #[allow(clippy::too_many_lines)]

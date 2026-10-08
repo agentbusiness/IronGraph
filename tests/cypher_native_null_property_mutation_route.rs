@@ -60,7 +60,7 @@ struct StrictNullPropertyMutationBackend {
 
 impl StrictNullPropertyMutationBackend {
     fn new(graph: &GraphStore) -> Result<Self> {
-        let image = ResidentProjectImage::build(
+        let image = super::legacy_resident_build(
             PROJECT,
             BOOKMARK,
             graph,
@@ -455,7 +455,7 @@ fn remove1_5_and_set1_8_erase_only_the_proven_null_mutation() -> Result<()> {
 
 #[test]
 fn known_null_property_noop_near_misses_fail_closed() -> Result<()> {
-    let mut declared = GraphStore::default();
+    let declared = GraphStore::default();
     let existing = declared.catalog_mut().intern_label("Existing")?;
     let num = declared.catalog_mut().intern_property("num")?;
     declared.insert_node(NodeInput {

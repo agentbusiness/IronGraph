@@ -433,7 +433,7 @@ struct Fixture {
 
 impl Fixture {
     fn from_rows(rows: Vec<(&'static str, Vec<(&'static str, ScalarValue)>)>) -> Result<Self> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let mut labels = BTreeMap::new();
         let mut properties = BTreeMap::new();
         for (label, row_properties) in &rows {
@@ -492,7 +492,7 @@ impl Fixture {
     }
 
     fn image(&self) -> Result<ResidentProjectImage> {
-        ResidentProjectImage::build(
+        super::legacy_resident_build(
             PROJECT,
             self.bookmark,
             &self.graph,
@@ -596,7 +596,7 @@ fn integer_fixture() -> Result<Fixture> {
 }
 
 fn mathematical2_fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let id = graph.catalog_mut().intern_property("id")?;
     let version = graph.catalog_mut().intern_property("version")?;
     graph.insert_node(NodeInput {

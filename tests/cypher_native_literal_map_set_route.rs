@@ -463,7 +463,7 @@ impl ExecutionBackend for StrictLiteralMapBackend {
 }
 
 fn fixture(shape: FixtureShape) -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     if matches!(shape, FixtureShape::Empty) {
         return Ok(graph);
     }
@@ -488,7 +488,7 @@ fn fixture(shape: FixtureShape) -> Result<GraphStore> {
 }
 
 fn cpu_backend(graph: &GraphStore) -> Result<CpuBackend> {
-    let image = ResidentProjectImage::build(
+    let image = super::legacy_resident_build(
         PROJECT,
         BOOKMARK,
         graph,

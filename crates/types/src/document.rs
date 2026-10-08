@@ -70,6 +70,47 @@ impl DocumentList {
         }
     }
 
+    /// Reads a flat numeric list without allocating a decoded tree or coordinate buffer.
+    pub fn numeric_values(&self) -> Result<impl ExactSizeIterator<Item = f64> + '_> {
+        let bytes = self.as_bytes();
+        let invalid = || {
+            Error::new(
+                ErrorCode::QueryType,
+                "vector property must be a flat finite numeric list",
+            )
+        };
+        if bytes.len() < 10 || bytes[0] != FORMAT_VERSION || bytes[1] != LIST {
+            return Err(invalid());
+        }
+        let count = u64::from_le_bytes(bytes[2..10].try_into().map_err(|_| invalid())?);
+        let count = usize::try_from(count).map_err(|_| invalid())?;
+        let expected = count
+            .checked_mul(9)
+            .and_then(|length| length.checked_add(10))
+            .ok_or_else(invalid)?;
+        if bytes.len() != expected {
+            return Err(invalid());
+        }
+        for value in bytes[10..].chunks_exact(9) {
+            match value[0] {
+                INTEGER => {}
+                FLOAT
+                    if f64::from_le_bytes(value[1..].try_into().map_err(|_| invalid())?)
+                        .is_finite() => {}
+                _ => return Err(invalid()),
+            }
+        }
+        Ok(bytes[10..].chunks_exact(9).map(|value| {
+            let mut encoded = [0_u8; 8];
+            encoded.copy_from_slice(&value[1..]);
+            if value[0] == INTEGER {
+                i64::from_le_bytes(encoded) as f64
+            } else {
+                f64::from_le_bytes(encoded)
+            }
+        }))
+    }
+
     /// Canonical flat bytes uploaded directly with the property column.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
@@ -782,6 +823,36 @@ fn corrupt(message: &'static str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numeric_list_iterates_canonical_bytes_and_rejects_invalid_vectors() -> Result<()> {
+        let list = DocumentList::new(vec![
+            DocumentItem::Scalar(ScalarValue::Integer(-7)),
+            DocumentItem::Scalar(ScalarValue::Float(OrderedFloat(0.25))),
+        ])?;
+        assert_eq!(list.numeric_values()?.collect::<Vec<_>>(), vec![-7.0, 0.25]);
+        let nested = DocumentList::new(vec![DocumentItem::List(vec![])])?;
+        assert!(nested.numeric_values().is_err());
+        let text = DocumentList::new(vec![DocumentItem::Scalar(ScalarValue::String(Arc::from(
+            "x",
+        )))])?;
+        assert!(text.numeric_values().is_err());
+        let mut malformed = list.as_bytes().to_vec();
+        malformed.pop();
+        assert!(
+            DocumentList::from_canonical(malformed.into())
+                .numeric_values()
+                .is_err()
+        );
+        let mut nonfinite = list.as_bytes().to_vec();
+        nonfinite[20..28].copy_from_slice(&f64::INFINITY.to_le_bytes());
+        assert!(
+            DocumentList::from_canonical(nonfinite.into())
+                .numeric_values()
+                .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn canonical_map_round_trip_is_key_ordered() -> Result<()> {

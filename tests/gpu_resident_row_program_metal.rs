@@ -4,8 +4,9 @@
 // functions that fixtures are built from. Scoping the allowance here keeps the production gate
 // enforceable instead of switched off globally.
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
-#![cfg(all(feature = "accelerator", target_os = "macos"))]
+#![cfg(all(feature = "legacy-graph", target_os = "macos"))]
 
+use irongraph::graph::legacy::{GraphStore, TemporalStore};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use irongraph::{
@@ -19,7 +20,7 @@ use irongraph::{
         ResidentRowProgramRequest, ResidentRowProgramResult, ResidentRowSortKey,
         ResidentRowValueType,
     },
-    graph::{EdgeInput, GraphStore, IndexCatalog, LayerMask, NodeInput, TemporalStore},
+    graph::{EdgeInput, IndexCatalog, LayerMask, NodeInput},
     types::{LabelId, PropertyId, RelationshipTypeId},
 };
 use ordered_float::OrderedFloat;
@@ -303,7 +304,7 @@ fn assert_alignment(result: &irongraph::gpu::ValidatedResidentRowProgramResult, 
     );
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "real-Metal no-ceiling gate: allocates and validates more than one million typed rows"]
 fn real_metal_typed_rows_cross_the_former_fixed_count_with_u64_lineage() -> Result<()> {

@@ -3,7 +3,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, OnceLock},
+    sync::Arc,
 };
 
 use half::{bf16, f16};
@@ -18,10 +18,11 @@ use crate::{
     types::{LabelId, PropertyId},
 };
 
-use super::{
-    GraphMutation, GraphStore, NodeView,
-    persistent::{PagedVec, PersistentMap},
-};
+use super::{GraphMutation, GraphStore, NodeView, persistent::PagedVec};
+
+#[path = "concurrent_index.rs"]
+mod concurrent_index;
+use concurrent_index::{ConcurrentMap, EntryMap, Postings, ProfileCell};
 
 /// Total-order key for indexable scalar values.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -79,563 +80,143 @@ impl TryFrom<&ScalarValue> for IndexKey {
     }
 }
 
-/// Equality postings over dense row ordinals.
+/// Equality memberships over stable dense row ordinals.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct EqualityIndex {
-    postings: Arc<BTreeMap<IndexKey, RoaringBitmap>>,
-    #[serde(default)]
-    deltas: PersistentMap<Arc<Vec<PostingDelta>>>,
+    postings: Postings<IndexKey>,
 }
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct PostingDelta {
-    key: Arc<IndexKey>,
-    changes: PersistentMap<bool>,
-}
-
-fn index_key_hash(key: &IndexKey) -> u128 {
-    fn write_key(hasher: &mut blake3::Hasher, key: &IndexKey) {
-        match key {
-            IndexKey::Boolean(value) => {
-                hasher.update(&[0, u8::from(*value)]);
-            }
-            IndexKey::Integer(value) => {
-                hasher.update(&[1]);
-                hasher.update(&value.to_le_bytes());
-            }
-            IndexKey::Float(value) => {
-                hasher.update(&[2]);
-                hasher.update(&value.to_bits().to_le_bytes());
-            }
-            IndexKey::String(value) => {
-                hasher.update(&[3]);
-                hasher.update(value.as_bytes());
-            }
-            IndexKey::Bytes(value) => {
-                hasher.update(&[4]);
-                hasher.update(value);
-            }
-            IndexKey::Date(value) => {
-                hasher.update(&[5]);
-                hasher.update(&value.to_le_bytes());
-            }
-            IndexKey::LocalTime(value) => {
-                hasher.update(&[6]);
-                hasher.update(&value.to_le_bytes());
-            }
-            IndexKey::ZonedTime(nanos, offset) => {
-                hasher.update(&[7]);
-                hasher.update(&nanos.to_le_bytes());
-                hasher.update(&offset.to_le_bytes());
-            }
-            IndexKey::LocalDateTime(seconds, nanos) => {
-                hasher.update(&[8]);
-                hasher.update(&seconds.to_le_bytes());
-                hasher.update(&nanos.to_le_bytes());
-            }
-            IndexKey::ZonedDateTime(seconds, nanos, timezone) => {
-                hasher.update(&[9]);
-                hasher.update(&seconds.to_le_bytes());
-                hasher.update(&nanos.to_le_bytes());
-                hasher.update(timezone.as_bytes());
-            }
-            IndexKey::Duration(months, days, seconds, nanos) => {
-                hasher.update(&[10]);
-                hasher.update(&months.to_le_bytes());
-                hasher.update(&days.to_le_bytes());
-                hasher.update(&seconds.to_le_bytes());
-                hasher.update(&nanos.to_le_bytes());
-            }
-            IndexKey::Composite(values) => {
-                hasher.update(&[11]);
-                for value in values {
-                    write_key(hasher, value);
-                }
-            }
-        }
-    }
-    let mut hasher = blake3::Hasher::new();
-    write_key(&mut hasher, key);
-    let bytes = hasher.finalize();
-    let mut prefix = [0_u8; 16];
-    prefix.copy_from_slice(&bytes.as_bytes()[..16]);
-    u128::from_le_bytes(prefix)
-}
-
-fn append_posting_delta(
-    deltas: &mut PersistentMap<Arc<Vec<PostingDelta>>>,
-    key: IndexKey,
-    row: u32,
-    present: bool,
-) {
-    let hash = index_key_hash(&key);
-    let mut bucket = deltas.get(hash).cloned().unwrap_or_default();
-    let values = Arc::make_mut(&mut bucket);
-    if let Some(delta) = values.iter_mut().find(|delta| delta.key.as_ref() == &key) {
-        delta.changes.insert(u128::from(row), present);
-    } else {
-        let mut changes = PersistentMap::default();
-        changes.insert(u128::from(row), present);
-        values.push(PostingDelta {
-            key: Arc::new(key),
-            changes,
-        });
-    }
-    deltas.insert(hash, bucket);
-}
-
-fn materialize_postings(
-    base: &BTreeMap<IndexKey, RoaringBitmap>,
-    deltas: &PersistentMap<Arc<Vec<PostingDelta>>>,
-) -> BTreeMap<IndexKey, RoaringBitmap> {
-    let mut postings = base.clone();
-    for (_, bucket) in deltas.iter() {
-        for delta in bucket.iter() {
-            let rows = postings.entry(delta.key.as_ref().clone()).or_default();
-            for (row, present) in delta.changes.iter() {
-                let Ok(row) = u32::try_from(row) else {
-                    continue;
-                };
-                if *present {
-                    rows.insert(row);
-                } else {
-                    rows.remove(row);
-                }
-            }
-            if rows.is_empty() {
-                postings.remove(delta.key.as_ref());
-            }
-        }
-    }
-    postings
-}
-
 impl EqualityIndex {
-    pub fn insert(&mut self, value: &ScalarValue, row: u32) -> Result<()> {
+    pub fn insert(&self, value: &ScalarValue, row: u32) -> Result<()> {
         if !matches!(value, ScalarValue::Null) {
             self.insert_key(IndexKey::try_from(value)?, row);
         }
         Ok(())
     }
-
-    pub fn insert_key(&mut self, key: IndexKey, row: u32) {
-        append_posting_delta(&mut self.deltas, key, row, true);
+    pub fn insert_key(&self, key: IndexKey, row: u32) {
+        self.postings.insert(key, row);
     }
-
-    pub fn remove(&mut self, value: &ScalarValue, row: u32) -> Result<()> {
-        if matches!(value, ScalarValue::Null) {
-            return Ok(());
+    pub fn remove(&self, value: &ScalarValue, row: u32) -> Result<()> {
+        if !matches!(value, ScalarValue::Null) {
+            self.remove_key(&IndexKey::try_from(value)?, row);
         }
-        self.remove_key(&IndexKey::try_from(value)?, row);
         Ok(())
     }
-
-    pub fn remove_key(&mut self, key: &IndexKey, row: u32) {
-        append_posting_delta(&mut self.deltas, key.clone(), row, false);
+    pub fn remove_key(&self, key: &IndexKey, row: u32) {
+        self.postings.remove(key, row);
     }
-
-    #[must_use]
     pub fn get(&self, key: &IndexKey) -> Option<RoaringBitmap> {
-        let mut rows = self.postings.get(key).cloned().unwrap_or_default();
-        if let Some(bucket) = self.deltas.get(index_key_hash(key))
-            && let Some(delta) = bucket.iter().find(|delta| delta.key.as_ref() == key)
-        {
-            apply_changes(&mut rows, &delta.changes);
-        }
-        (!rows.is_empty()).then_some(rows)
+        self.postings.rows(key)
     }
-
     fn get_bounded(&self, key: &IndexKey, limit: usize) -> Vec<u32> {
-        let changes = self
-            .deltas
-            .get(index_key_hash(key))
-            .and_then(|bucket| bucket.iter().find(|delta| delta.key.as_ref() == key))
-            .map(|delta| &delta.changes);
-        bounded_bitmap_with_changes(self.postings.get(key), changes, limit)
+        self.postings.bounded(key, limit)
     }
-
-    fn seal(&mut self) {
-        self.postings = Arc::new(materialize_postings(&self.postings, &self.deltas));
-        self.deltas = PersistentMap::default();
-    }
-
     fn materialized(&self) -> BTreeMap<IndexKey, RoaringBitmap> {
-        materialize_postings(&self.postings, &self.deltas)
-    }
-
-    #[cfg(test)]
-    fn detached_storage_bytes_from(&self, previous: &Self) -> usize {
-        let empty = PersistentMap::default();
-        let mut bytes = self.deltas.detached_node_bytes_from(&previous.deltas);
-        for (hash, bucket) in self.deltas.iter() {
-            let old_bucket = previous.deltas.get(hash);
-            for delta in bucket.iter() {
-                let old = old_bucket
-                    .and_then(|bucket| bucket.iter().find(|old| old.key == delta.key))
-                    .map_or(&empty, |old| &old.changes);
-                bytes = bytes.saturating_add(delta.changes.detached_node_bytes_from(old));
-            }
-        }
-        bytes
+        self.postings.materialized()
     }
 }
-
-/// Sorted scalar range postings with inclusive/exclusive endpoints.
+/// Concurrent range memberships; query unions are ephemeral result memory.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RangeIndex {
-    postings: Arc<BTreeMap<IndexKey, RoaringBitmap>>,
-    #[serde(default)]
-    deltas: PersistentMap<Arc<Vec<PostingDelta>>>,
+    postings: Postings<IndexKey>,
 }
-
 impl RangeIndex {
-    pub fn insert(&mut self, value: &ScalarValue, row: u32) -> Result<()> {
+    pub fn insert(&self, value: &ScalarValue, row: u32) -> Result<()> {
         if !matches!(value, ScalarValue::Null) {
             self.insert_key(IndexKey::try_from(value)?, row);
         }
         Ok(())
     }
-
-    pub fn insert_key(&mut self, key: IndexKey, row: u32) {
-        append_posting_delta(&mut self.deltas, key, row, true);
+    pub fn insert_key(&self, key: IndexKey, row: u32) {
+        self.postings.insert(key, row);
     }
-
-    pub fn remove_key(&mut self, key: &IndexKey, row: u32) {
-        append_posting_delta(&mut self.deltas, key.clone(), row, false);
+    pub fn remove_key(&self, key: &IndexKey, row: u32) {
+        self.postings.remove(key, row);
     }
-
     fn exact_bounded(&self, key: &IndexKey, limit: usize) -> Vec<u32> {
-        let changes = self
-            .deltas
-            .get(index_key_hash(key))
-            .and_then(|bucket| bucket.iter().find(|delta| delta.key.as_ref() == key))
-            .map(|delta| &delta.changes);
-        bounded_bitmap_with_changes(self.postings.get(key), changes, limit)
+        self.postings.bounded(key, limit)
     }
-
     pub fn between(
         &self,
         lower: Option<(&IndexKey, bool)>,
         upper: Option<(&IndexKey, bool)>,
     ) -> RoaringBitmap {
-        fn in_bounds(
-            key: &IndexKey,
-            lower: Option<(&IndexKey, bool)>,
-            upper: Option<(&IndexKey, bool)>,
-        ) -> bool {
-            let above_lower = lower.is_none_or(
-                |(bound, inclusive)| {
-                    if inclusive { key >= bound } else { key > bound }
-                },
-            );
-            let below_upper = upper.is_none_or(
-                |(bound, inclusive)| {
-                    if inclusive { key <= bound } else { key < bound }
-                },
-            );
-            above_lower && below_upper
-        }
-
-        let mut result = RoaringBitmap::new();
-        for (key, base_rows) in self.postings.iter() {
-            if in_bounds(key, lower, upper) {
-                let mut rows = base_rows.clone();
-                apply_posting_delta(&mut rows, &self.deltas, key);
-                result |= rows;
-            }
-        }
-        for (_, bucket) in self.deltas.iter() {
-            for delta in bucket.iter() {
-                if !self.postings.contains_key(delta.key.as_ref())
-                    && in_bounds(&delta.key, lower, upper)
-                {
-                    let mut rows = RoaringBitmap::new();
-                    apply_changes(&mut rows, &delta.changes);
-                    result |= rows;
+        let mut rows = RoaringBitmap::new();
+        for (key, posting) in self.materialized() {
+            if lower.is_none_or(|(bound, inclusive)| {
+                if inclusive {
+                    &key >= bound
+                } else {
+                    &key > bound
                 }
-            }
-        }
-        result
-    }
-
-    fn seal(&mut self) {
-        self.postings = Arc::new(materialize_postings(&self.postings, &self.deltas));
-        self.deltas = PersistentMap::default();
-    }
-
-    fn materialized(&self) -> BTreeMap<IndexKey, RoaringBitmap> {
-        materialize_postings(&self.postings, &self.deltas)
-    }
-}
-
-fn apply_changes(rows: &mut RoaringBitmap, changes: &PersistentMap<bool>) {
-    for (row, present) in changes.iter() {
-        let Ok(row) = u32::try_from(row) else {
-            continue;
-        };
-        if *present {
-            rows.insert(row);
-        } else {
-            rows.remove(row);
-        }
-    }
-}
-
-fn bounded_bitmap_with_changes(
-    base: Option<&RoaringBitmap>,
-    changes: Option<&PersistentMap<bool>>,
-    limit: usize,
-) -> Vec<u32> {
-    let mut base = base.into_iter().flat_map(RoaringBitmap::iter).peekable();
-    let mut changes = changes
-        .into_iter()
-        .flat_map(PersistentMap::iter)
-        .filter_map(|(row, present)| u32::try_from(row).ok().map(|row| (row, *present)))
-        .peekable();
-    let mut rows = Vec::with_capacity(limit.min(4096));
-    while rows.len() < limit {
-        let next = match (base.peek().copied(), changes.peek().copied()) {
-            (Some(base_row), Some((changed_row, _))) if base_row < changed_row => {
-                base.next();
-                Some(base_row)
-            }
-            (Some(base_row), Some((changed_row, present))) if changed_row < base_row => {
-                changes.next();
-                present.then_some(changed_row)
-            }
-            (Some(base_row), Some((_, present))) => {
-                base.next();
-                changes.next();
-                present.then_some(base_row)
-            }
-            (Some(base_row), None) => {
-                base.next();
-                Some(base_row)
-            }
-            (None, Some((changed_row, present))) => {
-                changes.next();
-                present.then_some(changed_row)
-            }
-            (None, None) => break,
-        };
-        if let Some(row) = next {
-            rows.push(row);
-        }
-    }
-    rows
-}
-
-fn apply_posting_delta(
-    rows: &mut RoaringBitmap,
-    deltas: &PersistentMap<Arc<Vec<PostingDelta>>>,
-    key: &IndexKey,
-) {
-    if let Some(bucket) = deltas.get(index_key_hash(key))
-        && let Some(delta) = bucket.iter().find(|delta| delta.key.as_ref() == key)
-    {
-        apply_changes(rows, &delta.changes);
-    }
-}
-
-/// Declared document text index using normalized token postings.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct TextIndex {
-    postings: Arc<BTreeMap<String, RoaringBitmap>>,
-    rows: Arc<BTreeMap<u32, BTreeSet<String>>>,
-    #[serde(default)]
-    posting_deltas: PersistentMap<Arc<Vec<TextPostingDelta>>>,
-    #[serde(default)]
-    row_overrides: PersistentMap<Option<Arc<BTreeSet<String>>>>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct TextPostingDelta {
-    term: Arc<str>,
-    changes: PersistentMap<bool>,
-}
-
-fn text_term_hash(term: &str) -> u128 {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"text-posting\0");
-    hasher.update(term.as_bytes());
-    let digest = hasher.finalize();
-    let mut prefix = [0_u8; 16];
-    prefix.copy_from_slice(&digest.as_bytes()[..16]);
-    u128::from_le_bytes(prefix)
-}
-
-fn append_text_delta(
-    deltas: &mut PersistentMap<Arc<Vec<TextPostingDelta>>>,
-    term: String,
-    row: u32,
-    present: bool,
-) {
-    let hash = text_term_hash(&term);
-    let mut bucket = deltas.get(hash).cloned().unwrap_or_default();
-    let values = Arc::make_mut(&mut bucket);
-    if let Some(delta) = values
-        .iter_mut()
-        .find(|delta| delta.term.as_ref() == term.as_str())
-    {
-        delta.changes.insert(u128::from(row), present);
-    } else {
-        let mut changes = PersistentMap::default();
-        changes.insert(u128::from(row), present);
-        values.push(TextPostingDelta {
-            term: Arc::from(term),
-            changes,
-        });
-    }
-    deltas.insert(hash, bucket);
-}
-
-impl TextIndex {
-    pub fn upsert(&mut self, row: u32, text: &str) {
-        self.remove(row);
-        let terms = tokenize(text);
-        for term in &terms {
-            append_text_delta(&mut self.posting_deltas, term.clone(), row, true);
-        }
-        self.row_overrides
-            .insert(u128::from(row), Some(Arc::new(terms)));
-    }
-
-    pub fn remove(&mut self, row: u32) {
-        let terms = match self.row_overrides.get(u128::from(row)) {
-            Some(terms) => terms.clone(),
-            None => self.rows.get(&row).cloned().map(Arc::new),
-        };
-        let Some(terms) = terms else {
-            return;
-        };
-        for term in terms.iter() {
-            append_text_delta(&mut self.posting_deltas, term.clone(), row, false);
-        }
-        self.row_overrides.insert(u128::from(row), None);
-    }
-
-    /// AND search: every normalized query term must be present.
-    #[must_use]
-    pub fn search(&self, query: &str) -> RoaringBitmap {
-        let terms = tokenize(query);
-        let mut iter = terms.iter();
-        let Some(first) = iter.next() else {
-            return RoaringBitmap::new();
-        };
-        let Some(mut result) = self.posting(first) else {
-            return RoaringBitmap::new();
-        };
-        for term in iter {
-            let Some(rows) = self.posting(term) else {
-                return RoaringBitmap::new();
-            };
-            result &= &rows;
-        }
-        result
-    }
-
-    /// Returns a deterministic bounded OR-ranked seed set. Work is capped by query terms and
-    /// posting rows so semantic retrieval never materializes a project-sized posting union.
-    fn bounded_ranked_search(&self, query: &str, limit: usize) -> Vec<(u32, u16)> {
-        if limit == 0 {
-            return Vec::new();
-        }
-        let row_budget = limit.saturating_mul(4).max(limit);
-        let mut scores = BTreeMap::<u32, u16>::new();
-        for term in tokenize(query).into_iter().take(32) {
-            for row in self.bounded_posting_rows(&term, row_budget) {
-                scores
-                    .entry(row)
-                    .and_modify(|score| *score = score.saturating_add(1))
-                    .or_insert(1);
-            }
-        }
-        let mut ranked = scores.into_iter().collect::<Vec<_>>();
-        ranked.sort_unstable_by(|left, right| {
-            right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0))
-        });
-        ranked.truncate(limit);
-        ranked
-    }
-
-    fn bounded_posting_rows(&self, term: &str, limit: usize) -> Vec<u32> {
-        let changes = self
-            .posting_deltas
-            .get(text_term_hash(term))
-            .and_then(|bucket| bucket.iter().find(|delta| delta.term.as_ref() == term))
-            .map(|delta| &delta.changes);
-        bounded_bitmap_with_changes(self.postings.get(term), changes, limit)
-    }
-
-    fn posting(&self, term: &str) -> Option<RoaringBitmap> {
-        let mut rows = self.postings.get(term).cloned().unwrap_or_default();
-        if let Some(bucket) = self.posting_deltas.get(text_term_hash(term))
-            && let Some(delta) = bucket.iter().find(|delta| delta.term.as_ref() == term)
-        {
-            apply_changes(&mut rows, &delta.changes);
-        }
-        (!rows.is_empty()).then_some(rows)
-    }
-
-    fn materialized_postings(&self) -> BTreeMap<String, RoaringBitmap> {
-        let mut postings = self.postings.as_ref().clone();
-        for (_, bucket) in self.posting_deltas.iter() {
-            for delta in bucket.iter() {
-                let rows = postings.entry(delta.term.to_string()).or_default();
-                apply_changes(rows, &delta.changes);
-                if rows.is_empty() {
-                    postings.remove(delta.term.as_ref());
+            }) && upper.is_none_or(|(bound, inclusive)| {
+                if inclusive {
+                    &key <= bound
+                } else {
+                    &key < bound
                 }
-            }
-        }
-        postings
-    }
-
-    fn materialized_rows(&self) -> BTreeMap<u32, BTreeSet<String>> {
-        let mut rows = self.rows.as_ref().clone();
-        for (row, terms) in self.row_overrides.iter() {
-            let Ok(row) = u32::try_from(row) else {
-                continue;
-            };
-            match terms {
-                Some(terms) => {
-                    rows.insert(row, terms.as_ref().clone());
-                }
-                None => {
-                    rows.remove(&row);
-                }
+            }) {
+                rows |= posting;
             }
         }
         rows
     }
-
-    fn seal(&mut self) {
-        self.postings = Arc::new(self.materialized_postings());
-        self.rows = Arc::new(self.materialized_rows());
-        self.posting_deltas = PersistentMap::default();
-        self.row_overrides = PersistentMap::default();
+    fn materialized(&self) -> BTreeMap<IndexKey, RoaringBitmap> {
+        self.postings.materialized()
     }
-
-    #[cfg(test)]
-    fn detached_storage_bytes_from(&self, previous: &Self) -> usize {
-        let empty = PersistentMap::default();
-        let mut bytes = self
-            .posting_deltas
-            .detached_node_bytes_from(&previous.posting_deltas)
-            .saturating_add(
-                self.row_overrides
-                    .detached_node_bytes_from(&previous.row_overrides),
-            );
-        for (hash, bucket) in self.posting_deltas.iter() {
-            let old_bucket = previous.posting_deltas.get(hash);
-            for delta in bucket.iter() {
-                let old = old_bucket
-                    .and_then(|bucket| bucket.iter().find(|old| old.term == delta.term))
-                    .map_or(&empty, |old| &old.changes);
-                bytes = bytes.saturating_add(delta.changes.detached_node_bytes_from(old));
+}
+/// Token membership is updated per changed owner, without copying unrelated postings.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TextIndex {
+    postings: Postings<String>,
+    rows: ConcurrentMap<u32, Arc<BTreeSet<String>>>,
+}
+impl TextIndex {
+    pub fn upsert(&self, row: u32, text: &str) {
+        self.remove(row);
+        let terms = tokenize(text);
+        for term in &terms {
+            self.postings.insert(term.clone(), row);
+        }
+        self.rows.insert(row, Arc::new(terms));
+    }
+    pub fn remove(&self, row: u32) {
+        if let Some(terms) = self.rows.remove(&row) {
+            for term in terms.iter() {
+                self.postings.remove(term, row);
             }
         }
-        bytes
+    }
+    pub fn search(&self, query: &str) -> RoaringBitmap {
+        let terms = tokenize(query);
+        let mut terms = terms.iter();
+        let Some(first) = terms.next() else {
+            return RoaringBitmap::new();
+        };
+        let Some(mut result) = self.postings.rows(first) else {
+            return RoaringBitmap::new();
+        };
+        for term in terms {
+            let Some(rows) = self.postings.rows(term) else {
+                return RoaringBitmap::new();
+            };
+            result &= rows;
+        }
+        result
+    }
+    fn bounded_ranked_search(&self, query: &str, limit: usize) -> Vec<(u32, u16)> {
+        let mut scores = BTreeMap::<u32, u16>::new();
+        for term in tokenize(query).into_iter().take(32) {
+            for row in self.postings.bounded(&term, limit.saturating_mul(4)) {
+                *scores.entry(row).or_default() += 1;
+            }
+        }
+        let mut scores: Vec<_> = scores.into_iter().collect();
+        scores.sort_by_key(|(row, score)| (std::cmp::Reverse(*score), *row));
+        scores.truncate(limit);
+        scores
+    }
+    fn materialized_postings(&self) -> BTreeMap<String, RoaringBitmap> {
+        self.postings.materialized()
     }
 }
 
@@ -664,18 +245,177 @@ pub struct VectorHit {
     pub score: f32,
 }
 
-/// Contiguous vector matrix with stable identities and per-row revisions.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Canonical per-owner quantized vectors. Clones share the same allocations.
+#[derive(Clone)]
 pub struct VectorIndex {
     dimension: usize,
     similarity: Similarity,
     dtype: EmbeddingDType,
-    entity_ids: PagedVec<u64>,
-    /// Canonical IEEE 754 half/bfloat16 bit patterns, quantized by the sequencer.
-    values: PagedVec<u16>,
-    versions: PagedVec<u64>,
-    active: PagedVec<bool>,
-    rows: PersistentMap<usize>,
+    store: Arc<VectorStore>,
+}
+#[derive(Default)]
+struct VectorStore {
+    slots: crate::concurrent::Segments<VectorSlot>,
+    free: crate::concurrent::FreeSlots,
+    sequence: std::sync::atomic::AtomicU64,
+    rows: ConcurrentMap<u64, usize>,
+    dirty: ConcurrentMap<usize, u64>,
+    graph: arc_swap::ArcSwapOption<GraphStore>,
+    live: std::sync::atomic::AtomicUsize,
+}
+#[derive(Default)]
+struct VectorSlot {
+    entity_id: std::sync::atomic::AtomicU64,
+    deleted_revision: std::sync::atomic::AtomicU64,
+    payload: arc_swap::ArcSwapOption<VectorPayload>,
+}
+#[derive(Serialize, Deserialize)]
+struct VectorPayload {
+    entity_id: u64,
+    stamp: u64,
+    #[serde(with = "atomic_vector_revision")]
+    revision: std::sync::atomic::AtomicU64,
+    coordinates: VectorCoordinates,
+}
+mod atomic_vector_revision {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub fn serialize<S: Serializer>(value: &AtomicU64, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u64(value.load(Ordering::Acquire))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<AtomicU64, D::Error> {
+        Ok(AtomicU64::new(u64::deserialize(d)?))
+    }
+}
+#[derive(Serialize, Deserialize)]
+enum VectorCoordinates {
+    Quantized(Box<[u16]>),
+    PropertyOwner {
+        property: PropertyId,
+        kind: crate::types::EntityKind,
+    },
+}
+struct CoordinateView<'a> {
+    quantized: Option<&'a [u16]>,
+    numeric: Option<(irongraph_types::DocumentList, f32, EmbeddingDType)>,
+}
+impl CoordinateView<'_> {
+    fn iter(&self) -> impl Iterator<Item = u16> + '_ {
+        self.quantized
+            .into_iter()
+            .flat_map(|values| values.iter().copied())
+            .chain(self.numeric.iter().flat_map(|(list, norm, dtype)| {
+                list.numeric_values()
+                    .into_iter()
+                    .flatten()
+                    .map(move |value| encode_coordinate(*dtype, value as f32 / *norm))
+            }))
+    }
+}
+
+impl std::fmt::Debug for VectorIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VectorIndex")
+            .field("dimension", &self.dimension)
+            .field("rows", &self.row_count())
+            .finish()
+    }
+}
+#[derive(Serialize, Deserialize)]
+struct VectorWire {
+    dimension: usize,
+    similarity: Similarity,
+    dtype: EmbeddingDType,
+    rows: Vec<(u64, u64, Option<Arc<VectorPayload>>)>,
+    dirty: ConcurrentMap<usize, u64>,
+}
+impl Serialize for VectorIndex {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeSeq, SerializeStruct};
+        struct Rows<'a>(&'a VectorIndex);
+        impl Serialize for Rows<'_> {
+            fn serialize<S: serde::Serializer>(
+                &self,
+                s: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                let count = self.0.row_count();
+                let mut seq = s.serialize_seq(Some(count))?;
+                for row in 0..count {
+                    if let Some(slot) = self.0.store.slots.get(row) {
+                        seq.serialize_element(&(
+                            slot.entity_id.load(std::sync::atomic::Ordering::Acquire),
+                            self.0.row_version(row).unwrap_or(0),
+                            slot.payload.load_full(),
+                        ))?;
+                    }
+                }
+                seq.end()
+            }
+        }
+        let mut value = s.serialize_struct("VectorIndex", 5)?;
+        value.serialize_field("dimension", &self.dimension)?;
+        value.serialize_field("similarity", &self.similarity)?;
+        value.serialize_field("dtype", &self.dtype)?;
+        value.serialize_field("rows", &Rows(self))?;
+        value.serialize_field("dirty", &self.store.dirty)?;
+        value.end()
+    }
+}
+impl<'de> Deserialize<'de> for VectorIndex {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let wire = VectorWire::deserialize(d)?;
+        let result = Self::new_with_dtype(wire.dimension, wire.similarity, wire.dtype)
+            .map_err(serde::de::Error::custom)?;
+        for (entity, revision, payload) in wire.rows {
+            if result.store.rows.contains_key(&entity) {
+                return Err(serde::de::Error::custom("duplicate canonical vector owner"));
+            }
+            if let Some(payload) = &payload {
+                if let VectorCoordinates::Quantized(coordinates) = &payload.coordinates {
+                    result
+                        .validate_coordinates(coordinates)
+                        .map_err(serde::de::Error::custom)?;
+                }
+            }
+            let active = payload.is_some();
+            let row = result
+                .store
+                .slots
+                .push(VectorSlot {
+                    entity_id: std::sync::atomic::AtomicU64::new(entity),
+                    deleted_revision: std::sync::atomic::AtomicU64::new(revision),
+                    payload: arc_swap::ArcSwapOption::from(payload),
+                })
+                .map_err(serde::de::Error::custom)?;
+            result
+                .store
+                .free
+                .ensure(row as u32)
+                .map_err(serde::de::Error::custom)?;
+            result
+                .store
+                .sequence
+                .fetch_max(revision, std::sync::atomic::Ordering::Relaxed);
+            if active {
+                result.store.rows.insert(entity, row);
+                result
+                    .store
+                    .live
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                result.store.free.release(row as u32);
+            }
+        }
+        for (row, revision) in wire.dirty.iter() {
+            if row >= result.row_count() {
+                return Err(serde::de::Error::custom(
+                    "vector delta references a missing owner slot",
+                ));
+            }
+            result.store.dirty.insert(row, revision);
+        }
+        Ok(result)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -866,56 +606,9 @@ impl IndexDeviceImage {
 }
 
 impl VectorIndex {
-    fn rebind_shared(&mut self, backing: SharedVectorBacking) -> Result<()> {
-        if self.dimension != backing.dimension
-            || self.entity_ids.len() != backing.entity_ids.len()
-            || self.values.len() != backing.values.len()
-            || self.versions.len() != backing.versions.len()
-            || self.active.len() != backing.active.len()
-        {
-            return Err(Error::new(
-                ErrorCode::CorruptStorage,
-                "shared vector backing does not match the canonical vector column",
-            ));
-        }
-        self.entity_ids = backing.entity_ids;
-        self.values = backing.values;
-        self.versions = backing.versions;
-        self.active = backing.active;
-        Ok(())
-    }
-
-    fn device_image(&self, property: PropertyId) -> Result<VectorDeviceImage> {
-        if self.values.len()
-            != self
-                .entity_ids
-                .len()
-                .checked_mul(self.dimension)
-                .ok_or_else(|| Error::new(ErrorCode::CorruptStorage, "vector shape overflow"))?
-            || self.versions.len() != self.entity_ids.len()
-            || self.active.len() != self.entity_ids.len()
-        {
-            return Err(Error::new(
-                ErrorCode::CorruptStorage,
-                "canonical vector matrix is structurally inconsistent",
-            ));
-        }
-        Ok(VectorDeviceImage {
-            property,
-            dimension: self.dimension,
-            similarity: self.similarity,
-            dtype: self.dtype,
-            entity_ids: self.entity_ids.to_vec(),
-            values: self.values.to_vec(),
-            versions: self.versions.to_vec(),
-            active: self.active.iter().map(|active| u8::from(*active)).collect(),
-        })
-    }
-
     pub fn new(dimension: usize, similarity: Similarity) -> Result<Self> {
         Self::new_with_dtype(dimension, similarity, EmbeddingDType::F16)
     }
-
     pub fn new_with_dtype(
         dimension: usize,
         similarity: Similarity,
@@ -931,126 +624,244 @@ impl VectorIndex {
             dimension,
             similarity,
             dtype,
-            entity_ids: PagedVec::default(),
-            values: PagedVec::default(),
-            versions: PagedVec::default(),
-            active: PagedVec::default(),
-            rows: PersistentMap::default(),
+            store: Arc::new(VectorStore::default()),
         })
     }
-
-    pub fn upsert(&mut self, entity_id: u64, vector: &[f32], revision: u64) -> Result<()> {
-        let vector = self.quantize(vector)?;
-        self.upsert_quantized(entity_id, &vector, revision)
-    }
-
-    pub fn upsert_quantized(
-        &mut self,
-        entity_id: u64,
-        coordinates: &[u16],
-        revision: u64,
-    ) -> Result<()> {
+    fn validate_coordinates(&self, coordinates: &[u16]) -> Result<()> {
         if coordinates.len() != self.dimension
             || coordinates
                 .iter()
-                .map(|bits| decode_coordinate(self.dtype, *bits))
-                .any(|value| !value.is_finite())
+                .any(|bits| !decode_coordinate(self.dtype, *bits).is_finite())
         {
             return Err(Error::new(
                 ErrorCode::EmbeddingProfileMismatch,
                 "quantized vector is incompatible with the embedding profile",
             ));
         }
-        if let Some(row) = self.rows.get(u128::from(entity_id)).copied() {
-            let start = row.checked_mul(self.dimension).ok_or_else(|| {
-                Error::new(ErrorCode::ResultBudgetExceeded, "vector offset overflow")
-            })?;
-            let end = start.checked_add(self.dimension).ok_or_else(|| {
-                Error::new(ErrorCode::ResultBudgetExceeded, "vector offset overflow")
-            })?;
-            if end > self.values.len() {
-                return Err(Error::internal("vector row points outside its matrix"));
-            }
-            for (offset, coordinate) in coordinates.iter().copied().enumerate() {
-                let target = self
-                    .values
-                    .get_mut(start + offset)
-                    .ok_or_else(|| Error::internal("vector row points outside its matrix"))?;
-                *target = coordinate;
-            }
-            if let Some(version) = self.versions.get_mut(row) {
-                *version = revision;
-            }
-            if let Some(active) = self.active.get_mut(row) {
-                *active = true;
-            }
-            return Ok(());
-        }
-        let row = self.entity_ids.len();
-        self.entity_ids.push(entity_id);
-        for coordinate in coordinates {
-            self.values.push(*coordinate);
-        }
-        self.versions.push(revision);
-        self.active.push(true);
-        self.rows.insert(u128::from(entity_id), row);
         Ok(())
     }
-
-    pub fn remove(&mut self, entity_id: u64, revision: u64) {
-        if let Some(row) = self.rows.get(u128::from(entity_id)).copied() {
-            if let Some(active) = self.active.get_mut(row) {
-                *active = false;
+    pub fn upsert(&self, entity_id: u64, vector: &[f32], revision: u64) -> Result<()> {
+        self.upsert_quantized(entity_id, &self.quantize(vector)?, revision)
+    }
+    pub fn upsert_quantized(
+        &self,
+        entity_id: u64,
+        coordinates: &[u16],
+        revision: u64,
+    ) -> Result<()> {
+        self.validate_coordinates(coordinates)?;
+        self.publish_payload(
+            entity_id,
+            VectorCoordinates::Quantized(coordinates.into()),
+            revision,
+        )
+    }
+    fn publish_payload(
+        &self,
+        entity_id: u64,
+        coordinates: VectorCoordinates,
+        revision: u64,
+    ) -> Result<()> {
+        let payload = Arc::new(VectorPayload {
+            entity_id,
+            stamp: self
+                .store
+                .sequence
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1,
+            revision: std::sync::atomic::AtomicU64::new(revision),
+            coordinates,
+        });
+        let stamp = payload.stamp;
+        if let Some(row) = self.store.rows.get(&entity_id) {
+            let slot = self
+                .store
+                .slots
+                .get(row)
+                .ok_or_else(|| Error::internal("vector owner slot is missing"))?;
+            if slot.payload.swap(Some(payload)).is_none() {
+                self.store
+                    .live
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
             }
-            if let Some(version) = self.versions.get_mut(row) {
-                *version = revision;
+            self.store.dirty.insert(row, stamp);
+        } else {
+            let row = if let Some(row) = self.store.free.pop() {
+                let row = row as usize;
+                let slot = self
+                    .store
+                    .slots
+                    .get(row)
+                    .ok_or_else(|| Error::internal("free vector slot is missing"))?;
+                slot.entity_id
+                    .store(entity_id, std::sync::atomic::Ordering::Release);
+                slot.payload.store(Some(payload));
+                row
+            } else {
+                let row = self.store.slots.push(VectorSlot {
+                    entity_id: std::sync::atomic::AtomicU64::new(entity_id),
+                    deleted_revision: std::sync::atomic::AtomicU64::new(stamp),
+                    payload: arc_swap::ArcSwapOption::from(Some(payload)),
+                })?;
+                let row_id = u32::try_from(row).map_err(|_| {
+                    Error::new(ErrorCode::ResultBudgetExceeded, "vector rows exceed u32")
+                })?;
+                self.store.free.ensure(row_id)?;
+                row
+            };
+            self.store.rows.insert(entity_id, row);
+            self.store.dirty.insert(row, stamp);
+            self.store
+                .live
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
+    }
+    /// Binds the same canonical graph allocation; no graph or vector payload is copied.
+    pub fn bind_canonical_graph(&self, graph: &GraphStore) {
+        self.store.graph.store(Some(Arc::new(graph.clone())));
+    }
+    pub fn upsert_property_owner(
+        &self,
+        graph: &GraphStore,
+        kind: crate::types::EntityKind,
+        property: PropertyId,
+        entity_id: u64,
+        revision: u64,
+    ) -> Result<()> {
+        let value = match kind {
+            crate::types::EntityKind::Node => graph
+                .node(crate::NodeId(entity_id))
+                .and_then(|node| node.property(property)),
+            crate::types::EntityKind::Relationship => graph
+                .edge(crate::EdgeId(entity_id))
+                .and_then(|edge| edge.property(property)),
+        };
+        let Some(ScalarValue::List(list)) = value else {
+            return Err(Error::new(
+                ErrorCode::EmbeddingProfileMismatch,
+                "vector property owner has no numeric list",
+            ));
+        };
+        self.numeric_norm(&list)?;
+        if self.store.graph.load().is_none() {
+            self.bind_canonical_graph(graph);
+        }
+        self.publish_payload(
+            entity_id,
+            VectorCoordinates::PropertyOwner { property, kind },
+            revision,
+        )
+    }
+    fn numeric_norm(&self, list: &irongraph_types::DocumentList) -> Result<f32> {
+        let values = list.numeric_values()?;
+        if values.len() != self.dimension {
+            return Err(Error::new(
+                ErrorCode::EmbeddingProfileMismatch,
+                "canonical vector property has wrong dimension",
+            ));
+        }
+        let mut squared = 0.0_f32;
+        for value in values {
+            let value = value as f32;
+            if !value.is_finite() {
+                return Err(Error::new(
+                    ErrorCode::EmbeddingProfileMismatch,
+                    "canonical vector property coordinate is not finite",
+                ));
+            }
+            squared += value * value;
+        }
+        let norm = if self.similarity == Similarity::Cosine {
+            squared.sqrt()
+        } else {
+            1.0
+        };
+        if !norm.is_finite() || norm <= f32::EPSILON {
+            return Err(Error::new(
+                ErrorCode::EmbeddingProfileMismatch,
+                "canonical vector property has invalid norm",
+            ));
+        }
+        Ok(norm)
+    }
+    fn payload_coordinates<'a>(
+        &self,
+        entity_id: u64,
+        payload: &'a VectorPayload,
+    ) -> Result<Option<CoordinateView<'a>>> {
+        match &payload.coordinates {
+            VectorCoordinates::Quantized(coordinates) => Ok(Some(CoordinateView {
+                quantized: Some(coordinates),
+                numeric: None,
+            })),
+            VectorCoordinates::PropertyOwner { property, kind } => {
+                let graph = self.store.graph.load();
+                let Some(graph) = graph.as_ref() else {
+                    return Ok(None);
+                };
+                let value = match kind {
+                    crate::types::EntityKind::Node => graph
+                        .node(crate::NodeId(entity_id))
+                        .and_then(|node| node.property(*property)),
+                    crate::types::EntityKind::Relationship => graph
+                        .edge(crate::EdgeId(entity_id))
+                        .and_then(|edge| edge.property(*property)),
+                };
+                let Some(ScalarValue::List(list)) = value else {
+                    return Ok(None);
+                };
+                let Ok(norm) = self.numeric_norm(&list) else {
+                    return Ok(None);
+                };
+                Ok(Some(CoordinateView {
+                    quantized: None,
+                    numeric: Some((list, norm, self.dtype)),
+                }))
             }
         }
     }
-
-    fn retain_entities(&mut self, retained: &BTreeSet<u64>) -> Result<BTreeMap<usize, u32>> {
-        let mut filtered = Self::new_with_dtype(self.dimension, self.similarity, self.dtype)?;
-        let mut remap = BTreeMap::new();
-        for row in 0..self.entity_ids.len() {
-            let Some(entity) = self.entity_ids.get(row).copied() else {
-                continue;
-            };
-            if !self.active.get(row).copied().unwrap_or(false) || !retained.contains(&entity) {
-                continue;
+    pub fn remove(&self, entity_id: u64, _revision: u64) {
+        if let Some(row) = self.store.rows.remove(&entity_id) {
+            if let Some(slot) = self.store.slots.get(row) {
+                let stamp = self
+                    .store
+                    .sequence
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                slot.deleted_revision
+                    .store(stamp, std::sync::atomic::Ordering::Release);
+                if slot.payload.swap(None).is_some() {
+                    self.store
+                        .live
+                        .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                }
+                self.store.dirty.insert(row, stamp);
+                self.store.free.release(row as u32);
             }
-            let start = row.checked_mul(self.dimension).ok_or_else(|| {
-                Error::new(ErrorCode::CorruptStorage, "vector row offset overflow")
-            })?;
-            let mut coordinates = Vec::with_capacity(self.dimension);
-            for offset in 0..self.dimension {
-                coordinates.push(*self.values.get(start + offset).ok_or_else(|| {
-                    Error::new(
-                        ErrorCode::CorruptStorage,
-                        "vector row points outside its canonical matrix",
-                    )
-                })?);
-            }
-            let revision = self.versions.get(row).copied().ok_or_else(|| {
-                Error::new(ErrorCode::CorruptStorage, "vector row has no revision")
-            })?;
-            let next_row = u32::try_from(filtered.entity_ids.len()).map_err(|_| {
-                Error::new(
-                    ErrorCode::ResultBudgetExceeded,
-                    "filtered vector row exceeds device index width",
-                )
-            })?;
-            filtered.upsert_quantized(entity, &coordinates, revision)?;
-            remap.insert(row, next_row);
         }
-        *self = filtered;
+    }
+    fn retain_entities(&self, retained: &BTreeSet<u64>) -> Result<BTreeMap<usize, u32>> {
+        let mut remap = BTreeMap::new();
+        for row in 0..self.row_count() {
+            if let Some(entity) = self.row_entity(row) {
+                if retained.contains(&entity) && self.row_active(row) {
+                    remap.insert(
+                        row,
+                        u32::try_from(row).map_err(|_| {
+                            Error::new(ErrorCode::ResultBudgetExceeded, "vector row exceeds u32")
+                        })?,
+                    );
+                } else {
+                    self.remove(entity, self.row_version(row).unwrap_or(0));
+                }
+            }
+        }
         Ok(remap)
     }
-
     pub fn exact_search(&self, query: &[f32], limit: usize) -> Result<Vec<VectorHit>> {
         self.exact_search_where(query, limit, |_| true)
     }
-
-    /// Filters visible owners before ranking so hidden or nonmatching entities never consume k.
     pub fn exact_search_where(
         &self,
         query: &[f32],
@@ -1058,38 +869,135 @@ impl VectorIndex {
         visible: impl Fn(u64) -> bool,
     ) -> Result<Vec<VectorHit>> {
         let query = self.prepare(query)?;
-        let mut hits = Vec::with_capacity(self.active.iter().filter(|active| **active).count());
-        for row in 0..self.entity_ids.len() {
-            if !self.active.get(row).copied().unwrap_or(false) {
-                continue;
-            }
-            if !visible(self.entity_ids.get(row).copied().unwrap_or_default()) {
-                continue;
-            }
-            let Some(vector) = self.vector(row) else {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut hits = Vec::with_capacity(limit.min(self.len()));
+        for row in 0..self.row_count() {
+            let Some(slot) = self.store.slots.get(row) else {
                 continue;
             };
-            hits.push(VectorHit {
-                entity_id: self.entity_ids.get(row).copied().unwrap_or_default(),
-                score: public_score(self.similarity, &query, &vector),
+            let payload = slot.payload.load();
+            let Some(payload) = payload.as_ref() else {
+                continue;
+            };
+            if !visible(payload.entity_id) {
+                continue;
+            }
+            let Some(coordinates) = self.payload_coordinates(payload.entity_id, payload)? else {
+                continue;
+            };
+            let score = match self.similarity {
+                Similarity::Euclidean => query
+                    .iter()
+                    .zip(coordinates.iter())
+                    .map(|(left, bits)| {
+                        let delta = left - decode_coordinate(self.dtype, bits);
+                        delta * delta
+                    })
+                    .sum::<f32>()
+                    .sqrt(),
+                Similarity::Dot | Similarity::Cosine => query
+                    .iter()
+                    .zip(coordinates.iter())
+                    .map(|(left, bits)| left * decode_coordinate(self.dtype, bits))
+                    .sum(),
+            };
+            let hit = VectorHit {
+                entity_id: payload.entity_id,
+                score,
+            };
+            let at = hits.partition_point(|current: &VectorHit| {
+                let order = if self.similarity == Similarity::Euclidean {
+                    current.score.total_cmp(&hit.score)
+                } else {
+                    hit.score.total_cmp(&current.score)
+                };
+                order
+                    .then_with(|| current.entity_id.cmp(&hit.entity_id))
+                    .is_lt()
             });
+            if at < limit {
+                hits.insert(at, hit);
+                if hits.len() > limit {
+                    hits.pop();
+                }
+            }
         }
         sort_hits(&mut hits, self.similarity);
         hits.truncate(limit);
         Ok(hits)
     }
-
-    /// Decodes one active canonical row for model-memory projection.
-    #[must_use]
-    pub fn vector_for(&self, entity_id: u64) -> Option<Vec<f32>> {
-        let row = self.rows.get(u128::from(entity_id)).copied()?;
-        self.active
-            .get(row)
-            .copied()
-            .unwrap_or(false)
-            .then(|| self.vector(row))?
+    fn acknowledge_ann(&self, ann: &IvfPqIndex) {
+        for (row, revision) in self.store.dirty.iter() {
+            let built = ann
+                .rows
+                .binary_search(&(row as u32))
+                .ok()
+                .and_then(|at| ann.built_versions.get(at))
+                .copied();
+            if built == Some(revision)
+                || (!self.row_active(row) && self.row_version(row) == Some(revision))
+            {
+                self.store.dirty.remove_matching(&row, &revision);
+            }
+        }
     }
-
+    pub fn vector_for(&self, entity_id: u64) -> Option<Vec<f32>> {
+        let slot = self.store.slots.get(self.store.rows.get(&entity_id)?)?;
+        let payload = slot.payload.load();
+        let payload = payload.as_ref()?;
+        (payload.entity_id == entity_id)
+            .then(|| self.decode_payload(payload))
+            .flatten()
+    }
+    /// Current owner revision without reading or decoding vector coordinates.
+    pub fn row_revision(&self, entity_id: u64) -> Option<u64> {
+        let slot = self.store.slots.get(self.store.rows.get(&entity_id)?)?;
+        let payload = slot.payload.load();
+        let payload = payload.as_ref()?;
+        (payload.entity_id == entity_id)
+            .then(|| payload.revision.load(std::sync::atomic::Ordering::Acquire))
+    }
+    /// Advance freshness after a metadata-only owner mutation, without replacing coordinates.
+    /// A vector older than the previous owner revision remains stale.
+    pub fn advance_row_revision(
+        &self,
+        entity_id: u64,
+        expected_old_revision: u64,
+        new_revision: u64,
+    ) -> bool {
+        use std::sync::atomic::Ordering;
+        let Some(row) = self.store.rows.get(&entity_id) else {
+            return false;
+        };
+        let Some(slot) = self.store.slots.get(row) else {
+            return false;
+        };
+        let guard = slot.payload.load();
+        let Some(payload) = guard.as_ref() else {
+            return false;
+        };
+        if payload.entity_id != entity_id || new_revision < expected_old_revision {
+            return false;
+        }
+        let previous = payload.revision.load(Ordering::Acquire);
+        if previous < expected_old_revision || previous > new_revision {
+            return false;
+        }
+        if payload
+            .revision
+            .compare_exchange(previous, new_revision, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        let current = slot.payload.load();
+        current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, payload))
+            && self.store.rows.get(&entity_id) == Some(row)
+    }
     fn prepare(&self, vector: &[f32]) -> Result<Vec<f32>> {
         if vector.len() != self.dimension || vector.iter().any(|value| !value.is_finite()) {
             return Err(Error::new(
@@ -1099,7 +1007,7 @@ impl VectorIndex {
         }
         let mut result = vector.to_vec();
         if self.similarity == Similarity::Cosine {
-            let norm = result.iter().map(|value| value * value).sum::<f32>().sqrt();
+            let norm = result.iter().map(|v| v * v).sum::<f32>().sqrt();
             if norm <= f32::EPSILON {
                 return Err(Error::new(
                     ErrorCode::EmbeddingProfileMismatch,
@@ -1112,71 +1020,108 @@ impl VectorIndex {
         }
         Ok(result)
     }
-
     pub fn quantize(&self, vector: &[f32]) -> Result<Vec<u16>> {
         Ok(self
             .prepare(vector)?
             .into_iter()
-            .map(|value| encode_coordinate(self.dtype, value))
+            .map(|v| encode_coordinate(self.dtype, v))
             .collect())
     }
-
     fn vector(&self, row: usize) -> Option<Vec<f32>> {
-        let start = row.checked_mul(self.dimension)?;
-        let end = start.checked_add(self.dimension)?;
-        (start..end)
-            .map(|index| {
-                self.values
-                    .get(index)
-                    .copied()
-                    .map(|bits| decode_coordinate(self.dtype, bits))
-            })
-            .collect()
+        let slot = self.store.slots.get(row)?;
+        let payload = slot.payload.load();
+        self.decode_payload(payload.as_ref()?)
     }
-
-    #[must_use]
+    fn decode_payload(&self, payload: &VectorPayload) -> Option<Vec<f32>> {
+        let coordinates = self
+            .payload_coordinates(payload.entity_id, payload)
+            .ok()??;
+        Some(
+            coordinates
+                .iter()
+                .map(|v| decode_coordinate(self.dtype, v))
+                .collect(),
+        )
+    }
+    fn row_active(&self, row: usize) -> bool {
+        self.store
+            .slots
+            .get(row)
+            .is_some_and(|slot| slot.payload.load().is_some())
+    }
+    fn row_entity(&self, row: usize) -> Option<u64> {
+        self.store
+            .slots
+            .get(row)
+            .map(|slot| slot.entity_id.load(std::sync::atomic::Ordering::Acquire))
+    }
+    fn row_version(&self, row: usize) -> Option<u64> {
+        self.store.slots.get(row).map(|slot| {
+            slot.payload.load().as_ref().map_or_else(
+                || {
+                    slot.deleted_revision
+                        .load(std::sync::atomic::Ordering::Acquire)
+                },
+                |payload| payload.stamp,
+            )
+        })
+    }
     pub const fn dimension(&self) -> usize {
         self.dimension
     }
-
-    #[must_use]
     pub const fn similarity(&self) -> Similarity {
         self.similarity
     }
-
-    #[must_use]
     pub const fn dtype(&self) -> EmbeddingDType {
         self.dtype
     }
-
-    #[must_use]
     pub fn len(&self) -> usize {
-        self.active.iter().filter(|active| **active).count()
+        self.store.live.load(std::sync::atomic::Ordering::Acquire)
     }
-
-    /// Allocated owner slots, available without scanning live flags.
-    #[must_use]
     pub fn row_count(&self) -> usize {
-        self.entity_ids.len()
+        self.store.slots.len()
     }
-
-    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-
-    #[cfg(test)]
-    fn detached_storage_bytes_from(&self, previous: &Self) -> usize {
-        self.entity_ids
-            .detached_page_bytes_from(&previous.entity_ids)
-            .saturating_add(self.values.detached_page_bytes_from(&previous.values))
-            .saturating_add(self.versions.detached_page_bytes_from(&previous.versions))
-            .saturating_add(self.active.detached_page_bytes_from(&previous.active))
-            .saturating_add(self.rows.detached_node_bytes_from(&previous.rows))
+    fn device_image(&self, property: PropertyId) -> Result<VectorDeviceImage> {
+        let mut entity_ids = Vec::new();
+        let mut values = Vec::new();
+        let mut versions = Vec::new();
+        let mut active = Vec::new();
+        for row in 0..self.row_count() {
+            let slot = self
+                .store
+                .slots
+                .get(row)
+                .ok_or_else(|| Error::internal("missing vector slot"))?;
+            let payload = slot.payload.load();
+            entity_ids.push(slot.entity_id.load(std::sync::atomic::Ordering::Acquire));
+            versions.push(self.row_version(row).unwrap_or(0));
+            active.push(u8::from(payload.is_some()));
+            if let Some(coordinates) = payload.as_ref().and_then(|payload| {
+                self.payload_coordinates(payload.entity_id, payload)
+                    .ok()
+                    .flatten()
+            }) {
+                values.extend(coordinates.iter());
+            } else {
+                values.resize(values.len() + self.dimension, 0);
+            }
+        }
+        Ok(VectorDeviceImage {
+            property,
+            dimension: self.dimension,
+            similarity: self.similarity,
+            dtype: self.dtype,
+            entity_ids,
+            values,
+            versions,
+            active,
+        })
     }
 }
 
-/// Frozen deterministic IVF-PQ build/search parameters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IvfPqConfig {
     pub size_class_version: u16,
@@ -1634,7 +1579,7 @@ impl IvfPqIndex {
     ) -> Result<Self> {
         check_ivf_build_cancelled(cancellation)?;
         validate_ivf_config(source, config)?;
-        let active_rows = source.active.iter().filter(|active| **active).count();
+        let active_rows = source.len();
         if active_rows == 0 {
             return Err(Error::new(
                 ErrorCode::IndexUnavailable,
@@ -1767,7 +1712,7 @@ impl IvfPqIndex {
                 if self
                     .rows
                     .get(*position as usize)
-                    .is_none_or(|row| !source.active.get(*row as usize).copied().unwrap_or(false))
+                    .is_none_or(|row| !source.row_active(*row as usize))
                 {
                     continue;
                 }
@@ -1803,36 +1748,28 @@ impl IvfPqIndex {
                 candidate_rows.insert(row as usize);
             }
         }
-        let mut built_position = 0_usize;
-        for row in 0..source.entity_ids.len() {
-            while self
-                .rows
-                .get(built_position)
-                .is_some_and(|built| (*built as usize) < row)
-            {
-                built_position += 1;
-            }
+        for (row, revision) in source.store.dirty.iter() {
             let built_revision = self
                 .rows
-                .get(built_position)
-                .filter(|built| (**built as usize) == row)
-                .and_then(|_| self.built_versions.get(built_position))
+                .binary_search(&(row as u32))
+                .ok()
+                .and_then(|position| self.built_versions.get(position))
                 .copied();
-            if built_revision != source.versions.get(row).copied() {
+            if built_revision != Some(revision) {
                 candidate_rows.insert(row);
             }
         }
         let mut hits = Vec::new();
         for row in candidate_rows {
-            if !source.active.get(row).copied().unwrap_or(false) {
+            if !source.row_active(row) {
                 continue;
             }
-            let (Some(entity_id), Some(vector)) = (source.entity_ids.get(row), source.vector(row))
+            let (Some(entity_id), Some(vector)) = (source.row_entity(row), source.vector(row))
             else {
                 continue;
             };
             hits.push(VectorHit {
-                entity_id: *entity_id,
+                entity_id,
                 score: public_score(self.similarity, &query, &vector),
             });
         }
@@ -1867,7 +1804,8 @@ fn deterministic_training_sample(
     let mut training = Vec::with_capacity(training_count);
     let mut active_position = 0_usize;
     let mut target_position = 0_usize;
-    for (row, active) in source.active.iter().copied().enumerate() {
+    for row in 0..source.row_count() {
+        let active = source.row_active(row);
         if !active {
             continue;
         }
@@ -1914,7 +1852,8 @@ fn stream_encode_rows(
         .map(|book| flatten_centroids(book))
         .collect::<Vec<_>>();
     let mut batch_rows = Vec::with_capacity(plan.batch_rows);
-    for (row, active) in source.active.iter().copied().enumerate() {
+    for row in 0..source.row_count() {
+        let active = source.row_active(row);
         if row.is_multiple_of(plan.batch_rows.max(1)) {
             check_ivf_build_cancelled(cancellation)?;
         }
@@ -2092,7 +2031,7 @@ fn encode_ivf_pq_batch(
                 )
             })?;
         rows.push(u32_len(row, "IVF source row")?);
-        built_versions.push(source.versions.get(row).copied().ok_or_else(|| {
+        built_versions.push(source.row_version(row).ok_or_else(|| {
             Error::new(
                 ErrorCode::CorruptStorage,
                 "canonical vector revisions are structurally inconsistent",
@@ -2406,7 +2345,7 @@ enum RuntimeIndex {
     Text(TextIndex),
     Vector {
         property: PropertyId,
-        approximate: Option<IvfPqIndex>,
+        approximate: Option<Arc<IvfPqIndex>>,
     },
 }
 
@@ -2421,23 +2360,514 @@ struct IndexEntry {
 /// Project-scoped durable definitions plus rebuildable physical index state and canonical vectors.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct IndexCatalog {
-    entries: BTreeMap<String, Arc<IndexEntry>>,
-    embeddings: BTreeMap<String, EmbeddingIndexDefinition>,
-    profile: Option<EmbeddingProfile>,
+    entries: EntryMap,
+    embeddings: ConcurrentMap<String, EmbeddingIndexDefinition>,
+    profile: ProfileCell,
     /// Vectors are canonical embedding rows; ANN structures in `entries` are derived.
-    vector_columns: BTreeMap<PropertyId, Arc<VectorIndex>>,
+    vector_columns: ConcurrentMap<PropertyId, Arc<VectorIndex>>,
     /// Allocated source slots covered by the last successful automatic-index build. Deleted
     /// owners keep their slots, so live ANN row counts cannot measure subsequent source growth.
     #[serde(default)]
-    semantic_built_slots: BTreeMap<PropertyId, usize>,
+    semantic_built_slots: ConcurrentMap<PropertyId, usize>,
     #[serde(skip)]
-    optimizer_generation_cache: OnceLock<[u8; 32]>,
+    optimizer_generation_cache: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl IndexCatalog {
+    /// Simulates only keys affected by this batch. Canonical rows and postings remain untouched.
+    pub fn validate_graph_mutations(
+        &self,
+        graph: &GraphStore,
+        mutations: &[GraphMutation],
+    ) -> Result<()> {
+        let constraints: Vec<_> = self.constraint_definitions().collect();
+        if constraints.is_empty() {
+            return Ok(());
+        }
+        struct Keys {
+            active: bool,
+            labels: BTreeSet<LabelId>,
+            properties: BTreeMap<PropertyId, ScalarValue>,
+        }
+        impl Keys {
+            fn key(&self, definition: &GraphIndexDefinition) -> Result<Option<IndexKey>> {
+                if !self.active || !self.labels.contains(&definition.label) {
+                    return Ok(None);
+                }
+                let Some(value) = self.properties.get(&definition.properties[0]) else {
+                    return Ok(None);
+                };
+                if matches!(value, ScalarValue::Null) {
+                    return Ok(None);
+                }
+                IndexKey::try_from(value).map(Some)
+            }
+        }
+        let properties: BTreeSet<_> = constraints
+            .iter()
+            .flat_map(|definition| definition.properties.iter().copied())
+            .collect();
+        let mut pending = BTreeMap::<crate::NodeId, Keys>::new();
+        let mut claims = BTreeMap::<(String, IndexKey), crate::NodeId>::new();
+        for mutation in mutations {
+            let owner = match mutation {
+                GraphMutation::InsertNode(input) => input.id,
+                GraphMutation::SetNodeProperty { node, .. }
+                | GraphMutation::AddNodeLabels { node, .. }
+                | GraphMutation::RemoveNodeLabels { node, .. }
+                | GraphMutation::DeleteNode { node, .. } => *node,
+                _ => continue,
+            };
+            pending.entry(owner).or_insert_with(|| {
+                if let Some(node) = graph.node(owner) {
+                    Keys {
+                        active: true,
+                        labels: node.labels().iter().copied().collect(),
+                        properties: properties
+                            .iter()
+                            .filter_map(|property| {
+                                node.property(*property).map(|value| (*property, value))
+                            })
+                            .collect(),
+                    }
+                } else {
+                    Keys {
+                        active: false,
+                        labels: BTreeSet::new(),
+                        properties: BTreeMap::new(),
+                    }
+                }
+            });
+            let state = pending
+                .get_mut(&owner)
+                .ok_or_else(|| Error::internal("validation owner disappeared"))?;
+            for definition in &constraints {
+                if let Some(key) = state.key(definition)? {
+                    claims.remove(&(definition.name.clone(), key));
+                }
+            }
+            match mutation {
+                GraphMutation::InsertNode(input) => {
+                    state.active = true;
+                    state.labels = input.labels.iter().copied().collect();
+                    state.properties = input
+                        .properties
+                        .iter()
+                        .filter(|(property, _)| properties.contains(property))
+                        .cloned()
+                        .collect();
+                }
+                GraphMutation::SetNodeProperty {
+                    property, value, ..
+                } => {
+                    if properties.contains(property) {
+                        state.properties.insert(*property, value.clone());
+                    }
+                }
+                GraphMutation::AddNodeLabels { labels, .. } => {
+                    state.labels.extend(labels.iter().copied())
+                }
+                GraphMutation::RemoveNodeLabels { labels, .. } => {
+                    state.labels.retain(|label| !labels.contains(label))
+                }
+                GraphMutation::DeleteNode { .. } => state.active = false,
+                _ => {}
+            }
+            for definition in &constraints {
+                let key = pending
+                    .get(&owner)
+                    .ok_or_else(|| Error::internal("validation owner disappeared"))?
+                    .key(definition)?;
+                let Some(key) = key else {
+                    continue;
+                };
+                if claims
+                    .get(&(definition.name.clone(), key.clone()))
+                    .is_some_and(|other| *other != owner)
+                {
+                    return Err(Error::new(
+                        ErrorCode::TransactionConflict,
+                        "node property uniqueness constraint was violated",
+                    ));
+                }
+                let entry = self
+                    .entries
+                    .get(&definition.name)
+                    .ok_or_else(|| Error::internal("constraint disappeared during validation"))?;
+                let Some(RuntimeIndex::Equality(index)) = entry.runtime.as_deref() else {
+                    return Err(Error::new(
+                        ErrorCode::IndexUnavailable,
+                        "constraint has no equality runtime",
+                    ));
+                };
+                if let Some(rows) = index.get(&key) {
+                    for row in rows {
+                        let Some(node) = graph.node_dense(row) else {
+                            continue;
+                        };
+                        if node.id() == owner {
+                            continue;
+                        }
+                        let conflict = if let Some(changed) = pending.get(&node.id()) {
+                            changed.key(definition)?.as_ref() == Some(&key)
+                        } else {
+                            node.labels().contains(&definition.label)
+                                && composite_key(node, &definition.properties)?.as_ref()
+                                    == Some(&key)
+                        };
+                        if conflict {
+                            return Err(Error::new(
+                                ErrorCode::TransactionConflict,
+                                "node property uniqueness constraint was violated",
+                            ));
+                        }
+                    }
+                }
+                claims.insert((definition.name.clone(), key), owner);
+            }
+        }
+        Ok(())
+    }
+
+    /// Read-only pre-WAL validation: no canonical definition or vector is changed here.
+    pub fn validate_activate_profile(&self, profile: &EmbeddingProfile) -> Result<()> {
+        profile.validate()?;
+        if self
+            .profile
+            .get()
+            .is_some_and(|current| current.as_ref() != profile)
+            && !self.embedding_profile_is_mutable()
+        {
+            return Err(Error::new(
+                ErrorCode::EmbeddingProfileImmutable,
+                "project embedding profile is fixed by vector data or an index",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_initialize_semantic(&self, profile: &EmbeddingProfile) -> Result<()> {
+        self.validate_activate_profile(profile)?;
+        for (name, property) in [
+            (SEMANTIC_NODE_INDEX, SEMANTIC_NODE_PROPERTY),
+            (SEMANTIC_RELATIONSHIP_INDEX, SEMANTIC_RELATIONSHIP_PROPERTY),
+        ] {
+            if self
+                .entries
+                .get(name)
+                .is_some_and(|entry| entry.definition.properties != [property])
+            {
+                return Err(Error::new(
+                    ErrorCode::QueryType,
+                    "automatic semantic index name is reserved",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_create(
+        &self,
+        graph: &GraphStore,
+        definition: &GraphIndexDefinition,
+    ) -> Result<()> {
+        if matches!(
+            definition.name.as_str(),
+            SEMANTIC_INDEX | SEMANTIC_NODE_INDEX | SEMANTIC_RELATIONSHIP_INDEX
+        ) {
+            return Err(Error::new(
+                ErrorCode::QueryType,
+                "automatic semantic index name is reserved",
+            ));
+        }
+        validate_definition(graph, definition)?;
+        if self.contains(&definition.name) {
+            return Err(Error::new(
+                ErrorCode::TransactionConflict,
+                "index already exists",
+            ));
+        }
+        if definition.kind == GraphIndexKind::Vector {
+            let profile = self.profile.get().ok_or_else(|| {
+                Error::new(
+                    ErrorCode::EmbeddingProfileMismatch,
+                    "vector index requires a project embedding profile",
+                )
+            })?;
+            profile.validate()?;
+            self.ensure_vector_property_available(definition.properties[0])?;
+            let validator = VectorIndex::new_with_dtype(
+                profile.dimension as usize,
+                profile.similarity,
+                profile.dtype,
+            )?;
+            for node in graph
+                .nodes()
+                .filter(|node| node.labels().contains(&definition.label))
+            {
+                match node.property(definition.properties[0]) {
+                    Some(ScalarValue::List(list)) => {
+                        validator.numeric_norm(&list)?;
+                    }
+                    None | Some(ScalarValue::Null) => {}
+                    Some(_) => {
+                        return Err(Error::new(
+                            ErrorCode::EmbeddingProfileMismatch,
+                            "vector property requires a numeric list",
+                        ));
+                    }
+                }
+            }
+        }
+        if definition.unique {
+            let mut keys = BTreeSet::new();
+            for node in graph
+                .nodes()
+                .filter(|node| node.labels().contains(&definition.label))
+            {
+                if let Some(key) = composite_key(node, &definition.properties)? {
+                    if !keys.insert(key) {
+                        return Err(Error::new(
+                            ErrorCode::TransactionConflict,
+                            "node property uniqueness constraint was violated",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_drop_index(&self, name: &str) -> Result<()> {
+        if matches!(
+            name,
+            SEMANTIC_INDEX | SEMANTIC_NODE_INDEX | SEMANTIC_RELATIONSHIP_INDEX
+        ) {
+            return Err(Error::new(
+                ErrorCode::QueryType,
+                "automatic semantic indexes cannot be dropped",
+            ));
+        }
+        let entry = self
+            .entries
+            .get(name)
+            .ok_or_else(|| Error::new(ErrorCode::IndexUnavailable, "index does not exist"))?;
+        if entry.definition.unique {
+            return Err(Error::new(
+                ErrorCode::QueryType,
+                "remove an enforced constraint with DROP CONSTRAINT",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_drop_constraint(&self, name: &str) -> Result<()> {
+        if self
+            .entries
+            .get(name)
+            .is_none_or(|entry| !entry.definition.unique)
+        {
+            return Err(Error::new(
+                ErrorCode::IndexUnavailable,
+                "uniqueness constraint does not exist",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_create_embedding(
+        &self,
+        graph: &GraphStore,
+        definition: &EmbeddingIndexDefinition,
+        profile: &EmbeddingProfile,
+        rows: &[(u64, Vec<u16>, u64)],
+    ) -> Result<()> {
+        self.validate_activate_profile(profile)?;
+        let ordinary = GraphIndexDefinition {
+            name: definition.name.clone(),
+            kind: GraphIndexKind::Vector,
+            label: definition.label,
+            properties: vec![definition.target_property],
+            unique: false,
+        };
+        if matches!(
+            definition.name.as_str(),
+            SEMANTIC_INDEX | SEMANTIC_NODE_INDEX | SEMANTIC_RELATIONSHIP_INDEX
+        ) {
+            return Err(Error::new(
+                ErrorCode::QueryType,
+                "automatic semantic index name is reserved",
+            ));
+        }
+        validate_definition(graph, &ordinary)?;
+        if self.contains(&definition.name) {
+            return Err(Error::new(
+                ErrorCode::TransactionConflict,
+                "index already exists",
+            ));
+        }
+        if definition.model.to_ascii_lowercase() != "default"
+            || graph
+                .catalog()
+                .property_name(definition.source_property)
+                .is_none()
+        {
+            return Err(Error::new(
+                ErrorCode::EmbeddingProfileMismatch,
+                "embedding declaration does not match the active model or schema",
+            ));
+        }
+        self.ensure_vector_property_available(definition.target_property)?;
+        let validator = VectorIndex::new_with_dtype(
+            profile.dimension as usize,
+            profile.similarity,
+            profile.dtype,
+        )?;
+        for (owner, coordinates, _) in rows {
+            validator.validate_coordinates(coordinates)?;
+            let node = graph.node(crate::NodeId(*owner)).ok_or_else(|| {
+                Error::new(ErrorCode::QueryType, "embedding owner does not exist")
+            })?;
+            if !node.labels().contains(&definition.label) {
+                return Err(Error::new(
+                    ErrorCode::QueryType,
+                    "embedding owner does not match its declared label",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_vector_mutations(&self, mutations: &[ResolvedVectorMutation]) -> Result<()> {
+        self.validate_vector_mutations_with_planned_columns(mutations, None, &[])
+    }
+
+    /// Validates definitions introduced by this WAL batch without installing them first.
+    pub fn validate_vector_mutations_with_planned_columns(
+        &self,
+        mutations: &[ResolvedVectorMutation],
+        planned_profile: Option<&EmbeddingProfile>,
+        planned_columns: &[PropertyId],
+    ) -> Result<()> {
+        if let Some(profile) = planned_profile {
+            self.validate_activate_profile(profile)?;
+        }
+        for mutation in mutations {
+            let property = match mutation {
+                ResolvedVectorMutation::Upsert { property, .. }
+                | ResolvedVectorMutation::Remove { property, .. } => property,
+            };
+            if let Some(column) = self.vector_columns.get(property) {
+                if let ResolvedVectorMutation::Upsert { coordinates, .. } = mutation {
+                    column.validate_coordinates(coordinates)?;
+                }
+            } else {
+                let profile = planned_profile
+                    .filter(|_| planned_columns.contains(property))
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorCode::EmbeddingProfileMismatch,
+                            "resolved vector targets an undeclared vector property",
+                        )
+                    })?;
+                if let ResolvedVectorMutation::Upsert { coordinates, .. } = mutation {
+                    if coordinates.len() != profile.dimension as usize
+                        || coordinates
+                            .iter()
+                            .any(|bits| !decode_coordinate(profile.dtype, *bits).is_finite())
+                    {
+                        return Err(Error::new(
+                            ErrorCode::EmbeddingProfileMismatch,
+                            "planned vector is incompatible with the embedding profile",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_create_embedding_with_planned_schema(
+        &self,
+        graph: &GraphStore,
+        definition: &EmbeddingIndexDefinition,
+        profile: &EmbeddingProfile,
+        rows: &[(u64, Vec<u16>, u64)],
+        planned: &[GraphMutation],
+    ) -> Result<()> {
+        self.validate_activate_profile(profile)?;
+        if definition.name.is_empty()
+            || definition.name.len() > 255
+            || matches!(
+                definition.name.as_str(),
+                SEMANTIC_INDEX | SEMANTIC_NODE_INDEX | SEMANTIC_RELATIONSHIP_INDEX
+            )
+        {
+            return Err(Error::new(
+                ErrorCode::QueryType,
+                "embedding index name is invalid or reserved",
+            ));
+        }
+        if self.contains(&definition.name) {
+            return Err(Error::new(
+                ErrorCode::TransactionConflict,
+                "index already exists",
+            ));
+        }
+        if !definition.model.eq_ignore_ascii_case("default") {
+            return Err(Error::new(
+                ErrorCode::EmbeddingProfileMismatch,
+                "only the active embedding model is supported",
+            ));
+        }
+        let label_exists=graph.catalog().label_name(definition.label).is_some() || planned.iter().any(|mutation|matches!(mutation,GraphMutation::DeclareLabel{id,..} if *id==definition.label));
+        let property_exists = |property: PropertyId| {
+            graph.catalog().property_name(property).is_some() || planned.iter().any(|mutation|matches!(mutation,GraphMutation::DeclareProperty{id,..} if *id==property))
+        };
+        if !label_exists
+            || !property_exists(definition.source_property)
+            || !property_exists(definition.target_property)
+        {
+            return Err(Error::new(
+                ErrorCode::QueryType,
+                "embedding definition references undeclared schema IDs",
+            ));
+        }
+        self.ensure_vector_property_available(definition.target_property)?;
+        for (owner, coordinates, _) in rows {
+            if coordinates.len() != profile.dimension as usize
+                || coordinates
+                    .iter()
+                    .any(|bits| !decode_coordinate(profile.dtype, *bits).is_finite())
+            {
+                return Err(Error::new(
+                    ErrorCode::EmbeddingProfileMismatch,
+                    "planned embedding row has invalid coordinates",
+                ));
+            }
+            let matches=graph.node(crate::NodeId(*owner)).is_some_and(|node|node.labels().contains(&definition.label)) || planned.iter().any(|mutation|matches!(mutation,GraphMutation::InsertNode(node) if node.id.0==*owner && node.labels.contains(&definition.label)));
+            if !matches {
+                return Err(Error::new(
+                    ErrorCode::QueryType,
+                    "planned embedding owner does not match its declared label",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn apply_vector_mutations(&self, mutations: &[ResolvedVectorMutation]) -> Result<()> {
+        self.validate_vector_mutations(mutations)?;
+        for mutation in mutations {
+            self.apply_vector_mutation(mutation)?;
+        }
+        Ok(())
+    }
+
     /// Installs the two automatically maintained graph-content indexes. Their vector slots are
     /// derived storage addresses and never become properties or entities in the user's graph.
-    pub fn initialize_semantic(&mut self, profile: EmbeddingProfile) -> Result<()> {
+    pub fn initialize_semantic(&self, profile: EmbeddingProfile) -> Result<()> {
+        self.validate_initialize_semantic(&profile)?;
         self.activate_profile(profile.clone())?;
         for (name, property) in [
             (SEMANTIC_NODE_INDEX, SEMANTIC_NODE_PROPERTY),
@@ -2492,41 +2922,16 @@ impl IndexCatalog {
                     } else {
                         SEMANTIC_RELATIONSHIP_PROPERTY
                     };
-                    let built_slots = self
-                        .semantic_built_slots
-                        .get(&property)
-                        .copied()
-                        .unwrap_or(0);
+                    let built_slots = self.semantic_built_slots.get(&property).unwrap_or(0);
                     vectors.row_count() >= 1_024
                         && vectors.row_count() >= built_slots.saturating_mul(2).max(1)
                 })
             })
     }
 
-    fn invalidate_optimizer_generation(&mut self) {
-        self.optimizer_generation_cache.take();
-    }
-
-    pub fn rebind_shared_vectors(&mut self, backings: Vec<SharedVectorBacking>) -> Result<()> {
-        if backings.len() != self.vector_columns.len() {
-            return Err(Error::new(
-                ErrorCode::CorruptStorage,
-                "shared vector backing set is incomplete",
-            ));
-        }
-        for backing in backings {
-            let column = self
-                .vector_columns
-                .get_mut(&backing.property)
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorCode::CorruptStorage,
-                        "shared vector backing targets an unknown property",
-                    )
-                })?;
-            Arc::make_mut(column).rebind_shared(backing)?;
-        }
-        Ok(())
+    fn invalidate_optimizer_generation(&self) {
+        self.optimizer_generation_cache
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     #[must_use]
@@ -2537,13 +2942,15 @@ impl IndexCatalog {
             && self.vector_columns.is_empty()
     }
 
-    /// Produces the complete canonical-vector and ONLINE-derived-index device image.
-    /// Failed or populating indexes remain query-ineligible and are intentionally absent.
-    pub fn device_image(&self) -> Result<IndexDeviceImage> {
+    /// Exports indexes exclusively for the preserved inactive graph implementation.
+    pub fn inactive_device_image(
+        &self,
+        _graph: &crate::legacy::GraphStore,
+    ) -> Result<IndexDeviceImage> {
         let vectors = self
             .vector_columns
             .iter()
-            .map(|(property, column)| column.device_image(*property))
+            .map(|(property, column)| column.device_image(property))
             .collect::<Result<Vec<_>>>()?;
         let mut indexes = Vec::new();
         for (name, entry) in &self.entries {
@@ -2577,13 +2984,13 @@ impl IndexCatalog {
                     property: *property,
                     approximate: approximate
                         .as_ref()
-                        .map(IvfPqIndex::device_image)
+                        .map(|index| index.device_image())
                         .transpose()?,
                 },
             });
         }
         Ok(IndexDeviceImage {
-            profile: self.profile.clone(),
+            profile: self.profile.get().map(|profile| (*profile).clone()),
             vectors,
             indexes,
         })
@@ -2595,8 +3002,8 @@ impl IndexCatalog {
     }
 
     #[must_use]
-    pub fn profile(&self) -> Option<&EmbeddingProfile> {
-        self.profile.as_ref()
+    pub fn profile(&self) -> Option<Arc<EmbeddingProfile>> {
+        self.profile.get()
     }
 
     /// Whether replacing the project profile would preserve every canonical vector and vector
@@ -2611,10 +3018,10 @@ impl IndexCatalog {
                 .all(|entry| entry.definition.kind != GraphIndexKind::Vector)
     }
 
-    pub fn activate_profile(&mut self, profile: EmbeddingProfile) -> Result<()> {
+    pub fn activate_profile(&self, profile: EmbeddingProfile) -> Result<()> {
         profile.validate()?;
-        if let Some(current) = &self.profile {
-            if current != &profile {
+        if let Some(current) = self.profile.get() {
+            if current.as_ref() != &profile {
                 if !self.embedding_profile_is_mutable() {
                     return Err(Error::new(
                         ErrorCode::EmbeddingProfileImmutable,
@@ -2622,16 +3029,16 @@ impl IndexCatalog {
                     ));
                 }
                 self.invalidate_optimizer_generation();
-                self.profile = Some(profile);
+                self.profile.set(profile);
             }
             return Ok(());
         }
         self.invalidate_optimizer_generation();
-        self.profile = Some(profile);
+        self.profile.set(profile);
         Ok(())
     }
 
-    pub fn create(&mut self, graph: &GraphStore, definition: GraphIndexDefinition) -> Result<()> {
+    pub fn create(&self, graph: &GraphStore, definition: GraphIndexDefinition) -> Result<()> {
         self.create_with_vector_population(graph, definition, true)
     }
 
@@ -2639,7 +3046,7 @@ impl IndexCatalog {
     /// execution backend. Scalar families still build immediately because they have no separate
     /// accelerator builder and may enforce constraints during semantic preflight.
     pub fn create_deferred(
-        &mut self,
+        &self,
         graph: &GraphStore,
         definition: GraphIndexDefinition,
     ) -> Result<()> {
@@ -2647,11 +3054,12 @@ impl IndexCatalog {
     }
 
     fn create_with_vector_population(
-        &mut self,
+        &self,
         graph: &GraphStore,
         definition: GraphIndexDefinition,
         populate_vector: bool,
     ) -> Result<()> {
+        self.validate_create(graph, &definition)?;
         if matches!(
             definition.name.as_str(),
             SEMANTIC_INDEX | SEMANTIC_NODE_INDEX | SEMANTIC_RELATIONSHIP_INDEX
@@ -2671,7 +3079,7 @@ impl IndexCatalog {
         }
         self.invalidate_optimizer_generation();
         if is_vector {
-            let profile = self.profile.as_ref().ok_or_else(|| {
+            let profile = self.profile.get().ok_or_else(|| {
                 Error::new(
                     ErrorCode::EmbeddingProfileMismatch,
                     "vector index requires a project embedding profile",
@@ -2682,13 +3090,29 @@ impl IndexCatalog {
                 Error::new(ErrorCode::QueryType, "vector index requires one property")
             })?;
             self.ensure_vector_property_available(property)?;
-            self.vector_columns
-                .entry(property)
-                .or_insert(Arc::new(VectorIndex::new_with_dtype(
+            let matrix = self.vector_columns.get_or_insert(
+                property,
+                Arc::new(VectorIndex::new_with_dtype(
                     profile.dimension as usize,
                     profile.similarity,
                     profile.dtype,
-                )?));
+                )?),
+            );
+            matrix.bind_canonical_graph(graph);
+            for node in graph
+                .nodes()
+                .filter(|node| node.labels().contains(&definition.label))
+            {
+                if matches!(node.property(property), Some(ScalarValue::List(_))) {
+                    matrix.upsert_property_owner(
+                        graph,
+                        crate::types::EntityKind::Node,
+                        property,
+                        node.id().0,
+                        node.revision(),
+                    )?;
+                }
+            }
         }
         let name = definition.name.clone();
         if definition.unique {
@@ -2723,7 +3147,7 @@ impl IndexCatalog {
 
     /// Creates an embedding declaration from already resolved canonical vectors.
     pub fn create_embedding(
-        &mut self,
+        &self,
         graph: &GraphStore,
         definition: EmbeddingIndexDefinition,
         profile: EmbeddingProfile,
@@ -2733,7 +3157,7 @@ impl IndexCatalog {
     }
 
     pub fn create_embedding_deferred(
-        &mut self,
+        &self,
         graph: &GraphStore,
         definition: EmbeddingIndexDefinition,
         profile: EmbeddingProfile,
@@ -2743,13 +3167,14 @@ impl IndexCatalog {
     }
 
     fn create_embedding_with_vector_population(
-        &mut self,
+        &self,
         graph: &GraphStore,
         definition: EmbeddingIndexDefinition,
         profile: EmbeddingProfile,
         rows: Vec<(u64, Vec<u16>, u64)>,
         populate_vector: bool,
     ) -> Result<()> {
+        self.validate_create_embedding(graph, &definition, &profile, &rows)?;
         if matches!(
             definition.name.as_str(),
             SEMANTIC_INDEX | SEMANTIC_NODE_INDEX | SEMANTIC_RELATIONSHIP_INDEX
@@ -2789,15 +3214,15 @@ impl IndexCatalog {
             ));
         }
         self.ensure_vector_property_available(definition.target_property)?;
-        let matrix = self
-            .vector_columns
-            .entry(definition.target_property)
-            .or_insert(Arc::new(VectorIndex::new_with_dtype(
+        let matrix = self.vector_columns.get_or_insert(
+            definition.target_property,
+            Arc::new(VectorIndex::new_with_dtype(
                 profile.dimension as usize,
                 profile.similarity,
                 profile.dtype,
-            )?));
-        let matrix = Arc::make_mut(matrix);
+            )?),
+        );
+        let matrix = matrix.as_ref();
         for (entity_id, coordinates, revision) in rows {
             let node = graph.node(crate::NodeId(entity_id)).ok_or_else(|| {
                 Error::new(
@@ -2852,7 +3277,7 @@ impl IndexCatalog {
     }
 
     /// Rebuilds one local derived index. Canonical data remains valid if population fails.
-    pub fn rebuild(&mut self, graph: &GraphStore, name: &str) -> Result<()> {
+    pub fn rebuild(&self, graph: &GraphStore, name: &str) -> Result<()> {
         let definition = self
             .entries
             .get(name)
@@ -2862,23 +3287,23 @@ impl IndexCatalog {
         if definition.unique {
             let runtime = self.build_runtime(graph, &definition)?;
             validate_unique_runtime(&runtime)?;
-            let entry = self
+            let mut entry = self
                 .entries
-                .get_mut(name)
+                .edit(name)
                 .ok_or_else(|| Error::internal("constraint disappeared during rebuild"))?;
-            let entry = Arc::make_mut(entry);
+            let entry = &mut *entry;
             entry.runtime = Some(Arc::new(runtime));
             entry.state = DerivedIndexState::Online;
             entry.diagnostic = None;
             return Ok(());
         }
-        if let Some(entry) = self.entries.get_mut(name) {
-            let entry = Arc::make_mut(entry);
+        if let Some(mut entry) = self.entries.edit(name) {
+            let entry = &mut *entry;
             entry.state = DerivedIndexState::Populating;
             entry.diagnostic = None;
             entry.runtime = None;
         }
-        match self.build_runtime(graph, &definition) {
+        let result: Result<()> = match self.build_runtime(graph, &definition) {
             Ok(runtime) => {
                 if let Some(property) = definition.properties.first().copied().filter(|property| {
                     matches!(
@@ -2891,30 +3316,39 @@ impl IndexCatalog {
                             .insert(property, source.row_count());
                     }
                 }
-                let entry = self
+                let mut entry = self
                     .entries
-                    .get_mut(name)
+                    .edit(name)
                     .ok_or_else(|| Error::internal("index disappeared during population"))?;
-                let entry = Arc::make_mut(entry);
+                let entry = &mut *entry;
                 entry.runtime = Some(Arc::new(runtime));
                 entry.state = DerivedIndexState::Online;
                 Ok(())
             }
             Err(error) => {
-                let entry = self.entries.get_mut(name).ok_or_else(|| {
+                let mut entry = self.entries.edit(name).ok_or_else(|| {
                     Error::internal("index disappeared while recording population failure")
                 })?;
-                let entry = Arc::make_mut(entry);
+                let entry = &mut *entry;
                 entry.state = DerivedIndexState::Failed;
                 entry.diagnostic = Some(error.to_string());
                 Ok(())
             }
+        };
+        result?;
+        self.acknowledge_published_ann(name);
+        Ok(())
+    }
+
+    fn acknowledge_published_ann(&self, name: &str) {
+        if let Some((source, Some(ann))) = self.vector_search_source(name) {
+            source.acknowledge_ann(&ann);
         }
     }
 
     /// Marks a vector rebuild request without executing a host builder during semantic
     /// validation. An existing validated runtime stays ONLINE until its replacement is ready.
-    pub fn rebuild_deferred(&mut self, graph: &GraphStore, name: &str) -> Result<()> {
+    pub fn rebuild_deferred(&self, graph: &GraphStore, name: &str) -> Result<()> {
         if name == SEMANTIC_INDEX {
             self.rebuild_deferred(graph, SEMANTIC_NODE_INDEX)?;
             return self.rebuild_deferred(graph, SEMANTIC_RELATIONSHIP_INDEX);
@@ -2927,25 +3361,28 @@ impl IndexCatalog {
             return self.rebuild(graph, name);
         }
         self.invalidate_optimizer_generation();
-        let entry = self
+        let mut entry = self
             .entries
-            .get_mut(name)
+            .edit(name)
             .ok_or_else(|| Error::internal("vector index disappeared during rebuild request"))?;
-        let entry = Arc::make_mut(entry);
-        // The old runtime, when present, remains owned by this staged catalog until the fully
-        // validated replacement is swapped below. No reader can observe this staged state.
+        let entry = &mut *entry;
+        // Readers keep using the canonical vectors while this derived builder is pending.
         entry.state = DerivedIndexState::Populating;
         entry.diagnostic = None;
         Ok(())
     }
 
     /// Retries failed derived vector builds when an execution backend is (re)admitted.
-    pub fn retry_failed_vectors(&mut self) {
-        for entry in self.entries.values_mut() {
+    pub fn retry_failed_vectors(&self) {
+        for mut entry in self
+            .entries
+            .keys()
+            .filter_map(|key| self.entries.edit(&key))
+        {
             if entry.definition.kind == GraphIndexKind::Vector
                 && entry.state == DerivedIndexState::Failed
             {
-                let entry = Arc::make_mut(entry);
+                let entry = &mut *entry;
                 entry.state = DerivedIndexState::Populating;
                 entry.diagnostic = None;
             }
@@ -2956,7 +3393,7 @@ impl IndexCatalog {
     /// Builds every local vector generation through the selected backend and atomically replaces
     /// each runtime after cancellation and structural checks.
     pub fn rebuild_vectors_with(
-        &mut self,
+        &self,
         mut builder: impl FnMut(&VectorIndex, IvfPqConfig) -> Result<IvfPqIndex>,
     ) -> Result<()> {
         let names = self
@@ -2983,7 +3420,7 @@ impl IndexCatalog {
                     "vector index has no source property",
                 )
             })?;
-            let source = self.vector_columns.get(&property).cloned().ok_or_else(|| {
+            let source = self.vector_columns.get(&property).ok_or_else(|| {
                 Error::new(
                     ErrorCode::CorruptStorage,
                     "vector index has no canonical vector column",
@@ -2999,7 +3436,7 @@ impl IndexCatalog {
                             "IVF-PQ builder returned an unvalidated generation",
                         ));
                     }
-                    Ok(Some(index))
+                    Ok(Some(Arc::new(index)))
                 })
             };
             match candidate {
@@ -3008,10 +3445,10 @@ impl IndexCatalog {
                         property,
                         approximate,
                     };
-                    let entry = self.entries.get_mut(&name).ok_or_else(|| {
+                    let mut entry = self.entries.edit(&name).ok_or_else(|| {
                         Error::internal("vector index disappeared before atomic publication")
                     })?;
-                    let entry = Arc::make_mut(entry);
+                    let entry = &mut *entry;
                     entry.runtime = Some(Arc::new(replacement));
                     entry.state = DerivedIndexState::Online;
                     entry.diagnostic = None;
@@ -3024,10 +3461,10 @@ impl IndexCatalog {
                     }
                 }
                 Err(error) => {
-                    let entry = self.entries.get_mut(&name).ok_or_else(|| {
+                    let mut entry = self.entries.edit(&name).ok_or_else(|| {
                         Error::internal("vector index disappeared while recording build failure")
                     })?;
-                    let entry = Arc::make_mut(entry);
+                    let entry = &mut *entry;
                     if entry.runtime.is_none() {
                         entry.state = DerivedIndexState::Failed;
                     } else {
@@ -3037,12 +3474,13 @@ impl IndexCatalog {
                     entry.diagnostic = Some(error.to_string());
                 }
             }
+            self.acknowledge_published_ann(&name);
         }
         Ok(())
     }
 
-    pub fn rebuild_all(&mut self, graph: &GraphStore) -> Result<()> {
-        let names = self.entries.keys().cloned().collect::<Vec<_>>();
+    pub fn rebuild_all(&self, graph: &GraphStore) -> Result<()> {
+        let names = self.entries.keys().collect::<Vec<_>>();
         for name in names {
             self.rebuild(graph, &name)?;
         }
@@ -3051,7 +3489,7 @@ impl IndexCatalog {
 
     /// Rebuilds every derived family after a layer-filtered graph is compacted. Vector columns are
     /// first reduced to the stable entities retained by the compacted graph.
-    pub fn rebuild_row_indexes(&mut self, graph: &GraphStore) -> Result<()> {
+    pub fn rebuild_row_indexes(&self, graph: &GraphStore) -> Result<()> {
         self.invalidate_optimizer_generation();
         let retained = graph
             .nodes()
@@ -3062,19 +3500,17 @@ impl IndexCatalog {
             .edges()
             .map(|edge| edge.id().0)
             .collect::<BTreeSet<_>>();
-        for (property, column) in &mut self.vector_columns {
-            let owners = if *property == SEMANTIC_RELATIONSHIP_PROPERTY {
+        for (property, column) in &self.vector_columns {
+            let owners = if property == SEMANTIC_RELATIONSHIP_PROPERTY {
                 &retained_relationships
             } else {
                 &retained
             };
-            let remap = Arc::make_mut(column).retain_entities(owners)?;
-            if let Some(built_slots) = self.semantic_built_slots.get_mut(property) {
-                *built_slots = remap.keys().filter(|row| **row < *built_slots).count();
-            }
-            vector_row_remaps.insert(*property, remap);
+            let remap = column.retain_entities(owners)?;
+
+            vector_row_remaps.insert(property, remap);
         }
-        let names = self.entries.keys().cloned().collect::<Vec<_>>();
+        let names = self.entries.keys().collect::<Vec<_>>();
         for name in names {
             let is_vector = self
                 .entries
@@ -3085,11 +3521,11 @@ impl IndexCatalog {
                 continue;
             }
 
-            let entry = self
+            let mut entry = self
                 .entries
-                .get_mut(&name)
+                .edit(&name)
                 .ok_or_else(|| Error::internal("vector index disappeared during filtering"))?;
-            let entry = Arc::make_mut(entry);
+            let entry = &mut *entry;
             let property = entry
                 .definition
                 .properties
@@ -3118,7 +3554,8 @@ impl IndexCatalog {
                     .as_ref()
                     .map(|index| index.remap_rows(remap))
                     .transpose()?
-                    .flatten(),
+                    .flatten()
+                    .map(Arc::new),
                 Some(RuntimeIndex::Vector { .. }) => {
                     return Err(Error::new(
                         ErrorCode::CorruptStorage,
@@ -3143,7 +3580,7 @@ impl IndexCatalog {
         Ok(())
     }
 
-    pub fn drop_index(&mut self, name: &str) -> Result<()> {
+    pub fn drop_index(&self, name: &str) -> Result<()> {
         if matches!(
             name,
             SEMANTIC_INDEX | SEMANTIC_NODE_INDEX | SEMANTIC_RELATIONSHIP_INDEX
@@ -3166,7 +3603,7 @@ impl IndexCatalog {
         self.remove_definition(name)
     }
 
-    pub fn drop_constraint(&mut self, name: &str) -> Result<()> {
+    pub fn drop_constraint(&self, name: &str) -> Result<()> {
         if self
             .entries
             .get(name)
@@ -3180,16 +3617,14 @@ impl IndexCatalog {
         self.remove_definition(name)
     }
 
-    fn remove_definition(&mut self, name: &str) -> Result<()> {
+    fn remove_definition(&self, name: &str) -> Result<()> {
         self.invalidate_optimizer_generation();
-        let Some(mut entry) = self.entries.remove(name) else {
+        let Some(_entry) = self.entries.remove(name) else {
             return Err(Error::new(
                 ErrorCode::IndexUnavailable,
                 "index does not exist",
             ));
         };
-        let entry = Arc::make_mut(&mut entry);
-        entry.state = DerivedIndexState::Dropping;
         self.embeddings.remove(name);
         let used_targets = self
             .entries
@@ -3215,11 +3650,11 @@ impl IndexCatalog {
         })
     }
 
-    pub fn constraint_definitions(&self) -> impl Iterator<Item = &GraphIndexDefinition> {
+    pub fn constraint_definitions(&self) -> impl Iterator<Item = GraphIndexDefinition> {
         self.entries
             .values()
             .filter(|entry| entry.definition.unique)
-            .map(|entry| &entry.definition)
+            .map(|entry| entry.definition.clone())
     }
 
     pub fn statuses(&self) -> impl Iterator<Item = IndexStatus> + '_ {
@@ -3262,7 +3697,7 @@ impl IndexCatalog {
     /// an estimate stale, but cannot make an ONLINE access path semantically invalid.
     #[must_use]
     pub fn optimizer_generation(&self) -> [u8; 32] {
-        *self.optimizer_generation_cache.get_or_init(|| {
+        {
             let mut hasher = blake3::Hasher::new();
             hasher.update(b"index-generation-v1\0");
             for (name, entry) in &self.entries {
@@ -3283,11 +3718,11 @@ impl IndexCatalog {
                 hasher.update(&definition.target_property.0.to_le_bytes());
                 hash_bytes(&mut hasher, definition.model.as_bytes());
             }
-            if let Some(profile) = &self.profile {
+            if let Some(profile) = self.profile.get() {
                 hasher.update(&profile.profile_hash);
             }
             *hasher.finalize().as_bytes()
-        })
+        }
     }
 
     /// Collects bounded planner statistics without exposing or persisting derived pages.
@@ -3309,11 +3744,11 @@ impl IndexCatalog {
                     resident_bytes,
                 ) = match runtime {
                     RuntimeIndex::Equality(index) => {
-                        let shape = scalar_posting_shape(&index.postings, &index.deltas);
+                        let shape = scalar_posting_shape(&index.postings);
                         (shape.0, shape.1, shape.2, 0, 0, shape.3)
                     }
                     RuntimeIndex::Range(index) => {
-                        let shape = scalar_posting_shape(&index.postings, &index.deltas);
+                        let shape = scalar_posting_shape(&index.postings);
                         (shape.0, shape.1, shape.2, 0, 0, shape.3)
                     }
                     RuntimeIndex::Text(index) => {
@@ -3333,7 +3768,7 @@ impl IndexCatalog {
                             .map_or(0_u64, |ann| ann.config.candidate_budget as u64);
                         let dimension = self
                             .profile
-                            .as_ref()
+                            .get()
                             .map_or(0_u64, |profile| u64::from(profile.dimension));
                         let bytes = rows.saturating_mul(
                             8_u64
@@ -3360,8 +3795,8 @@ impl IndexCatalog {
             .collect()
     }
 
-    pub fn definitions(&self) -> impl Iterator<Item = &GraphIndexDefinition> {
-        self.entries.values().map(|entry| &entry.definition)
+    pub fn definitions(&self) -> impl Iterator<Item = GraphIndexDefinition> {
+        self.entries.values().map(|entry| entry.definition.clone())
     }
 
     /// Selects an exact ONLINE equality posting by count and then stable index name without
@@ -3407,14 +3842,8 @@ impl IndexCatalog {
                 )
             })?;
             let estimated_rows = match runtime {
-                RuntimeIndex::Equality(index) => posting_cardinality(
-                    index.postings.get(&key),
-                    posting_changes(&index.deltas, &key),
-                ),
-                RuntimeIndex::Range(index) => posting_cardinality(
-                    index.postings.get(&key),
-                    posting_changes(&index.deltas, &key),
-                ),
+                RuntimeIndex::Equality(index) => index.postings.count(&key),
+                RuntimeIndex::Range(index) => index.postings.count(&key),
                 RuntimeIndex::Text(_) | RuntimeIndex::Vector { .. } => {
                     return Err(Error::new(
                         ErrorCode::CorruptStorage,
@@ -3587,7 +4016,7 @@ impl IndexCatalog {
         label: LabelId,
         values: &BTreeMap<PropertyId, ScalarValue>,
     ) -> Result<Option<Vec<u32>>> {
-        let mut best: Option<(usize, &str, Vec<u32>)> = None;
+        let mut best: Option<(usize, String, Vec<u32>)> = None;
         for (name, entry) in &self.entries {
             if entry.state != DerivedIndexState::Online
                 || entry.definition.label != label
@@ -3645,28 +4074,27 @@ impl IndexCatalog {
                     }
                 }
             };
-            let candidate = (rows.len(), name.as_str(), rows);
-            if best
-                .as_ref()
-                .is_none_or(|current| (candidate.0, candidate.1) < (current.0, current.1))
-            {
+            let candidate = (rows.len(), name, rows);
+            if best.as_ref().is_none_or(|current| {
+                (candidate.0, candidate.1.as_str()) < (current.0, current.1.as_str())
+            }) {
                 best = Some(candidate);
             }
         }
         Ok(best.map(|(_, _, rows)| rows))
     }
 
-    pub fn embedding_definitions(&self) -> impl Iterator<Item = &EmbeddingIndexDefinition> {
+    pub fn embedding_definitions(&self) -> impl Iterator<Item = EmbeddingIndexDefinition> {
         self.embeddings.values()
     }
 
     #[must_use]
-    pub fn embedding_definition(&self, name: &str) -> Option<&EmbeddingIndexDefinition> {
+    pub fn embedding_definition(&self, name: &str) -> Option<EmbeddingIndexDefinition> {
         self.embeddings.get(name)
     }
 
     /// Returns the project's single canonical embedding column when one is declared.
-    pub fn canonical_embedding_column(&self) -> Result<Option<(PropertyId, &VectorIndex)>> {
+    pub fn canonical_embedding_column(&self) -> Result<Option<(PropertyId, Arc<VectorIndex>)>> {
         let mut targets = self
             .embeddings
             .values()
@@ -3692,11 +4120,7 @@ impl IndexCatalog {
     }
 
     /// Removes old postings before a canonical graph mutation changes or deletes a row.
-    pub fn before_graph_apply(
-        &mut self,
-        graph: &GraphStore,
-        mutation: &GraphMutation,
-    ) -> Result<()> {
+    pub fn before_graph_apply(&self, graph: &GraphStore, mutation: &GraphMutation) -> Result<()> {
         match mutation {
             GraphMutation::SetNodeProperty { node, .. }
             | GraphMutation::AddNodeLabels { node, .. }
@@ -3705,9 +4129,34 @@ impl IndexCatalog {
                     self.remove_node(view, false)?;
                 }
             }
-            GraphMutation::DeleteNode { node, .. } => {
+            GraphMutation::DeleteNode {
+                node,
+                detach,
+                revision,
+            } => {
                 if let Some(view) = graph.node(*node) {
                     self.remove_node(view, true)?;
+                }
+                if let Some(column) = self.vector_columns.get(&crate::SEMANTIC_NODE_PROPERTY) {
+                    column.remove(node.0, *revision);
+                }
+                if *detach {
+                    if let Some(column) = self
+                        .vector_columns
+                        .get(&crate::SEMANTIC_RELATIONSHIP_PROPERTY)
+                    {
+                        for edge in graph.incident_edge_ids(*node)? {
+                            column.remove(edge.0, *revision);
+                        }
+                    }
+                }
+            }
+            GraphMutation::DeleteEdge { edge, revision } => {
+                if let Some(column) = self
+                    .vector_columns
+                    .get(&crate::SEMANTIC_RELATIONSHIP_PROPERTY)
+                {
+                    column.remove(edge.0, *revision);
                 }
             }
             _ => {}
@@ -3716,11 +4165,7 @@ impl IndexCatalog {
     }
 
     /// Adds current postings after a canonical graph mutation creates or updates a row.
-    pub fn after_graph_apply(
-        &mut self,
-        graph: &GraphStore,
-        mutation: &GraphMutation,
-    ) -> Result<()> {
+    pub fn after_graph_apply(&self, graph: &GraphStore, mutation: &GraphMutation) -> Result<()> {
         match mutation {
             GraphMutation::InsertNode(input) => {
                 if let Some(view) = graph.node(input.id) {
@@ -3739,7 +4184,50 @@ impl IndexCatalog {
         Ok(())
     }
 
-    pub fn apply_vector_mutation(&mut self, mutation: &ResolvedVectorMutation) -> Result<()> {
+    /// Binds recovered property-owner references to the one canonical graph.
+    pub fn bind_catalog_graph(&self, graph: &GraphStore) {
+        for matrix in self.vector_columns.values() {
+            matrix.bind_canonical_graph(graph);
+        }
+    }
+
+    /// Publishes owner references for user vector properties; generated embeddings own quantized cells.
+    pub fn apply_vector_mutation_from_graph(
+        &self,
+        graph: &GraphStore,
+        mutation: &ResolvedVectorMutation,
+    ) -> Result<()> {
+        if let ResolvedVectorMutation::Upsert {
+            property,
+            entity_id,
+            revision,
+            ..
+        } = mutation
+        {
+            let kind = self.entries.values().find_map(|entry| {
+                (entry.definition.kind == GraphIndexKind::Vector
+                    && entry.definition.properties.first() == Some(property)
+                    && !self.embeddings.contains_key(&entry.definition.name)
+                    && !matches!(
+                        entry.definition.name.as_str(),
+                        SEMANTIC_INDEX | SEMANTIC_NODE_INDEX | SEMANTIC_RELATIONSHIP_INDEX
+                    ))
+                .then_some(crate::types::EntityKind::Node)
+            });
+            if let Some(kind) = kind {
+                let matrix = self.vector_columns.get(property).ok_or_else(|| {
+                    Error::new(
+                        ErrorCode::EmbeddingProfileMismatch,
+                        "vector property is undeclared",
+                    )
+                })?;
+                return matrix.upsert_property_owner(graph, kind, *property, *entity_id, *revision);
+            }
+        }
+        self.apply_vector_mutation(mutation)
+    }
+
+    pub fn apply_vector_mutation(&self, mutation: &ResolvedVectorMutation) -> Result<()> {
         let (property, entity_id, revision) = match mutation {
             ResolvedVectorMutation::Upsert {
                 property,
@@ -3753,13 +4241,13 @@ impl IndexCatalog {
                 revision,
             } => (*property, *entity_id, *revision),
         };
-        let matrix = self.vector_columns.get_mut(&property).ok_or_else(|| {
+        let matrix = self.vector_columns.get(&property).ok_or_else(|| {
             Error::new(
                 ErrorCode::EmbeddingProfileMismatch,
                 "resolved vector targets an undeclared vector property",
             )
         })?;
-        let matrix = Arc::make_mut(matrix);
+        let matrix = matrix.as_ref();
         match mutation {
             ResolvedVectorMutation::Upsert { coordinates, .. } => {
                 matrix.upsert_quantized(entity_id, coordinates, revision)?;
@@ -3771,19 +4259,24 @@ impl IndexCatalog {
 
     /// Returns an ONLINE vector matrix and its immutable ANN base for native SEARCH.
     #[must_use]
-    pub fn vector_search_source(&self, name: &str) -> Option<(&VectorIndex, Option<&IvfPqIndex>)> {
+    pub fn vector_search_source(
+        &self,
+        name: &str,
+    ) -> Option<(Arc<VectorIndex>, Option<Arc<IvfPqIndex>>)> {
         let entry = self.entries.get(name)?;
-        if entry.state != DerivedIndexState::Online {
+        if entry.definition.kind != GraphIndexKind::Vector {
             return None;
         }
-        let RuntimeIndex::Vector {
+        let property = *entry.definition.properties.first()?;
+        let source = self.vector_columns.get(&property)?;
+        let Some(RuntimeIndex::Vector {
             property,
             approximate,
-        } = entry.runtime.as_deref()?
+        }) = entry.runtime.as_deref()
         else {
-            return None;
+            return Some((source, None));
         };
-        Some((self.vector_columns.get(property)?, approximate.as_ref()))
+        Some((self.vector_columns.get(property)?, approximate.clone()))
     }
 
     fn build_runtime(
@@ -3793,7 +4286,7 @@ impl IndexCatalog {
     ) -> Result<RuntimeIndex> {
         match definition.kind {
             GraphIndexKind::Equality => {
-                let mut index = EqualityIndex::default();
+                let index = EqualityIndex::default();
                 for node in graph
                     .nodes()
                     .filter(|node| node.labels().contains(&definition.label))
@@ -3802,11 +4295,10 @@ impl IndexCatalog {
                         index.insert_key(key, node.dense());
                     }
                 }
-                index.seal();
                 Ok(RuntimeIndex::Equality(index))
             }
             GraphIndexKind::Range => {
-                let mut index = RangeIndex::default();
+                let index = RangeIndex::default();
                 for node in graph
                     .nodes()
                     .filter(|node| node.labels().contains(&definition.label))
@@ -3815,12 +4307,11 @@ impl IndexCatalog {
                         index.insert_key(key, node.dense());
                     }
                 }
-                index.seal();
                 Ok(RuntimeIndex::Range(index))
             }
             GraphIndexKind::Text => {
                 let property = definition.properties[0];
-                let mut index = TextIndex::default();
+                let index = TextIndex::default();
                 for node in graph
                     .nodes()
                     .filter(|node| node.labels().contains(&definition.label))
@@ -3836,7 +4327,6 @@ impl IndexCatalog {
                         }
                     }
                 }
-                index.seal();
                 Ok(RuntimeIndex::Text(index))
             }
             GraphIndexKind::Vector => {
@@ -3850,7 +4340,7 @@ impl IndexCatalog {
                 let approximate = if matrix.is_empty() {
                     None
                 } else {
-                    Some(IvfPqIndex::build(matrix, ivf_config(matrix))?)
+                    Some(Arc::new(IvfPqIndex::build(&matrix, ivf_config(&matrix))?))
                 };
                 Ok(RuntimeIndex::Vector {
                     property,
@@ -3860,21 +4350,20 @@ impl IndexCatalog {
         }
     }
 
-    fn remove_node(&mut self, node: NodeView<'_>, remove_vectors: bool) -> Result<()> {
-        for entry in self.entries.values_mut() {
+    fn remove_node(&self, node: NodeView<'_>, remove_vectors: bool) -> Result<()> {
+        for entry in self.entries.values() {
             if entry.state != DerivedIndexState::Online
                 || !node.labels().contains(&entry.definition.label)
             {
                 continue;
             }
-            let entry = Arc::make_mut(entry);
-            let Some(runtime) = entry.runtime.as_mut() else {
+            let Some(runtime) = entry.runtime.as_ref() else {
                 continue;
             };
             if matches!(runtime.as_ref(), RuntimeIndex::Vector { .. }) {
                 continue;
             }
-            match Arc::make_mut(runtime) {
+            match runtime.as_ref() {
                 RuntimeIndex::Equality(index) => {
                     if let Some(key) = composite_key(node, &entry.definition.properties)? {
                         index.remove_key(&key, node.dense());
@@ -3892,8 +4381,8 @@ impl IndexCatalog {
         if remove_vectors {
             for definition in self.embeddings.values() {
                 if node.labels().contains(&definition.label) {
-                    if let Some(matrix) = self.vector_columns.get_mut(&definition.target_property) {
-                        Arc::make_mut(matrix).remove(node.id().0, node.revision());
+                    if let Some(matrix) = self.vector_columns.get(&definition.target_property) {
+                        matrix.remove(node.id().0, node.revision());
                     }
                 }
             }
@@ -3901,21 +4390,20 @@ impl IndexCatalog {
         Ok(())
     }
 
-    fn insert_node(&mut self, node: NodeView<'_>) -> Result<()> {
-        for entry in self.entries.values_mut() {
+    fn insert_node(&self, node: NodeView<'_>) -> Result<()> {
+        for entry in self.entries.values() {
             if entry.state != DerivedIndexState::Online
                 || !node.labels().contains(&entry.definition.label)
             {
                 continue;
             }
-            let entry = Arc::make_mut(entry);
-            let Some(runtime) = entry.runtime.as_mut() else {
+            let Some(runtime) = entry.runtime.as_ref() else {
                 continue;
             };
             if matches!(runtime.as_ref(), RuntimeIndex::Vector { .. }) {
                 continue;
             }
-            match Arc::make_mut(runtime) {
+            match runtime.as_ref() {
                 RuntimeIndex::Equality(index) => {
                     if let Some(key) = composite_key(node, &entry.definition.properties)? {
                         if entry.definition.unique
@@ -3992,94 +4480,25 @@ fn scalar_lookup_key(
     }))
 }
 
-fn posting_changes<'a>(
-    deltas: &'a PersistentMap<Arc<Vec<PostingDelta>>>,
-    key: &IndexKey,
-) -> Option<&'a PersistentMap<bool>> {
-    deltas
-        .get(index_key_hash(key))?
+fn scalar_posting_shape(postings: &Postings<IndexKey>) -> (u64, u64, u64, u64) {
+    let values = postings.materialized();
+    let total = values.values().map(RoaringBitmap::len).sum();
+    let largest = values.values().map(RoaringBitmap::len).max().unwrap_or(0);
+    let bytes = values
         .iter()
-        .find(|delta| delta.key.as_ref() == key)
-        .map(|delta| &delta.changes)
+        .map(|(key, rows)| index_key_estimated_bytes(key) + rows.len() * 4)
+        .sum();
+    (values.len() as u64, total, largest, bytes)
 }
-
-fn posting_cardinality(base: Option<&RoaringBitmap>, changes: Option<&PersistentMap<bool>>) -> u64 {
-    let mut count = base.map_or(0, RoaringBitmap::len);
-    if let Some(changes) = changes {
-        for (row, present) in changes.iter() {
-            let Ok(row) = u32::try_from(row) else {
-                continue;
-            };
-            let was_present = base.is_some_and(|rows| rows.contains(row));
-            match (*present, was_present) {
-                (true, false) => count = count.saturating_add(1),
-                (false, true) => count = count.saturating_sub(1),
-                _ => {}
-            }
-        }
-    }
-    count
-}
-
-fn scalar_posting_shape(
-    base: &BTreeMap<IndexKey, RoaringBitmap>,
-    deltas: &PersistentMap<Arc<Vec<PostingDelta>>>,
-) -> (u64, u64, u64, u64) {
-    let mut keys = BTreeSet::<&IndexKey>::new();
-    keys.extend(base.keys());
-    for (_, bucket) in deltas.iter() {
-        keys.extend(bucket.iter().map(|delta| delta.key.as_ref()));
-    }
-    let mut distinct = 0_u64;
-    let mut total = 0_u64;
-    let mut largest = 0_u64;
-    let mut bytes = 0_u64;
-    for key in keys {
-        let rows = posting_cardinality(base.get(key), posting_changes(deltas, key));
-        if rows == 0 {
-            continue;
-        }
-        distinct = distinct.saturating_add(1);
-        total = total.saturating_add(rows);
-        largest = largest.max(rows);
-        bytes = bytes
-            .saturating_add(index_key_estimated_bytes(key))
-            .saturating_add(rows.saturating_mul(4));
-    }
-    (distinct, total, largest, bytes)
-}
-
 fn text_posting_shape(index: &TextIndex) -> (u64, u64, u64, u64) {
-    // Statistics need only cardinalities. Applying sparse presence overrides arithmetically avoids
-    // cloning every bitmap and never scales with unrelated posting rows; work is one pass over the
-    // term dictionary plus the changed row keys.
-    let mut terms = BTreeSet::<&str>::new();
-    terms.extend(index.postings.keys().map(String::as_str));
-    for (_, bucket) in index.posting_deltas.iter() {
-        terms.extend(bucket.iter().map(|delta| delta.term.as_ref()));
-    }
-    let mut distinct = 0_u64;
-    let mut total = 0_u64;
-    let mut largest = 0_u64;
-    let mut bytes = 0_u64;
-    for term in terms {
-        let changes = index
-            .posting_deltas
-            .get(text_term_hash(term))
-            .and_then(|bucket| bucket.iter().find(|delta| delta.term.as_ref() == term))
-            .map(|delta| &delta.changes);
-        let rows = posting_cardinality(index.postings.get(term), changes);
-        if rows == 0 {
-            continue;
-        }
-        distinct = distinct.saturating_add(1);
-        total = total.saturating_add(rows);
-        largest = largest.max(rows);
-        bytes = bytes
-            .saturating_add(term.len() as u64)
-            .saturating_add(rows.saturating_mul(4));
-    }
-    (distinct, total, largest, bytes)
+    let values = index.materialized_postings();
+    let total = values.values().map(RoaringBitmap::len).sum();
+    let largest = values.values().map(RoaringBitmap::len).max().unwrap_or(0);
+    let bytes = values
+        .iter()
+        .map(|(key, rows)| key.len() as u64 + rows.len() * 4)
+        .sum();
+    (values.len() as u64, total, largest, bytes)
 }
 
 fn index_key_estimated_bytes(key: &IndexKey) -> u64 {
@@ -4402,1014 +4821,518 @@ fn total_f32(left: f32, right: f32) -> Ordering {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
+mod concurrent_tests {
     use super::*;
-    use crate::{Layer, NodeId, NodeInput};
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
-    #[test]
-    fn surgical_dirty_scalar_neighbors_share_large_keys_and_preserve_postings() -> Result<()> {
-        let mut detached = Vec::new();
-        for size in [64 * 1_024, 2 * 1_024 * 1_024] {
-            let neighbors = [
-                IndexKey::String("s".repeat(size)),
-                IndexKey::Bytes(vec![71; size]),
-                IndexKey::Composite(vec![
-                    IndexKey::String("c".repeat(size)),
-                    IndexKey::Integer(7),
-                ]),
-            ];
-            let changed = IndexKey::String("changed".to_owned());
-            let mut equality = EqualityIndex::default();
-            let mut range = RangeIndex::default();
-            for (row, key) in neighbors
-                .iter()
-                .chain(std::iter::once(&changed))
-                .enumerate()
-            {
-                equality.insert_key(key.clone(), row as u32);
-                range.insert_key(key.clone(), row as u32);
-            }
-            let pinned_equality = equality.clone();
-            let pinned_range = range.clone();
-            equality.remove_key(&changed, 3);
-            equality.insert_key(changed.clone(), 9);
-            range.remove_key(&changed, 3);
-            range.insert_key(changed.clone(), 9);
-            for (row, key) in neighbors.iter().enumerate() {
-                let hash = index_key_hash(key);
-                let original = pinned_equality
-                    .deltas
-                    .get(hash)
-                    .expect("pinned scalar bucket");
-                let current = equality.deltas.get(hash).expect("current scalar bucket");
-                assert!(Arc::ptr_eq(original, current));
-                assert!(Arc::ptr_eq(&original[0].key, &current[0].key));
-                assert!(Arc::ptr_eq(
-                    pinned_range.deltas.get(hash).expect("pinned range bucket"),
-                    range.deltas.get(hash).expect("range bucket")
-                ));
-                assert_eq!(equality.get_bounded(key, 2), vec![row as u32]);
-                assert_eq!(
-                    range
-                        .between(Some((key, true)), Some((key, true)))
-                        .iter()
-                        .collect::<Vec<_>>(),
-                    vec![row as u32]
-                );
-            }
-            assert_eq!(pinned_equality.get_bounded(&changed, 4), vec![3]);
-            assert_eq!(equality.get_bounded(&changed, 4), vec![9]);
-            assert_eq!(pinned_range.exact_bounded(&changed, 4), vec![3]);
-            assert_eq!(range.exact_bounded(&changed, 4), vec![9]);
-            // Copying a collision bucket must also share each key's heap payload, rather than
-            // merely sharing buckets in neighboring radix leaves.
-            let original = Arc::new(
-                neighbors
-                    .iter()
-                    .map(|key| PostingDelta {
-                        key: Arc::new(key.clone()),
-                        changes: PersistentMap::default(),
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            let mut collision = Arc::clone(&original);
-            Arc::make_mut(&mut collision)[0].changes.insert(99, true);
-            for (before, after) in original.iter().zip(collision.iter()) {
-                assert!(Arc::ptr_eq(&before.key, &after.key));
-            }
-            assert!(original[0].changes.get(99).is_none());
-            detached.push(equality.detached_storage_bytes_from(&pinned_equality));
-        }
-        assert_eq!(detached[0], detached[1]);
-        eprintln!(
-            "scalar neighbor payloads: 64KiB/2MiB keys remain shared; detached radix bytes {detached:?}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn surgical_dirty_text_neighbors_share_large_terms_and_token_sets() {
-        let huge_term = "x".repeat(1_024 * 1_024);
-        let token_text = (0..4_096)
-            .map(|row| format!("token{row}{}", "z".repeat(256)))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let mut index = TextIndex::default();
-        index.upsert(0, "alpha beta");
-        index.upsert(1, &huge_term);
-        index.upsert(2, &token_text);
-        let pinned = index.clone();
-        index.upsert(0, "beta replacement");
-        for row in [1, 2] {
-            let original = pinned
-                .row_overrides
-                .get(row)
-                .and_then(Option::as_ref)
-                .expect("pinned terms");
-            let current = index
-                .row_overrides
-                .get(row)
-                .and_then(Option::as_ref)
-                .expect("current terms");
-            assert!(Arc::ptr_eq(original, current));
-            for (before, after) in original.iter().zip(current.iter()) {
-                assert_eq!(before.as_ptr(), after.as_ptr());
-            }
-        }
-        let hash = text_term_hash(&huge_term);
-        let before = pinned.posting_deltas.get(hash).expect("pinned huge term");
-        let after = index.posting_deltas.get(hash).expect("huge term");
-        assert!(Arc::ptr_eq(before, after));
-        assert!(Arc::ptr_eq(&before[0].term, &after[0].term));
-        assert_eq!(pinned.search("alpha").iter().collect::<Vec<_>>(), vec![0]);
-        assert!(index.search("alpha").is_empty());
-        assert_eq!(
-            index.search("replacement").iter().collect::<Vec<_>>(),
-            vec![0]
-        );
-        assert_eq!(index.search(&huge_term).iter().collect::<Vec<_>>(), vec![1]);
-        let token = format!("token2048{}", "z".repeat(256));
-        assert_eq!(index.search(&token).iter().collect::<Vec<_>>(), vec![2]);
-        let mut collision = Arc::clone(before);
-        Arc::make_mut(&mut collision)[0].changes.insert(99, true);
-        assert!(Arc::ptr_eq(&before[0].term, &collision[0].term));
-        assert!(before[0].changes.get(99).is_none());
-    }
-
-    #[test]
-    fn surgical_index_payload_ownership_preserves_checkpoint_wire_shapes() -> Result<()> {
-        #[derive(Clone, Serialize)]
-        struct OldPosting {
-            key: IndexKey,
-            changes: PersistentMap<bool>,
-        }
-        #[derive(Serialize)]
-        struct OldScalar {
-            postings: Arc<BTreeMap<IndexKey, RoaringBitmap>>,
-            deltas: PersistentMap<Vec<OldPosting>>,
-        }
-        #[derive(Clone, Serialize)]
-        struct OldTextPosting {
-            term: String,
-            changes: PersistentMap<bool>,
-        }
-        #[derive(Serialize)]
-        struct OldText {
-            postings: Arc<BTreeMap<String, RoaringBitmap>>,
-            rows: Arc<BTreeMap<u32, BTreeSet<String>>>,
-            posting_deltas: PersistentMap<Vec<OldTextPosting>>,
-            row_overrides: PersistentMap<Option<BTreeSet<String>>>,
-        }
-        let key = IndexKey::String("large indexed value ".repeat(4_096));
-        let mut scalar = EqualityIndex::default();
-        scalar.insert_key(key.clone(), 7);
-        let mut old_deltas = PersistentMap::default();
-        old_deltas.insert(
-            index_key_hash(&key),
-            vec![OldPosting {
-                key: key.clone(),
-                changes: scalar.deltas.get(index_key_hash(&key)).expect("delta")[0]
-                    .changes
-                    .clone(),
-            }],
-        );
-        let old = OldScalar {
-            postings: scalar.postings.clone(),
-            deltas: old_deltas,
-        };
-        let old_bytes =
-            postcard::to_stdvec(&old).map_err(|error| Error::internal(error.to_string()))?;
-        assert_eq!(
-            old_bytes,
-            postcard::to_stdvec(&scalar).map_err(|error| Error::internal(error.to_string()))?
-        );
-        let recovered: EqualityIndex =
-            postcard::from_bytes(&old_bytes).map_err(|error| Error::internal(error.to_string()))?;
-        let recovered_range: RangeIndex =
-            postcard::from_bytes(&old_bytes).map_err(|error| Error::internal(error.to_string()))?;
-        assert_eq!(recovered.get_bounded(&key, 2), vec![7]);
-        assert_eq!(recovered_range.exact_bounded(&key, 2), vec![7]);
-        let mut text = TextIndex::default();
-        text.upsert(8, "alpha beta");
-        let mut posting_deltas = PersistentMap::default();
-        for (hash, bucket) in text.posting_deltas.iter() {
-            posting_deltas.insert(
-                hash,
-                bucket
-                    .iter()
-                    .map(|delta| OldTextPosting {
-                        term: delta.term.to_string(),
-                        changes: delta.changes.clone(),
-                    })
-                    .collect(),
-            );
-        }
-        let mut row_overrides = PersistentMap::default();
-        row_overrides.insert(8, Some(tokenize("alpha beta")));
-        let old_text = OldText {
-            postings: text.postings.clone(),
-            rows: text.rows.clone(),
-            posting_deltas,
-            row_overrides,
-        };
-        let old_bytes =
-            postcard::to_stdvec(&old_text).map_err(|error| Error::internal(error.to_string()))?;
-        assert_eq!(
-            old_bytes,
-            postcard::to_stdvec(&text).map_err(|error| Error::internal(error.to_string()))?
-        );
-        let recovered: TextIndex =
-            postcard::from_bytes(&old_bytes).map_err(|error| Error::internal(error.to_string()))?;
-        assert_eq!(
-            recovered.search("alpha beta").iter().collect::<Vec<_>>(),
-            vec![8]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn scalar_index_key_preserves_wide_date_days() -> Result<()> {
-        let wide_days = 365_242_499_634_i64;
-        assert_eq!(
-            IndexKey::try_from(&ScalarValue::Date(wide_days))?,
-            IndexKey::Date(wide_days)
-        );
-        Ok(())
-    }
-
-    fn indexed_graph() -> Result<(GraphStore, LabelId, PropertyId, PropertyId)> {
-        let mut graph = GraphStore::default();
-        let label = graph.catalog_mut().intern_label("Document")?;
-        let source = graph.catalog_mut().intern_property("text")?;
-        let target = graph.catalog_mut().intern_property("embedding")?;
-        graph.insert_node(NodeInput {
-            id: NodeId(7),
-            layer: Layer::Observed,
-            revision: 1,
-            labels: vec![label],
-            properties: vec![(source, ScalarValue::String(Arc::from("first")))],
-        })?;
-        Ok((graph, label, source, target))
-    }
-
-    #[test]
-    fn index_optimizer_generation_is_cached_and_invalidated_by_definition_change() -> Result<()> {
-        let (graph, label, source, _) = indexed_graph()?;
-        let mut catalog = IndexCatalog::default();
-        let empty = catalog.optimizer_generation();
-        assert!(catalog.optimizer_generation_cache.get().is_some());
-        assert_eq!(catalog.optimizer_generation(), empty);
-        catalog.create(
-            &graph,
-            GraphIndexDefinition {
-                name: "document_text".to_owned(),
-                kind: GraphIndexKind::Equality,
-                label,
-                properties: vec![source],
-                unique: false,
-            },
-        )?;
-        assert!(catalog.optimizer_generation_cache.get().is_none());
-        assert_ne!(catalog.optimizer_generation(), empty);
-        assert!(catalog.optimizer_generation_cache.get().is_some());
-        Ok(())
-    }
-
-    fn equality_with_rows(rows: u32) -> EqualityIndex {
-        EqualityIndex {
-            postings: Arc::new(BTreeMap::from([(
-                IndexKey::String("shared".to_owned()),
-                (0..rows).collect(),
-            )])),
-            deltas: PersistentMap::default(),
-        }
-    }
-
-    fn text_with_rows(rows: u32) -> TextIndex {
-        let terms = BTreeSet::from(["common".to_owned()]);
-        TextIndex {
-            postings: Arc::new(BTreeMap::from([("common".to_owned(), (0..rows).collect())])),
-            rows: Arc::new((0..rows).map(|row| (row, terms.clone())).collect()),
-            posting_deltas: PersistentMap::default(),
-            row_overrides: PersistentMap::default(),
-        }
-    }
-
-    #[test]
-    fn optimizer_statistics_delta_shape_avoids_posting_materialization() {
-        let small = text_with_rows(40);
-        let large = text_with_rows(400_000);
-        let mut small_next = small.clone();
-        let mut large_next = large.clone();
-        small_next.upsert(17, "replacement");
-        large_next.upsert(17, "replacement");
-
-        assert!(Arc::ptr_eq(&small.postings, &small_next.postings));
-        assert!(Arc::ptr_eq(&large.postings, &large_next.postings));
-        assert_eq!(text_posting_shape(&small_next), (2, 40, 39, 177));
-        assert_eq!(
-            text_posting_shape(&large_next),
-            (2, 400_000, 399_999, 1_600_017)
-        );
-        assert_eq!(
-            small_next.detached_storage_bytes_from(&small),
-            large_next.detached_storage_bytes_from(&large),
-            "one changed row must detach the same bounded delta shape regardless of base postings"
-        );
-    }
-
-    fn vector_with_rows(rows: u64) -> Result<VectorIndex> {
-        let mut index = VectorIndex::new(16, Similarity::Dot)?;
-        let coordinates = vec![f16::from_f32(1.0).to_bits(); 16];
-        for entity in 0..rows {
-            index.upsert_quantized(entity, &coordinates, 1)?;
-        }
-        Ok(index)
-    }
-
-    #[test]
-    fn ivf_pq_parameters_and_bounded_scratch_scale_to_large_shape() -> Result<()> {
-        let small = ivf_config_for_shape(8_000, 384);
-        assert_eq!(small.coarse_centroids, 64);
-        assert_eq!(small.subquantizers, 8);
-        assert_eq!(small.candidate_budget, 256);
-        let small_plan = IvfPqBuildPlan::for_shape(8_000, 384, small)?;
-        assert!(small_plan.assignment_tile_bytes < IVF_PQ_ASSIGNMENT_TILE_BYTES);
-
-        let large_rows = 100_000_000;
-        let large = ivf_config_for_shape(large_rows, 384);
-        assert_eq!(large.coarse_centroids, u16::MAX as usize);
-        assert_eq!(large.subquantizers, 48);
-        assert_eq!(large.probes, 128);
-        assert_eq!(large.candidate_budget, 8_192);
-        let plan = IvfPqBuildPlan::for_shape(large_rows as u64, 384, large)?;
-        assert_eq!(plan.training_rows, MAX_IVF_PQ_TRAINING_ROWS);
-        assert_eq!(plan.batch_rows, IVF_PQ_BUILD_BATCH_ROWS);
-        assert_eq!(plan.assignment_tile_bytes, IVF_PQ_ASSIGNMENT_TILE_BYTES);
-        assert!((6_000_000_000..7_000_000_000).contains(&plan.derived_bytes));
-        assert!(plan.peak_scratch_bytes < 1_200_000_000);
-        let mut incompatible = large;
-        incompatible.size_class_version = 0;
-        assert!(IvfPqBuildPlan::for_shape(large_rows as u64, 384, incompatible).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn source_encoding_is_streamed_in_fixed_bounded_batches() -> Result<()> {
-        struct RecordingKernel {
-            row_counts: Vec<usize>,
-        }
-
-        impl IvfPqBuildKernel for RecordingKernel {
-            fn assign(
-                &mut self,
-                vectors: &[f32],
-                row_count: usize,
-                dimension: usize,
-                centroids: &[f32],
-                centroid_count: usize,
-            ) -> Result<Vec<u32>> {
-                self.row_counts.push(row_count);
-                CpuIvfPqBuildKernel.assign(vectors, row_count, dimension, centroids, centroid_count)
-            }
-        }
-
-        let row_count = IVF_PQ_BUILD_BATCH_ROWS + 17;
-        let mut source = VectorIndex::new(4, Similarity::Dot)?;
-        for row in 0..row_count {
-            let value = (row % 97) as f32 / 97.0;
-            source.upsert(row as u64, &[value, 1.0 - value, value * value, 0.5], 1)?;
-        }
-        let config = IvfPqConfig {
-            size_class_version: IVF_PQ_SIZE_CLASS_VERSION,
-            coarse_centroids: 2,
-            subquantizers: 2,
-            bits_per_code: 2,
-            probes: 1,
-            candidate_budget: 64,
-            iterations: 1,
-            seed: 7,
-        };
-        let plan = IvfPqBuildPlan::for_shape(row_count as u64, 4, config)?;
-        let coarse = vec![vec![0.0, 1.0, 0.0, 0.5], vec![1.0, 0.0, 1.0, 0.5]];
-        let codebooks = vec![
-            vec![
-                vec![-0.5, -0.5],
-                vec![-0.1, 0.1],
-                vec![0.1, -0.1],
-                vec![0.5, 0.5],
-            ],
-            vec![
-                vec![-0.5, 0.0],
-                vec![-0.1, 0.0],
-                vec![0.1, 0.0],
-                vec![0.5, 0.0],
-            ],
-        ];
-        let mut recording = RecordingKernel {
-            row_counts: Vec::new(),
-        };
-        let encoded = stream_encode_rows(
-            &source,
-            &coarse,
-            &codebooks,
-            config,
-            plan,
-            &mut recording,
-            &CancellationToken::new(),
-        )?;
-        assert_eq!(encoded.rows.len(), row_count);
-        assert_eq!(encoded.codes.len(), row_count * config.subquantizers);
-        assert_eq!(encoded.list_offsets.last().copied(), Some(row_count as u32));
-        assert!(
-            recording
-                .row_counts
-                .iter()
-                .all(|rows| *rows <= IVF_PQ_BUILD_BATCH_ROWS)
-        );
-        assert!(recording.row_counts.contains(&IVF_PQ_BUILD_BATCH_ROWS));
-        assert!(recording.row_counts.contains(&17));
-        Ok(())
-    }
-
-    #[test]
-    fn filtered_vector_rows_remap_existing_ann_without_retraining() -> Result<()> {
-        let mut source = VectorIndex::new(4, Similarity::Dot)?;
-        for entity in 0_u64..64 {
-            let value = entity as f32 / 64.0;
-            source.upsert(
-                entity,
-                &[value, 1.0 - value, value * value, (entity % 7) as f32],
-                entity + 1,
-            )?;
-        }
-        let config = IvfPqConfig {
-            size_class_version: IVF_PQ_SIZE_CLASS_VERSION,
-            coarse_centroids: 4,
-            subquantizers: 2,
-            bits_per_code: 3,
-            probes: 4,
-            candidate_budget: 64,
-            iterations: 2,
-            seed: 19,
-        };
-        let approximate = IvfPqIndex::build(&source, config)?;
-        let retained = (0_u64..64)
-            .filter(|entity| entity % 3 == 1)
-            .collect::<BTreeSet<_>>();
-        let remap = source.retain_entities(&retained)?;
-        let filtered = approximate
-            .remap_rows(&remap)?
-            .ok_or_else(|| Error::internal("non-empty ANN filter returned no index"))?;
-        let query = [0.4, 0.6, 0.16, 3.0];
-        assert_eq!(
-            filtered.search(&source, &query, 10)?,
-            source.exact_search(&query, 10)?
-        );
-        assert_eq!(filtered.rows.len(), retained.len());
-        filtered.device_image()?;
-
-        let empty = BTreeSet::new();
-        let empty_remap = source.retain_entities(&empty)?;
-        assert!(filtered.remap_rows(&empty_remap)?.is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn index_point_updates_detach_only_bounded_storage_pages() -> Result<()> {
-        let equality_key = IndexKey::String("shared".to_owned());
-        let small_equality = equality_with_rows(4_096);
-        let large_equality = equality_with_rows(32_768);
-        let mut small_equality_next = small_equality.clone();
-        let mut large_equality_next = large_equality.clone();
-        small_equality_next.remove_key(&equality_key, 17);
-        large_equality_next.remove_key(&equality_key, 17);
-        assert!(Arc::ptr_eq(
-            &small_equality.postings,
-            &small_equality_next.postings
-        ));
-        assert!(Arc::ptr_eq(
-            &large_equality.postings,
-            &large_equality_next.postings
-        ));
-        assert!(
-            small_equality
-                .get(&equality_key)
-                .is_some_and(|rows| rows.contains(17))
-        );
-        assert!(
-            small_equality_next
-                .get(&equality_key)
-                .is_some_and(|rows| !rows.contains(17))
-        );
-        let small_scalar_bytes = small_equality_next.detached_storage_bytes_from(&small_equality);
-        let large_scalar_bytes = large_equality_next.detached_storage_bytes_from(&large_equality);
-        assert_eq!(small_scalar_bytes, large_scalar_bytes);
-        assert!(large_scalar_bytes <= 32 * 1024);
-
-        let small_text = text_with_rows(4_096);
-        let large_text = text_with_rows(32_768);
-        let mut small_text_next = small_text.clone();
-        let mut large_text_next = large_text.clone();
-        small_text_next.upsert(17, "replacement");
-        large_text_next.upsert(17, "replacement");
-        assert!(Arc::ptr_eq(&small_text.postings, &small_text_next.postings));
-        assert!(Arc::ptr_eq(&small_text.rows, &small_text_next.rows));
-        assert!(Arc::ptr_eq(&large_text.postings, &large_text_next.postings));
-        assert!(Arc::ptr_eq(&large_text.rows, &large_text_next.rows));
-        assert!(small_text.search("common").contains(17));
-        assert!(!small_text_next.search("common").contains(17));
-        assert!(small_text_next.search("replacement").contains(17));
-        let small_text_bytes = small_text_next.detached_storage_bytes_from(&small_text);
-        let large_text_bytes = large_text_next.detached_storage_bytes_from(&large_text);
-        assert_eq!(small_text_bytes, large_text_bytes);
-        assert!(large_text_bytes <= 96 * 1024);
-
-        let small_vector = vector_with_rows(4_096)?;
-        let large_vector = vector_with_rows(8_192)?;
-        let mut small_vector_next = small_vector.clone();
-        let mut large_vector_next = large_vector.clone();
-        let replacement = vec![f16::from_f32(2.0).to_bits(); 16];
-        small_vector_next.upsert_quantized(17, &replacement, 2)?;
-        large_vector_next.upsert_quantized(17, &replacement, 2)?;
-        assert_eq!(
-            small_vector
-                .vector_for(17)
-                .and_then(|row| row.first().copied()),
-            Some(1.0)
-        );
-        assert_eq!(
-            small_vector_next
-                .vector_for(17)
-                .and_then(|row| row.first().copied()),
-            Some(2.0)
-        );
-        let small_vector_bytes = small_vector_next.detached_storage_bytes_from(&small_vector);
-        let large_vector_bytes = large_vector_next.detached_storage_bytes_from(&large_vector);
-        assert_eq!(small_vector_bytes, large_vector_bytes);
-        assert!(large_vector_bytes <= 32 * 1024);
-        Ok(())
-    }
-
-    #[test]
-    fn posting_overrides_do_not_retain_write_history() -> Result<()> {
-        let key = IndexKey::String("value".to_owned());
-        let mut equality = EqualityIndex::default();
-        for revision in 0..10_000 {
-            if revision % 2 == 0 {
-                equality.insert_key(key.clone(), 7);
-            } else {
-                equality.remove_key(&key, 7);
-            }
-        }
-        assert!(equality.get(&key).is_none());
-        let equality_bytes = postcard::to_stdvec(&equality)
-            .map_err(|error| Error::new(ErrorCode::CorruptStorage, error.to_string()))?;
-        assert!(equality_bytes.len() < 1_024);
-
-        let mut text = TextIndex::default();
-        for revision in 0..10_000 {
-            text.upsert(7, if revision % 2 == 0 { "alpha" } else { "beta" });
-        }
-        assert!(!text.search("alpha").contains(7));
-        assert!(text.search("beta").contains(7));
-        let text_bytes = postcard::to_stdvec(&text)
-            .map_err(|error| Error::new(ErrorCode::CorruptStorage, error.to_string()))?;
-        assert!(text_bytes.len() < 2_048);
-        Ok(())
-    }
-
-    #[test]
-    fn quantized_vector_mutation_replays_identical_bits() -> Result<()> {
-        let (graph, label, source, target) = indexed_graph()?;
-        let profile = EmbeddingProfile::new(
-            [11; 32],
-            [17; 32],
-            4,
-            EmbeddingDType::F16,
-            true,
-            Similarity::Cosine,
-        )?;
-        let initial = profile.quantize(&[1.0, 0.0, 0.0, 0.0])?;
-        let definition = EmbeddingIndexDefinition {
-            name: "semantic".to_owned(),
-            label,
-            source_property: source,
-            target_property: target,
-            model: "default".to_owned(),
-        };
-        let mut first = IndexCatalog::default();
-        first.create_embedding(
-            &graph,
-            definition.clone(),
-            profile.clone(),
-            vec![(7, initial.clone(), 1)],
-        )?;
-        let mut second = IndexCatalog::default();
-        second.create_embedding(&graph, definition, profile.clone(), vec![(7, initial, 1)])?;
-
-        let bits = profile.quantize(&[0.25, -0.5, 0.75, 1.0])?;
-        let mutation = ResolvedVectorMutation::Upsert {
-            property: target,
-            entity_id: 7,
-            coordinates: bits.clone(),
-            revision: 41,
-        };
-        let encoded = postcard::to_stdvec(&mutation)
-            .map_err(|error| Error::internal(format!("test encoding failed: {error}")))?;
-        let replayed: ResolvedVectorMutation = postcard::from_bytes(&encoded)
-            .map_err(|error| Error::internal(format!("test decoding failed: {error}")))?;
-        let ResolvedVectorMutation::Upsert { coordinates, .. } = &replayed else {
-            return Err(Error::internal("upsert changed kind during replay"));
-        };
-        assert_eq!(coordinates, &bits);
-        first.apply_vector_mutation(&mutation)?;
-        second.apply_vector_mutation(&replayed)?;
-
-        let first_bytes = postcard::to_stdvec(&first)
-            .map_err(|error| Error::internal(format!("test encoding failed: {error}")))?;
-        let second_bytes = postcard::to_stdvec(&second)
-            .map_err(|error| Error::internal(format!("test encoding failed: {error}")))?;
-        assert_eq!(first_bytes, second_bytes);
-        assert_eq!(
-            first
-                .vector_search_source("semantic")
-                .ok_or_else(|| Error::internal("first vector index is offline"))?
-                .0
-                .exact_search(&[0.25, -0.5, 0.75, 1.0], 1)?,
-            second
-                .vector_search_source("semantic")
-                .ok_or_else(|| Error::internal("second vector index is offline"))?
-                .0
-                .exact_search(&[0.25, -0.5, 0.75, 1.0], 1)?,
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn ivf_build_is_cancellable_and_searches_exact_delta() -> Result<()> {
-        let mut source = VectorIndex::new(2, Similarity::Euclidean)?;
-        for (entity, value) in [(1_u64, 10.0_f32), (2, 20.0), (3, 30.0)] {
-            source.upsert_quantized(
-                entity,
-                &[
-                    f16::from_f32(value).to_bits(),
-                    f16::from_f32(value).to_bits(),
-                ],
-                1,
-            )?;
-        }
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        let cancelled = IvfPqIndex::build_cancellable(&source, ivf_config(&source), &cancellation)
-            .expect_err("cancelled IVF-PQ build completed");
-        assert_eq!(cancelled.code, ErrorCode::Cancelled);
-
-        let index = IvfPqIndex::build(&source, ivf_config(&source))?;
-        assert_ne!(index.build_generation(), [0_u8; 32]);
-
-        let zero = [f16::from_f32(0.0).to_bits(); 2];
-        source.upsert_quantized(99, &zero, 2)?;
-        let hits = index.search(&source, &[0.0, 0.0], 1)?;
-        assert_eq!(hits.first().map(|hit| hit.entity_id), Some(99));
-        assert_eq!(hits.first().map(|hit| hit.score), Some(0.0));
-        Ok(())
-    }
-
-    #[test]
-    fn semantic_rebuild_growth_ignores_deleted_slots_and_survives_recovery() -> Result<()> {
-        let profile = EmbeddingProfile::new(
-            [11; 32],
-            [17; 32],
-            4,
-            EmbeddingDType::F16,
-            true,
-            Similarity::Cosine,
-        )?;
-        let mut indexes = IndexCatalog::default();
-        indexes.initialize_semantic(profile.clone())?;
-        let coordinates = profile.quantize(&[1.0, 0.5, 0.25, 0.125])?;
-        for entity_id in 0..1_024 {
-            indexes.apply_vector_mutation(&ResolvedVectorMutation::Upsert {
-                property: SEMANTIC_NODE_PROPERTY,
-                entity_id,
-                coordinates: coordinates.clone(),
-                revision: 1,
-            })?;
-        }
-        let graph = GraphStore::default();
-        let build = |source: &VectorIndex, mut config: IvfPqConfig| {
-            config.coarse_centroids = 4;
-            config.probes = config.probes.min(4);
-            config.iterations = 1;
-            IvfPqIndex::build(source, config)
-        };
-        indexes.rebuild_vectors_with(build)?;
-        assert!(!indexes.semantic_rebuild_needed());
-        for entity_id in 0..768 {
-            indexes.apply_vector_mutation(&ResolvedVectorMutation::Remove {
-                property: SEMANTIC_NODE_PROPERTY,
-                entity_id,
-                revision: 2,
-            })?;
-        }
-        indexes.rebuild_deferred(&graph, SEMANTIC_NODE_INDEX)?;
-        indexes.rebuild_vectors_with(build)?;
-        let (_, ann) = indexes
-            .vector_search_source(SEMANTIC_NODE_INDEX)
-            .ok_or_else(|| Error::internal("semantic index missing"))?;
-        assert_eq!(ann.map(|ann| ann.rows.len()), Some(256));
-        for _ in 0..3 {
-            assert!(!indexes.semantic_rebuild_needed());
-        }
-
-        // Only newly allocated slots count as growth. A failed build must not advance the baseline.
-        for entity_id in 1_024..2_048 {
-            indexes.apply_vector_mutation(&ResolvedVectorMutation::Upsert {
-                property: SEMANTIC_NODE_PROPERTY,
-                entity_id,
-                coordinates: coordinates.clone(),
-                revision: 3,
-            })?;
-        }
-        assert!(indexes.semantic_rebuild_needed());
-        indexes.rebuild_deferred(&graph, SEMANTIC_NODE_INDEX)?;
-        indexes.rebuild_vectors_with(|_, _| {
-            Err(Error::new(
-                ErrorCode::Cancelled,
-                "test rebuild cancellation",
-            ))
-        })?;
-        assert!(indexes.semantic_rebuild_needed());
-        indexes.rebuild_deferred(&graph, SEMANTIC_NODE_INDEX)?;
-        indexes.rebuild_vectors_with(build)?;
-        assert!(!indexes.semantic_rebuild_needed());
-
-        // Empty source columns still remember their allocated slots after a successful build.
-        for entity_id in 0..2_048 {
-            indexes.apply_vector_mutation(&ResolvedVectorMutation::Remove {
-                property: SEMANTIC_NODE_PROPERTY,
-                entity_id,
-                revision: 4,
-            })?;
-        }
-        indexes.rebuild_deferred(&graph, SEMANTIC_NODE_INDEX)?;
-        indexes.rebuild_vectors_with(build)?;
-        assert!(
-            indexes
-                .vector_search_source(SEMANTIC_NODE_INDEX)
-                .is_some_and(|(_, ann)| ann.is_none())
-        );
-        let mut encoded = Vec::new();
-        ciborium::ser::into_writer(&indexes, &mut encoded)
-            .map_err(|error| Error::internal(error.to_string()))?;
-        let recovered: IndexCatalog = ciborium::de::from_reader(encoded.as_slice())
-            .map_err(|error| Error::internal(error.to_string()))?;
-        for _ in 0..3 {
-            assert!(!recovered.semantic_rebuild_needed());
-        }
-        assert_eq!(
-            recovered.semantic_built_slots[&SEMANTIC_NODE_PROPERTY],
-            2_048
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn failed_vector_rebuild_keeps_previous_validated_generation_online() -> Result<()> {
-        let (graph, label, source, target) = indexed_graph()?;
-        let profile = EmbeddingProfile::new(
-            [11; 32],
-            [17; 32],
-            4,
-            EmbeddingDType::F16,
-            true,
-            Similarity::Cosine,
-        )?;
-        let mut indexes = IndexCatalog::default();
-        indexes.create_embedding(
-            &graph,
-            EmbeddingIndexDefinition {
-                name: "semantic".to_owned(),
-                label,
-                source_property: source,
-                target_property: target,
-                model: "default".to_owned(),
-            },
-            profile.clone(),
-            vec![(7, profile.quantize(&[1.0, 0.0, 0.0, 0.0])?, 1)],
-        )?;
-        let before = indexes
-            .vector_search_source("semantic")
-            .and_then(|(_, approximate)| approximate)
-            .map(IvfPqIndex::build_generation)
-            .ok_or_else(|| Error::internal("initial ANN generation is unavailable"))?;
-        indexes.rebuild_deferred(&graph, "semantic")?;
-        indexes.rebuild_vectors_with(|_, _| {
-            Err(Error::new(
-                ErrorCode::GpuAdmissionFailure,
-                "injected local builder failure",
-            ))
-        })?;
-        let after = indexes
-            .vector_search_source("semantic")
-            .and_then(|(_, approximate)| approximate)
-            .map(IvfPqIndex::build_generation)
-            .ok_or_else(|| Error::internal("failed rebuild evicted the valid ANN generation"))?;
-        assert_eq!(after, before);
-        assert_eq!(
-            indexes.statuses().next().map(|status| status.state),
-            Some(DerivedIndexState::Online)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn profile_replacement_ignores_scalar_indexes_but_not_vector_state() -> Result<()> {
-        let (graph, label, source, target) = indexed_graph()?;
-        let first = EmbeddingProfile::new(
+    fn profile() -> Result<EmbeddingProfile> {
+        EmbeddingProfile::new(
             [1; 32],
             [2; 32],
             4,
             EmbeddingDType::F16,
-            true,
-            Similarity::Cosine,
-        )?;
-        let second = EmbeddingProfile::new(
-            [3; 32],
-            [4; 32],
-            4,
-            EmbeddingDType::F16,
-            true,
-            Similarity::Cosine,
-        )?;
-        let mut catalog = IndexCatalog::default();
-        catalog.activate_profile(first.clone())?;
+            false,
+            Similarity::Dot,
+        )
+    }
+    #[test]
+    fn metadata_revision_advances_without_coordinates_or_ann_stamp_replacement() -> Result<()> {
+        let source = VectorIndex::new(4, Similarity::Dot)?;
+        source.upsert(1, &[1.0; 4], 10)?;
+        let row = source.store.rows.get(&1).expect("owner");
+        let before = source
+            .store
+            .slots
+            .get(row)
+            .expect("slot")
+            .payload
+            .load_full()
+            .expect("payload");
+        let dirty = source.store.dirty.get(&row);
+        assert!(source.advance_row_revision(1, 10, 11));
+        let after = source
+            .store
+            .slots
+            .get(row)
+            .expect("slot")
+            .payload
+            .load_full()
+            .expect("payload");
+        assert!(Arc::ptr_eq(&before, &after));
+        assert_eq!(before.stamp, after.stamp);
+        assert_eq!(source.store.dirty.get(&row), dirty);
+        assert_eq!(source.row_revision(1), Some(11));
+        assert!(!source.advance_row_revision(1, 12, 13));
+        assert_eq!(source.row_revision(1), Some(11));
+        source.remove(1, 14);
+        source.upsert(2, &[2.0; 4], 1)?;
+        assert!(!source.advance_row_revision(1, 11, 15));
+        assert_eq!(source.row_revision(2), Some(1));
+        Ok(())
+    }
+    fn fixture() -> Result<(GraphStore, LabelId, PropertyId, PropertyId)> {
+        let graph = GraphStore::default();
+        let label = graph.catalog().intern_label("Record")?;
+        let body = graph.catalog().intern_property("body")?;
+        let vector = graph.catalog().intern_property("vector")?;
+        for id in 1..=4 {
+            graph.insert_node(crate::NodeInput {
+                id: crate::NodeId(id),
+                layer: crate::Layer::Knowledge,
+                revision: 1,
+                labels: vec![label],
+                properties: vec![(body, ScalarValue::String("complete document".into()))],
+            })?;
+        }
+        Ok((graph, label, body, vector))
+    }
+    #[test]
+    fn manual_vectors_serialize_owner_references_and_rebind_without_payload_copy()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let (graph, label, _, property) = fixture()?;
+        let numeric = |value: f64| {
+            irongraph_types::DocumentList::new(vec![
+                irongraph_types::DocumentItem::Scalar(
+                    ScalarValue::Float(value.into())
+                );
+                4
+            ])
+            .map(ScalarValue::List)
+        };
+        graph.set_node_property(crate::NodeId(1), property, numeric(1.0)?, 2)?;
+        let catalog = IndexCatalog::default();
+        catalog.activate_profile(profile()?)?;
         catalog.create(
             &graph,
             GraphIndexDefinition {
-                name: "ordinary".to_owned(),
-                kind: GraphIndexKind::Equality,
-                label,
-                properties: vec![source],
-                unique: false,
-            },
-        )?;
-        assert!(catalog.embedding_profile_is_mutable());
-        catalog.activate_profile(second.clone())?;
-        assert_eq!(catalog.profile(), Some(&second));
-
-        catalog.create(
-            &graph,
-            GraphIndexDefinition {
-                name: "vectors".to_owned(),
+                name: "manual".into(),
                 kind: GraphIndexKind::Vector,
                 label,
-                properties: vec![target],
+                properties: vec![property],
                 unique: false,
             },
         )?;
+        let (source, _) = catalog
+            .vector_search_source("manual")
+            .ok_or("missing source")?;
+        let payload = source
+            .store
+            .slots
+            .get(0)
+            .ok_or("missing slot")?
+            .payload
+            .load_full()
+            .ok_or("missing payload")?;
+        assert!(matches!(
+            payload.coordinates,
+            VectorCoordinates::PropertyOwner { .. }
+        ));
+        let bytes = postcard::to_stdvec(source.as_ref())?;
         assert!(
-            catalog
-                .create(
-                    &graph,
-                    GraphIndexDefinition {
-                        name: "duplicate_vectors".to_owned(),
-                        kind: GraphIndexKind::Vector,
-                        label,
-                        properties: vec![target],
-                        unique: false,
-                    },
-                )
-                .is_err()
+            bytes.len() < 37,
+            "index checkpoint stores coordinate bytes: {}",
+            bytes.len()
         );
-        assert!(!catalog.embedding_profile_is_mutable());
-        let error = catalog
-            .activate_profile(first)
-            .expect_err("vector state must freeze the embedding profile");
-        assert_eq!(error.code, ErrorCode::EmbeddingProfileImmutable);
+        let restored: VectorIndex = postcard::from_bytes(&bytes)?;
+        restored.bind_canonical_graph(&graph);
+        assert_eq!(restored.vector_for(1), Some(vec![1.0; 4]));
+        graph.set_node_property(crate::NodeId(1), property, numeric(2.0)?, 3)?;
+        assert_eq!(restored.vector_for(1), Some(vec![2.0; 4]));
+        assert_eq!(source.vector_for(1), Some(vec![2.0; 4]));
         Ok(())
     }
 
     #[test]
-    fn uniqueness_constraint_rejects_existing_and_new_duplicate_values() -> Result<()> {
-        let (graph, label, property, _) = indexed_graph()?;
-        let definition = GraphIndexDefinition {
-            name: "document_text_unique".to_owned(),
-            kind: GraphIndexKind::Equality,
-            label,
-            properties: vec![property],
-            unique: true,
-        };
-
-        let mut duplicated = graph.clone();
-        duplicated.apply(GraphMutation::InsertNode(NodeInput {
-            id: NodeId(8),
-            layer: Layer::Observed,
-            revision: 2,
-            labels: vec![label],
-            properties: vec![(property, ScalarValue::String(Arc::from("first")))],
-        }))?;
-        let mut rejected = IndexCatalog::default();
-        let error = rejected
-            .create(&duplicated, definition.clone())
-            .expect_err("constraint accepted duplicate existing values");
-        assert_eq!(error.code, ErrorCode::TransactionConflict);
-
-        let mut graph = graph;
-        let mut catalog = IndexCatalog::default();
-        catalog.create(&graph, definition)?;
-        assert!(catalog.has_unique_constraint(label, property));
-        let mutation = GraphMutation::InsertNode(NodeInput {
-            id: NodeId(8),
-            layer: Layer::Observed,
-            revision: 2,
-            labels: vec![label],
-            properties: vec![(property, ScalarValue::String(Arc::from("first")))],
-        });
-        catalog.before_graph_apply(&graph, &mutation)?;
-        graph.apply(mutation.clone())?;
-        let error = catalog
-            .after_graph_apply(&graph, &mutation)
-            .expect_err("constraint accepted a duplicate mutation");
-        assert_eq!(error.code, ErrorCode::TransactionConflict);
-        assert!(catalog.drop_index("document_text_unique").is_err());
-        catalog.drop_constraint("document_text_unique")?;
-        Ok(())
-    }
-
-    #[test]
-    fn index_catalog_lifecycle_survives_checkpoint_roundtrip() -> Result<()> {
-        let (mut graph, label, source, _) = indexed_graph()?;
-        let mut indexes = IndexCatalog::default();
-        indexes.create(
+    fn invalid_final_unique_write_is_pure_and_released_keys_can_be_reused() -> Result<()> {
+        let (graph, label, property, _) = fixture()?;
+        for owner in 1..=4 {
+            graph.set_node_property(
+                crate::NodeId(owner),
+                property,
+                ScalarValue::Integer(owner as i64),
+                2,
+            )?;
+        }
+        let catalog = IndexCatalog::default();
+        catalog.create(
             &graph,
             GraphIndexDefinition {
-                name: "text_lookup".to_owned(),
-                kind: GraphIndexKind::Text,
-                label,
-                properties: vec![source],
-                unique: false,
-            },
-        )?;
-        assert_eq!(
-            indexes.statuses().next().map(|status| status.state),
-            Some(DerivedIndexState::Online)
-        );
-
-        let checkpoint = postcard::to_stdvec(&indexes)
-            .map_err(|error| Error::internal(format!("test encoding failed: {error}")))?;
-        let mut restored: IndexCatalog = postcard::from_bytes(&checkpoint)
-            .map_err(|error| Error::internal(format!("test decoding failed: {error}")))?;
-        let mutation = GraphMutation::SetNodeProperty {
-            node: NodeId(7),
-            property: source,
-            value: ScalarValue::String(Arc::from("updated graph memory")),
-            revision: 2,
-        };
-        restored.before_graph_apply(&graph, &mutation)?;
-        graph.apply(mutation.clone())?;
-        restored.after_graph_apply(&graph, &mutation)?;
-        restored.rebuild(&graph, "text_lookup")?;
-        assert_eq!(
-            restored.statuses().next().map(|status| status.state),
-            Some(DerivedIndexState::Online)
-        );
-        restored.drop_index("text_lookup")?;
-        assert!(restored.statuses().next().is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn catalog_selects_exact_online_scalar_posting() -> Result<()> {
-        let (graph, label, source, _) = indexed_graph()?;
-        let mut indexes = IndexCatalog::default();
-        indexes.create(
-            &graph,
-            GraphIndexDefinition {
-                name: "document_text".to_owned(),
+                name: "unique".into(),
                 kind: GraphIndexKind::Equality,
                 label,
-                properties: vec![source],
+                properties: vec![property],
+                unique: true,
+            },
+        )?;
+        let write = |owner, value| GraphMutation::SetNodeProperty {
+            node: crate::NodeId(owner),
+            property,
+            value: ScalarValue::Integer(value),
+            revision: 3,
+        };
+        assert!(
+            catalog
+                .validate_graph_mutations(&graph, &[write(1, 10), write(2, 10)])
+                .is_err()
+        );
+        assert_eq!(
+            graph
+                .node(crate::NodeId(1))
+                .and_then(|node| node.property(property)),
+            Some(ScalarValue::Integer(1))
+        );
+        assert_eq!(
+            graph
+                .node(crate::NodeId(2))
+                .and_then(|node| node.property(property)),
+            Some(ScalarValue::Integer(2))
+        );
+        catalog.validate_graph_mutations(&graph, &[write(1, 10), write(2, 1)])?;
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_edit_never_resurrects_dropped_definition() -> Result<()> {
+        let (graph, label, body, _) = fixture()?;
+        let catalog = IndexCatalog::default();
+        catalog.create(
+            &graph,
+            GraphIndexDefinition {
+                name: "text".into(),
+                kind: GraphIndexKind::Text,
+                label,
+                properties: vec![body],
                 unique: false,
             },
         )?;
-        let rows = indexes
-            .equality_candidates(
-                label,
-                &BTreeMap::from([(source, ScalarValue::String(Arc::from("first")))]),
-            )?
-            .ok_or_else(|| Error::internal("ONLINE equality posting was not selected"))?;
-        assert_eq!(rows, vec![0]);
+        let mut edit = catalog
+            .entries
+            .edit("text")
+            .ok_or_else(|| Error::internal("missing definition"))?;
+        catalog.entries.remove("text");
+        edit.state = DerivedIndexState::Failed;
+        drop(edit);
+        assert!(!catalog.contains("text"));
+        Ok(())
+    }
+
+    #[test]
+    fn scalar_text_clone_shares_canonical_memberships() -> Result<()> {
+        let equality = EqualityIndex::default();
+        let alias = equality.clone();
+        equality.insert(&ScalarValue::Integer(7), 3)?;
         assert_eq!(
-            indexes.equality_candidates(
-                label,
-                &BTreeMap::from([(source, ScalarValue::String(Arc::from("missing")))])
-            )?,
-            Some(Vec::new())
+            alias.get(&IndexKey::Integer(7)).map(|rows| rows.len()),
+            Some(1)
         );
+        alias.remove_key(&IndexKey::Integer(7), 3);
+        assert!(equality.get(&IndexKey::Integer(7)).is_none());
+        let range = RangeIndex::default();
+        range.insert(&ScalarValue::Integer(5), 2)?;
+        range.insert(&ScalarValue::Integer(9), 4)?;
+        assert_eq!(
+            range
+                .between(Some((&IndexKey::Integer(5), false)), None)
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![4]
+        );
+        let text = TextIndex::default();
+        text.upsert(2, "complete long owner text");
+        let alias = text.clone();
+        alias.upsert(2, "changed long owner text");
+        assert!(text.search("complete").is_empty());
+        assert_eq!(
+            text.search("changed owner").iter().collect::<Vec<_>>(),
+            vec![2]
+        );
+        Ok(())
+    }
+    #[test]
+    fn vector_slot_churn_keeps_metadata_bounded_and_owner_guards_valid() -> Result<()> {
+        let source = VectorIndex::new(4, Similarity::Dot)?;
+        for owner in 0..16 {
+            source.upsert(owner, &[1.0; 4], 1)?;
+        }
+        let held = source
+            .store
+            .slots
+            .get(0)
+            .ok_or_else(|| Error::internal("missing slot"))?
+            .payload
+            .load_full()
+            .ok_or_else(|| Error::internal("missing payload"))?;
+        for step in 0..4096_u64 {
+            source.remove(step, 1);
+            source.upsert(step + 16, &[2.0; 4], 1)?;
+            assert_eq!(source.row_count(), 16);
+            assert_eq!(source.store.rows.len(), 16);
+            assert!(source.store.dirty.len() <= 16);
+            assert_eq!(source.vector_for(step), None);
+        }
+        assert_eq!(held.entity_id, 0);
+        assert_eq!(source.decode_payload(&held), Some(vec![1.0; 4]));
+        assert_eq!(source.row_revision(4111), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn readers_and_vector_writers_progress_with_held_old_payload() -> Result<()> {
+        let vector = VectorIndex::new(384, Similarity::Dot)?;
+        vector.upsert(1, &vec![1.0; 384], 1)?;
+        let slot = vector
+            .store
+            .slots
+            .get(0)
+            .ok_or_else(|| Error::internal("missing test slot"))?;
+        let held = slot
+            .payload
+            .load_full()
+            .ok_or_else(|| Error::internal("missing test payload"))?;
+        let retired = Arc::downgrade(&held);
+        let complete = AtomicBool::new(false);
+        std::thread::scope(|scope| -> Result<()> {
+            let writer = scope.spawn(|| -> Result<()> {
+                for revision in 2..=2000 {
+                    vector.upsert(1, &vec![revision as f32 / 2000.0; 384], revision)?;
+                }
+                complete.store(true, AtomicOrdering::Release);
+                Ok(())
+            });
+            while !complete.load(AtomicOrdering::Acquire) {
+                let coordinates = vector
+                    .vector_for(1)
+                    .ok_or_else(|| Error::internal("live owner disappeared"))?;
+                assert_eq!(coordinates.len(), 384);
+                assert!(coordinates.iter().all(|v| v.is_finite()));
+                assert!(coordinates.windows(2).all(|pair| pair[0] == pair[1]));
+            }
+            writer
+                .join()
+                .map_err(|_| Error::internal("test writer panicked"))??;
+            Ok(())
+        })?;
+        assert_eq!(vector.row_count(), 1);
+        assert_eq!(vector.store.dirty.len(), 1);
+        assert!(
+            matches!(&held.coordinates,VectorCoordinates::Quantized(values) if values.len()==384)
+        );
+        drop(held);
+        assert!(
+            retired.upgrade().is_none(),
+            "retired payload was retained without a reader"
+        );
+        Ok(())
+    }
+    #[test]
+    fn scalar_text_reads_remain_structurally_valid_during_writes() -> Result<()> {
+        let equality = EqualityIndex::default();
+        let text = TextIndex::default();
+        let done = AtomicBool::new(false);
+        std::thread::scope(|scope| -> Result<()> {
+            let writer = scope.spawn(|| {
+                for _ in 0..3000 {
+                    equality.insert_key(IndexKey::Integer(1), 8);
+                    text.upsert(8, "old text");
+                    equality.remove_key(&IndexKey::Integer(1), 8);
+                    text.upsert(8, "new text");
+                }
+                done.store(true, AtomicOrdering::Release);
+            });
+            while !done.load(AtomicOrdering::Acquire) {
+                if let Some(rows) = equality.get(&IndexKey::Integer(1)) {
+                    assert!(rows.iter().all(|row| row == 8));
+                }
+                assert!(text.search("text").iter().all(|row| row == 8));
+            }
+            writer
+                .join()
+                .map_err(|_| Error::internal("test writer panicked"))?;
+            Ok(())
+        })
+    }
+    #[test]
+    fn invalid_final_vector_mutation_leaves_every_payload_unchanged() -> Result<()> {
+        let catalog = IndexCatalog::default();
+        catalog.initialize_semantic(profile()?)?;
+        let initial = ResolvedVectorMutation::Upsert {
+            property: SEMANTIC_NODE_PROPERTY,
+            entity_id: 1,
+            coordinates: vec![f16::from_f32(1.0).to_bits(); 4],
+            revision: 1,
+        };
+        catalog.apply_vector_mutation(&initial)?;
+        let alias = catalog.clone();
+        let invalid = [
+            ResolvedVectorMutation::Upsert {
+                property: SEMANTIC_NODE_PROPERTY,
+                entity_id: 1,
+                coordinates: vec![f16::from_f32(2.0).to_bits(); 4],
+                revision: 2,
+            },
+            ResolvedVectorMutation::Upsert {
+                property: SEMANTIC_NODE_PROPERTY,
+                entity_id: 2,
+                coordinates: vec![0; 3],
+                revision: 2,
+            },
+        ];
+        assert!(catalog.validate_vector_mutations(&invalid).is_err());
+        assert!(catalog.apply_vector_mutations(&invalid).is_err());
+        let (source, _) = alias
+            .vector_search_source(SEMANTIC_NODE_INDEX)
+            .ok_or_else(|| Error::internal("missing source"))?;
+        assert_eq!(source.vector_for(1), Some(vec![1.0; 4]));
+        assert!(source.vector_for(2).is_none());
+        assert!(Arc::ptr_eq(
+            &source,
+            &catalog
+                .vector_search_source(SEMANTIC_NODE_INDEX)
+                .ok_or_else(|| Error::internal("missing source"))?
+                .0
+        ));
+        Ok(())
+    }
+    #[test]
+    fn invalid_embedding_declaration_does_not_publish_profile_or_owners() -> Result<()> {
+        let (graph, label, body, vector) = fixture()?;
+        let catalog = IndexCatalog::default();
+        let definition = EmbeddingIndexDefinition {
+            name: "documents".into(),
+            label,
+            source_property: body,
+            target_property: vector,
+            model: "default".into(),
+        };
+        let rows = vec![(1, vec![0; 4], 1), (2, vec![0; 3], 1)];
+        assert!(
+            catalog
+                .create_embedding_deferred(&graph, definition, profile()?, rows)
+                .is_err()
+        );
+        assert!(catalog.is_empty());
+        assert!(catalog.profile().is_none());
+        Ok(())
+    }
+    #[test]
+    fn catalog_postcard_roundtrip_preserves_scalar_text_vectors_and_deltas()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let (graph, label, body, _) = fixture()?;
+        let catalog = IndexCatalog::default();
+        for (name, kind) in [
+            ("equality", GraphIndexKind::Equality),
+            ("range", GraphIndexKind::Range),
+            ("text", GraphIndexKind::Text),
+        ] {
+            catalog.create(
+                &graph,
+                GraphIndexDefinition {
+                    name: name.into(),
+                    kind,
+                    label,
+                    properties: vec![body],
+                    unique: false,
+                },
+            )?;
+        }
+        catalog.initialize_semantic(profile()?)?;
+        catalog.apply_vector_mutation(&ResolvedVectorMutation::Upsert {
+            property: SEMANTIC_NODE_PROPERTY,
+            entity_id: 1,
+            coordinates: vec![f16::from_f32(1.0).to_bits(); 4],
+            revision: 2,
+        })?;
+        let bytes = postcard::to_stdvec(&catalog)?;
+        let restored: IndexCatalog = postcard::from_bytes(&bytes)?;
+        assert_eq!(restored.definitions().count(), 5);
+        let values = BTreeMap::from([(body, ScalarValue::String("complete document".into()))]);
+        assert_eq!(
+            restored
+                .equality_candidates_named("equality", label, &values)?
+                .map(|rows| rows.len()),
+            Some(4)
+        );
+        assert_eq!(restored.bounded_text_candidates("document", 10)?.len(), 4);
+        let (source, _) = restored
+            .vector_search_source(SEMANTIC_NODE_INDEX)
+            .ok_or("missing source")?;
+        assert_eq!(source.vector_for(1), Some(vec![1.0; 4]));
+        assert_eq!(source.store.dirty.len(), 1);
+        Ok(())
+    }
+    #[test]
+    fn ann_cold_build_and_single_row_delta_do_not_gate_search() -> Result<()> {
+        let source = VectorIndex::new(4, Similarity::Dot)?;
+        for owner in 0..4096 {
+            source.upsert(owner, &[0.1, 0.2, (owner % 7) as f32 / 10.0, 0.3], 1)?;
+        }
+        let config = IvfPqConfig {
+            coarse_centroids: 4,
+            subquantizers: 2,
+            bits_per_code: 2,
+            probes: 2,
+            candidate_budget: 32,
+            iterations: 2,
+            ..IvfPqConfig::default()
+        };
+        let ann = IvfPqIndex::build(&source, config)?;
+        source.acknowledge_ann(&ann);
+        assert_eq!(source.store.dirty.len(), 0);
+        source.upsert(100, &[0.0, 0.0, 100.0, 0.0], 2)?;
+        assert_eq!(source.store.dirty.len(), 1);
+        assert_eq!(
+            ann.search(&source, &[0.0, 0.0, 1.0, 0.0], 1)?
+                .first()
+                .map(|hit| hit.entity_id),
+            Some(100)
+        );
+        assert_eq!(source.row_count(), 4096);
+        source.remove(100, 3);
+        assert!(
+            ann.search(&source, &[0.0, 0.0, 1.0, 0.0], 32)?
+                .iter()
+                .all(|hit| hit.entity_id != 100)
+        );
+        source.upsert(10_000, &[0.0, 0.0, 200.0, 0.0], 1)?;
+        assert_eq!(source.row_count(), 4096);
+        assert_eq!(
+            ann.search(&source, &[0.0, 0.0, 1.0, 0.0], 1)?
+                .first()
+                .map(|hit| hit.entity_id),
+            Some(10_000)
+        );
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert!(IvfPqIndex::build_cancellable(&source, config, &cancellation).is_err());
+        Ok(())
+    }
+    #[test]
+    fn bounded_text_delta_replaces_only_changed_large_owner() -> Result<()> {
+        let text = TextIndex::default();
+        let body = "unchanged token ".repeat(4096);
+        for row in 0..4096 {
+            text.upsert(row, &body);
+        }
+        let held = text
+            .rows
+            .get(&99)
+            .ok_or_else(|| Error::internal("missing owner terms"))?;
+        let retired = Arc::downgrade(&held);
+        text.upsert(99, "replacement token");
+        drop(held);
+        // Papaya may defer retired map values to its bounded reclamation batch.
+        for row in 5000..6000 {
+            text.upsert(row, "pressure");
+            text.remove(row);
+        }
+        assert_eq!(
+            text.search("replacement").iter().collect::<Vec<_>>(),
+            vec![99]
+        );
+        assert!(!text.search("unchanged").contains(99));
+        assert_eq!(text.search("unchanged").len(), 4095);
+        assert!(text.bounded_ranked_search("token", 10).len() <= 10);
+        assert!(retired.strong_count() <= 1);
         Ok(())
     }
 }

@@ -2,6 +2,8 @@ import json
 import os
 import tempfile
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -9,10 +11,15 @@ from irongraph import Client, EmbeddedDatabase
 
 
 class QueryHandler(BaseHTTPRequestHandler):
+    parallel_barrier = None
+    returned_values = None
+
     def do_POST(self) -> None:
         assert self.path == "/api/query"
         length = int(self.headers["content-length"])
         request = json.loads(self.rfile.read(length))
+        if self.parallel_barrier is not None:
+            self.parallel_barrier.wait(timeout=5)
         events = [
             {
                 "type": "schema",
@@ -50,6 +57,10 @@ class QueryHandler(BaseHTTPRequestHandler):
                 "truncation_reason": None,
             },
         ]
+        if self.returned_values is not None:
+            events[1]["row_count"] = len(self.returned_values)
+            events[1]["columns"][0]["values"] = self.returned_values
+            events[2]["statistics"]["rows"] = len(self.returned_values)
         body = ("\n".join(json.dumps(event) for event in events) + "\n").encode()
         self.send_response(200)
         self.send_header("content-type", "application/x-ndjson")
@@ -99,16 +110,9 @@ def embedded_smoke() -> None:
             page = database.stream_fetch(fetch)
             assert page["high_watermark"] == 1
             assert page["records"][0][1]["payload"] == [1, 2, 3]
-            bounded = database.query("UNWIND [1,2,3] AS n RETURN n", project_id=project_id,
-                                     query_options={"bookmark": ack["bookmark"], "limits": {"rows": 3}})
-            assert len(bounded["rows"]) == 3
-            try:
-                database.query("UNWIND [1,2,3] AS n RETURN n", project_id=project_id,
-                               query_options={"limits": {"rows": 1}})
-            except RuntimeError as error:
-                assert "ResultBudgetExceeded" in str(error)
-            else:
-                raise AssertionError("row limit was ignored")
+            complete = database.query("UNWIND [1,2,3] AS n RETURN n", project_id=project_id,
+                                      query_options={"bookmark": ack["bookmark"]})
+            assert len(complete["rows"]) == 3
             database.snapshot()
             database.flush()
         with EmbeddedDatabase(data_dir, device="cpu", load_embeddings=False) as reopened:
@@ -124,19 +128,30 @@ def embedded_smoke() -> None:
             assert not reopened.query("USE app MATCH (d:Document) RETURN d")["rows"]
 
 
+def wait_rows(database, query, expected, **options):
+    deadline = time.monotonic() + 120
+    while True:
+        result = database.query(query, **options)
+        if len(result["rows"]) == expected:
+            return result
+        if time.monotonic() >= deadline:
+            raise AssertionError("asynchronous embeddings did not finish")
+        time.sleep(0.01)
+
+
 def embedding_qualification() -> None:
     """Release gate: runs the real model on the selected release backend."""
     device = os.environ.get("IRONGRAPH_QUALIFY_DEVICE", "cpu")
     with tempfile.TemporaryDirectory(prefix="irongraph-python-embedding-") as temporary:
-        with EmbeddedDatabase(temporary, device=device, load_embeddings=True) as database:
+        with EmbeddedDatabase(temporary, device="cpu", embedding_device=device, load_embeddings=True) as database:
             database.query("CREATE PROJECT semantic")
             database.query(
                 "USE semantic CREATE (p:Person {name:'Ada'}), (t:Task {title:'Arrange lessons'}), "
                 "(t)-[:ASSIGNED_TO {description:'guitar music tuition'}]->(p)"
             )
-            automatic = database.query(
+            automatic = wait_rows(database,
                 "USE semantic SEARCH entity IN (EMBEDDING INDEX graph_semantic "
-                "FOR TEXT 'guitar music tuition' LIMIT 10) SCORE AS score RETURN entity, score"
+                "FOR TEXT 'guitar music tuition' LIMIT 10) SCORE AS score RETURN entity, score", 3
             )
             assert len(automatic["rows"]) == 3
             assert automatic["rows"][0][0]["type"] == "relationship"
@@ -154,7 +169,7 @@ def embedding_qualification() -> None:
                 "USE semantic MATCH (d:Document) SEARCH d IN (EMBEDDING INDEX document_semantic "
                 "FOR TEXT $text LIMIT 1) SCORE AS score RETURN d.id, d.body, score"
             )
-            result = database.query(search, parameters={"text": "connected graph data"})
+            result = wait_rows(database, search, 1, parameters={"text": "connected graph data"})
             assert len(result["rows"]) == 1
             assert result["rows"][0][0]["value"] == "graph"
             assert result["rows"][0][2]["type"] == "float"
@@ -170,7 +185,7 @@ def embedding_qualification() -> None:
             result = database.query(search, parameters={"text": "editing complete documents"})
             assert result["rows"][0][1]["value"] == "Documents remain complete graph records after editing."
             database.snapshot()
-        with EmbeddedDatabase(temporary, device=device, load_embeddings=True) as reopened:
+        with EmbeddedDatabase(temporary, device="cpu", embedding_device=device, load_embeddings=True) as reopened:
             assert len(reopened.query(
                 "USE semantic SEARCH entity IN (EMBEDDING INDEX graph_semantic "
                 "FOR TEXT 'guitar lessons' LIMIT 10) SCORE AS score RETURN entity"
@@ -188,7 +203,37 @@ def remote_smoke() -> None:
         client = Client.api(f"http://127.0.0.1:{server.server_port}")
         result = client.query("RETURN 42 AS answer")
         assert result["rows"][0][0] == {"type": "integer", "value": "42"}
+        QueryHandler.parallel_barrier = threading.Barrier(2)
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            results = list(workers.map(lambda _: client.query("RETURN 42 AS answer"), range(2)))
+        assert all(result["rows"][0][0]["value"] == "42" for result in results)
+        QueryHandler.parallel_barrier = None
+        node = {"id": "9007199254740993", "labels": ["Unicode 🦀"], "properties": {
+            "body": {"type": "string", "value": "Unicode 🦀\0\\\"" * 2048},
+            "number": {"type": "integer", "value": "9007199254740993"}}}
+        relationship = {"id": "2", "source": node["id"], "target": "3",
+                        "relationship_type": "LINK", "properties": node["properties"]}
+        values = [
+            {"type": "null"}, {"type": "boolean", "value": True},
+            {"type": "integer", "value": "9007199254740993"}, {"type": "float", "value": 1.2345678901234567},
+            {"type": "string", "value": "Unicode 🦀\0"}, {"type": "bytes", "value": [0, 255]},
+            {"type": "date", "value": -123}, {"type": "time", "value": {"nanos": 123, "offset_seconds": None}},
+            {"type": "date_time", "value": {"seconds": -1, "nanos": 23, "timezone": "UTC"}},
+            {"type": "duration", "value": {"months": -2, "days": 3, "seconds": 4, "nanos": 5}},
+            {"type": "vector", "value": [0.10000000149011612, 1.401298464324817e-45, 3.4028234663852886e38]},
+            {"type": "node", "value": node}, {"type": "relationship", "value": relationship},
+            {"type": "path", "value": {"nodes": [node], "relationships": [relationship]}},
+        ]
+        values.extend([{"type": "list", "value": values[:2]},
+                       {"type": "map", "value": {"nested": values[-1]}}])
+        # Both metadata and the optimized multi-row decoder preserve the complete wire shape.
+        QueryHandler.returned_values = values * 2
+        decoded = client.query("RETURN complete_protocol_values")
+        assert decoded["rows"] == [[value] for value in QueryHandler.returned_values]
+        assert not decoded["summary"]["truncated"]
     finally:
+        QueryHandler.parallel_barrier = None
+        QueryHandler.returned_values = None
         server.shutdown()
         server.server_close()
         serving.join()

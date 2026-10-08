@@ -19,16 +19,16 @@ This statement declares that a named property on a label or relationship type ke
 
 The label and the property must already exist in the project's schema. A property that has never been written is not yet in the catalogue, so the declaration is rejected — write the property once, then declare it. This is the single most common surprise with this statement.
 
-The declaration is not retrospective. Values written before it are not history, and the property's canonical value is left exactly as it was. History begins at the declaration.
+The declaration is not retrospective. Values written before it are not historical samples. A declared property with no retained samples reads as `null`; history begins with its temporal samples.
 
 The type names the scalar the samples hold and is checked on write, so a declaration is also a type constraint on the temporal series.
 
 A declared temporal property has two distinct reads that are easy to confuse.
 
-- Reading it in an ordinary query returns the **canonical** value: whatever an ordinary `SET` last wrote. Writes made with `AT TIME` do not touch it.
-- Reading it under `AT TIME`, or through `HISTORY`, returns the **temporal** value: the sample in effect at that instant.
+- Reading it in an ordinary query returns the **current sample**: the latest retained sample in event-time order.
+- Reading it under `AT TIME` returns the sample in effect at the selected instant. `HISTORY` returns samples in its requested range.
 
-The two can differ, and on the `trust` dataset they do: `reputation` was written entirely through backdated samples, so its canonical value is still the `0.0` set at load while its temporal value follows the real 2010-2016 curve.
+Current and historical samples can differ. Backdated samples participate in both reads according to their event times.
 
 ## When to use it
 
@@ -56,7 +56,7 @@ No rows returned. 0 changes committed.
 
 ## Advanced example
 
-The full cycle on that declaration: three backdated samples, then the canonical value and two past instants read back beside them. The canonical value is still the `0.0` written at creation, because a write with `AT TIME` records a sample and leaves the current value alone.
+Read three backdated samples alongside the current sample. The current price is `96`, the latest value in event-time order.
 
 ```cypher
 USE temporal_example
@@ -66,15 +66,15 @@ HISTORY instrument.price
   TO datetime('2026-01-01T00:00:00Z') AS sample
 RETURN datetime.fromepoch(sample.time / 1000000000, 0) AS at,
        sample.value AS price,
-       instrument.price AS canonical_value
+       instrument.price AS current_value
 ORDER BY sample.time
 ```
 
 Result:
 
 ```
-at                   | price  | canonical_value
----------------------+--------+----------------
+at                   | price  | current_value
+---------------------+--------+--------------
 2024-01-15T00:00:00Z | 101.5  | 96             
 2024-06-01T00:00:00Z | 118.25 | 96             
 2025-02-01T00:00:00Z | 96     | 96             

@@ -367,7 +367,7 @@ struct Fixture {
 }
 
 fn fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let a = graph.catalog_mut().intern_label("A")?;
     let x = graph.catalog_mut().intern_label("X")?;
     let rel = graph.catalog_mut().intern_relationship_type("REL")?;
@@ -412,7 +412,7 @@ fn fixture() -> Result<Fixture> {
 }
 
 fn cpu_backend(fixture: &Fixture) -> Result<CpuBackend> {
-    let image = ResidentProjectImage::build(
+    let image = super::legacy_resident_build(
         fixture.project,
         fixture.bookmark,
         &fixture.graph,

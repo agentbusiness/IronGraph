@@ -1,7 +1,7 @@
 {
   "name": "@irongraph/node",
   "version": "0.1.6",
-  "description": "Embed a GPU-first graph database in Node.js with automatic local embeddings, Cypher, vector search, streaming, and queues.",
+  "description": "Embed a CPU graph database in Node.js with asynchronous GPU text embeddings, Cypher, vector search, streaming, and queues.",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",

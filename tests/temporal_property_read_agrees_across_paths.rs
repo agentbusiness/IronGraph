@@ -22,7 +22,7 @@ use irongraph::types::EntityKind;
 use irongraph::{
     Bookmark, Layer, NodeId, ProjectId, Result, ScalarValue,
     cypher::{BindCapabilities, ExecutionContext, QueryEngine, ResultValue},
-    gpu::{CpuBackend, ExecutionBackend, ResidentProjectImage},
+    gpu::{CpuBackend, ExecutionBackend},
     graph::{
         GraphStore, IndexCatalog, NodeInput, TemporalDeclaration, TemporalSample, TemporalStore,
         TemporalType,
@@ -35,7 +35,7 @@ const DECLARED_AT: i64 = 1_000;
 
 /// Three instruments, each carrying a canonical price written before the declaration.
 fn priced_graph() -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let instrument = graph.catalog_mut().intern_label("Instrument")?;
     let symbol = graph.catalog_mut().intern_property("symbol")?;
     let price = graph.catalog_mut().intern_property("price")?;
@@ -65,7 +65,7 @@ fn priced_history(graph: &GraphStore) -> Result<TemporalStore> {
         .catalog()
         .property("price")
         .ok_or_else(|| irongraph::Error::internal("price property missing"))?;
-    let mut temporal = TemporalStore::default();
+    let temporal = TemporalStore::default();
     temporal.declare(
         TemporalDeclaration {
             entity_kind: EntityKind::Node,
@@ -109,7 +109,7 @@ const BOOKMARK: Bookmark = Bookmark {
 /// correctly — and these tests would pass no matter what the resident compilers did.
 fn admitted_backend(graph: &GraphStore, temporal: &TemporalStore) -> Result<CpuBackend> {
     let image =
-        ResidentProjectImage::build(PROJECT, BOOKMARK, graph, temporal, &IndexCatalog::default())?;
+        super::legacy_resident_build(PROJECT, BOOKMARK, graph, temporal, &IndexCatalog::default())?;
     let mut backend = CpuBackend::new(64 * 1024 * 1024, 1024 * 1024);
     backend.admit_project(image)?;
     Ok(backend)

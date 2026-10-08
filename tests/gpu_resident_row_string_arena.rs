@@ -5,12 +5,13 @@
 // enforceable instead of switched off globally.
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+use irongraph::graph::legacy::{GraphStore, TemporalStore};
 use std::mem::size_of;
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 use irongraph::gpu::MetalBackend;
 use irongraph::{
     Bookmark, Error, ErrorCode, Layer, NodeId, ProjectId, Result, ScalarValue,
@@ -21,7 +22,7 @@ use irongraph::{
         ResidentRowProgram, ResidentRowProgramManifest, ResidentRowProgramRequest,
         ResidentRowSortKey, ResidentRowValueType, ValidatedResidentRowProgramResult,
     },
-    graph::{GraphStore, IndexCatalog, LayerMask, NodeInput, TemporalStore},
+    graph::{IndexCatalog, LayerMask, NodeInput},
     types::{LabelId, PropertyId},
 };
 use tokio_util::sync::CancellationToken;
@@ -113,7 +114,7 @@ impl Harness {
         Ok(backend)
     }
 
-    #[cfg(all(feature = "accelerator", target_os = "macos"))]
+    #[cfg(all(feature = "legacy-graph", target_os = "macos"))]
     fn metal(&self) -> Result<MetalBackend> {
         let mut backend = MetalBackend::new(0, MEMORY_LIMIT_BYTES, RESERVED_BYTES)?;
         backend.admit_project(self.image()?)?;
@@ -739,7 +740,7 @@ fn cpu_load_string_property_requires_the_exact_admitted_maximum_width() -> Resul
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn metal_test_guard() -> MutexGuard<'static, ()> {
     static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
     GUARD
@@ -748,7 +749,7 @@ fn metal_test_guard() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn real_metal_matches_cpu_for_scalar_and_property_string_arenas_without_fallback() -> Result<()> {
@@ -785,7 +786,7 @@ fn real_metal_matches_cpu_for_scalar_and_property_string_arenas_without_fallback
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn real_metal_string_arena_scratch_and_width_mismatch_fail_closed() -> Result<()> {

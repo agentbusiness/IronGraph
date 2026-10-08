@@ -1,6 +1,6 @@
 # IronGraph for JavaScript and React
 
-**Connect JavaScript and React to a GPU-first temporal graph database with built-in streaming and queues.**
+**Connect JavaScript and React to a CPU graph database with built-in streaming and queues.**
 
 Use Cypher to query graph structure, search text and vectors, inspect property history, and
 administer the database. Built-in Kafka-compatible Streams and AMQP-compatible Queues handle event
@@ -10,12 +10,9 @@ open-source software released under the Apache License 2.0.
 
 ## Performance at a glance
 
-- **0.834 µs graph count** at 2 million nodes on Metal — sub-microsecond at scale.
-- **12× faster indexed range count** on Metal than CPU: 1.61 ms versus 19.38 ms.
-- **7.5× faster k-core analysis** on Metal than CPU: 326 ms versus 2,430 ms.
-
-Median results from five runs on an Apple M5 Pro with 2 million nodes and 8 million
-relationships. See [more performance results](https://irongraph.tech/).
+Graph queries execute on the CPU against one shared canonical graph. Local text inference can
+use Metal or CUDA independently. Measure complete queries separately from individual graph operations;
+latency depends on the workload, graph size, indexes, and host.
 
 ## Database capabilities
 
@@ -116,8 +113,8 @@ declared embedding indexes. Select a project explicitly; there is no implicit de
 
 Remote deployments require HTTPS and browser-managed mutual TLS certificates authorized for
 the required project and operations. Plain HTTP is loopback-only. The database process selects
-one CPU, Metal, or optional CUDA device; GPU admission rejects graphs and indexes that do not
-fit. Embedding runs in the database process, with no generative language model hosted by
+CPU graph execution and an independently selected text inference device. Parallel reads do not
+wait for writers and may observe mixed values during a multi-record write. Embedding runs in the database process, with no generative language model hosted by
 IronGraph.
 
 Native database release targets are macOS 15+ ARM64 and Linux with glibc 2.28+ on ARM64 or

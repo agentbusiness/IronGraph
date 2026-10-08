@@ -505,7 +505,7 @@ struct Fixture {
 
 impl Fixture {
     fn new(case: TckCase) -> Result<Self> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let n_label = graph.catalog_mut().intern_label("N")?;
         let relationship_type = graph.catalog_mut().intern_relationship_type("R")?;
         let num = graph.catalog_mut().intern_property("num")?;
@@ -589,7 +589,7 @@ impl Fixture {
     }
 
     fn duplicate_target() -> Result<Self> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let n_label = graph.catalog_mut().intern_label("N")?;
         let relationship_type = graph.catalog_mut().intern_relationship_type("R")?;
         let num = graph.catalog_mut().intern_property("num")?;
@@ -635,7 +635,7 @@ impl Fixture {
     }
 
     fn no_op_effects() -> Result<Self> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let n_label = graph.catalog_mut().intern_label("N")?;
         let other_label = graph.catalog_mut().intern_label("Other")?;
         let only_on_other_label = graph.catalog_mut().intern_label("OnlyOnOther")?;
@@ -670,7 +670,7 @@ impl Fixture {
     }
 
     fn image(&self) -> Result<ResidentProjectImage> {
-        ResidentProjectImage::build(
+        super::legacy_resident_build(
             PROJECT,
             self.bookmark,
             &self.graph,
@@ -1634,7 +1634,7 @@ fn assert_no_op_fixture(fixture: &Fixture) -> std::result::Result<(), String> {
         .graph
         .node(NodeId(2))
         .ok_or_else(|| "no-op fixture omitted the Other node".to_owned())?;
-    if target.labels() != [fixture.n_label]
+    if target.labels().to_vec() != [fixture.n_label]
         || target.property(fixture.num) != Some(ScalarValue::Integer(7))
         || target.property(fixture.name).is_some()
         || target.labels().contains(&only_on_other_label)

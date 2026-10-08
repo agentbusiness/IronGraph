@@ -253,7 +253,7 @@ struct Fixture {
 }
 
 fn fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let person = graph.catalog_mut().intern_label("Person")?;
     let target = graph.catalog_mut().intern_label("Target")?;
     let missing = graph.catalog_mut().intern_label("Missing")?;
@@ -302,7 +302,7 @@ fn fixture() -> Result<Fixture> {
 }
 
 fn resident_image(fixture: &Fixture) -> Result<ResidentProjectImage> {
-    ResidentProjectImage::build(
+    super::legacy_resident_build(
         fixture.project,
         fixture.bookmark,
         &fixture.graph,

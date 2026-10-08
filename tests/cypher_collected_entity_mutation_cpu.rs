@@ -47,7 +47,7 @@ fn context(graph: &GraphStore) -> ExecutionContext<'_> {
 }
 
 fn sample_graph() -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let entity = graph.catalog_mut().intern_label("Entity")?;
     let link = graph.catalog_mut().intern_relationship_type("LINK")?;
     let name = graph.catalog_mut().intern_property("name")?;

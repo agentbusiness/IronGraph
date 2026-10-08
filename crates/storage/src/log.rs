@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     path::Path,
     sync::{Arc, OnceLock},
 };
@@ -174,8 +174,30 @@ impl MutationEntry {
 pub struct DurableLog {
     frames: FramedFile,
     compacted_through: Bookmark,
-    entries: Vec<MutationEntry>,
+    entries: Vec<LogEntryLocation>,
     request_index: BTreeMap<Uuid, u64>,
+}
+
+/// WAL payloads live on disk, independently of inference catch-up speed.
+struct LogEntryLocation {
+    bookmark: Bookmark,
+    request_id: Option<Uuid>,
+    offset: u64,
+    encoded_bytes: usize,
+}
+
+impl LogEntryLocation {
+    fn index(&self) -> u64 {
+        self.bookmark.index
+    }
+    fn from_entry(entry: &MutationEntry, offset: u64, encoded_bytes: usize) -> Self {
+        Self {
+            bookmark: entry.bookmark(),
+            request_id: entry.request_id(),
+            offset,
+            encoded_bytes,
+        }
+    }
 }
 
 impl DurableLog {
@@ -236,7 +258,11 @@ impl DurableLog {
             expected = expected.checked_add(1).ok_or_else(|| {
                 Error::new(ErrorCode::CorruptStorage, "mutation log index overflow")
             })?;
-            entries.push(entry);
+            entries.push(LogEntryLocation::from_entry(
+                &entry,
+                record.offset,
+                record.payload.len(),
+            ));
             Ok(())
         })?;
         let compacted_through = persisted_base.unwrap_or(compacted_through);
@@ -257,7 +283,7 @@ impl DurableLog {
     pub fn last_bookmark(&self) -> Bookmark {
         self.entries
             .last()
-            .map_or(self.compacted_through, MutationEntry::bookmark)
+            .map_or(self.compacted_through, |entry| entry.bookmark)
     }
 
     #[must_use]
@@ -312,12 +338,13 @@ impl DurableLog {
             ));
         }
         let encoded = entry.encode()?;
-        self.frames.append(&encoded, durability)?;
+        let offset = self.frames.append(&encoded, durability)?;
         if let Some(request_id) = entry.request_id() {
             self.request_index.insert(request_id, entry.index());
         }
         let bookmark = entry.bookmark();
-        self.entries.push(entry);
+        self.entries
+            .push(LogEntryLocation::from_entry(&entry, offset, encoded.len()));
         Ok(bookmark)
     }
 
@@ -375,6 +402,7 @@ impl DurableLog {
                 .ok_or_else(|| Error::new(ErrorCode::CorruptStorage, "mutation index overflow"))?;
         }
 
+        let mut offset = self.frames.byte_len()?;
         self.frames.append_batch(&encoded, durability)?;
         for entry in &entries {
             if let Some(request_id) = entry.request_id() {
@@ -385,7 +413,13 @@ impl DurableLog {
             .last()
             .map(MutationEntry::bookmark)
             .ok_or_else(|| Error::internal("validated mutation batch disappeared"))?;
-        self.entries.extend(entries);
+        for (entry, encoded) in entries.iter().zip(&encoded) {
+            self.entries
+                .push(LogEntryLocation::from_entry(entry, offset, encoded.len()));
+            offset = offset
+                .checked_add(FramedFile::physical_record_bytes(encoded.len())?)
+                .ok_or_else(|| Error::internal("WAL record location overflow"))?;
+        }
         Ok(bookmark)
     }
 
@@ -393,17 +427,21 @@ impl DurableLog {
         self.frames.sync()
     }
 
-    #[must_use]
-    pub fn lookup(&self, index: u64) -> Option<&MutationEntry> {
+    pub fn lookup(&self, index: u64) -> Result<Option<MutationEntry>> {
         if index <= self.compacted_through.index {
-            return None;
+            return Ok(None);
         }
-        let relative = index
-            .checked_sub(self.compacted_through.index)?
-            .checked_sub(1)?;
-        usize::try_from(relative)
+        let relative = index - self.compacted_through.index - 1;
+        let location = usize::try_from(relative)
             .ok()
-            .and_then(|offset| self.entries.get(offset))
+            .and_then(|offset| self.entries.get(offset));
+        location
+            .map(|location| {
+                self.frames
+                    .read_record_at(location.offset)
+                    .and_then(|payload| MutationEntry::decode(&payload))
+            })
+            .transpose()
     }
 
     #[must_use]
@@ -411,23 +449,33 @@ impl DurableLog {
         if index == self.compacted_through.index {
             return Some(self.compacted_through.term);
         }
-        self.lookup(index).map(MutationEntry::term)
+        let relative = index
+            .checked_sub(self.compacted_through.index)?
+            .checked_sub(1)?;
+        self.entries
+            .get(usize::try_from(relative).ok()?)
+            .map(|entry| entry.bookmark.term)
     }
 
     #[must_use]
     pub fn request_bookmark(&self, request_id: Uuid) -> Option<Bookmark> {
-        self.request_index
-            .get(&request_id)
-            .and_then(|index| self.lookup(*index))
-            .map(MutationEntry::bookmark)
+        self.request_index.get(&request_id).and_then(|index| {
+            self.term_at(*index).map(|term| Bookmark {
+                term,
+                index: *index,
+            })
+        })
     }
 
-    #[must_use]
-    pub fn replay_from(&self, first_index: u64) -> Vec<MutationEntry> {
+    pub fn replay_from(&self, first_index: u64) -> Result<Vec<MutationEntry>> {
         self.entries
             .iter()
             .filter(|entry| entry.index() >= first_index)
-            .cloned()
+            .map(|entry| {
+                self.frames
+                    .read_record_at(entry.offset)
+                    .and_then(|payload| MutationEntry::decode(&payload))
+            })
             .collect()
     }
 
@@ -507,12 +555,30 @@ impl DurableLog {
 
     fn rewrite_entries(&mut self) -> Result<()> {
         let marker = encode_compaction_marker(self.compacted_through)?;
-        self.frames.rewrite_streaming(
-            std::iter::once(Ok(marker)).chain(self.entries.iter().map(MutationEntry::encode)),
-        )?;
+        let mut source = self.frames.open_reader()?;
+        let mut offset = FramedFile::physical_record_bytes(marker.len())?;
+        self.frames
+            .rewrite_streaming(std::iter::once(Ok(marker)).chain(self.entries.iter().map(
+                |entry| -> Result<Vec<u8>> {
+                    source.seek(SeekFrom::Start(
+                        entry
+                            .offset
+                            .checked_add(32)
+                            .ok_or_else(|| Error::internal("WAL offset overflow"))?,
+                    ))?;
+                    let mut payload = vec![0; entry.encoded_bytes];
+                    source.read_exact(&mut payload)?;
+                    MutationEntry::decode(&payload)?;
+                    Ok(payload)
+                },
+            )))?;
         self.request_index.clear();
-        for entry in &self.entries {
-            if let Some(request_id) = entry.request_id() {
+        for entry in &mut self.entries {
+            entry.offset = offset;
+            offset = offset
+                .checked_add(FramedFile::physical_record_bytes(entry.encoded_bytes)?)
+                .ok_or_else(|| Error::internal("WAL rewrite location overflow"))?;
+            if let Some(request_id) = entry.request_id {
                 self.request_index.insert(request_id, entry.index());
             }
         }
@@ -596,6 +662,39 @@ mod tests {
     }
 
     #[test]
+    fn disk_log_does_not_retain_large_mutation_bodies_and_reads_compacted_suffix() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("large.wal");
+        let mut log = DurableLog::open(&path, usize::MAX, Bookmark::default())?;
+        let payload = vec![0x5a; 3_500_000];
+        let first = MutationEntry::new(
+            1,
+            1,
+            MutationKind::Graph,
+            Some(ProjectId::random()),
+            None,
+            0,
+            payload.clone(),
+        )?;
+        let borrowed = Arc::downgrade(&first.body);
+        log.append(first)?;
+        assert!(
+            borrowed.upgrade().is_none(),
+            "WAL metadata retained the source payload in memory"
+        );
+        let second = entry(2)?;
+        log.append(second.clone())?;
+        assert_eq!(log.lookup(1)?.unwrap().payload(), payload.as_slice());
+        log.compact_prefix(Bookmark { term: 1, index: 1 })?;
+        assert!(log.lookup(1)?.is_none());
+        assert_eq!(log.lookup(2)?.unwrap(), second);
+        drop(log);
+        let reopened = DurableLog::open(&path, usize::MAX, Bookmark::default())?;
+        assert_eq!(reopened.lookup(2)?.unwrap(), second);
+        Ok(())
+    }
+
+    #[test]
     fn snapshot_covered_discard_realigns_the_base_and_refuses_to_drop_newer_entries() -> Result<()>
     {
         let directory = tempfile::tempdir()?;
@@ -639,7 +738,7 @@ mod tests {
         let reopened = DurableLog::open(&path, 1024, Bookmark::default())?;
         assert_eq!(reopened.compacted_through(), Bookmark { term: 1, index: 3 });
         assert_eq!(reopened.last_bookmark(), Bookmark { term: 1, index: 4 });
-        assert_eq!(reopened.replay_from(4).len(), 1);
+        assert_eq!(reopened.replay_from(4)?.len(), 1);
         Ok(())
     }
 }

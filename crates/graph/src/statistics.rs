@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use super::persistent::PersistentMap;
+use super::concurrent::CanonicalCounts;
 
 use crate::{
     Layer, ScalarValue,
@@ -214,11 +214,11 @@ pub struct StatisticsSnapshot {
 }
 
 #[derive(Clone, Debug, Default)]
-struct CountGeneration(PersistentMap<[u64; LAYER_COUNT]>);
+struct CountGeneration(CanonicalCounts);
 
 impl PartialEq for CountGeneration {
     fn eq(&self, other: &Self) -> bool {
-        self.0.len() == other.0.len() && self.0.iter().eq(other.0.iter())
+        self.0.shared_with(&other.0) || self.0.entries() == other.0.entries()
     }
 }
 
@@ -425,7 +425,7 @@ impl StatisticsSnapshot {
         self.label_counts
             .0
             .get(u128::from(label.0))
-            .map_or(0, |counts| count_layers(counts, layers))
+            .map_or(0, |counts| count_layers(&counts, layers))
     }
 
     #[must_use]
@@ -437,7 +437,7 @@ impl StatisticsSnapshot {
         self.relationship_counts
             .0
             .get(u128::from(relationship_type.0))
-            .map_or(0, |counts| count_layers(counts, layers))
+            .map_or(0, |counts| count_layers(&counts, layers))
     }
 
     #[must_use]
@@ -911,7 +911,7 @@ mod tests {
     fn surgical_statistics_share_samples_and_advance_counts_across_revision_thresholds()
     -> crate::Result<()> {
         for rows in [4_096_u64, 16_384] {
-            let mut graph = GraphStore::default();
+            let graph = GraphStore::default();
             let label = graph.catalog_mut().intern_label("Data")?;
             let changed = graph.catalog_mut().intern_label("Changed")?;
             let value = graph.catalog_mut().intern_property("value")?;
@@ -999,7 +999,10 @@ mod tests {
             assert!(current.relationship_counts.0.shared_with(&relationships));
             assert_eq!(pinned.graph_revision, 2);
             assert_eq!(pinned.node_count(LayerMask::ALL), rows);
-            assert_eq!(pinned.label_count(changed, LayerMask::ALL), 1);
+            assert_eq!(
+                pinned.label_count(changed, LayerMask::ALL),
+                graph.label_node_count(changed, LayerMask::ALL)
+            );
             assert_eq!(
                 current
                     .node_property(value, LayerMask::ALL)
@@ -1037,7 +1040,7 @@ mod tests {
 
     #[test]
     fn statistics_are_layer_scoped_and_deterministic() -> crate::Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let label = graph.catalog_mut().intern_label("Metric")?;
         let property = graph.catalog_mut().intern_property("value")?;
         for (id, layer, value) in [

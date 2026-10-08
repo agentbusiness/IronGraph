@@ -99,7 +99,7 @@ fn integer_column(output: &irongraph::cypher::ExecutionOutput, name: &str) -> Re
 }
 
 fn apply_output(graph: &GraphStore, mutations: &[GraphMutation]) -> Result<GraphStore> {
-    let mut committed = graph.clone();
+    let committed = graph.clone();
     for mutation in mutations {
         committed.apply(mutation.clone())?;
     }

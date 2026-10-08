@@ -2,17 +2,9 @@
 
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, ValueEnum, builder::TypedValueParser as _};
 
-/// Default device-memory ceiling: unbounded. The system imposes no artificial sub-hardware cap — it
-/// uses whatever the machine actually has. On Metal the governor still clamps this to the hardware
-/// recommended working-set size at backend construction, so a discrete/unified GPU never over-commits
-/// its real memory; on CPU the ceiling is the host's own RAM (allocations are lazy and OS-governed),
-/// so a query that fits in memory runs instead of being rejected by a constant. Override with
-/// `IRONGRAPH_DEVICE_MEMORY_LIMIT_BYTES` only to deliberately throttle a shared host.
-pub const UNBOUNDED_DEVICE_MEMORY_BYTES: usize = usize::MAX;
-
-/// Embedded local-inference device family.
+/// Device family selector. Graph execution accepts Auto/Cpu; inference selects independently.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum BackendSelection {
     #[default]
@@ -66,30 +58,14 @@ pub struct Config {
     #[arg(long = "remote-tls-trust", env = "IRONGRAPH_REMOTE_TLS_TRUST")]
     pub remote_tls_trust_path: Option<PathBuf>,
 
-    #[arg(long, env = "IRONGRAPH_STARTUP_TIMEOUT_SECS", default_value_t = 60)]
-    startup_timeout_secs: u64,
-
-    #[arg(
-        long,
-        env = "IRONGRAPH_WAL_MAX_RECORD_BYTES",
-        default_value_t = 128 * 1024 * 1024
-    )]
-    pub wal_max_record_bytes: usize,
-
-    #[arg(long, env = "IRONGRAPH_MAX_CONNECTIONS", default_value_t = 4_096)]
-    pub max_connections: usize,
-
-    #[arg(
-        long,
-        env = "IRONGRAPH_PROTOCOL_HANDSHAKE_TIMEOUT_SECS",
-        default_value_t = 10
-    )]
-    protocol_handshake_timeout_secs: u64,
-
     #[arg(
         long,
         env = "IRONGRAPH_EXECUTION_BACKEND",
-        value_enum,
+        value_parser = clap::builder::PossibleValuesParser::new(["auto", "cpu"])
+            .map(|value| match value.as_str() {
+                "cpu" => BackendSelection::Cpu,
+                _ => BackendSelection::Auto,
+            }),
         default_value = "auto"
     )]
     pub execution_backend: BackendSelection,
@@ -97,23 +73,21 @@ pub struct Config {
     #[arg(long, env = "IRONGRAPH_EXECUTION_DEVICE", default_value_t = 0)]
     pub execution_device: u32,
 
-    /// Upper bound on device or unified memory that IronGraph may admit. Hardware limits may lower
-    /// the effective capacity.
+    /// Text inference device, selected independently of CPU graph execution.
     #[arg(
         long,
-        env = "IRONGRAPH_DEVICE_MEMORY_LIMIT_BYTES",
-        default_value_t = UNBOUNDED_DEVICE_MEMORY_BYTES
+        env = "IRONGRAPH_EMBEDDING_BACKEND",
+        value_enum,
+        default_value = "auto"
     )]
-    pub device_memory_limit_bytes: usize,
+    pub embedding_backend: BackendSelection,
 
-    /// Bytes reserved for the operating system and allocator overhead. Increase this value when the
-    /// host needs more memory headroom.
     #[arg(
-        long,
-        env = "IRONGRAPH_DEVICE_RESERVED_BYTES",
-        default_value_t = 3 * 1024 * 1024 * 1024_usize
+        long = "embedding-device",
+        env = "IRONGRAPH_EMBEDDING_DEVICE",
+        default_value_t = 0
     )]
-    pub device_reserved_bytes: usize,
+    pub embedding_device_ordinal: u32,
 
     /// Immutable project selected by loopback Kafka/AMQP listeners. Remote listeners derive this
     /// from their authenticated service credential instead.
@@ -126,15 +100,6 @@ pub struct Config {
         default_value_t = 30
     )]
     broker_retention_interval_secs: u64,
-
-    #[arg(long, env = "IRONGRAPH_MAX_WRITE_BYTES", default_value_t = 64 * 1024 * 1024)]
-    pub max_write_bytes: usize,
-
-    #[arg(long, env = "IRONGRAPH_MAX_RESULT_BYTES", default_value_t = usize::MAX)]
-    pub max_result_bytes: usize,
-
-    #[arg(long, env = "IRONGRAPH_REQUEST_TIMEOUT_SECS", default_value_t = 30)]
-    request_timeout_secs: u64,
 }
 
 /// The data directory this process runs against: the environment's, or the default.
@@ -161,7 +126,7 @@ fn default_data_dir() -> PathBuf {
 impl Config {
     #[must_use]
     pub const fn request_timeout(&self) -> Duration {
-        Duration::from_secs(self.request_timeout_secs)
+        Duration::ZERO
     }
 
     #[must_use]
@@ -171,49 +136,40 @@ impl Config {
 
     #[must_use]
     pub const fn startup_timeout(&self) -> Duration {
-        Duration::from_secs(self.startup_timeout_secs)
-    }
-
-    #[must_use]
-    pub const fn protocol_handshake_timeout(&self) -> Duration {
-        Duration::from_secs(self.protocol_handshake_timeout_secs)
+        Duration::ZERO
     }
 
     #[must_use]
     pub const fn embedding_device(&self) -> crate::embeddings::EmbeddingDevice {
-        match self.execution_backend {
+        match self.embedding_backend {
             BackendSelection::Auto => crate::embeddings::EmbeddingDevice::Auto,
             BackendSelection::Cpu => crate::embeddings::EmbeddingDevice::Cpu,
             BackendSelection::Metal => {
-                crate::embeddings::EmbeddingDevice::Metal(self.execution_device)
+                crate::embeddings::EmbeddingDevice::Metal(self.embedding_device_ordinal)
             }
             BackendSelection::Cuda => {
-                crate::embeddings::EmbeddingDevice::Cuda(self.execution_device)
+                crate::embeddings::EmbeddingDevice::Cuda(self.embedding_device_ordinal)
             }
         }
     }
 
     pub fn validate(&self) -> crate::Result<()> {
-        if self.max_write_bytes == 0
-            || self.max_result_bytes == 0
-            || self.request_timeout_secs == 0
-            || self.broker_retention_interval_secs == 0
-            || self.startup_timeout_secs == 0
-            || self.protocol_handshake_timeout_secs == 0
-            || self.wal_max_record_bytes == 0
-            || self.device_memory_limit_bytes == 0
-            || self.device_reserved_bytes >= self.device_memory_limit_bytes
-            || self.max_connections == 0
-        {
+        if !matches!(
+            self.execution_backend,
+            BackendSelection::Auto | BackendSelection::Cpu
+        ) {
             return Err(crate::Error::invalid_data(
-                "runtime byte and timeout limits must be non-zero",
+                "graph execution is CPU-only; select GPU inference with --embedding-backend",
             ));
         }
-        if self.wal_max_record_bytes > u32::MAX as usize
-            || self.max_write_bytes > self.wal_max_record_bytes.saturating_sub(1024 * 1024)
-        {
+        if self.execution_device != 0 {
             return Err(crate::Error::invalid_data(
-                "maximum writes must fit inside the bounded WAL record",
+                "CPU graph execution device ordinal must be zero",
+            ));
+        }
+        if self.broker_retention_interval_secs == 0 {
+            return Err(crate::Error::invalid_data(
+                "broker retention interval must be positive",
             ));
         }
         let remote_enabled = self.remote_query_addr.is_some()
@@ -297,7 +253,7 @@ mod tests {
 
     use clap::Parser as _;
 
-    use super::Config;
+    use super::{BackendSelection, Config};
 
     #[test]
     fn database_defaults_to_the_private_data_home() -> Result<(), Box<dyn std::error::Error>> {
@@ -343,6 +299,40 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let config = Config::try_parse_from(["irongraph"])?;
         config.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn embedding_selection_is_independent_of_cpu_graph_execution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let default = Config::try_parse_from(["irongraph", "--execution-backend", "cpu"])?;
+        default.validate()?;
+        assert_eq!(
+            default.embedding_device(),
+            crate::embeddings::EmbeddingDevice::Auto
+        );
+        let metal = Config::try_parse_from([
+            "irongraph",
+            "--execution-backend",
+            "cpu",
+            "--embedding-backend",
+            "metal",
+            "--embedding-device",
+            "2",
+        ])?;
+        metal.validate()?;
+        assert_eq!(
+            metal.embedding_device(),
+            crate::embeddings::EmbeddingDevice::Metal(2)
+        );
+        for backend in ["metal", "cuda"] {
+            assert!(Config::try_parse_from(["irongraph", "--execution-backend", backend]).is_err());
+        }
+        let graph_gpu = Config {
+            execution_backend: BackendSelection::Metal,
+            ..default
+        };
+        assert!(graph_gpu.validate().is_err());
         Ok(())
     }
 }

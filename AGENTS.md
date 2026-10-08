@@ -25,7 +25,7 @@ information or authorization cannot be obtained within the task's existing scope
 
 # IronGraph repository contract
 
-IronGraph is a standalone, GPU-first, single-node graph database. This file is the only
+IronGraph is a standalone, CPU-executed, single-node graph database with GPU text embedding. This file is the only
 authoritative repository-guidance document for future work. User-facing Markdown documentation,
 including `README.md` and files below `docs/`, is allowed when it describes the current product.
 
@@ -36,7 +36,8 @@ including `README.md` and files below `docs/`, is allowed when it describes the 
   HTTP listener for URL-based local hosts. Both transports expose the same tool and resource surface
   and reach graph data only through the canonical Query API.
 - The only browser-facing graph-data endpoint is `POST /api/query`. Loopback-only Settings controls
-  use `/system/local-ai-integrations` to inspect and install local host packages; remote listeners
+  and `/system/startup` model-readiness progress expose operational state only, never graph data.
+  Settings controls use `/system/local-ai-integrations` to inspect and install local host packages; remote listeners
   never expose those controls. The web application is served below `/web/` and contains Query,
   Streams, Documents, Training, Docs, and Settings surfaces. Graph is the Plot result view inside
   Query rather than a separate route.
@@ -45,18 +46,23 @@ including `README.md` and files below `docs/`, is allowed when it describes the 
 - The Rust library exposes both in-process database access and remote API/Bolt access. Python and
   Node.js packages expose the same two modes; the browser and React package is remote-only. An embedded
   caller chooses the database directory, while the embedded node still uses the one canonical
-  WAL/snapshot path, one selected device, and one-process single-node boundary.
+  WAL/snapshot path, one canonical CPU data representation, and one-process single-node boundary.
 - Projects and the OBSERVED, KNOWLEDGE, and WORKSPACE graph layers remain first-class database
   semantics. There is no implicit default project.
 - Graph storage, indexes, temporal data, algorithms, transactions, WAL recovery, periodic snapshots,
   and asynchronous WAL durability remain database core.
-- CPU is the reference execution backend. Metal is the primary local accelerator and CUDA is an
-  optional build target. These are the complete execution-backend set.
-- Every GPU-backed process selects one device and keeps each admitted project graph and its derived
-  indexes resident. Admission failure is explicit; canonical graph rows are never silently paged or
-  truncated.
+- CPU executes all graph queries, mutations, algorithms, vector scoring, and index construction.
+  The active database runtime has exactly one canonical in-memory data representation. It must not
+  construct a second CPU or GPU resident graph image, publish graph device deltas, or retain old
+  graph generations through copy-on-write containers or transaction working copies.
+- Metal accelerates text-embedding inference only. Preserve the existing Metal/CUDA graph source
+  and shaders in a clearly separated inactive implementation for possible future use; the active
+  CPU database must not initialize it or depend on its graph residency/publication machinery.
+  Retaining these files is an explicit exception to the prohibition on deprecated modules below.
 - Full vector storage, vector indexes, text embedding, and vector search remain. The verified local
-  embedding model installs, loads, binds to the selected device, and warms automatically at startup.
+  embedding model installs, loads, binds to its independently selected embedding device, and warms
+  automatically at startup. Embedding generation runs asynchronously through bounded, cancellable
+  work and must not perform inference on an async runtime worker or block graph requests on inference.
   IronGraph does not install, host, or invoke generative language models.
 - Documents are ordinary Cypher-native graph records, for example `(:Document {body: ...})`. They
   persist through the normal WAL/snapshot path. Meaningful content from all nodes and relationships
@@ -111,8 +117,9 @@ control shapes is wrong even if it looks good.
 
 The product consists exactly of the database capabilities named above. New work must extend one of
 those capabilities directly; it must not introduce a parallel application domain, second data store,
-second query language, or bespoke data endpoint. The database is one process on one node, with one
-selected execution device and one asynchronous WAL/snapshot durability path. Kafka and AMQP wire
+second query language, or bespoke data endpoint. The database is one process on one node, with CPU
+graph execution, an independently selected embedding device, and one asynchronous WAL/snapshot
+durability path. Kafka and AMQP wire
 fields exist solely for client compatibility.
 
 Repository guidance is maintained only here. User-facing Markdown must not contain agent
@@ -150,10 +157,42 @@ functionality outside the current product boundary.
   surfaces.
 - Use notes sparingly for prerequisites, security boundaries, destructive actions, and common
   mistakes. State limitations directly: IronGraph is single-node, has no implicit default project,
-  selects one execution device per process, and rejects GPU admission when resident data does not
-  fit.
+  keeps one canonical CPU data representation, and selects its embedding device independently.
 
 ## Graph invariants
+
+- Parallel reads operate on the canonical store. No graph copy-on-write, immutable historical
+  graph generations, or full transaction-local graph copies may be introduced to implement reads.
+  Reads do not wait for writers and may observe values from before and after the same multi-record
+  write. This is the explicitly selected consistency contract; do not promise snapshot isolation
+  or atomic multi-record visibility to readers. Every individual read must remain memory-safe and
+  structurally valid during insertion, replacement, and deletion. Async functions, retries, or
+  blocking locks alone do not establish nonblocking reads. Bounded reclamation of an allocation
+  currently borrowed by a reader is permitted for memory safety, but may not become retained graph
+  versions or a second graph representation.
+- Async request paths use bounded scheduling, cancellation, and backpressure. Parallelize independent
+  work; keep dependent mutations ordered. CPU work and blocking IO must not stall async runtime
+  workers. Submicrosecond claims require named workloads and current release-build measurements,
+  Match graph size and timing boundaries when comparing prior results. Claims of an implementation
+  speedup require matching hardware; comparisons with saved results from another host must state
+  that difference and must not attribute the ratio to the implementation alone.
+- Performance qualification measures matching complete queries through internal execution, every
+  supported embedded and remote SDK language, the HTTP Query API, Bolt, and the rendered console.
+  Include full result decoding and verification, memory samples and physical footprint, and an
+  instrumentation overhead control. Keep primitive timings separate from query/interface latency.
+  Optimize application and SDK paths; never alter workloads, omit results, cache benchmark answers,
+  or subtract estimated overhead to manufacture an improvement. Preserve failed and slower runs.
+
+- Do not impose configurable database quotas or caps on ingestion, pending embedding owners,
+  request or result sizes, connections, memory admission, or operation duration. Query API, SDK,
+  and MCP requests must not expose or enforce byte, row, node, or relationship result quotas.
+  Explicit Cypher LIMIT and semantic top-k select query results; they are query semantics.
+  Embedding backlog
+  must never reject graph-write acceptance. Keep pending inference recoverable through canonical
+  durability and process it asynchronously without an unbounded RAM queue or copied graph data.
+  Wire-format representability, checked arithmetic, memory safety, explicit caller cancellation,
+  and bounded internal processing batches remain necessary. Verify every bundled example import
+  with embedding enabled and concurrent reads before declaring ingestion changes complete.
 
 - Every canonical node and relationship represents real user or domain data. Embedding rows,
   passages, scores, cache entries, prompts, and processing intermediates are derived state and never

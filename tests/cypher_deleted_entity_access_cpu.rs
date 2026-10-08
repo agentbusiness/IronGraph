@@ -89,7 +89,7 @@ fn column_values(output: &ExecutionOutput, name: &str) -> Result<Vec<ResultValue
 }
 
 fn node_graph(labels: &[&str], property: Option<(&str, ScalarValue)>) -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let labels = labels
         .iter()
         .map(|label| graph.catalog_mut().intern_label(label))
@@ -114,7 +114,7 @@ fn node_graph(labels: &[&str], property: Option<(&str, ScalarValue)>) -> Result<
 }
 
 fn relationship_graph(property: Option<(&str, ScalarValue)>) -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let relationship_type = graph.catalog_mut().intern_relationship_type("T")?;
     let properties = property
         .map(|(name, value)| {

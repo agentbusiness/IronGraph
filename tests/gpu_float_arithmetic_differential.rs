@@ -18,7 +18,7 @@
 //! Equality here is bit-for-bit on purpose. A tolerance would accept precisely the drift that makes
 //! the CPU reference and the GPU backend disagree about a query's result.
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 use irongraph::Result;
 use irongraph::gpu::{
     CpuBackend, ExecutionBackend, ResidentScalarCell, ResidentScalarCellTag,
@@ -27,7 +27,7 @@ use irongraph::gpu::{
 };
 use tokio_util::sync::CancellationToken;
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 use irongraph::gpu::MetalBackend;
 
 const NULL_CELL: u16 = 0;
@@ -176,7 +176,7 @@ fn the_cpu_reference_is_stable_across_repeated_evaluation() {
     assert_backends_agree(&cpu, &CpuBackend::new(usize::MAX / 4, 0));
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn real_metal_binary64_arithmetic_matches_the_cpu_reference_bit_for_bit() -> Result<()> {
@@ -186,7 +186,7 @@ fn real_metal_binary64_arithmetic_matches_the_cpu_reference_bit_for_bit() -> Res
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn real_metal_integer_exponent_power_matches_the_reference_or_declines() -> Result<()> {
@@ -244,7 +244,7 @@ fn real_metal_integer_exponent_power_matches_the_reference_or_declines() -> Resu
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn real_metal_float_modulo_is_the_exact_ieee_remainder() -> Result<()> {
@@ -273,7 +273,7 @@ fn real_metal_float_modulo_is_the_exact_ieee_remainder() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn real_metal_square_root_is_correctly_rounded() -> Result<()> {

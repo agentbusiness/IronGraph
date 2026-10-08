@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
+
+use crate::broker::concurrent::{CanonicalMap, CanonicalSet};
 
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
@@ -149,11 +151,24 @@ pub struct AuthorizedCredential {
 }
 
 /// Deterministic durable mTLS service-credential registry.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CredentialRegistry {
-    by_fingerprint: BTreeMap<[u8; 32], CredentialRecord>,
-    ids: BTreeSet<CredentialId>,
+    by_fingerprint: CanonicalMap<[u8; 32], CredentialRecord>,
+    ids: CanonicalSet<CredentialId>,
 }
+impl PartialEq for CredentialRegistry {
+    fn eq(&self, other: &Self) -> bool {
+        self.by_fingerprint.len() == other.by_fingerprint.len()
+            && self.by_fingerprint.iter().all(|(key, value)| {
+                other
+                    .by_fingerprint
+                    .get(&key)
+                    .is_some_and(|other| other == value)
+            })
+            && self.ids.iter().collect::<BTreeSet<_>>() == other.ids.iter().collect::<BTreeSet<_>>()
+    }
+}
+impl Eq for CredentialRegistry {}
 
 impl CredentialRegistry {
     pub fn authenticate(
@@ -192,10 +207,10 @@ impl CredentialRegistry {
                 "credential does not allow this protocol",
             ));
         }
-        Ok(record.clone())
+        Ok((*record).clone())
     }
 
-    pub fn register(&mut self, record: CredentialRecord, now_millis: i64) -> Result<()> {
+    pub fn validate_register(&self, record: &CredentialRecord, now_millis: i64) -> Result<()> {
         record.validate()?;
         if record.expires_at_millis <= now_millis || record.revoked_at_index.is_some() {
             return Err(Error::invalid_data("new credential is expired or revoked"));
@@ -216,17 +231,21 @@ impl CredentialRegistry {
                 None,
             ));
         }
+        Ok(())
+    }
+
+    pub fn register(&self, record: CredentialRecord, now_millis: i64) -> Result<()> {
+        self.validate_register(&record, now_millis)?;
         self.ids.insert(record.credential_id);
         self.by_fingerprint
             .insert(record.certificate_fingerprint, record);
         Ok(())
     }
 
-    /// Atomically registers a replacement and revokes the old fingerprint at one log index.
-    pub fn rotate(
-        &mut self,
+    pub fn validate_rotate(
+        &self,
         old_fingerprint: [u8; 32],
-        replacement: CredentialRecord,
+        replacement: &CredentialRecord,
         rotation_index: u64,
         now_millis: i64,
     ) -> Result<()> {
@@ -269,25 +288,30 @@ impl CredentialRegistry {
             ));
         }
 
-        let replacement_id = replacement.credential_id;
-        let replacement_fingerprint = replacement.certificate_fingerprint;
-        self.ids.insert(replacement_id);
-        self.by_fingerprint
-            .insert(replacement_fingerprint, replacement);
-        if let Some(old_mut) = self.by_fingerprint.get_mut(&old_fingerprint) {
-            old_mut.revoked_at_index = Some(rotation_index);
-        } else {
-            self.by_fingerprint.remove(&replacement_fingerprint);
-            self.ids.remove(&replacement_id);
-            return Err(Error::new(
-                ErrorCode::CorruptStorage,
-                "credential disappeared during rotation",
-            ));
-        }
         Ok(())
     }
 
-    pub fn revoke(&mut self, fingerprint: [u8; 32], index: u64) -> Result<()> {
+    /// Publishes a replacement and revokes the previous fingerprint in writer order.
+    pub fn rotate(
+        &self,
+        old_fingerprint: [u8; 32],
+        replacement: CredentialRecord,
+        rotation_index: u64,
+        now_millis: i64,
+    ) -> Result<()> {
+        self.validate_rotate(old_fingerprint, &replacement, rotation_index, now_millis)?;
+        let mut old = self
+            .by_fingerprint
+            .get_mut(&old_fingerprint)
+            .ok_or_else(|| Error::new(ErrorCode::AuthenticationFailed, "unknown credential"))?;
+        self.ids.insert(replacement.credential_id);
+        self.by_fingerprint
+            .insert(replacement.certificate_fingerprint, replacement);
+        old.revoked_at_index = Some(rotation_index);
+        Ok(())
+    }
+
+    pub fn validate_revoke(&self, fingerprint: [u8; 32], index: u64) -> Result<()> {
         if index == 0 {
             return Err(Error::invalid_data(
                 "credential revocation index must be non-zero",
@@ -295,7 +319,7 @@ impl CredentialRegistry {
         }
         let record = self
             .by_fingerprint
-            .get_mut(&fingerprint)
+            .get(&fingerprint)
             .ok_or_else(|| Error::new(ErrorCode::AuthenticationFailed, "unknown credential"))?;
         if record.revoked_at_index.is_some() {
             return Err(Error::new(
@@ -303,6 +327,14 @@ impl CredentialRegistry {
                 "credential is revoked",
             ));
         }
+        Ok(())
+    }
+    pub fn revoke(&self, fingerprint: [u8; 32], index: u64) -> Result<()> {
+        self.validate_revoke(fingerprint, index)?;
+        let mut record = self
+            .by_fingerprint
+            .get_mut(&fingerprint)
+            .ok_or_else(|| Error::new(ErrorCode::AuthenticationFailed, "unknown credential"))?;
         record.revoked_at_index = Some(index);
         Ok(())
     }
@@ -348,13 +380,13 @@ impl CredentialRegistry {
         })
     }
 
-    pub fn cleanup_expired(&mut self, now_millis: i64) {
+    pub fn cleanup_expired(&self, now_millis: i64) {
         let expired = self
             .by_fingerprint
             .iter()
             .filter_map(|(fingerprint, record)| {
                 (record.expires_at_millis <= now_millis)
-                    .then_some((*fingerprint, record.credential_id))
+                    .then_some((fingerprint, record.credential_id))
             })
             .collect::<Vec<_>>();
         for (fingerprint, id) in expired {
@@ -375,7 +407,7 @@ impl CredentialRegistry {
         let mut expected_ids = BTreeSet::new();
         for (fingerprint, record) in &self.by_fingerprint {
             record.validate()?;
-            if fingerprint != &record.certificate_fingerprint
+            if fingerprint != record.certificate_fingerprint
                 || !expected_ids.insert(record.credential_id)
             {
                 return Err(Error::new(
@@ -384,7 +416,7 @@ impl CredentialRegistry {
                 ));
             }
         }
-        if expected_ids != self.ids {
+        if expected_ids != self.ids.iter().collect::<BTreeSet<_>>() {
             return Err(Error::new(
                 ErrorCode::CorruptStorage,
                 "client credential ID index mismatch",
@@ -399,6 +431,145 @@ mod tests {
     use rcgen::{CertificateParams, KeyPair};
 
     use super::{certificate_ed25519_identity_key, certificate_public_key_fingerprint};
+
+    fn record(id: u64, project: crate::ProjectId) -> super::CredentialRecord {
+        super::CredentialRecord {
+            credential_id: crate::types::CredentialId(id),
+            certificate_fingerprint: [id as u8; 32],
+            project_id: project,
+            protocols: super::ProtocolScope::QUERY_HTTP,
+            operations: super::OperationScope::READ,
+            layers: super::LayerScope::KNOWLEDGE,
+            expires_at_millis: 10_000,
+            revoked_at_index: None,
+        }
+    }
+    #[test]
+    fn canonical_credentials_and_checkpoint_preserve_authorization() -> crate::Result<()> {
+        let registry = super::CredentialRegistry::default();
+        let project = crate::ProjectId::random();
+        registry.register(record(1, project), 1)?;
+        let reader = registry.clone();
+        registry.rotate([1; 32], record(2, project), 2, 1)?;
+        assert!(
+            reader
+                .authenticate([1; 32], super::ProtocolScope::QUERY_HTTP, 1)
+                .is_err()
+        );
+        assert!(
+            reader
+                .authorize(
+                    [2; 32],
+                    project,
+                    super::ProtocolScope::QUERY_HTTP,
+                    super::OperationScope::READ,
+                    super::LayerScope::KNOWLEDGE,
+                    1
+                )
+                .is_ok()
+        );
+        assert!(
+            reader
+                .authorize(
+                    [2; 32],
+                    crate::ProjectId::random(),
+                    super::ProtocolScope::QUERY_HTTP,
+                    super::OperationScope::READ,
+                    super::LayerScope::KNOWLEDGE,
+                    1
+                )
+                .is_err()
+        );
+        let bytes =
+            postcard::to_allocvec(&registry).map_err(|e| crate::Error::internal(e.to_string()))?;
+        let restored: super::CredentialRegistry =
+            postcard::from_bytes(&bytes).map_err(|e| crate::Error::internal(e.to_string()))?;
+        restored.validate()?;
+        assert_eq!(registry, restored);
+        registry.cleanup_expired(10_000);
+        assert!(
+            reader
+                .authenticate([2; 32], super::ProtocolScope::QUERY_HTTP, 1)
+                .is_err()
+        );
+        Ok(())
+    }
+    #[test]
+    fn credential_checkpoint_preserves_existing_wire_shape()
+    -> Result<(), Box<dyn std::error::Error>> {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct WireRegistry {
+            by_fingerprint: std::collections::BTreeMap<[u8; 32], super::CredentialRecord>,
+            ids: std::collections::BTreeSet<crate::types::CredentialId>,
+        }
+        let credential = record(1, crate::ProjectId::random());
+        let wire = WireRegistry {
+            by_fingerprint: [(credential.certificate_fingerprint, credential.clone())].into(),
+            ids: [credential.credential_id].into(),
+        };
+        let registry: super::CredentialRegistry =
+            postcard::from_bytes(&postcard::to_allocvec(&wire)?)?;
+        registry.validate()?;
+        assert_eq!(
+            registry.authenticate([1; 32], super::ProtocolScope::QUERY_HTTP, 1)?,
+            credential
+        );
+        let restored: WireRegistry = postcard::from_bytes(&postcard::to_allocvec(&registry)?)?;
+        assert_eq!(restored.by_fingerprint, wire.by_fingerprint);
+        assert_eq!(restored.ids, wire.ids);
+        Ok(())
+    }
+    #[test]
+    fn invalid_credential_preflight_does_not_mutate_canonical_registry() -> crate::Result<()> {
+        let registry = super::CredentialRegistry::default();
+        let project = crate::ProjectId::random();
+        registry.register(record(1, project), 1)?;
+        let before =
+            postcard::to_allocvec(&registry).map_err(|e| crate::Error::internal(e.to_string()))?;
+        let invalid = record(2, crate::ProjectId::random());
+        assert!(registry.validate_rotate([1; 32], &invalid, 2, 1).is_err());
+        assert!(registry.rotate([1; 32], invalid, 2, 1).is_err());
+        assert!(registry.validate_register(&record(1, project), 1).is_err());
+        assert!(registry.validate_revoke([1; 32], 0).is_err());
+        assert_eq!(
+            before,
+            postcard::to_allocvec(&registry).map_err(|e| crate::Error::internal(e.to_string()))?
+        );
+        Ok(())
+    }
+    #[test]
+    fn authentication_finishes_while_credential_writer_is_paused()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let registry = super::CredentialRegistry::default();
+        registry.register(record(1, crate::ProjectId::random()), 1)?;
+        let reader = registry.clone();
+        let mut pending = registry
+            .by_fingerprint
+            .get_mut(&[1; 32])
+            .ok_or("credential missing")?;
+        pending.revoked_at_index = Some(2);
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            send.send(
+                reader
+                    .authenticate([1; 32], super::ProtocolScope::QUERY_HTTP, 1)
+                    .is_ok(),
+            )
+            .unwrap();
+        });
+        let result = receive.recv_timeout(std::time::Duration::from_secs(2));
+        drop(pending);
+        worker
+            .join()
+            .map_err(|_| "authentication reader panicked")?;
+        assert!(result?);
+        assert!(
+            registry
+                .authenticate([1; 32], super::ProtocolScope::QUERY_HTTP, 1)
+                .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn fingerprint_is_bound_to_subject_public_key_not_certificate_bytes()

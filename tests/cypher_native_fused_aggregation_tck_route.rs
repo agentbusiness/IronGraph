@@ -751,7 +751,7 @@ fn context_with_max_result_rows<'a>(
 }
 
 fn fixture_graph(source: &SourceCase) -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     for setup in &source.setup_queries {
         let output =
             QueryEngine.execute(setup, &mut context(&graph, BTreeMap::new(), None, false))?;
@@ -1534,7 +1534,7 @@ fn execute_strict_case(
 ) -> Result<()> {
     let graph = fixture_graph(source)?;
     backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-        graph.snapshot()?,
+        super::legacy_fixture_snapshot(&graph)?,
     ))])?;
     let calls = backend.calls();
     let before = calls.snapshot();
@@ -2194,7 +2194,7 @@ fn graph_fused_string_reductions_reject_unbounded_or_unsupported_shapes() -> Res
     let graph = fixture_graph(&source)?;
     let mut backend = ObservedBackend::strict_cpu();
     backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-        graph.snapshot()?,
+        super::legacy_fixture_snapshot(&graph)?,
     ))])?;
     let calls = backend.calls();
 
@@ -2376,7 +2376,7 @@ fn grouped_relationship_rebound_rewrite_rejects_every_structural_near_miss() -> 
     let graph = fixture_graph(&source)?;
     let mut backend = ObservedBackend::strict_cpu();
     backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-        graph.snapshot()?,
+        super::legacy_fixture_snapshot(&graph)?,
     ))])?;
     let calls = backend.calls();
 
@@ -2463,7 +2463,7 @@ fn graph_fused_arithmetic_sources_fail_closed_when_not_proven_numeric() -> Resul
     let graph = fixture_graph(&source)?;
     let mut backend = ObservedBackend::strict_cpu();
     backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-        graph.snapshot()?,
+        super::legacy_fixture_snapshot(&graph)?,
     ))])?;
     let calls = backend.calls();
 
@@ -2620,7 +2620,7 @@ fn strict_cpu_applies_skip_before_limit_after_ordering_all_aggregate_groups() ->
     let graph = fixture_graph(&source)?;
     let mut backend = ObservedBackend::strict_cpu();
     backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-        graph.snapshot()?,
+        super::legacy_fixture_snapshot(&graph)?,
     ))])?;
     let calls = backend.calls();
     let before = calls.snapshot();
@@ -2672,7 +2672,7 @@ fn graph_fused_post_aggregate_windows_fail_closed_for_invalid_or_oversized_rows(
     let graph = fixture_graph(&source)?;
     let mut backend = ObservedBackend::strict_cpu();
     backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-        graph.snapshot()?,
+        super::legacy_fixture_snapshot(&graph)?,
     ))])?;
     let calls = backend.calls();
 
@@ -2744,7 +2744,7 @@ fn strict_cpu_global_count_fences_the_complete_graph_without_enumerating_entitie
     let graph = fixture_graph(&source)?;
     let mut backend = ObservedBackend::strict_cpu();
     backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-        graph.snapshot()?,
+        super::legacy_fixture_snapshot(&graph)?,
     ))])?;
     let calls = backend.calls();
     let before = calls.snapshot();
@@ -3142,7 +3142,7 @@ fn graph_fused_compiler_declines_nested_documents_variable_paths_and_unsupported
         let graph = fixture_graph(&source)?;
         let mut backend = ObservedBackend::strict_cpu();
         backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-            graph.snapshot()?,
+            super::legacy_fixture_snapshot(&graph)?,
         ))])?;
         let calls = backend.calls();
         let before = calls.snapshot();
@@ -3228,7 +3228,7 @@ fn valid_limit_collect_declines_the_sealed_range_sum_compiler() -> Result<()> {
 
     let mut backend = ObservedBackend::strict_cpu();
     backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-        graph.snapshot()?,
+        super::legacy_fixture_snapshot(&graph)?,
     ))])?;
     let calls = backend.calls();
     let before = calls.snapshot();
@@ -3256,7 +3256,7 @@ fn sealed_range_sum_enforces_query_intermediate_budget_at_128_129() -> Result<()
     let graph = GraphStore::default();
     let mut backend = ObservedBackend::strict_cpu();
     backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-        graph.snapshot()?,
+        super::legacy_fixture_snapshot(&graph)?,
     ))])?;
     let calls = backend.calls();
     let expected_calls = CallSnapshot {
@@ -3302,7 +3302,7 @@ fn strict_cpu_reduces_more_than_one_million_logical_range_rows_without_an_engine
     let graph = GraphStore::default();
     let mut backend = ObservedBackend::strict_cpu();
     backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-        graph.snapshot()?,
+        super::legacy_fixture_snapshot(&graph)?,
     ))])?;
     let calls = backend.calls();
     let before = calls.snapshot();
@@ -3955,7 +3955,7 @@ fn real_metal_reduces_more_than_one_million_logical_range_rows_without_an_engine
     let graph = GraphStore::default();
     let mut backend = ObservedBackend::real_metal()?;
     backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-        graph.snapshot()?,
+        super::legacy_fixture_snapshot(&graph)?,
     ))])?;
     let calls = backend.calls();
     let before = calls.snapshot();

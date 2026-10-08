@@ -5,6 +5,7 @@
 // enforceable instead of switched off globally.
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+use irongraph::graph::legacy::{GraphStore, TemporalStore};
 use irongraph::{
     Bookmark, EdgeId, ErrorCode, Layer, NodeId, ProjectId, Result, ScalarValue,
     gpu::{
@@ -16,7 +17,7 @@ use irongraph::{
         ResidentRowProgramRequest, ResidentRowProgramResult, ResidentRowSortKey,
         ResidentRowValueType,
     },
-    graph::{EdgeInput, GraphStore, IndexCatalog, LayerMask, NodeInput, TemporalStore},
+    graph::{EdgeInput, IndexCatalog, LayerMask, NodeInput},
     types::{LabelId, PropertyId, RelationshipTypeId},
 };
 use ordered_float::OrderedFloat;

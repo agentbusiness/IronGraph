@@ -1,15 +1,19 @@
-//! Deterministic operator execution, typed batches, and strict-serializable dependency capture.
+//! Canonical mixed-visibility execution, typed batches, and dependency validation for writes.
 
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
     time::Instant,
 };
 
 use chrono::{Datelike, Offset, TimeZone, Timelike};
 use ordered_float::OrderedFloat;
 use rand::Rng as _;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use tokio_util::sync::CancellationToken;
@@ -31,7 +35,7 @@ use crate::{
         ResidentPatternCountRequest, ResidentPatternCountStartLabels,
         ResidentPatternPairPredicateRequest, ResidentPatternPairVisibleNodeScans,
         ResidentPatternPredicateInput, ResidentPatternPredicateRequest,
-        ResidentPatternRelationshipTypes, ResidentProcedureTableRequest, ResidentProjectDelta,
+        ResidentPatternRelationshipTypes, ResidentProcedureTableRequest,
         ResidentQuantifierEntityHandle, ResidentQuantifierEntityList, ResidentQuantifierSource,
         ResidentQuantifierValue, ResidentRowBoundMergeBranch, ResidentRowBoundMergePropertyMode,
         ResidentRowBoundMergePropertySource, ResidentRowBoundRelationshipColumn,
@@ -42,20 +46,22 @@ use crate::{
         ResidentRowMutationWorkIntentAction, ResidentSegmentedGraphReadDependency,
         ResidentSegmentedRelation, ResidentSegmentedValueTag, ResidentSortKey, ResidentSortRequest,
         ResidentSortSource, ResidentTemporalAccessor, ResidentTemporalArithmeticStatus,
-        ResidentTemporalDelta, ResidentTemporalValue, ResidentTemporalValueFunction,
-        ResidentToBooleanRequest, ResidentVectorAccess, ResidentVectorQuery, ScratchReservation,
+        ResidentTemporalValue, ResidentTemporalValueFunction, ResidentToBooleanRequest,
+        ResidentVectorAccess, ResidentVectorQuery, ScratchReservation,
         ValidatedResidentDeleteResult, ValidatedResidentMutationBatch,
         ValidatedResidentRowBoundRelationshipMerge, ValidatedResidentRowCreate,
         ValidatedResidentRowMatchMergeRelationship, resident_range_budget_error,
         resident_range_step_error, resident_range_type_error, resident_row_bound_property_value,
     },
     graph::{
-        EdgeInput, GraphMutation, GraphStore, IndexCatalog, IvfPqIndex, NodeInput, PageRankConfig,
-        StatisticsSnapshot, TemporalSample, TemporalStore, VectorIndex, bfs_cancellable,
-        clustering_coefficients_cancellable, dfs_cancellable, dijkstra_cancellable,
+        AdjacencyRead, EdgeInput, GraphMutation, GraphStore, IndexCatalog, IvfPqIndex, NodeInput,
+        PageRankConfig, StatisticsSnapshot, TemporalSample, TemporalStore, VectorIndex,
+        bfs_cancellable, clustering_coefficients_cancellable,
+        clustering_coefficients_into_cancellable, dfs_cancellable, dijkstra_cancellable,
         k_core_cancellable, louvain_communities_cancellable, page_rank_cancellable,
         shortest_path_cancellable, strongly_connected_components_cancellable,
-        triangle_count_cancellable, weakly_connected_components_cancellable,
+        triangle_count_cancellable, triangle_count_range_cancellable,
+        weakly_connected_components_cancellable,
     },
     types::{EntityKind, LabelId, PropertyId, RelationshipTypeId},
 };
@@ -535,7 +541,7 @@ enum BindingValue {
 /// allocation plus one node allocation per bound symbol.
 #[derive(Clone, Debug, Default, Serialize)]
 struct Row {
-    values: SmallVec<[(String, BindingValue); 8]>,
+    values: SmallVec<[(String, BindingValue); 2]>,
     /// Dense relationship identities already selected by patterns in the current MATCH clause.
     /// This is execution metadata, not a Cypher binding: projections, equality, and result
     /// serialization must never expose it. A different `MatchGroupId` clears the set.
@@ -1101,26 +1107,22 @@ fn execute_plan_inner(
     force_host_adaptive: bool,
 ) -> Result<ExecutionOutput> {
     check_execution(context)?;
-    // Bare cardinality: `MATCH (n[:Label]) RETURN count(n)` is answered in O(1) from the optimizer
-    // statistics instead of materializing one row per node (which trips the row budget at millions).
-    // Only for a pure read with no pending mutations, so the statistics snapshot is authoritative.
+    if let Some(output) = stream_canonical_relationship_rows(&plan, context, &mut stream)? {
+        return Ok(output);
+    }
+    // Bare cardinality reads the maintained live counter without materializing node rows.
     if !context.capabilities.require_native_execution
         && context.prior_graph_mutations.is_empty()
         && context.prior_temporal_mutations.is_empty()
         && let Some((label_name, output_name)) = plan_is_label_count(&plan)
     {
-        // Answer `count(n)` / `count(n:Label)` / `count(*)` directly from the graph's O(1) live
-        // counters. This is independent of the optimizer statistics snapshot, so the fast path fires
-        // the first time a count is asked — no heavyweight pre-warm scan required — and both a bare
-        // CPU node and a resident GPU node return the same cardinality without materializing rows.
-        let view = GraphReadView::new(context.graph);
         let count = match &label_name {
-            Some(name) => view.label(name).map_or(0, |label| {
+            Some(name) => context.graph.catalog().label(name).map_or(0, |label| {
                 context.graph.label_node_count(label, plan.read_layers)
             }),
             None => context.graph.node_count_in_layers(plan.read_layers),
         };
-        return emit_resident_scalar_count(count, &output_name, &view, context, stream);
+        return emit_scalar_count(count, &output_name, context, stream);
     }
     // Relationship counts: `MATCH ()-[r]->() RETURN count(r)` / `count(*)` (optionally `[r:TYPE]`)
     // reduce to the graph's O(1) live edge counters, the same way label counts do for nodes.
@@ -1129,16 +1131,27 @@ fn execute_plan_inner(
         && context.prior_temporal_mutations.is_empty()
         && let Some((type_name, output_name)) = plan_is_relationship_count(&plan)
     {
-        let view = GraphReadView::new(context.graph);
         let count = match &type_name {
-            Some(name) => view.relationship_type(name).map_or(0, |relationship_type| {
+            Some(name) => {
                 context
                     .graph
-                    .relationship_count(relationship_type, plan.read_layers)
-            }),
+                    .catalog()
+                    .relationship_type(name)
+                    .map_or(0, |relationship_type| {
+                        context
+                            .graph
+                            .relationship_count(relationship_type, plan.read_layers)
+                    })
+            }
             None => context.graph.edge_count_in_layers(plan.read_layers),
         };
-        return emit_resident_scalar_count(count, &output_name, &view, context, stream);
+        return emit_scalar_count(count, &output_name, context, stream);
+    }
+    if let Some(output) = stream_bounded_integer_nodes(&plan, context, &mut stream)? {
+        return Ok(output);
+    }
+    if let Some(output) = stream_integer_node_aggregates(&plan, context, &mut stream)? {
+        return Ok(output);
     }
     // `count(DISTINCT n.<int property>)` over a bare label scan: the answer is the number of distinct
     // non-null integer values of that column. Collect them in one column pass into a set instead of
@@ -1171,13 +1184,7 @@ fn execute_plan_inner(
                     distinct.insert(value);
                 }
             }
-            return emit_resident_scalar_count(
-                distinct.len() as u64,
-                &output_name,
-                &view,
-                context,
-                stream,
-            );
+            return emit_scalar_count(distinct.len() as u64, &output_name, context, stream);
         }
     }
     // Variable-length reachability count: `MATCH (n[:L])-[:R*min..max]->(m[:E]) RETURN count(DISTINCT m)`
@@ -1322,7 +1329,6 @@ fn execute_plan_inner(
                     .transpose()?
             },
             allow_context_backend: !force_host_adaptive,
-            resident_overlay_mutations: 0,
             existential_subquery_depth: 0,
             initial_scan_cap: plan_direct_node_scan(&plan)
                 .map(|scan| scan.row_cap.unwrap_or(usize::MAX)),
@@ -1721,40 +1727,1209 @@ fn plan_is_host_indexed_seek_read(plan: &PhysicalPlan) -> bool {
     seeds == 1
 }
 
-/// A bare label/all-node cardinality query — `MATCH (n[:Label]) RETURN count(n) [AS c]` with no
-/// steps, no property predicate, no filter, no `DISTINCT`, and no other operators. Every scanned
-/// row binds `n`, so `count(n)` equals the number of matching nodes, which the maintained optimizer
-/// statistics already hold per label. Returns `(optional start-label name, output column name)`.
-///
-/// Without this, the host executor materializes one row per node before aggregating — 1M rows at a
-/// million nodes, which trips the result-row budget. This lets the count return in O(1) from the
-/// statistics snapshot instead, in every execution mode (host, deferred, or GPU-absent).
-/// Emits a single-row, single-column integer result carrying `count` under `output_name`. Shared by
-/// the O(1) label-count and relationship-count fast paths.
-fn emit_resident_scalar_count(
+/// Keeps grouped counts and paginated integer sorting bounded by their output state.
+fn parallel_integer_group_counts(
+    context: &ExecutionContext<'_>,
+    reader: Option<&crate::graph::NodePropertyReader<'_>>,
+    labels: &[LabelId],
+    layers: crate::graph::LayerMask,
+) -> Result<Option<BTreeMap<Option<i64>, i64>>> {
+    let slots = context.graph.node_slot_count();
+    let permit = (slots >= 32768)
+        .then(integer_scan_pool)
+        .flatten()
+        .and_then(IntegerScanPool::try_claim);
+    let Some(permit) = permit else {
+        return Ok(None);
+    };
+    let groups = papaya::HashMap::<Option<i64>, std::sync::atomic::AtomicI64>::new();
+    let unique = std::sync::atomic::AtomicUsize::new(0);
+    let tasks = permit
+        .0
+        .workers
+        .current_num_threads()
+        .saturating_mul(4)
+        .min(slots / 4096);
+    let width = slots.div_ceil(tasks);
+    permit.0.workers.install(|| {
+        (0..tasks)
+            .into_par_iter()
+            .with_max_len(1)
+            .try_for_each(|task| {
+                let groups = groups.pin();
+                let capacity = context.max_batch_rows.clamp(1, 4096).next_power_of_two();
+                let mut pending: Vec<Option<(&std::sync::atomic::AtomicI64, i64)>> =
+                    vec![None; capacity];
+                check_execution(context)?;
+                for dense in task * width..((task + 1) * width).min(slots) {
+                    if dense & 4095 == 0 {
+                        check_execution(context)?;
+                        if unique.load(AtomicOrdering::Relaxed) > context.max_result_rows {
+                            return Err(Error::new(
+                                ErrorCode::ResultBudgetExceeded,
+                                "query row budget exceeded",
+                            ));
+                        }
+                    }
+                    let Some(node) = context.graph.node_dense(dense as u32) else {
+                        continue;
+                    };
+                    if !layers.contains_layer(node.layer()) || !node.has_labels(labels) {
+                        continue;
+                    }
+                    let value = reader.and_then(|reader| reader.get_integer(node));
+                    let count = groups.get(&value).unwrap_or_else(|| {
+                        groups.get_or_insert_with(value, || std::sync::atomic::AtomicI64::new(-1))
+                    });
+                    if count.load(AtomicOrdering::Relaxed) == -1
+                        && count
+                            .compare_exchange(
+                                -1,
+                                1,
+                                AtomicOrdering::Relaxed,
+                                AtomicOrdering::Relaxed,
+                            )
+                            .is_ok()
+                    {
+                        if unique.fetch_add(1, AtomicOrdering::Relaxed) >= context.max_result_rows {
+                            return Err(Error::new(
+                                ErrorCode::ResultBudgetExceeded,
+                                "query row budget exceeded",
+                            ));
+                        }
+                        continue;
+                    }
+                    // Only borrowed counter addresses and actual contributions enter this bounded batch.
+                    let address = count as *const std::sync::atomic::AtomicI64 as usize;
+                    let slot = &mut pending[((address >> 3) ^ (address >> 11)) & (capacity - 1)];
+                    match slot {
+                        Some((counter, amount)) if std::ptr::eq(*counter, count) => *amount += 1,
+                        _ => {
+                            if let Some((counter, amount)) = slot.take() {
+                                counter.fetch_add(amount, AtomicOrdering::Relaxed);
+                            }
+                            *slot = Some((count, 1));
+                        }
+                    }
+                }
+                // Every canonical ordinal contributes once, bounding each total by u32::MAX.
+                for (counter, amount) in pending.into_iter().flatten() {
+                    counter.fetch_add(amount, AtomicOrdering::Relaxed);
+                }
+                Ok(())
+            })
+    })?;
+    check_execution(context)?;
+    Ok(Some(
+        groups
+            .pin()
+            .iter()
+            .map(|(key, count)| (*key, count.load(AtomicOrdering::Relaxed)))
+            .collect(),
+    ))
+}
+
+type IntegerTopRank = (bool, u64, std::cmp::Reverse<u32>);
+type IntegerTopHeap =
+    std::collections::BinaryHeap<std::cmp::Reverse<(IntegerTopRank, Option<i64>)>>;
+
+#[inline]
+fn integer_top_rank(value: Option<i64>, dense: u32, ascending: bool) -> IntegerTopRank {
+    let ordered = u64::from_ne_bytes(value.unwrap_or_default().to_ne_bytes()) ^ (1_u64 << 63);
+    (
+        if ascending {
+            value.is_some()
+        } else {
+            value.is_none()
+        },
+        if ascending { !ordered } else { ordered },
+        std::cmp::Reverse(dense),
+    )
+}
+
+#[inline]
+fn retain_integer_top(heap: &mut IntegerTopHeap, cap: usize, item: (IntegerTopRank, Option<i64>)) {
+    if heap.len() < cap {
+        heap.push(std::cmp::Reverse(item));
+    } else if heap.peek().is_some_and(|worst| item.0 > worst.0.0)
+        && let Some(mut worst) = heap.peek_mut()
+    {
+        *worst = std::cmp::Reverse(item);
+    }
+}
+
+fn parallel_integer_top(
+    context: &ExecutionContext<'_>,
+    reader: Option<&crate::graph::NodePropertyReader<'_>>,
+    labels: &[LabelId],
+    layers: crate::graph::LayerMask,
+    ascending: bool,
+    cap: usize,
+) -> Result<Option<IntegerTopHeap>> {
+    let slots = context.graph.node_slot_count();
+    // At most 32 partial heaps of 1024 primitive candidates plus one output heap.
+    let permit = (slots >= 32768 && (1..=1024).contains(&cap))
+        .then(integer_scan_pool)
+        .flatten()
+        .and_then(IntegerScanPool::try_claim);
+    let Some(permit) = permit else {
+        return Ok(None);
+    };
+    #[cfg(test)]
+    PARALLEL_TOP_REDUCTIONS.with(|count| count.set(count.get() + 1));
+    let tasks = permit
+        .0
+        .workers
+        .current_num_threads()
+        .saturating_mul(4)
+        .min(slots / 4096);
+    let width = slots.div_ceil(tasks);
+    let parts = permit.0.workers.install(|| {
+        (0..tasks)
+            .into_par_iter()
+            .with_max_len(1)
+            .map(|task| {
+                check_execution(context)?;
+                let mut heap = IntegerTopHeap::new();
+                for dense in task * width..((task + 1) * width).min(slots) {
+                    if dense & 4095 == 0 {
+                        check_execution(context)?;
+                    }
+                    let Some(node) = context.graph.node_dense(dense as u32) else {
+                        continue;
+                    };
+                    if !layers.contains_layer(node.layer()) {
+                        continue;
+                    }
+                    let value = if let Some(reader) = reader {
+                        let Some(value) = reader.get_integer_with_labels(node, labels) else {
+                            continue;
+                        };
+                        value
+                    } else {
+                        if !node.has_labels(labels) {
+                            continue;
+                        }
+                        None
+                    };
+                    retain_integer_top(
+                        &mut heap,
+                        cap,
+                        (integer_top_rank(value, node.dense(), ascending), value),
+                    );
+                }
+                Ok(heap)
+            })
+            .collect::<Result<Vec<_>>>()
+    })?;
+    let mut heap = IntegerTopHeap::new();
+    for part in parts {
+        for std::cmp::Reverse(item) in part {
+            retain_integer_top(&mut heap, cap, item);
+        }
+    }
+    check_execution(context)?;
+    Ok(Some(heap))
+}
+
+fn stream_bounded_integer_nodes(
+    plan: &PhysicalPlan,
+    context: &ExecutionContext<'_>,
+    stream: &mut Option<&mut dyn FnMut(ExecutionStreamItem) -> Result<()>>,
+) -> Result<Option<ExecutionOutput>> {
+    if plan.dependencies.is_empty()
+        || !plan.read_only
+        || plan.at_time.is_some()
+        || !plan.unions.is_empty()
+        || context.capabilities.require_native_execution
+        || !context.prior_graph_mutations.is_empty()
+        || !context.prior_temporal_mutations.is_empty()
+    {
+        return Ok(None);
+    }
+    let Some(PhysicalOperator::ScanPattern {
+        optional: false,
+        pattern,
+        ..
+    }) = plan.operators.first()
+    else {
+        return Ok(None);
+    };
+    let Some(variable) = pattern.start.variable.as_deref() else {
+        return Ok(None);
+    };
+    if !pattern.steps.is_empty()
+        || pattern.variable.is_some()
+        || pattern.selector != PathSelector::All
+        || pattern.start.property_predicate_present
+        || !pattern.start.properties.is_empty()
+    {
+        return Ok(None);
+    }
+    let Some(project_index) = plan.operators.iter().position(|operator| {
+        matches!(
+            operator,
+            PhysicalOperator::Project {
+                keep_scope: false,
+                ..
+            }
+        )
+    }) else {
+        return Ok(None);
+    };
+    if !plan.operators[1..project_index]
+        .iter()
+        .all(|operator| matches!(operator, PhysicalOperator::CardinalityCheckpoint { .. }))
+    {
+        return Ok(None);
+    }
+    let PhysicalOperator::Project { projection, .. } = &plan.operators[project_index] else {
+        return Ok(None);
+    };
+    if projection.distinct {
+        return Ok(None);
+    }
+    let property_expression = |expression: &Expression| -> Option<Option<PropertyId>> {
+        let Expression::Property(owner, name) = expression else {
+            return None;
+        };
+        if !matches!(owner.as_ref(),Expression::Variable(name) if name==variable) {
+            return None;
+        }
+        let property = context.graph.catalog().property(name);
+        if property.is_some_and(|id| !context.graph.node_property_is_integer(id)) {
+            return None;
+        }
+        Some(property)
+    };
+    let count_expression = |expression: &Expression| matches!(expression,Expression::Function{name,distinct:false,arguments} if name.len()==1 && name[0].eq_ignore_ascii_case("count") && arguments.len()==1 && (matches!(arguments[0],Expression::Star) || matches!(&arguments[0],Expression::Variable(name) if name==variable)));
+    enum Mode {
+        Groups { key_index: usize },
+        Top { ascending: bool, cap: usize },
+    }
+    let (property, mode) = match projection.items.as_slice() {
+        [left, right] if project_index + 1 == plan.operators.len() => {
+            if let Some(property) = property_expression(&left.expression) {
+                if !count_expression(&right.expression) {
+                    return Ok(None);
+                }
+                (property, Mode::Groups { key_index: 0 })
+            } else if let Some(property) = property_expression(&right.expression) {
+                if !count_expression(&left.expression) {
+                    return Ok(None);
+                }
+                (property, Mode::Groups { key_index: 1 })
+            } else {
+                return Ok(None);
+            }
+        }
+        [item] => {
+            let Some(property) = property_expression(&item.expression) else {
+                return Ok(None);
+            };
+            let limit_value = |expression: &Expression| match expression {
+                Expression::Literal(ScalarValue::Integer(value)) => usize::try_from(*value).ok(),
+                Expression::Parameter(name) => match context.parameters.get(name) {
+                    Some(ResultValue::Scalar(ScalarValue::Integer(value))) => {
+                        usize::try_from(*value).ok()
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            let (items, limit) = match &plan.operators[project_index + 1..] {
+                [
+                    PhysicalOperator::Sort(items),
+                    PhysicalOperator::Limit(limit),
+                ] => {
+                    let Some(limit) = limit_value(limit) else {
+                        return Ok(None);
+                    };
+                    (items, limit)
+                }
+                [PhysicalOperator::TopK { items, limit }] => (items, *limit),
+                [
+                    PhysicalOperator::TopK { items, limit },
+                    PhysicalOperator::Limit(final_limit),
+                ] => {
+                    let Some(final_limit) = limit_value(final_limit) else {
+                        return Ok(None);
+                    };
+                    (items, (*limit).min(final_limit))
+                }
+                _ => return Ok(None),
+            };
+            let [sort] = items.as_slice() else {
+                return Ok(None);
+            };
+            let output_name = item.column_name(0);
+            if sort.expression != item.expression
+                && !matches!(&sort.expression,Expression::Variable(name) if *name==output_name)
+            {
+                return Ok(None);
+            }
+            (
+                property,
+                Mode::Top {
+                    ascending: sort.ascending,
+                    cap: limit.min(context.max_result_rows.saturating_add(1)),
+                },
+            )
+        }
+        _ => return Ok(None),
+    };
+    let labels: Option<Vec<_>> = pattern
+        .start
+        .labels
+        .iter()
+        .map(|name| context.graph.catalog().label(name))
+        .collect();
+    let mut dependencies = TransactionDependencies::default();
+    for dependency in &plan.dependencies {
+        dependencies.predicates.insert(
+            dependency.clone(),
+            context
+                .predicate_versions
+                .get(dependency)
+                .copied()
+                .unwrap_or(context.bookmark.index),
+        );
+    }
+    let property_reader = property.and_then(|id| context.graph.node_property_reader(id));
+    let parallel_groups = if matches!(mode, Mode::Groups { .. }) {
+        labels
+            .as_deref()
+            .map(|labels| {
+                parallel_integer_group_counts(
+                    context,
+                    property_reader.as_ref(),
+                    labels,
+                    plan.read_layers,
+                )
+            })
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let parallel_top = if let Mode::Top { ascending, cap } = mode {
+        labels
+            .as_deref()
+            .map(|labels| {
+                parallel_integer_top(
+                    context,
+                    property_reader.as_ref(),
+                    labels,
+                    plan.read_layers,
+                    ascending,
+                    cap,
+                )
+            })
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let scanned_in_parallel = parallel_groups.is_some() || parallel_top.is_some();
+    let mut heap = parallel_top.unwrap_or_default();
+    let mut groups = parallel_groups.unwrap_or_default();
+    if !scanned_in_parallel && let Some(labels) = labels {
+        for node in context.graph.nodes() {
+            if node.dense() & 4095 == 0 {
+                check_execution(context)?;
+            }
+            if !plan.read_layers.contains_layer(node.layer()) {
+                continue;
+            }
+            if matches!(mode, Mode::Top { cap: 0, .. }) {
+                break;
+            }
+            // Bound scan predicates fence the complete population, including rows entering a
+            // group later. Individual entity dependencies would add redundant population state.
+            let value = if let Some(reader) = property_reader.as_ref() {
+                let Some(value) = reader.get_integer_with_labels(node, &labels) else {
+                    continue;
+                };
+                value
+            } else {
+                if !node.has_labels(&labels) {
+                    continue;
+                }
+                None
+            };
+            match mode {
+                Mode::Groups { .. } => {
+                    if !groups.contains_key(&value) && groups.len() >= context.max_result_rows {
+                        return Err(Error::new(
+                            ErrorCode::ResultBudgetExceeded,
+                            "query row budget exceeded",
+                        ));
+                    }
+                    let count = groups.entry(value).or_default();
+                    *count = count.checked_add(1).ok_or_else(|| {
+                        Error::new(ErrorCode::ResultBudgetExceeded, "aggregate count overflow")
+                    })?;
+                }
+                Mode::Top { ascending, cap } => {
+                    // Bigger rank is better; NULL sorts last ascending and first descending.
+                    retain_integer_top(
+                        &mut heap,
+                        cap,
+                        (integer_top_rank(value, node.dense(), ascending), value),
+                    );
+                }
+            }
+        }
+    }
+    let columns = projection
+        .items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| item.column_name(index))
+        .collect::<Vec<_>>();
+    if columns.iter().collect::<BTreeSet<_>>().len() != columns.len() {
+        return Ok(None);
+    }
+    let mut rows = Vec::new();
+    let integer = |value: Option<i64>| {
+        BindingValue::Value(ResultValue::Scalar(
+            value.map_or(ScalarValue::Null, ScalarValue::Integer),
+        ))
+    };
+    match mode {
+        Mode::Groups { key_index } => {
+            for (value, count) in groups {
+                let mut row = Row::new();
+                row.insert(columns[key_index].clone(), integer(value));
+                row.insert(columns[1 - key_index].clone(), integer(Some(count)));
+                rows.push(row);
+            }
+        }
+        Mode::Top { .. } => {
+            let mut selected = heap
+                .into_iter()
+                .map(|std::cmp::Reverse(value)| value)
+                .collect::<Vec<_>>();
+            selected.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
+            if selected.len() > context.max_result_rows {
+                return Err(Error::new(
+                    ErrorCode::ResultBudgetExceeded,
+                    "query row budget exceeded",
+                ));
+            }
+            for (_, value) in selected {
+                let mut row = Row::new();
+                row.insert(columns[0].clone(), integer(value));
+                rows.push(row);
+            }
+        }
+    }
+    let view = GraphReadView::new(context.graph);
+    let result = rows_to_result(
+        &rows,
+        &columns,
+        &view,
+        context.bookmark,
+        StatementStats::default(),
+        context.max_batch_rows,
+        stream.take(),
+    )?;
+    Ok(Some(ExecutionOutput {
+        result,
+        graph_mutations: Vec::new(),
+        temporal_mutations: Vec::new(),
+        dependencies,
+        administrative: None,
+        vector_searches: Vec::new(),
+        runtime_replans: 0,
+    }))
+}
+
+#[derive(Clone, Default)]
+struct IntegerSumPrefix {
+    total: i128,
+    minimum: i128,
+    maximum: i128,
+}
+
+impl IntegerSumPrefix {
+    #[inline(always)]
+    fn push(&mut self, value: i64, check_prefix: bool) -> Result<()> {
+        // u32 canonical ordinal bounds keep the complete i64 sum within i128.
+        self.total += i128::from(value);
+        if value >= 0 {
+            self.maximum = self.maximum.max(self.total);
+        } else {
+            self.minimum = self.minimum.min(self.total);
+        }
+        if check_prefix && (self.total < i128::from(i64::MIN) || self.total > i128::from(i64::MAX))
+        {
+            return Err(Error::new(
+                ErrorCode::QueryType,
+                "integer aggregate sum overflow",
+            ));
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, other: &Self) -> Result<()> {
+        let low = self.total + other.minimum;
+        let high = self.total + other.maximum;
+        if low < i128::from(i64::MIN) || high > i128::from(i64::MAX) {
+            return Err(Error::new(
+                ErrorCode::QueryType,
+                "integer aggregate sum overflow",
+            ));
+        }
+        self.minimum = self.minimum.min(low);
+        self.maximum = self.maximum.max(high);
+        self.total += other.total;
+        Ok(())
+    }
+}
+
+struct IntegerNodeScan<'a, 'g> {
+    context: &'a ExecutionContext<'g>,
+    labels: &'a [LabelId],
+    readers: &'a [Option<crate::graph::NodePropertyReader<'g>>],
+    filters: &'a [(Option<usize>, BinaryOperator, i64)],
+    layers: crate::graph::LayerMask,
+}
+
+impl IntegerNodeScan<'_, '_> {
+    fn visit(
+        &self,
+        range: std::ops::Range<usize>,
+        mut reduce: impl FnMut(&[Option<i64>]) -> Result<()>,
+    ) -> Result<()> {
+        check_execution(self.context)?;
+        let mut single_value = [None];
+        let mut multiple_values = Vec::new();
+        let values = if self.readers.len() == 1 {
+            single_value.as_mut_slice()
+        } else {
+            multiple_values.resize(self.readers.len(), None);
+            multiple_values.as_mut_slice()
+        };
+        for dense in range {
+            if dense & 4095 == 0 {
+                check_execution(self.context)?;
+            }
+            let Some(node) = self.context.graph.node_dense(dense as u32) else {
+                continue;
+            };
+            if !self.layers.contains_layer(node.layer()) {
+                continue;
+            }
+            // Only this row's distinct primitive values survive; all handles borrow canonical columns.
+            if let [Some(reader)] = self.readers {
+                let Some(value) = reader.get_integer_with_labels(node, self.labels) else {
+                    continue;
+                };
+                values[0] = value;
+            } else {
+                if !node.has_labels(self.labels) {
+                    continue;
+                }
+                for (slot, reader) in self.readers.iter().enumerate() {
+                    values[slot] = reader.as_ref().and_then(|reader| reader.get_integer(node));
+                }
+            }
+            if self.filters.iter().all(|(slot, operation, operand)| {
+                let Some(value) = slot.and_then(|slot| values[slot]) else {
+                    return false;
+                };
+                match operation {
+                    BinaryOperator::Equal => value == *operand,
+                    BinaryOperator::NotEqual => value != *operand,
+                    BinaryOperator::Less => value < *operand,
+                    BinaryOperator::LessOrEqual => value <= *operand,
+                    BinaryOperator::Greater => value > *operand,
+                    BinaryOperator::GreaterOrEqual => value >= *operand,
+                    _ => false,
+                }
+            }) {
+                reduce(values)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Reduces eligible integer columns directly from canonical cells. Only small aggregate state
+/// and read dependencies survive the scan; no per-node binding rows or column image are built.
+struct IntegerScanPool {
+    workers: rayon::ThreadPool,
+    busy: AtomicBool,
+}
+#[cfg(test)]
+static INTEGER_SCAN_DIAGNOSTICS: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static CPU_POOL_TEST_CONTROL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg(test)]
+static INTEGER_SCAN_CANCEL_AFTER_REDUCTION: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+thread_local! {
+    static PARALLEL_TRIANGLE_REDUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PARALLEL_CLUSTERING_REDUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PARALLEL_TOP_REDUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+struct IntegerScanPermit<'a>(&'a IntegerScanPool);
+impl Drop for IntegerScanPermit<'_> {
+    fn drop(&mut self) {
+        self.0.busy.store(false, AtomicOrdering::Release);
+    }
+}
+impl IntegerScanPool {
+    fn try_claim(&self) -> Option<IntegerScanPermit<'_>> {
+        self.busy
+            .compare_exchange(
+                false,
+                true,
+                AtomicOrdering::Acquire,
+                AtomicOrdering::Relaxed,
+            )
+            .ok()
+            .map(|_| IntegerScanPermit(self))
+    }
+}
+fn integer_scan_pool() -> Option<&'static IntegerScanPool> {
+    static POOL: OnceLock<Option<IntegerScanPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(8);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|index| format!("irongraph-scan-{index}"))
+            .build()
+            .ok()
+            .map(|workers| IntegerScanPool {
+                workers,
+                busy: AtomicBool::new(false),
+            })
+    })
+    .as_ref()
+}
+
+fn stream_integer_node_aggregates(
+    plan: &PhysicalPlan,
+    context: &ExecutionContext<'_>,
+    stream: &mut Option<&mut dyn FnMut(ExecutionStreamItem) -> Result<()>>,
+) -> Result<Option<ExecutionOutput>> {
+    if plan.dependencies.is_empty()
+        || !plan.read_only
+        || plan.at_time.is_some()
+        || !plan.unions.is_empty()
+        || context.capabilities.require_native_execution
+        || !context.prior_graph_mutations.is_empty()
+        || !context.prior_temporal_mutations.is_empty()
+    {
+        return Ok(None);
+    }
+    let Some(PhysicalOperator::ScanPattern {
+        optional: false,
+        pattern,
+        ..
+    }) = plan.operators.first()
+    else {
+        return Ok(None);
+    };
+    let Some(variable) = pattern.start.variable.as_deref() else {
+        return Ok(None);
+    };
+    if !pattern.steps.is_empty()
+        || pattern.variable.is_some()
+        || pattern.selector != PathSelector::All
+        || pattern.start.property_predicate_present
+        || !pattern.start.properties.is_empty()
+    {
+        return Ok(None);
+    }
+    let Some(PhysicalOperator::Project {
+        keep_scope: false,
+        projection,
+    }) = plan.operators.last()
+    else {
+        return Ok(None);
+    };
+    if projection.distinct {
+        return Ok(None);
+    }
+    let mut filters = Vec::new();
+    fn filter(
+        expression: &Expression,
+        variable: &str,
+        context: &ExecutionContext<'_>,
+        output: &mut Vec<(Option<PropertyId>, BinaryOperator, i64)>,
+    ) -> bool {
+        let Expression::Binary {
+            left,
+            operation,
+            right,
+        } = expression
+        else {
+            return false;
+        };
+        if *operation == BinaryOperator::And {
+            return filter(left, variable, context, output)
+                && filter(right, variable, context, output);
+        }
+        if !matches!(
+            operation,
+            BinaryOperator::Equal
+                | BinaryOperator::NotEqual
+                | BinaryOperator::Less
+                | BinaryOperator::LessOrEqual
+                | BinaryOperator::Greater
+                | BinaryOperator::GreaterOrEqual
+        ) {
+            return false;
+        }
+        let Expression::Property(owner, name) = left.as_ref() else {
+            return false;
+        };
+        if !matches!(owner.as_ref(),Expression::Variable(name) if name==variable) {
+            return false;
+        }
+        let value = match right.as_ref() {
+            Expression::Literal(ScalarValue::Integer(value)) => Some(*value),
+            Expression::Parameter(name) => match context.parameters.get(name) {
+                Some(ResultValue::Scalar(ScalarValue::Integer(value))) => Some(*value),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(value) = value else {
+            return false;
+        };
+        let property = context.graph.catalog().property(name);
+        if property.is_some_and(|id| !context.graph.node_property_is_integer(id)) {
+            return false;
+        }
+        output.push((property, *operation, value));
+        true
+    }
+    for operator in &plan.operators[1..plan.operators.len() - 1] {
+        match operator {
+            PhysicalOperator::CardinalityCheckpoint { .. } => {}
+            PhysicalOperator::Filter(expression)
+                if filter(expression, variable, context, &mut filters) => {}
+            _ => return Ok(None),
+        }
+    }
+    #[derive(Clone)]
+    enum Accumulator {
+        Count(i64),
+        CountDistinct(BTreeSet<i64>),
+        Sum(IntegerSumPrefix),
+        Average {
+            count: i64,
+            sum: f64,
+            compensation: f64,
+        },
+        Minimum(Option<i64>),
+        Maximum(Option<i64>),
+    }
+    #[derive(Clone)]
+    struct Reduce {
+        name: String,
+        property: Option<PropertyId>,
+        property_slot: Option<usize>,
+        accumulator: Accumulator,
+    }
+    let mut reducers = Vec::new();
+    let mut names = BTreeSet::new();
+    for (index, item) in projection.items.iter().enumerate() {
+        let Expression::Function {
+            name,
+            distinct,
+            arguments,
+        } = &item.expression
+        else {
+            return Ok(None);
+        };
+        if name.len() != 1 || arguments.len() != 1 {
+            return Ok(None);
+        }
+        let function = name[0].to_ascii_lowercase();
+        if !matches!(function.as_str(), "count" | "sum" | "avg" | "min" | "max") {
+            return Ok(None);
+        }
+        if *distinct && function != "count" {
+            return Ok(None);
+        }
+        let property = match &arguments[0] {
+            Expression::Star if function == "count" => None,
+            Expression::Variable(name) if function == "count" && name == variable => None,
+            Expression::Property(owner, name) if matches!(owner.as_ref(),Expression::Variable(name) if name==variable) =>
+            {
+                let Some(id) = context.graph.catalog().property(name) else {
+                    return Ok(None);
+                };
+                if !context.graph.node_property_is_integer(id) {
+                    return Ok(None);
+                }
+                Some(id)
+            }
+            _ => return Ok(None),
+        };
+        if *distinct && property.is_none() {
+            return Ok(None);
+        }
+        let name = item.column_name(index);
+        if !names.insert(name.clone()) {
+            return Ok(None);
+        }
+        reducers.push(Reduce {
+            name,
+            property,
+            property_slot: None,
+            accumulator: match function.as_str() {
+                "count" if *distinct => Accumulator::CountDistinct(BTreeSet::new()),
+                "sum" => Accumulator::Sum(IntegerSumPrefix::default()),
+                "avg" => Accumulator::Average {
+                    count: 0,
+                    sum: 0.0,
+                    compensation: 0.0,
+                },
+                "min" => Accumulator::Minimum(None),
+                "max" => Accumulator::Maximum(None),
+                _ => Accumulator::Count(0),
+            },
+        });
+    }
+    // Whole-population counts retain their existing constant-time path.
+    if reducers.is_empty()
+        || (filters.is_empty() && reducers.iter().all(|reduce| reduce.property.is_none()))
+    {
+        return Ok(None);
+    }
+    let labels: Option<Vec<_>> = pattern
+        .start
+        .labels
+        .iter()
+        .map(|name| context.graph.catalog().label(name))
+        .collect();
+    let mut dependencies = TransactionDependencies::default();
+    for dependency in &plan.dependencies {
+        dependencies.predicates.insert(
+            dependency.clone(),
+            context
+                .predicate_versions
+                .get(dependency)
+                .copied()
+                .unwrap_or(context.bookmark.index),
+        );
+    }
+    let properties = filters
+        .iter()
+        .filter_map(|(id, _, _)| *id)
+        .chain(reducers.iter().filter_map(|reduce| reduce.property))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let property_slots = properties
+        .iter()
+        .enumerate()
+        .map(|(slot, id)| (*id, slot))
+        .collect::<BTreeMap<_, _>>();
+    let readers = properties
+        .iter()
+        .map(|id| context.graph.node_property_reader(*id))
+        .collect::<Vec<_>>();
+    let filters = filters
+        .into_iter()
+        .map(|(property, operation, operand)| {
+            (
+                property.and_then(|id| property_slots.get(&id).copied()),
+                operation,
+                operand,
+            )
+        })
+        .collect::<Vec<_>>();
+    for reduce in &mut reducers {
+        reduce.property_slot = reduce
+            .property
+            .and_then(|id| property_slots.get(&id).copied());
+    }
+    let scan = |start: usize,
+                end: usize,
+                reducers: &mut [Reduce],
+                check_sum_prefix: bool|
+     -> Result<()> {
+        check_execution(context)?;
+        let Some(labels) = labels.as_ref() else {
+            return Ok(());
+        };
+        let scan = IntegerNodeScan {
+            context,
+            labels,
+            readers: &readers,
+            filters: &filters,
+            layers: plan.read_layers,
+        };
+        if let [reduce] = reducers {
+            let slot = reduce.property_slot;
+            match &mut reduce.accumulator {
+                Accumulator::Sum(sum) => {
+                    let mut local_sum = sum.clone();
+                    scan.visit(start..end, |values| {
+                        if let Some(value) = slot.map_or(Some(1), |slot| values[slot]) {
+                            local_sum.push(value, check_sum_prefix)?;
+                        }
+                        Ok(())
+                    })?;
+                    *sum = local_sum;
+                    return Ok(());
+                }
+                Accumulator::Average {
+                    count,
+                    sum,
+                    compensation,
+                } => {
+                    let (mut local_count, mut local_sum, mut local_compensation) =
+                        (*count, *sum, *compensation);
+                    scan.visit(start..end, |values| {
+                        if let Some(value) = slot.map_or(Some(1), |slot| values[slot]) {
+                            local_count = local_count.checked_add(1).ok_or_else(|| {
+                                Error::new(
+                                    ErrorCode::ResultBudgetExceeded,
+                                    "aggregate count overflow",
+                                )
+                            })?;
+                            compensated_add(&mut local_sum, &mut local_compensation, value as f64);
+                        }
+                        Ok(())
+                    })?;
+                    (*count, *sum, *compensation) = (local_count, local_sum, local_compensation);
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        scan.visit(start..end, |property_values| {
+            for reduce in reducers.iter_mut() {
+                let value = match reduce.property_slot {
+                    None => Some(1),
+                    Some(slot) => property_values[slot],
+                };
+                let Some(value) = value else {
+                    continue;
+                };
+                match &mut reduce.accumulator {
+                    Accumulator::CountDistinct(values) => {
+                        values.insert(value);
+                    }
+                    Accumulator::Count(count) => {
+                        *count = count.checked_add(1).ok_or_else(|| {
+                            Error::new(ErrorCode::ResultBudgetExceeded, "aggregate count overflow")
+                        })?;
+                    }
+                    Accumulator::Sum(sum) => sum.push(value, check_sum_prefix)?,
+                    Accumulator::Average {
+                        count,
+                        sum,
+                        compensation,
+                    } => {
+                        *count = count.checked_add(1).ok_or_else(|| {
+                            Error::new(ErrorCode::ResultBudgetExceeded, "aggregate count overflow")
+                        })?;
+                        compensated_add(sum, compensation, value as f64);
+                    }
+                    Accumulator::Minimum(minimum) => {
+                        *minimum = Some(minimum.map_or(value, |old| old.min(value)))
+                    }
+                    Accumulator::Maximum(maximum) => {
+                        *maximum = Some(maximum.map_or(value, |old| old.max(value)))
+                    }
+                }
+            }
+            Ok(())
+        })
+    };
+    let slots = context.graph.node_slot_count();
+    let parallel = slots >= 32768
+        && reducers.iter().all(|reduce| {
+            matches!(
+                reduce.accumulator,
+                Accumulator::Count(_)
+                    | Accumulator::Minimum(_)
+                    | Accumulator::Maximum(_)
+                    | Accumulator::Average { .. }
+                    | Accumulator::Sum(_)
+            )
+        });
+    let permit = parallel
+        .then(integer_scan_pool)
+        .flatten()
+        .and_then(IntegerScanPool::try_claim);
+    if let Some(permit) = permit {
+        let tasks = permit
+            .0
+            .workers
+            .current_num_threads()
+            .saturating_mul(8)
+            .min(slots / 1024);
+        let width = slots.div_ceil(tasks);
+        #[cfg(test)]
+        let dispatch_started = std::time::Instant::now();
+        let partials: Vec<Vec<Reduce>> = permit.0.workers.install(|| {
+            (0..tasks)
+                .into_par_iter()
+                .with_max_len(1)
+                .map(|task| {
+                    #[cfg(test)]
+                    let task_started = std::time::Instant::now();
+                    let mut partial = reducers.clone();
+                    scan(task * width, ((task + 1) * width).min(slots), &mut partial, false)?;
+                    #[cfg(test)]
+                    if INTEGER_SCAN_DIAGNOSTICS.load(AtomicOrdering::Relaxed) {
+                        let end = std::time::Instant::now();
+                        eprintln!(
+                            "SCAN_PARTITION task={task}/{tasks} start={} end={} worker={} dispatch_us={} duration_us={} completed_us={}",
+                            task * width,
+                            ((task + 1) * width).min(slots),
+                            std::thread::current().name().unwrap_or("unnamed"),
+                            task_started.duration_since(dispatch_started).as_micros(),
+                            end.duration_since(task_started).as_micros(),
+                            end.duration_since(dispatch_started).as_micros(),
+                        );
+                    }
+                    Ok(partial)
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        for partial in partials {
+            for (reduce, partial) in reducers.iter_mut().zip(partial) {
+                match (&mut reduce.accumulator, partial.accumulator) {
+                    (Accumulator::Sum(sum), Accumulator::Sum(partial)) => sum.merge(&partial)?,
+                    (
+                        Accumulator::Average {
+                            count,
+                            sum,
+                            compensation,
+                        },
+                        Accumulator::Average {
+                            count: partial_count,
+                            sum: partial_sum,
+                            compensation: partial_compensation,
+                        },
+                    ) => {
+                        *count = count.checked_add(partial_count).ok_or_else(|| {
+                            Error::new(ErrorCode::ResultBudgetExceeded, "aggregate count overflow")
+                        })?;
+                        compensated_add(sum, compensation, partial_sum);
+                        compensated_add(sum, compensation, partial_compensation);
+                    }
+                    (Accumulator::Count(count), Accumulator::Count(value)) => {
+                        *count = count.checked_add(value).ok_or_else(|| {
+                            Error::new(ErrorCode::ResultBudgetExceeded, "aggregate count overflow")
+                        })?;
+                    }
+                    (Accumulator::Minimum(minimum), Accumulator::Minimum(Some(value))) => {
+                        *minimum = Some(minimum.map_or(value, |old| old.min(value)));
+                    }
+                    (Accumulator::Maximum(maximum), Accumulator::Maximum(Some(value))) => {
+                        *maximum = Some(maximum.map_or(value, |old| old.max(value)));
+                    }
+                    (Accumulator::Minimum(_), Accumulator::Minimum(None))
+                    | (Accumulator::Maximum(_), Accumulator::Maximum(None)) => {}
+                    _ => return Err(Error::internal("parallel integer reducer shape differs")),
+                }
+            }
+        }
+    } else {
+        scan(0, slots, &mut reducers, true)?;
+    }
+    #[cfg(test)]
+    if context.project_id.0 == uuid::Uuid::from_u128(u128::MAX)
+        && INTEGER_SCAN_CANCEL_AFTER_REDUCTION.swap(false, AtomicOrdering::Relaxed)
+    {
+        context.cancellation.cancel();
+    }
+    check_execution(context)?;
+    let mut row = Row::new();
+    let mut columns = Vec::new();
+    for reduce in reducers {
+        let value = match reduce.accumulator {
+            Accumulator::CountDistinct(values) => {
+                ResultValue::Scalar(ScalarValue::Integer(i64::try_from(values.len()).map_err(
+                    |_| Error::new(ErrorCode::ResultBudgetExceeded, "aggregate count overflow"),
+                )?))
+            }
+            Accumulator::Count(count) => ResultValue::Scalar(ScalarValue::Integer(count)),
+            Accumulator::Sum(sum) => {
+                ResultValue::Scalar(ScalarValue::Integer(i64::try_from(sum.total).map_err(
+                    |_| Error::new(ErrorCode::QueryType, "integer aggregate sum overflow"),
+                )?))
+            }
+            Accumulator::Average {
+                count,
+                sum,
+                compensation,
+            } if count != 0 => number((sum + compensation) / count as f64),
+            Accumulator::Minimum(value) | Accumulator::Maximum(value) => {
+                ResultValue::Scalar(value.map_or(ScalarValue::Null, ScalarValue::Integer))
+            }
+            Accumulator::Average { .. } => ResultValue::Scalar(ScalarValue::Null),
+        };
+        columns.push(reduce.name.clone());
+        row.insert(reduce.name, BindingValue::Value(value));
+    }
+    let view = GraphReadView::new(context.graph);
+    let result = rows_to_result(
+        std::slice::from_ref(&row),
+        &columns,
+        &view,
+        context.bookmark,
+        StatementStats::default(),
+        context.max_batch_rows,
+        stream.take(),
+    )?;
+    Ok(Some(ExecutionOutput {
+        result,
+        graph_mutations: Vec::new(),
+        temporal_mutations: Vec::new(),
+        dependencies,
+        administrative: None,
+        vector_searches: Vec::new(),
+        runtime_replans: 0,
+    }))
+}
+
+/// Emits the same scalar-count schema and batch without a temporary binding row.
+fn emit_scalar_count(
     count: u64,
     output_name: &str,
-    view: &GraphReadView<'_>,
     context: &ExecutionContext<'_>,
     stream: Option<&mut dyn FnMut(ExecutionStreamItem) -> Result<()>>,
 ) -> Result<ExecutionOutput> {
     let value = i64::try_from(count)
         .map_err(|_| Error::new(ErrorCode::ResultBudgetExceeded, "count exceeds INTEGER"))?;
-    let mut row = Row::new();
-    row.insert(
-        output_name.to_string(),
-        BindingValue::Value(ResultValue::Scalar(ScalarValue::Integer(value))),
-    );
-    let output_names = [output_name.to_string()];
-    let result = rows_to_result(
-        std::slice::from_ref(&row),
-        &output_names,
-        view,
-        context.bookmark,
-        StatementStats::default(),
-        context.max_batch_rows,
-        stream,
-    )?;
+    let schema = vec![(output_name.to_owned(), ColumnType::Integer)];
+    let batch = ResultBatch {
+        row_count: 1,
+        columns: vec![ResultColumn {
+            name: output_name.to_owned(),
+            value_type: ColumnType::Integer,
+            values: vec![ResultValue::Scalar(ScalarValue::Integer(value))],
+        }],
+    };
+    let batches = if let Some(emit) = stream {
+        emit(ExecutionStreamItem::Schema(schema.clone()))?;
+        emit(ExecutionStreamItem::Batch(batch))?;
+        Vec::new()
+    } else {
+        vec![batch]
+    };
+    let result = QueryResult {
+        schema,
+        batches,
+        bookmark: context.bookmark,
+        statistics: StatementStats::default(),
+        truncated: false,
+    };
     Ok(ExecutionOutput {
         result,
         graph_mutations: Vec::new(),
@@ -2088,7 +3263,7 @@ fn execute_reachable_endpoint_count(
         Some(name) => match view.relationship_type(name) {
             Some(id) => Some(id),
             None => {
-                return emit_resident_scalar_count(0, &spec.output_name, &view, context, stream);
+                return emit_scalar_count(0, &spec.output_name, context, stream);
             }
         },
         None => None,
@@ -2097,7 +3272,7 @@ fn execute_reachable_endpoint_count(
         Some(name) => Some(match view.label(name) {
             Some(id) => id,
             None => {
-                return emit_resident_scalar_count(0, &spec.output_name, &view, context, stream);
+                return emit_scalar_count(0, &spec.output_name, context, stream);
             }
         }),
         None => None,
@@ -2106,7 +3281,7 @@ fn execute_reachable_endpoint_count(
         Some(name) => Some(match view.label(name) {
             Some(id) => id,
             None => {
-                return emit_resident_scalar_count(0, &spec.output_name, &view, context, stream);
+                return emit_scalar_count(0, &spec.output_name, context, stream);
             }
         }),
         None => None,
@@ -2167,7 +3342,7 @@ fn execute_reachable_endpoint_count(
             .count(),
         None => reachable.len(),
     };
-    emit_resident_scalar_count(count as u64, &spec.output_name, &view, context, stream)
+    emit_scalar_count(count as u64, &spec.output_name, context, stream)
 }
 
 fn plan_is_label_count(plan: &PhysicalPlan) -> Option<(Option<String>, String)> {
@@ -2503,7 +3678,7 @@ mod direct_node_scan_tests {
     use super::*;
 
     fn scan(source: &str) -> Result<Option<DirectNodeScan>> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         graph.catalog_mut().intern_label("Channel")?;
         let catalog = graph.catalog();
         let bound = super::super::bind(parse(source)?, catalog, BindCapabilities::default())?;
@@ -2657,23 +3832,279 @@ fn plan_supports_resident_mutation_execution(plan: &PhysicalPlan) -> bool {
     })
 }
 
-/// A plain fixed single-hop read that the streaming resident scan/expand executors
-/// (`compile_resident` / `compile_resident_row`) handle in O(limit) by walking the CSR adjacency
-/// directly. Such a plan must be kept away from the variable-path and nullable-relation compilers:
-/// both reserve a device trail/candidate buffer whose size is O(edges × frontier), which cannot
-/// scale to real graphs.
-///
-/// Restricted to a single hop deliberately: the streaming executors materialize intermediate rows
-/// for multi-hop patterns rather than streaming with early LIMIT termination, so multi-hop belongs
-/// with variable-length paths in the frontier-streaming work, not here.
-///
-/// The shape mirrors `plan_supports_resident_mutation_execution`'s streamable whitelist: exactly one
-/// mandatory, directed, fixed single-hop `ScanPattern` with a bound end variable, an ordinary
-/// (non-DISTINCT, non-aggregating) projection, and only streaming-compatible operators around it
-/// (WHERE filters, LIMIT). Anything requiring the trail machinery — OPTIONAL null-extension, path
-/// variables, variable-length, ORDER BY (`Sort`/`TopK`), `Skip`, `Unwind`, DISTINCT, aggregation,
-/// or a `WITH` re-match (a second `ScanPattern`) — makes this return `false`, so those plans still
-/// reach the variable-path compiler unchanged.
+/// Emits fixed-hop entity and identity projections directly from canonical relationships. Only
+/// one output batch is retained; unsupported expressions continue through the general executor.
+/// Transaction execution has no stream and retains its dependency-recording general path.
+fn stream_canonical_relationship_rows(
+    plan: &PhysicalPlan,
+    context: &ExecutionContext<'_>,
+    stream: &mut Option<&mut dyn FnMut(ExecutionStreamItem) -> Result<()>>,
+) -> Result<Option<ExecutionOutput>> {
+    if stream.is_none()
+        || !plan.read_only
+        || plan.at_time.is_some()
+        || !plan.unions.is_empty()
+        || context.capabilities.require_native_execution
+        || context.backend.is_some()
+        || !context.prior_graph_mutations.is_empty()
+        || !context.prior_temporal_mutations.is_empty()
+        || context
+            .temporal
+            .is_some_and(|temporal| !temporal.is_empty())
+    {
+        return Ok(None);
+    }
+    let operators = plan
+        .operators
+        .iter()
+        .filter(|operator| {
+            !matches!(
+                operator,
+                PhysicalOperator::CardinalityCheckpoint { .. } | PhysicalOperator::Finish
+            )
+        })
+        .collect::<Vec<_>>();
+    let (pattern, projection, limit) = match operators.as_slice() {
+        [
+            PhysicalOperator::ScanPattern {
+                pattern,
+                optional: false,
+                ..
+            },
+            PhysicalOperator::Project {
+                projection,
+                keep_scope: false,
+            },
+        ] => (pattern, projection, usize::MAX),
+        [
+            PhysicalOperator::ScanPattern {
+                pattern,
+                optional: false,
+                ..
+            },
+            PhysicalOperator::Project {
+                projection,
+                keep_scope: false,
+            },
+            PhysicalOperator::Limit(value),
+        ] => {
+            let value = match value {
+                Expression::Literal(ScalarValue::Integer(value)) => Some(*value),
+                Expression::Parameter(name) => match context.parameters.get(name) {
+                    Some(ResultValue::Scalar(ScalarValue::Integer(value))) => Some(*value),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(limit) = value.and_then(|value| usize::try_from(value).ok()) else {
+                return Ok(None);
+            };
+            (pattern, projection, limit)
+        }
+        _ => return Ok(None),
+    };
+    let [step] = pattern.steps.as_slice() else {
+        return Ok(None);
+    };
+    if pattern.variable.is_some()
+        || pattern.selector != PathSelector::All
+        || !pattern.start.properties.is_empty()
+        || !step.node.properties.is_empty()
+        || !step.relationship.properties.is_empty()
+        || step.relationship.variable_length
+        || step.relationship.min_hops.is_some()
+        || step.relationship.max_hops.is_some()
+        || projection.distinct
+        || step.relationship.direction == Direction::Undirected
+    {
+        return Ok(None);
+    }
+    #[derive(Clone, Copy)]
+    enum Owner {
+        Start,
+        Edge,
+        End,
+    }
+    let owner = |name: &str| {
+        if pattern.start.variable.as_deref() == Some(name) {
+            Some(Owner::Start)
+        } else if step.relationship.variable.as_deref() == Some(name) {
+            Some(Owner::Edge)
+        } else if step.node.variable.as_deref() == Some(name) {
+            Some(Owner::End)
+        } else {
+            None
+        }
+    };
+    let mut outputs = Vec::new();
+    let mut schema = Vec::new();
+    for (index, item) in projection.items.iter().enumerate() {
+        let (selected, identity) = match &item.expression {
+            Expression::Variable(name) => (owner(name), false),
+            Expression::Function {
+                name,
+                arguments,
+                distinct: false,
+            } if matches!(name.as_slice(), [name] if name.eq_ignore_ascii_case("id")) => {
+                let [Expression::Variable(variable)] = arguments.as_slice() else {
+                    return Ok(None);
+                };
+                (owner(variable), true)
+            }
+            _ => return Ok(None),
+        };
+        let Some(selected) = selected else {
+            return Ok(None);
+        };
+        let name = item.column_name(index);
+        if schema.iter().any(|(existing, _)| existing == &name) {
+            return Ok(None);
+        }
+        let kind = if identity {
+            ColumnType::Integer
+        } else if matches!(selected, Owner::Edge) {
+            ColumnType::Relationship
+        } else {
+            ColumnType::Node
+        };
+        schema.push((name, kind));
+        outputs.push((selected, identity));
+    }
+    if outputs.is_empty() {
+        return Ok(None);
+    }
+    let start_labels = pattern
+        .start
+        .labels
+        .iter()
+        .map(|name| context.graph.catalog().label(name))
+        .collect::<Option<Vec<_>>>();
+    let end_labels = step
+        .node
+        .labels
+        .iter()
+        .map(|name| context.graph.catalog().label(name))
+        .collect::<Option<Vec<_>>>();
+    let types = step
+        .relationship
+        .types
+        .iter()
+        .filter_map(|name| context.graph.catalog().relationship_type(name))
+        .collect::<Vec<_>>();
+    let view = GraphReadView::new(context.graph);
+    let Some(emit) = stream.as_deref_mut() else {
+        return Ok(None);
+    };
+    emit(ExecutionStreamItem::Schema(schema.clone()))?;
+    let batch_size = context.max_batch_rows.clamp(1, 4096);
+    let new_columns = || {
+        schema
+            .iter()
+            .map(|(name, kind)| ResultColumn {
+                name: name.clone(),
+                value_type: kind.clone(),
+                values: Vec::with_capacity(batch_size),
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut columns = new_columns();
+    let mut batch_rows = 0;
+    let mut total_rows = 0;
+    if let (Some(start_labels), Some(end_labels)) = (start_labels, end_labels) {
+        for edge in context.graph.edges() {
+            if total_rows >= limit {
+                break;
+            }
+            if total_rows & 255 == 0 {
+                check_execution(context)?;
+            }
+            if !plan.read_layers.contains_layer(edge.layer())
+                || (!step.relationship.types.is_empty()
+                    && !types.contains(&edge.relationship_type()))
+            {
+                continue;
+            }
+            let (source, target) = if step.relationship.direction == Direction::Incoming {
+                (edge.target(), edge.source())
+            } else {
+                (edge.source(), edge.target())
+            };
+            let (Some(start), Some(end)) = (context.graph.node(source), context.graph.node(target))
+            else {
+                continue;
+            };
+            if !plan.read_layers.contains_layer(start.layer())
+                || !plan.read_layers.contains_layer(end.layer())
+                || !start.has_labels(&start_labels)
+                || !end.has_labels(&end_labels)
+                || (pattern.start.variable.is_some()
+                    && pattern.start.variable == step.node.variable
+                    && source != target)
+                || (pattern.mode == PathMode::Acyclic && source == target)
+            {
+                continue;
+            }
+            if total_rows >= context.max_result_rows {
+                return Err(Error::new(
+                    ErrorCode::ResultBudgetExceeded,
+                    "query row address space exhausted",
+                ));
+            }
+            for (column, (owner, identity)) in columns.iter_mut().zip(&outputs) {
+                let value = if *identity {
+                    let id = match owner {
+                        Owner::Start => source.0,
+                        Owner::Edge => edge.id().0,
+                        Owner::End => target.0,
+                    };
+                    ResultValue::Scalar(ScalarValue::Integer(i64::try_from(id).map_err(|_| {
+                        Error::invalid_data("entity identity exceeds Cypher integer range")
+                    })?))
+                } else {
+                    match owner {
+                        Owner::Start => ResultValue::Node(materialize_node(&view, start.dense())?),
+                        Owner::Edge => {
+                            ResultValue::Relationship(materialize_edge(&view, edge.dense())?)
+                        }
+                        Owner::End => ResultValue::Node(materialize_node(&view, end.dense())?),
+                    }
+                };
+                column.values.push(value);
+            }
+            total_rows += 1;
+            batch_rows += 1;
+            if batch_rows == batch_size {
+                emit(ExecutionStreamItem::Batch(ResultBatch {
+                    row_count: batch_rows,
+                    columns: std::mem::replace(&mut columns, new_columns()),
+                }))?;
+                batch_rows = 0;
+            }
+        }
+    }
+    if batch_rows > 0 {
+        emit(ExecutionStreamItem::Batch(ResultBatch {
+            row_count: batch_rows,
+            columns,
+        }))?;
+    }
+    Ok(Some(ExecutionOutput {
+        result: QueryResult {
+            schema,
+            batches: Vec::new(),
+            bookmark: context.bookmark,
+            statistics: StatementStats::default(),
+            truncated: false,
+        },
+        graph_mutations: Vec::new(),
+        temporal_mutations: Vec::new(),
+        dependencies: TransactionDependencies::default(),
+        administrative: None,
+        vector_searches: Vec::new(),
+        runtime_replans: 0,
+    }))
+}
+
 fn plan_is_plain_streamable_read(plan: &PhysicalPlan) -> bool {
     if !plan.read_only || plan.at_time.is_some() || !plan.unions.is_empty() {
         return false;
@@ -5595,7 +7026,6 @@ fn execute_resident_row_match_merge_relationship_plan(
         vector_searches: Vec::new(),
         resident_backend: None,
         allow_context_backend: true,
-        resident_overlay_mutations: 0,
         existential_subquery_depth: 0,
         initial_scan_cap: None,
     };
@@ -6502,7 +7932,6 @@ fn execute_resident_bound_relationship_merge_plan(
         vector_searches: Vec::new(),
         resident_backend: None,
         allow_context_backend: true,
-        resident_overlay_mutations: 0,
         existential_subquery_depth: 0,
         initial_scan_cap: None,
     };
@@ -7581,7 +9010,6 @@ fn execute_resident_row_create_plan(
         vector_searches: Vec::new(),
         resident_backend: None,
         allow_context_backend: true,
-        resident_overlay_mutations: 0,
         existential_subquery_depth: 0,
         initial_scan_cap: None,
     };
@@ -8163,7 +9591,6 @@ fn execute_resident_row_mutation_plan(
         vector_searches: Vec::new(),
         resident_backend: None,
         allow_context_backend: true,
-        resident_overlay_mutations: 0,
         existential_subquery_depth: 0,
         initial_scan_cap: None,
     };
@@ -8405,7 +9832,6 @@ fn execute_resident_create_node_plan(
         vector_searches: Vec::new(),
         resident_backend: None,
         allow_context_backend: true,
-        resident_overlay_mutations: 0,
         existential_subquery_depth: 0,
         initial_scan_cap: None,
     };
@@ -8739,7 +10165,6 @@ fn execute_resident_delete_plan(
         vector_searches: Vec::new(),
         resident_backend: None,
         allow_context_backend: true,
-        resident_overlay_mutations: 0,
         existential_subquery_depth: 0,
         initial_scan_cap: None,
     };
@@ -8895,7 +10320,6 @@ fn execute_resident_mutation_plan(
         vector_searches: Vec::new(),
         resident_backend: None,
         allow_context_backend: true,
-        resident_overlay_mutations: 0,
         existential_subquery_depth: 0,
         initial_scan_cap: None,
     };
@@ -13367,7 +14791,6 @@ fn execute_resident_vector_plan(
         vector_searches: Vec::new(),
         resident_backend: None,
         allow_context_backend: true,
-        resident_overlay_mutations: 0,
         existential_subquery_depth: 0,
         initial_scan_cap: None,
     };
@@ -13863,7 +15286,6 @@ struct ExecutionState<'a> {
     /// False only for a plan selected wholly for CPU by the measured adaptive policy. This keeps
     /// host operators from re-entering Metal through opportunistic sort/group helpers mid-plan.
     allow_context_backend: bool,
-    resident_overlay_mutations: usize,
     existential_subquery_depth: usize,
     /// Selects the direct initial scan and its match cap. `Some(usize::MAX)` consumes all matches;
     /// `None` leaves scan selection to the other execution strategies. Consumed only
@@ -13885,6 +15307,86 @@ fn apply_operator_sequence_step(
     let Some(operator) = operators.get(operator_index) else {
         return Ok((rows, 0));
     };
+    if let Some(output) =
+        canonical_trail_count::reduce(&operators[operator_index..], &rows, state, context)?
+    {
+        return Ok(output);
+    }
+    if let [
+        PhysicalOperator::BuiltinProcedure(call),
+        PhysicalOperator::Project {
+            keep_scope: false,
+            projection,
+        },
+    ] = &operators[operator_index..]
+        && projection_is_only_count_star(projection)
+        && !context.capabilities.require_native_execution
+        && state.resident_backend.is_none()
+        && context.backend.is_none()
+        && state.mutations.is_empty()
+        && state.temporal_mutations.is_empty()
+        && context.prior_graph_mutations.is_empty()
+        && context.prior_temporal_mutations.is_empty()
+        && matches!(
+            validate_call(call, procedures, Some(&context.parameters))?,
+            ResolvedProcedure::Builtin(_)
+        )
+    {
+        return Ok((
+            builtin_graph_procedure_count(rows, call, projection, state, context)?,
+            2,
+        ));
+    }
+    if let PhysicalOperator::ScanPattern {
+        match_group,
+        optional: false,
+        pattern,
+        access,
+    } = operator
+    {
+        let predicates = operators[operator_index + 1..]
+            .iter()
+            .take_while(|operator| {
+                matches!(
+                    operator,
+                    PhysicalOperator::Filter(_) | PhysicalOperator::CardinalityCheckpoint { .. }
+                )
+            })
+            .filter_map(|operator| match operator {
+                PhysicalOperator::Filter(expression)
+                    if safe_start_equality(
+                        expression,
+                        pattern.start.variable.as_deref(),
+                        context,
+                    ) =>
+                {
+                    Some(expression)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !predicates.is_empty()
+            && !pattern.steps.is_empty()
+            && pattern.selector == PathSelector::All
+        {
+            let mut rows = rows;
+            for row in &mut rows {
+                row.enter_match_group(*match_group);
+            }
+            let output = match_pattern_seed_filtered(
+                rows,
+                pattern,
+                access,
+                false,
+                true,
+                &predicates,
+                state,
+                context,
+            )?;
+            extend_pattern_scope(&mut state.scope_columns, pattern);
+            return Ok((output, 1));
+        }
+    }
     if let PhysicalOperator::ScanPattern {
         match_group,
         optional: true,
@@ -14001,7 +15503,10 @@ fn unwind_rows(
             state,
             context,
         )?;
-        for value in values {
+        for (value_index, value) in values.into_iter().enumerate() {
+            if value_index & 4095 == 0 {
+                check_execution(context)?;
+            }
             if demand.is_some_and(|demand| output.len() >= demand) {
                 break;
             }
@@ -14027,10 +15532,9 @@ fn unwind_expression_values(
     state: &mut ExecutionState<'_>,
     context: &ExecutionContext<'_>,
 ) -> Result<Vec<BindingValue>> {
-    if let Some(demand) = demand
-        && let Expression::Function {
-            name, arguments, ..
-        } = expression
+    if let Expression::Function {
+        name, arguments, ..
+    } = expression
         && name.len() == 1
         && name[0].eq_ignore_ascii_case("range")
     {
@@ -14039,11 +15543,14 @@ fn unwind_expression_values(
             .map(|argument| evaluate_state(argument, row, state, context))
             .collect::<Result<Vec<_>>>()?;
         let ResultValue::List(values) =
-            cypher_range_with_demand(&values, maximum_rows, Some(demand))?
+            cypher_range_with_demand(&values, maximum_rows, demand, context)?
         else {
             return Err(Error::internal("range did not produce a list"));
         };
-        return Ok(values.into_iter().map(untrusted_result_binding).collect());
+        return values
+            .into_iter()
+            .map(|value| checked_result_binding(value, context))
+            .collect();
     }
 
     let value = evaluate_binding_state(expression, row, state, context)?;
@@ -14052,11 +15559,11 @@ fn unwind_expression_values(
             Some(demand) => Ok(values.into_iter().take(demand).collect()),
             None => Ok(values),
         },
-        BindingValue::Value(ResultValue::List(values)) => Ok(values
+        BindingValue::Value(ResultValue::List(values)) => values
             .into_iter()
             .take(demand.unwrap_or(usize::MAX))
-            .map(untrusted_result_binding)
-            .collect()),
+            .map(|value| checked_result_binding(value, context))
+            .collect(),
         value if binding_is_null(&value) => Ok(Vec::new()),
         _ => Err(Error::new(
             ErrorCode::QueryType,
@@ -15363,92 +16870,6 @@ const fn reverse_comparison(operation: BinaryOperator) -> BinaryOperator {
     }
 }
 
-/// Publishes the current statement-local graph overlay into the pinned GPU generation before a
-/// later MATCH reads it. The overlay remains private to this execution and is discarded with the
-/// pinned backend; canonical publication still happens only after the complete statement commits.
-fn refresh_resident_overlay(
-    state: &mut ExecutionState<'_>,
-    context: &ExecutionContext<'_>,
-) -> Result<()> {
-    let overlay_mutations = context
-        .prior_graph_mutations
-        .len()
-        .checked_add(state.mutations.len())
-        .ok_or_else(|| {
-            Error::new(
-                ErrorCode::ResultBudgetExceeded,
-                "statement-local resident overlay mutation count overflow",
-            )
-        })?;
-    if overlay_mutations == state.resident_overlay_mutations {
-        return Ok(());
-    }
-    let mutations = context
-        .prior_graph_mutations
-        .iter()
-        .chain(state.mutations.iter())
-        .cloned()
-        .collect::<Vec<_>>();
-    let last_device_mutation = mutations
-        .iter()
-        .enumerate()
-        .skip(state.resident_overlay_mutations)
-        .filter_map(|(index, mutation)| {
-            (!matches!(
-                mutation,
-                GraphMutation::DeclareLabel { .. }
-                    | GraphMutation::DeclareProperty { .. }
-                    | GraphMutation::DeclareRelationshipType { .. }
-            ))
-            .then_some(index)
-        })
-        .next_back();
-    let Some(backend) = state.resident_backend.as_mut() else {
-        return Ok(());
-    };
-    let mut staged = context.graph.clone();
-    for (index, mutation) in mutations.into_iter().enumerate() {
-        let changes_device_rows = !matches!(
-            mutation,
-            GraphMutation::DeclareLabel { .. }
-                | GraphMutation::DeclareProperty { .. }
-                | GraphMutation::DeclareRelationshipType { .. }
-        );
-        staged.apply(mutation)?;
-        if index < state.resident_overlay_mutations || !changes_device_rows {
-            continue;
-        }
-        // A transaction may contain mutations from several prior statement revisions. The graph
-        // change journal intentionally retains only one revision, so publishing just the final
-        // `device_delta` would omit every earlier inserted or updated row. Replay each new graph
-        // mutation into the pinned generation in transaction order. Repeated mutations at one
-        // revision are safe: their cumulative delta replaces the same stable dense rows.
-        let temporal = if Some(index) == last_device_mutation {
-            state
-                .temporal_mutations
-                .iter()
-                .map(|mutation| ResidentTemporalDelta {
-                    entity_kind: mutation.entity_kind,
-                    target: mutation.target,
-                    sample: mutation.sample.clone(),
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        backend.apply_project_overlay(ResidentProjectDelta {
-            project: context.project_id,
-            bookmark: context.bookmark,
-            graph: staged.device_delta(staged.revision())?,
-            temporal,
-            vectors: Vec::new(),
-            invalidate_derived: true,
-        })?;
-    }
-    state.resident_overlay_mutations = overlay_mutations;
-    Ok(())
-}
-
 fn match_pattern(
     input: Vec<Row>,
     pattern: &Pattern,
@@ -15458,7 +16879,55 @@ fn match_pattern(
     state: &mut ExecutionState<'_>,
     context: &ExecutionContext<'_>,
 ) -> Result<Vec<Row>> {
-    refresh_resident_overlay(state, context)?;
+    match_pattern_seed_filtered(
+        input,
+        pattern,
+        access,
+        optional,
+        share_match_relationships,
+        &[],
+        state,
+        context,
+    )
+}
+
+/// Only total scalar equality is pushed before expansion. The original post-match filter remains.
+/// Optional matches and expressions that could raise errors or depend on later bindings stay local.
+fn safe_start_equality(
+    expression: &Expression,
+    start: Option<&str>,
+    context: &ExecutionContext<'_>,
+) -> bool {
+    let Some(start) = start else { return false };
+    let Expression::Binary {
+        left,
+        operation: BinaryOperator::Equal,
+        right,
+    } = expression
+    else {
+        return false;
+    };
+    let property = |expression: &Expression| matches!(expression,Expression::Property(source,_) if matches!(source.as_ref(),Expression::Variable(variable) if variable==start));
+    let scalar = |expression: &Expression| match expression {
+        Expression::Literal(_) => true,
+        Expression::Parameter(name) => {
+            matches!(context.parameters.get(name), Some(ResultValue::Scalar(_)))
+        }
+        _ => false,
+    };
+    (property(left) && scalar(right)) || (property(right) && scalar(left))
+}
+
+fn match_pattern_seed_filtered(
+    input: Vec<Row>,
+    pattern: &Pattern,
+    access: &super::ScanAccessPath,
+    optional: bool,
+    share_match_relationships: bool,
+    predicates: &[&Expression],
+    state: &mut ExecutionState<'_>,
+    context: &ExecutionContext<'_>,
+) -> Result<Vec<Row>> {
     let mut output = Vec::new();
     for row in input {
         check_execution(context)?;
@@ -15467,10 +16936,31 @@ fn match_pattern(
         } else {
             BTreeSet::new()
         };
-        let starts = start_candidates(&row, &pattern.start, access, true, state, context)?;
+        let starts = start_candidates_filtered(
+            &row,
+            &pattern.start,
+            access,
+            true,
+            predicates,
+            state,
+            context,
+        )?;
         let mut matches = Vec::new();
         for (start, mut candidate) in starts {
             check_execution(context)?;
+            let mut selected = true;
+            for predicate in predicates {
+                if !matches!(
+                    truth(&evaluate_state(predicate, &candidate, state, context)?)?,
+                    Truth::True
+                ) {
+                    selected = false;
+                    break;
+                }
+            }
+            if !selected {
+                continue;
+            }
             let mut path_nodes = vec![start];
             let mut path_relationships = Vec::new();
             let mut used_nodes = BTreeSet::from([start]);
@@ -15532,7 +17022,6 @@ fn pattern_predicate_exists(
     state: &mut ExecutionState<'_>,
     context: &ExecutionContext<'_>,
 ) -> Result<bool> {
-    refresh_resident_overlay(state, context)?;
     let starts = start_candidates(
         row,
         &pattern.start,
@@ -15811,6 +17300,161 @@ fn start_candidates(
     state: &mut ExecutionState<'_>,
     context: &ExecutionContext<'_>,
 ) -> Result<Vec<(u32, Row)>> {
+    start_candidates_filtered(
+        row,
+        pattern,
+        access,
+        record_dependencies,
+        &[],
+        state,
+        context,
+    )
+}
+
+/// A typed absence cannot rule out a value promoted after integer-only eligibility was captured.
+fn canonical_seed_integer_may_match(value: Option<i64>, operand: i64) -> bool {
+    value.is_none_or(|value| value == operand)
+}
+
+/// Filters total integer start predicates before generic row binding and dependency recording.
+/// Existing columns remain canonical; selected ordinals are only query-local candidate scratch.
+/// The original predicate and all pattern/trail guards still execute after this selection.
+fn canonical_integer_seed_readers<'g>(
+    pattern: &NodePattern,
+    predicates: &[&Expression],
+    state: &ExecutionState<'_>,
+    context: &ExecutionContext<'g>,
+) -> Option<Vec<(crate::graph::NodePropertyReader<'g>, i64)>> {
+    if predicates.is_empty()
+        || !pattern.properties.is_empty()
+        || pattern.property_predicate_present
+        || context.resolved_query_at_time_nanos.is_some()
+        || context
+            .temporal
+            .is_some_and(|temporal| !temporal.is_empty())
+        || context.capabilities.require_native_execution
+        || current_backend(state, context).is_some()
+        || state.graph.has_overlay_node_modifications()
+        || !state.mutations.is_empty()
+        || !state.temporal_mutations.is_empty()
+        || !context.prior_graph_mutations.is_empty()
+        || !context.prior_temporal_mutations.is_empty()
+        || state.initial_scan_cap.is_some()
+    {
+        return None;
+    }
+    let variable = pattern.variable.as_deref()?;
+    let property_name = |expression: &Expression| match expression {
+        Expression::Property(owner, property) if matches!(owner.as_ref(), Expression::Variable(name) if name == variable) => {
+            Some(property.clone())
+        }
+        _ => None,
+    };
+    let integer = |expression: &Expression| match expression {
+        Expression::Literal(ScalarValue::Integer(value)) => Some(*value),
+        Expression::Parameter(name) => match context.parameters.get(name) {
+            Some(ResultValue::Scalar(ScalarValue::Integer(value))) => Some(*value),
+            _ => None,
+        },
+        _ => None,
+    };
+    let mut filters = Vec::with_capacity(predicates.len());
+    for predicate in predicates {
+        let Expression::Binary {
+            left,
+            operation: BinaryOperator::Equal,
+            right,
+        } = predicate
+        else {
+            return None;
+        };
+        let selected = property_name(left)
+            .zip(integer(right))
+            .or_else(|| property_name(right).zip(integer(left)));
+        let (name, operand) = selected?;
+        let property = context.graph.catalog().property(&name)?;
+        if !context.graph.node_property_is_integer(property) {
+            return None;
+        }
+        let reader = context.graph.node_property_reader(property)?;
+        filters.push((reader, operand));
+    }
+    Some(filters)
+}
+
+fn canonical_integer_seed_candidates(
+    pattern: &NodePattern,
+    predicates: &[&Expression],
+    labels: &[LabelId],
+    state: &ExecutionState<'_>,
+    context: &ExecutionContext<'_>,
+) -> Result<Option<Vec<u32>>> {
+    let Some(filters) = canonical_integer_seed_readers(pattern, predicates, state, context) else {
+        return Ok(None);
+    };
+    let (first_reader, first_operand) = &filters[0];
+    let scan = |start, end| {
+        let mut selected = Vec::new();
+        first_reader.visit_integer_candidates_range(
+            start,
+            end,
+            *first_operand,
+            || check_execution(context),
+            |dense| {
+                let Some(node) = context.graph.node_dense(dense) else {
+                    return Ok(());
+                };
+                if state.read_layers.contains_layer(node.layer())
+                    && node.has_labels(labels)
+                    && filters.iter().all(|(reader, operand)| {
+                        // A type may change after capture. Missing typed values still reach
+                        // the original predicate, which can accept an equal FLOAT.
+                        canonical_seed_integer_may_match(reader.get_integer(node), *operand)
+                    })
+                {
+                    selected.push(dense);
+                }
+                Ok(())
+            },
+        )?;
+        Ok::<_, Error>(selected)
+    };
+    let slots = context.graph.node_slot_count();
+    let permit = (slots >= 32768)
+        .then(integer_scan_pool)
+        .flatten()
+        .and_then(IntegerScanPool::try_claim);
+    let selected = if let Some(permit) = permit {
+        let tasks = permit
+            .0
+            .workers
+            .current_num_threads()
+            .min(slots.div_ceil(4096));
+        let width = slots.div_ceil(tasks).div_ceil(256) * 256;
+        let parts = permit.0.workers.install(|| {
+            (0..tasks)
+                .into_par_iter()
+                .with_max_len(1)
+                .map(|task| scan(task * width, ((task + 1) * width).min(slots)))
+                .collect::<Result<Vec<_>>>()
+        })?;
+        parts.into_iter().flatten().collect()
+    } else {
+        scan(0, slots)?
+    };
+    check_execution(context)?;
+    Ok(Some(selected))
+}
+
+fn start_candidates_filtered(
+    row: &Row,
+    pattern: &NodePattern,
+    access: &super::ScanAccessPath,
+    record_dependencies: bool,
+    predicates: &[&Expression],
+    state: &mut ExecutionState<'_>,
+    context: &ExecutionContext<'_>,
+) -> Result<Vec<(u32, Row)>> {
     if let Some(variable) = &pattern.variable {
         if let Some(value) = row.get(variable) {
             return match value {
@@ -15843,12 +17487,17 @@ fn start_candidates(
     let backend = current_backend(state, context);
     let stable_id = match access {
         super::ScanAccessPath::StableId { value, .. } => {
-            match evaluate_state(value, row, state, context)? {
-                ResultValue::Scalar(ScalarValue::Integer(value)) if value >= 0 => state
-                    .graph
-                    .node(NodeId(value as u64))
-                    .map(|node| vec![node.dense()]),
-                ResultValue::Scalar(ScalarValue::Null) => Some(Vec::new()),
+            match evaluate_state(value, row, state, context) {
+                Ok(ResultValue::Scalar(ScalarValue::Integer(value))) => Some(
+                    u64::try_from(value)
+                        .ok()
+                        .and_then(|value| state.graph.node(NodeId(value)))
+                        .map(|node| vec![node.dense()])
+                        .unwrap_or_default(),
+                ),
+                Ok(ResultValue::Scalar(ScalarValue::Null)) => Some(Vec::new()),
+                // Preserve error timing: an empty later match never evaluates its WHERE.
+                // Unsupported values and expression errors continue through the original filter.
                 _ => None,
             }
         }
@@ -15863,7 +17512,11 @@ fn start_candidates(
     let mut candidates: Vec<_> = match indexed {
         Some(candidates) => candidates,
         None => {
-            if let Some(cap) = state.initial_scan_cap {
+            if let Some(selected) =
+                canonical_integer_seed_candidates(pattern, predicates, &labels, state, context)?
+            {
+                selected
+            } else if let Some(cap) = state.initial_scan_cap {
                 // Bare direct scan: consume every match or stop at the proven pagination bound,
                 // even when a resident backend is present. Both forms avoid resident preparation.
                 state
@@ -15939,7 +17592,19 @@ fn start_candidates(
             if let Some(variable) = &pattern.variable {
                 next.insert(variable.clone(), BindingValue::Node(dense));
             }
-            result.push((dense, next));
+            let mut selected = true;
+            for predicate in predicates {
+                if !matches!(
+                    truth(&evaluate_state(predicate, &next, state, context)?)?,
+                    Truth::True
+                ) {
+                    selected = false;
+                    break;
+                }
+            }
+            if selected {
+                result.push((dense, next));
+            }
         }
     }
     Ok(result)
@@ -16365,13 +18030,11 @@ fn expand_relationship(
                     }),
             );
         } else {
-            expanded.extend(
-                state
-                    .graph
-                    .expand_out(current_node.id(), None, state.read_layers)?
-                    .into_iter()
-                    .map(|(edge, node)| (edge.dense(), node.dense())),
-            );
+            expanded.extend(state.graph.expand_denses(
+                current_node.dense(),
+                true,
+                state.read_layers,
+            )?);
         }
     }
     if matches!(
@@ -16392,13 +18055,11 @@ fn expand_relationship(
                     }),
             );
         } else {
-            expanded.extend(
-                state
-                    .graph
-                    .expand_in(current_node.id(), None, state.read_layers)?
-                    .into_iter()
-                    .map(|(edge, node)| (edge.dense(), node.dense())),
-            );
+            expanded.extend(state.graph.expand_denses(
+                current_node.dense(),
+                false,
+                state.read_layers,
+            )?);
         }
     }
     expanded.sort_unstable();
@@ -16504,33 +18165,33 @@ fn select_paths(
 }
 
 fn path_order(left: &MatchedPath, right: &MatchedPath, graph: &GraphReadView<'_>) -> Ordering {
-    let node_ids = |path: &MatchedPath| {
-        path.nodes
-            .iter()
-            .map(|dense| {
-                graph
-                    .node_dense(*dense)
-                    .map(|node| node.id().0)
-                    .unwrap_or(u64::MAX)
-            })
-            .collect::<Vec<_>>()
+    let node_id = |dense: &u32| {
+        graph
+            .node_dense(*dense)
+            .map(|node| node.id().0)
+            .unwrap_or(u64::MAX)
     };
-    let edge_ids = |path: &MatchedPath| {
-        path.relationships
-            .iter()
-            .map(|dense| {
-                graph
-                    .edge_dense(*dense)
-                    .map(|edge| edge.id().0)
-                    .unwrap_or(u64::MAX)
-            })
-            .collect::<Vec<_>>()
+    let edge_id = |dense: &u32| {
+        graph
+            .edge_dense(*dense)
+            .map(|edge| edge.id().0)
+            .unwrap_or(u64::MAX)
     };
     left.relationships
         .len()
         .cmp(&right.relationships.len())
-        .then_with(|| node_ids(left).cmp(&node_ids(right)))
-        .then_with(|| edge_ids(left).cmp(&edge_ids(right)))
+        .then_with(|| {
+            left.nodes
+                .iter()
+                .map(node_id)
+                .cmp(right.nodes.iter().map(node_id))
+        })
+        .then_with(|| {
+            left.relationships
+                .iter()
+                .map(edge_id)
+                .cmp(right.relationships.iter().map(edge_id))
+        })
 }
 
 fn binding_compatible(existing: Option<&BindingValue>, candidate: BindingValue) -> bool {
@@ -16952,10 +18613,15 @@ impl PropertyMutationTarget {
         }
     }
 
-    fn validate(self, graph: &GraphStore, property: PropertyId, value: &ScalarValue) -> Result<()> {
+    fn validate(
+        self,
+        _graph: &GraphStore,
+        _property: PropertyId,
+        value: &ScalarValue,
+    ) -> Result<()> {
         match self {
-            Self::Node(_) => graph.validate_node_property_value(property, value),
-            Self::Relationship(_) => graph.validate_edge_property_value(property, value),
+            Self::Node(_) => crate::graph::validate_property_value_shape(value),
+            Self::Relationship(_) => crate::graph::validate_property_value_shape(value),
         }
     }
 
@@ -16985,14 +18651,14 @@ fn binding_is_null(binding: &BindingValue) -> bool {
 }
 
 fn validate_property_for_binding(
-    graph: &GraphStore,
+    _graph: &GraphStore,
     binding: &BindingValue,
-    property: PropertyId,
+    _property: PropertyId,
     value: &ScalarValue,
 ) -> Result<()> {
     match binding {
-        BindingValue::Node(_) => graph.validate_node_property_value(property, value),
-        BindingValue::Relationship(_) => graph.validate_edge_property_value(property, value),
+        BindingValue::Node(_) => crate::graph::validate_property_value_shape(value),
+        BindingValue::Relationship(_) => crate::graph::validate_property_value_shape(value),
         _ => Err(Error::new(
             ErrorCode::QueryType,
             "SET target must be a node or relationship",
@@ -17371,17 +19037,25 @@ fn project_rows(
     context: &ExecutionContext<'_>,
     keep_scope: bool,
 ) -> Result<(Vec<Row>, Vec<String>)> {
-    let star_columns: Vec<_> = input_scope
+    let star_columns: Vec<_> = if projection
+        .items
         .iter()
-        .filter(|name| !name.starts_with('\0'))
-        .cloned()
-        .chain(
-            rows.iter()
-                .flat_map(|row| row.keys().filter(|name| !name.starts_with('\0')).cloned()),
-        )
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+        .any(|item| matches!(item.expression, Expression::Star))
+    {
+        input_scope
+            .iter()
+            .filter(|name| !name.starts_with('\0'))
+            .cloned()
+            .chain(
+                rows.iter()
+                    .flat_map(|row| row.keys().filter(|name| !name.starts_with('\0')).cloned()),
+            )
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut columns = Vec::new();
     for (index, item) in projection.items.iter().enumerate() {
         if matches!(item.expression, Expression::Star) {
@@ -17477,6 +19151,14 @@ fn group_rows(
     state: &mut ExecutionState<'_>,
     context: &ExecutionContext<'_>,
 ) -> Result<Vec<Vec<Row>>> {
+    if projection
+        .items
+        .iter()
+        .all(|item| is_aggregate(&item.expression))
+    {
+        check_execution(context)?;
+        return Ok(vec![rows]);
+    }
     let mut groups: BTreeMap<Vec<u8>, Vec<Row>> = BTreeMap::new();
     for row in rows {
         let mut key_values = Vec::new();
@@ -17534,6 +19216,68 @@ fn evaluate_group(
     evaluate_correlated_binding_state(&materialized, &bindings, state, context)
 }
 
+/// Entity COUNT needs validated kind and identity, not result labels or property payloads.
+/// Decline before validating anything when a mixed binding requires the original value semantics.
+fn count_entity_bindings(
+    rows: &[Row],
+    variable: &str,
+    distinct: bool,
+    graph: &GraphReadView<'_>,
+    context: &ExecutionContext<'_>,
+) -> Result<Option<i64>> {
+    for (index, row) in rows.iter().enumerate() {
+        if index % 4096 == 0 {
+            check_execution(context)?;
+        }
+        if let Some(binding) = row.get(variable)
+            && !binding_is_null(binding)
+            && !matches!(
+                binding,
+                BindingValue::Node(_) | BindingValue::Relationship(_)
+            )
+        {
+            return Ok(None);
+        }
+    }
+    let mut unique = BTreeSet::new();
+    let mut count = 0_i64;
+    for (index, row) in rows.iter().enumerate() {
+        if index % 4096 == 0 {
+            check_execution(context)?;
+        }
+        let identity = match row.get(variable) {
+            Some(BindingValue::Node(dense)) => {
+                let node = graph.node_dense(*dense).ok_or_else(|| {
+                    if graph.node_dense_was_deleted(*dense) {
+                        deleted_entity_access("node")
+                    } else {
+                        Error::new(ErrorCode::QueryType, "node binding does not exist")
+                    }
+                })?;
+                (0_u8, node.id().0)
+            }
+            Some(BindingValue::Relationship(dense)) => {
+                let edge = graph.edge_dense(*dense).ok_or_else(|| {
+                    if graph.deleted_edge_relationship_type(*dense).is_some() {
+                        deleted_entity_access("relationship")
+                    } else {
+                        Error::new(ErrorCode::QueryType, "relationship binding does not exist")
+                    }
+                })?;
+                (1_u8, edge.id().0)
+            }
+            _ => continue,
+        };
+        if !distinct || unique.insert(identity) {
+            count = count.checked_add(1).ok_or_else(|| {
+                Error::new(ErrorCode::ResultBudgetExceeded, "aggregate count overflow")
+            })?;
+        }
+    }
+    check_execution(context)?;
+    Ok(Some(count))
+}
+
 fn evaluate_aggregate_root(
     expression: &Expression,
     rows: &[Row],
@@ -17580,6 +19324,19 @@ fn evaluate_aggregate_root(
         );
     }
     let argument = arguments.first();
+    if function == "count" && !*distinct && matches!(argument, Some(Expression::Star)) {
+        return count_star_rows(rows, context)
+            .map(|count| ResultValue::Scalar(ScalarValue::Integer(count)));
+    }
+    if function == "count"
+        && let Some(Expression::Variable(variable)) = argument
+        && let Some(count) =
+            count_entity_bindings(rows, variable, *distinct, &state.graph, context)?
+    {
+        #[cfg(test)]
+        entity_count_tests::observe_payload_owners();
+        return Ok(ResultValue::Scalar(ScalarValue::Integer(count)));
+    }
     let mut values = Vec::new();
     for row in rows {
         let value = if matches!(argument, Some(Expression::Star)) {
@@ -17610,11 +19367,15 @@ fn evaluate_aggregate_root(
         values = unique;
     }
     match function.as_str() {
-        "count" => Ok(ResultValue::Scalar(ScalarValue::Integer(
-            i64::try_from(values.len()).map_err(|_| {
-                Error::new(ErrorCode::ResultBudgetExceeded, "aggregate count overflow")
-            })?,
-        ))),
+        "count" => {
+            #[cfg(test)]
+            entity_count_tests::observe_payload_owners();
+            Ok(ResultValue::Scalar(ScalarValue::Integer(
+                i64::try_from(values.len()).map_err(|_| {
+                    Error::new(ErrorCode::ResultBudgetExceeded, "aggregate count overflow")
+                })?,
+            )))
+        }
         "collect" => Ok(ResultValue::List(values)),
         "sum" => aggregate_sum(&values),
         "avg" => aggregate_average(&values),
@@ -17666,6 +19427,19 @@ fn evaluate_aggregate_root(
         }
         _ => Err(Error::internal("aggregate dispatch is inconsistent")),
     }
+}
+
+fn count_star_rows(rows: &[Row], context: &ExecutionContext<'_>) -> Result<i64> {
+    let mut count = 0_usize;
+    for (position, row) in rows.iter().enumerate() {
+        if position & 4095 == 0 {
+            check_execution(context)?;
+        }
+        count += usize::from(!row.contains_key(INTERNAL_WINDOW_EMPTY));
+    }
+    check_execution(context)?;
+    i64::try_from(count)
+        .map_err(|_| Error::new(ErrorCode::ResultBudgetExceeded, "aggregate count overflow"))
 }
 
 fn evaluate_aggregate_binding_root(
@@ -18027,6 +19801,7 @@ fn validate_percentile_argument(percentile: f64) -> Result<()> {
     Ok(())
 }
 
+#[inline(always)]
 fn compensated_add(sum: &mut f64, compensation: &mut f64, value: f64) {
     let next = *sum + value;
     *compensation += if sum.abs() >= value.abs() {
@@ -18103,6 +19878,25 @@ fn materialized_value_rows_are_ordered(
 }
 
 #[cfg(test)]
+#[path = "procedure_streaming_tests.rs"]
+mod procedure_streaming_tests;
+
+#[cfg(test)]
+#[path = "range_scheduling_tests.rs"]
+mod range_scheduling_tests;
+
+#[cfg(test)]
+#[path = "traversal_seed_tests.rs"]
+mod traversal_seed_tests;
+
+#[path = "canonical_trail_count.rs"]
+mod canonical_trail_count;
+
+#[cfg(test)]
+#[path = "entity_count_tests.rs"]
+mod entity_count_tests;
+
+#[cfg(test)]
 mod materialized_value_order_tests {
     use super::*;
 
@@ -18146,6 +19940,818 @@ mod materialized_value_order_tests {
                 BindingValue::Value(ResultValue::Scalar(ScalarValue::Integer(payload))),
             ),
         ])
+    }
+
+    #[test]
+    fn count_star_fold_preserves_null_empty_and_window_rows() -> Result<()> {
+        let graph = GraphStore::default();
+        let scan_context = context(&graph);
+        let empty_window = Row::from([(INTERNAL_WINDOW_EMPTY.to_owned(), BindingValue::Null)]);
+        let null_row = Row::from([("value".to_owned(), BindingValue::Null)]);
+        assert_eq!(count_star_rows(&[], &scan_context)?, 0);
+        assert_eq!(count_star_rows(&[empty_window.clone()], &scan_context)?, 0);
+        assert_eq!(
+            count_star_rows(&[empty_window, null_row, value_row(1, 1)], &scan_context)?,
+            2
+        );
+        for (source, expected) in [
+            ("UNWIND [] AS value RETURN count(*) AS count", vec![0]),
+            (
+                "UNWIND [null, 1, 1, 2] AS value \
+                 RETURN count(*) AS all, count(value) AS present, count(DISTINCT value) AS unique",
+                vec![4, 3, 2],
+            ),
+        ] {
+            let mut query_context = context(&graph);
+            let output = QueryEngine.execute(source, &mut query_context)?;
+            let actual = output.result.batches[0]
+                .columns
+                .iter()
+                .map(|column| column.values[0].clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual,
+                expected
+                    .into_iter()
+                    .map(|value| ResultValue::Scalar(ScalarValue::Integer(value)))
+                    .collect::<Vec<_>>()
+            );
+        }
+        scan_context.cancellation.cancel();
+        let error = count_star_rows(&[Row::new()], &scan_context)
+            .expect_err("count star ignored caller cancellation");
+        assert_eq!(error.code, ErrorCode::Cancelled);
+        Ok(())
+    }
+
+    #[test]
+    fn subsequent_statement_reads_journal_schema_without_publishing_it() -> Result<()> {
+        let graph = GraphStore::default();
+        let mut first = context(&graph);
+        first.capabilities.write = true;
+        first.capabilities.schema = true;
+        let created = QueryEngine.execute(
+            "CREATE (:JournalOnly {value: 7}) RETURN 1 AS created",
+            &mut first,
+        )?;
+        assert!(graph.catalog().label("JournalOnly").is_none());
+        assert!(graph.catalog().property("value").is_none());
+        assert_eq!(graph.node_count(), 0);
+        let mut second = context(&graph);
+        second.prior_graph_mutations = &created.graph_mutations;
+        let read =
+            QueryEngine.execute("MATCH (n:JournalOnly) RETURN n.value AS value", &mut second)?;
+        assert_eq!(read.result.batches.len(), 1);
+        assert_eq!(
+            read.result.batches[0].columns[0].values,
+            vec![ResultValue::Scalar(ScalarValue::Integer(7))]
+        );
+        assert!(graph.catalog().label("JournalOnly").is_none());
+        assert_eq!(graph.node_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn variable_path_start_equality_filters_before_expansion() -> Result<()> {
+        let graph = GraphStore::default();
+        let label = graph.catalog().intern_label("Seed")?;
+        let property = graph.catalog().intern_property("value")?;
+        let kind = graph.catalog().intern_relationship_type("NEXT")?;
+        for id in 1..=48 {
+            graph.insert_node(crate::graph::NodeInput {
+                id: NodeId(id),
+                layer: Layer::Observed,
+                revision: 1,
+                labels: vec![label],
+                properties: vec![(property, ScalarValue::Integer(id as i64 - 1))],
+            })?;
+        }
+        let mut edge_id = 1;
+        for source in 1..=48 {
+            for step in [1, 2] {
+                graph.insert_edge(crate::graph::EdgeInput {
+                    id: EdgeId(edge_id),
+                    source: NodeId(source),
+                    target: NodeId((source - 1 + step) % 48 + 1),
+                    relationship_type: kind,
+                    layer: Layer::Observed,
+                    revision: 1,
+                    properties: Vec::new(),
+                })?;
+                edge_id += 1;
+            }
+        }
+        let mut context = context(&graph);
+        let output = QueryEngine.execute(
+            "MATCH (n:Seed)-[:NEXT*1..3]->(m) WHERE n.value = 42 RETURN count(DISTINCT m)",
+            &mut context,
+        )?;
+        assert_eq!(
+            output.result.batches[0].columns[0].values,
+            vec![ResultValue::Scalar(ScalarValue::Integer(6))]
+        );
+        let expression = Expression::Binary {
+            left: Box::new(Expression::Property(
+                Box::new(Expression::Variable("n".into())),
+                "value".into(),
+            )),
+            operation: BinaryOperator::Equal,
+            right: Box::new(Expression::Literal(ScalarValue::Integer(42))),
+        };
+        assert!(safe_start_equality(&expression, Some("n"), &context));
+        assert!(!safe_start_equality(&expression, Some("m"), &context));
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_integer_sum_preserves_ordered_prefix_overflow() -> Result<()> {
+        let _control = CPU_POOL_TEST_CONTROL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        const NODES: usize = 32769;
+        let graph = GraphStore::default();
+        let label = graph.catalog().intern_label("PrefixSum")?;
+        let property = graph.catalog().intern_property("value")?;
+        for row in 0..NODES {
+            graph.insert_node(crate::graph::NodeInput {
+                id: NodeId(row as u64 + 1),
+                layer: Layer::Observed,
+                revision: 1,
+                labels: vec![label],
+                properties: vec![(property, ScalarValue::Integer(0))],
+            })?;
+        }
+        let pool = integer_scan_pool().ok_or_else(|| Error::internal("scan pool absent"))?;
+        let tasks = pool
+            .workers
+            .current_num_threads()
+            .saturating_mul(8)
+            .min(NODES / 1024);
+        let boundary = NODES.div_ceil(tasks) as u64 + 1;
+        let touched = [1, 2, 3, boundary, boundary + 1];
+        for (changes, expected) in [
+            (vec![(1, i64::MAX), (2, 1), (3, i64::MIN)], None),
+            (vec![(1, i64::MIN), (2, -1), (3, i64::MAX)], None),
+            (
+                vec![(1, -100), (boundary, i64::MAX), (boundary + 1, 1)],
+                Some(i64::MAX - 99),
+            ),
+            (
+                vec![(1, 100), (boundary, i64::MIN), (boundary + 1, -1)],
+                Some(i64::MIN + 99),
+            ),
+            (vec![(1, i64::MAX), (boundary, 1), (boundary + 1, -1)], None),
+            (vec![(1, i64::MIN), (boundary, -1), (boundary + 1, 1)], None),
+        ] {
+            for id in touched {
+                graph.set_node_property(NodeId(id), property, ScalarValue::Integer(0), 2)?;
+            }
+            for (id, value) in changes {
+                graph.set_node_property(NodeId(id), property, ScalarValue::Integer(value), 2)?;
+            }
+            let mut context = context(&graph);
+            context.max_result_rows = NODES;
+            let check = |output: Result<ExecutionOutput>| -> Result<()> {
+                if let Some(value) = expected {
+                    assert_eq!(
+                        output?.result.batches[0].columns[0].values,
+                        vec![ResultValue::Scalar(ScalarValue::Integer(value))]
+                    );
+                } else {
+                    assert!(matches!(output, Err(error) if error.code == ErrorCode::QueryType));
+                }
+                Ok(())
+            };
+            let deadline = Instant::now() + std::time::Duration::from_secs(10);
+            let permit = loop {
+                if let Some(permit) = pool.try_claim() {
+                    break permit;
+                }
+                if Instant::now() >= deadline {
+                    return Err(Error::internal("scan pool stayed busy"));
+                }
+                std::thread::yield_now();
+            };
+            check(QueryEngine.execute("MATCH (n:PrefixSum) RETURN sum(n.value)", &mut context))?;
+            drop(permit);
+            check(QueryEngine.execute("MATCH (n:PrefixSum) RETURN sum(n.value)", &mut context))?;
+            check(
+                QueryEngine.execute("MATCH (n:PrefixSum) RETURN sum(n.value) + 0", &mut context),
+            )?;
+        }
+        println!("CANONICAL_PARALLEL_SUM_PREFIX_PASS");
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_integer_average_matches_generic_wide_values_and_nulls() -> Result<()> {
+        let graph = GraphStore::default();
+        let label = graph.catalog().intern_label("WideAverage")?;
+        let property = graph.catalog().intern_property("value")?;
+        let values = [i64::MIN, i64::MAX, 1];
+        for row in 0..32769_usize {
+            graph.insert_node(crate::graph::NodeInput {
+                id: NodeId(row as u64 + 1),
+                layer: Layer::Observed,
+                revision: 1,
+                labels: vec![label],
+                properties: if row % 11 == 0 {
+                    Vec::new()
+                } else {
+                    vec![(property, ScalarValue::Integer(values[row % values.len()]))]
+                },
+            })?;
+        }
+        let mut context = context(&graph);
+        context.max_result_rows = 32769;
+        let reduced = QueryEngine.execute(
+            "MATCH (n:WideAverage) RETURN avg(n.value) AS average",
+            &mut context,
+        )?;
+        let generic = QueryEngine.execute(
+            "MATCH (n:WideAverage) RETURN avg(n.value) + 0 AS average",
+            &mut context,
+        )?;
+        assert_eq!(reduced.result.batches, generic.result.batches);
+        assert!(reduced.dependencies.entities.is_empty());
+        println!("CANONICAL_PARALLEL_AVERAGE_PASS");
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_parallel_integer_scans_match_busy_serial_and_recycled_rows() -> Result<()> {
+        let _control = CPU_POOL_TEST_CONTROL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let graph = GraphStore::default();
+        let label = graph.catalog().intern_label("Parallel")?;
+        let property = graph.catalog().intern_property("value")?;
+        let body = graph.catalog().intern_property("body")?;
+        let payload: Arc<str> = "complete owning node source text ".repeat(32768).into();
+        for id in 1..=65539 {
+            let mut properties = if id % 5 == 0 {
+                Vec::new()
+            } else {
+                vec![(property, ScalarValue::Integer(id as i64 % 100))]
+            };
+            if id % 4096 == 0 {
+                properties.push((body, ScalarValue::String(Arc::clone(&payload))));
+            }
+            graph.insert_node(crate::graph::NodeInput {
+                id: NodeId(id),
+                layer: Layer::Observed,
+                revision: 1,
+                labels: vec![label],
+                properties,
+            })?;
+        }
+        for id in (1000..=65000).step_by(1000) {
+            graph.delete_node(NodeId(id), true, 2)?;
+            graph.insert_node(crate::graph::NodeInput {
+                id: NodeId(id + 100000),
+                layer: Layer::Observed,
+                revision: 2,
+                labels: vec![label],
+                properties: vec![(property, ScalarValue::Integer(7))],
+            })?;
+        }
+        let pool = integer_scan_pool().ok_or_else(|| Error::internal("scan pool absent"))?;
+        // Other parallel tests may legitimately own this process-wide pool. Only this
+        // fixture waits for its controlled admission check; production readers never retry.
+        let acquisition_started = std::time::Instant::now();
+        let permit = loop {
+            if let Some(permit) = pool.try_claim() {
+                break permit;
+            }
+            if acquisition_started.elapsed() > std::time::Duration::from_secs(5) {
+                return Err(Error::internal(
+                    "test scan pool remained busy for five seconds",
+                ));
+            }
+            std::thread::yield_now();
+        };
+        assert!(pool.try_claim().is_none());
+        let mut scan_context = context(&graph);
+        let source = "MATCH (n:Parallel) WHERE n.value >= 30 AND n.value <= 70 RETURN count(n), count(n.value), min(n.value), max(n.value), avg(n.value), sum(n.value)";
+        let bytes = graph.resident_bytes();
+        let owners = Arc::strong_count(&payload);
+        let serial = QueryEngine.execute(source, &mut scan_context)?;
+        let grouping = "MATCH (n:Parallel) RETURN n.value AS value, count(*) AS counted";
+        let serial_groups = QueryEngine.execute(grouping, &mut scan_context)?;
+        drop(permit);
+        let parallel = QueryEngine.execute(source, &mut scan_context)?;
+        let parallel_groups = QueryEngine.execute(grouping, &mut scan_context)?;
+        assert_eq!(serial_groups.result.batches, parallel_groups.result.batches);
+        let group_rows = |output: &ExecutionOutput| {
+            output
+                .result
+                .batches
+                .iter()
+                .flat_map(|batch| {
+                    (0..batch.row_count).map(|row| {
+                        batch
+                            .columns
+                            .iter()
+                            .map(|column| column.values[row].clone())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        for batch_size in [1, 7, 257, 8192] {
+            scan_context.max_batch_rows = batch_size;
+            let batched = QueryEngine.execute(grouping, &mut scan_context)?;
+            assert_eq!(group_rows(&batched), group_rows(&serial_groups));
+        }
+        scan_context.max_batch_rows = 3;
+        assert_eq!(
+            serial_groups.dependencies.predicates,
+            parallel_groups.dependencies.predicates
+        );
+        assert!(parallel_groups.dependencies.entities.is_empty());
+        scan_context.max_result_rows = 1;
+        let over_budget = QueryEngine.execute(grouping, &mut scan_context);
+        assert!(matches!(over_budget, Err(error) if error.code == ErrorCode::ResultBudgetExceeded));
+        scan_context.max_result_rows = 1000;
+        assert_eq!(serial.result.batches, parallel.result.batches);
+        assert!(parallel.dependencies.entities.is_empty());
+        assert_eq!(
+            serial.dependencies.predicates,
+            parallel.dependencies.predicates
+        );
+        let reader = graph
+            .node_property_reader(property)
+            .ok_or_else(|| Error::internal("top ordering column missing"))?;
+        let mut expected = graph
+            .nodes()
+            .map(|node| reader.get_integer(node))
+            .collect::<Vec<_>>();
+        expected.sort_by(|left, right| match (left, right) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (Some(left), Some(right)) => left.cmp(right),
+        });
+        for direction in ["ASC", "DESC"] {
+            if direction == "DESC" {
+                expected.reverse();
+            }
+            for (skip, limit) in [(0, 0), (0, 17), (13, 87)] {
+                let pagination = if skip == 0 {
+                    String::new()
+                } else {
+                    format!(" SKIP {skip}")
+                };
+                scan_context.max_result_rows = if skip == 0 { 1000 } else { graph.node_count() };
+                let source = format!(
+                    "MATCH (n:Parallel) RETURN n.value AS value ORDER BY value {direction}{pagination} LIMIT {limit}"
+                );
+                let output = QueryEngine.execute(&source, &mut scan_context)?;
+                let actual = output
+                    .result
+                    .batches
+                    .iter()
+                    .flat_map(|batch| batch.columns[0].values.iter().cloned())
+                    .collect::<Vec<_>>();
+                let expected = expected
+                    .iter()
+                    .skip(skip)
+                    .take(limit)
+                    .map(|value| {
+                        ResultValue::Scalar(value.map_or(ScalarValue::Null, ScalarValue::Integer))
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+                if skip == 0 {
+                    assert!(output.dependencies.entities.is_empty());
+                }
+            }
+        }
+        scan_context.max_result_rows = 1000;
+        let top_source = "MATCH (n:Parallel) RETURN n.value AS value ORDER BY value ASC LIMIT 17";
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        let permit = loop {
+            if let Some(permit) = pool.try_claim() {
+                break permit;
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::internal("CPU pool stayed busy before Top-K"));
+            }
+            std::thread::yield_now();
+        };
+        let before = PARALLEL_TOP_REDUCTIONS.with(std::cell::Cell::get);
+        let serial_top = QueryEngine.execute(top_source, &mut scan_context)?;
+        assert_eq!(PARALLEL_TOP_REDUCTIONS.with(std::cell::Cell::get), before);
+        drop(permit);
+        loop {
+            let parallel_top = QueryEngine.execute(top_source, &mut scan_context)?;
+            assert_eq!(parallel_top.result.batches, serial_top.result.batches);
+            assert_eq!(
+                parallel_top.dependencies.predicates,
+                serial_top.dependencies.predicates
+            );
+            assert!(parallel_top.dependencies.entities.is_empty());
+            if PARALLEL_TOP_REDUCTIONS.with(std::cell::Cell::get) > before {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::internal("parallel Top-K unavailable"));
+            }
+            std::thread::yield_now();
+        }
+        scan_context.max_result_rows = 1;
+        let over_budget = QueryEngine.execute(
+            "MATCH (n:Parallel) RETURN n.value AS value ORDER BY value ASC LIMIT 2",
+            &mut scan_context,
+        );
+        assert!(matches!(over_budget, Err(error) if error.code == ErrorCode::ResultBudgetExceeded));
+        scan_context.max_result_rows = 1000;
+        let missing = QueryEngine.execute(
+            "MATCH (n:Parallel) WHERE n.value > 1000 RETURN count(n), min(n.value), max(n.value)",
+            &mut scan_context,
+        )?;
+        assert_eq!(
+            missing.result.batches[0].columns[0].values,
+            vec![ResultValue::Scalar(ScalarValue::Integer(0))]
+        );
+        assert_eq!(
+            missing.result.batches[0].columns[1].values,
+            vec![ResultValue::Scalar(ScalarValue::Null)]
+        );
+        let (plan, _) = prepared_plan(source, &scan_context, None)?;
+        scan_context.cancellation.cancel();
+        let result = stream_integer_node_aggregates(&plan, &scan_context, &mut None);
+        assert!(matches!(result, Err(error) if error.code == ErrorCode::Cancelled));
+        assert_eq!(graph.resident_bytes(), bytes);
+        assert_eq!(Arc::strong_count(&payload), owners);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "release-only million-node partition timing; acceptance gate runs explicitly"]
+    fn canonical_range_partition_diagnostics() -> Result<()> {
+        let graph = GraphStore::default();
+        let label = graph.catalog().intern_label("Node")?;
+        let value = graph.catalog().intern_property("value")?;
+        let bucket = graph.catalog().intern_property("bucket")?;
+        let body = graph.catalog().intern_property("body")?;
+        let relationship = graph.catalog().intern_relationship_type("R")?;
+        const NODES: u64 = 1_000_000;
+        for row in 0..NODES {
+            let mut properties = vec![
+                (
+                    value,
+                    ScalarValue::Integer(
+                        i64::try_from(row % 1000)
+                            .map_err(|error| Error::internal(error.to_string()))?,
+                    ),
+                ),
+                (
+                    bucket,
+                    ScalarValue::Integer(
+                        i64::try_from(row % 64)
+                            .map_err(|error| Error::internal(error.to_string()))?,
+                    ),
+                ),
+            ];
+            if row % 10_000 == 0 {
+                properties.push((body, ScalarValue::String("x".repeat(2048).into())));
+            }
+            graph.insert_node(crate::graph::NodeInput {
+                id: NodeId(row + 1),
+                layer: Layer::Observed,
+                revision: 1,
+                labels: vec![label],
+                properties,
+            })?;
+        }
+        for row in 0..NODES {
+            for step in 1..=4 {
+                graph.insert_edge(crate::graph::EdgeInput {
+                    id: EdgeId(row * 4 + step),
+                    source: NodeId(row + 1),
+                    target: NodeId((row + step * 7919) % NODES + 1),
+                    relationship_type: relationship,
+                    layer: Layer::Observed,
+                    revision: 1,
+                    properties: Vec::new(),
+                })?;
+            }
+        }
+        let mut scan_context = context(&graph);
+        let source = "MATCH (n:Node) WHERE n.value >= 400 AND n.value < 600 RETURN count(n)";
+        for _ in 0..2 {
+            QueryEngine.execute(source, &mut scan_context)?;
+        }
+        INTEGER_SCAN_DIAGNOSTICS.store(true, AtomicOrdering::Relaxed);
+        let result = (|| -> Result<()> {
+            for query in 0..3 {
+                let started = std::time::Instant::now();
+                let output = QueryEngine.execute(source, &mut scan_context)?;
+                assert_eq!(
+                    output.result.batches[0].columns[0].values,
+                    vec![ResultValue::Scalar(ScalarValue::Integer(200_000))]
+                );
+                eprintln!(
+                    "SCAN_QUERY query={query} elapsed_us={} count=200000",
+                    started.elapsed().as_micros()
+                );
+            }
+            Ok(())
+        })();
+        INTEGER_SCAN_DIAGNOSTICS.store(false, AtomicOrdering::Relaxed);
+        result?;
+        eprintln!("CANONICAL_RANGE_PARTITION_DIAGNOSTICS_PASS");
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_cpu_automatic_semantic_search_dispatches_eligible_ann() -> Result<()> {
+        let graph = GraphStore::default();
+        let vectors = VectorIndex::new(2, crate::graph::Similarity::Cosine)?;
+        for id in 1..=80 {
+            graph.insert_node(crate::graph::NodeInput {
+                id: NodeId(id),
+                layer: Layer::Observed,
+                revision: 1,
+                labels: Vec::new(),
+                properties: Vec::new(),
+            })?;
+            vectors.upsert(id, &[1.0, id as f32 / 80.0], 1)?;
+        }
+        let ann = IvfPqIndex::build(
+            &vectors,
+            crate::graph::IvfPqConfig {
+                coarse_centroids: 4,
+                subquantizers: 1,
+                bits_per_code: 2,
+                probes: 4,
+                candidate_budget: 16,
+                iterations: 2,
+                ..crate::graph::IvfPqConfig::default()
+            },
+        )?;
+        let mut scan_context = context(&graph);
+        scan_context.vector_indexes.insert(
+            crate::graph::SEMANTIC_NODE_INDEX.into(),
+            VectorSearchSource {
+                property: crate::graph::SEMANTIC_NODE_PROPERTY,
+                exact: &vectors,
+                approximate: Some(&ann),
+                profile_hash: [0; 32],
+            },
+        );
+        scan_context
+            .parameters
+            .insert("query".into(), ResultValue::Vector(vec![1.0, 0.0]));
+        let output = QueryEngine.execute("SEARCH entity IN (EMBEDDING INDEX semantic_nodes FOR VECTOR $query LIMIT 2) SCORE AS score RETURN entity, score", &mut scan_context)?;
+        assert_eq!(
+            output
+                .result
+                .batches
+                .iter()
+                .map(|batch| batch.row_count)
+                .sum::<usize>(),
+            2
+        );
+        assert_eq!(output.vector_searches.len(), 1);
+        assert_eq!(
+            output.vector_searches[0].access,
+            ResidentVectorAccess::IvfPq
+        );
+        assert_eq!(output.vector_searches[0].candidate_budget, 16);
+        assert_eq!(
+            output.vector_searches[0].build_generation,
+            ann.build_generation()
+        );
+        assert!(scan_context.backend.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_integer_aggregates_preserve_null_empty_filter_and_dependencies() -> Result<()> {
+        let graph = GraphStore::default();
+        let label = graph.catalog().intern_label("Streamed")?;
+        let property = graph.catalog().intern_property("value")?;
+        for (id, value) in [
+            (1, ScalarValue::Integer(1)),
+            (2, ScalarValue::Null),
+            (3, ScalarValue::Integer(3)),
+        ] {
+            graph.insert_node(crate::graph::NodeInput {
+                id: NodeId(id),
+                layer: Layer::Observed,
+                revision: 1,
+                labels: vec![label],
+                properties: vec![(property, value)],
+            })?;
+        }
+        let mut context = context(&graph);
+        let output=QueryEngine.execute("MATCH (n:Streamed) WHERE n.value >= 2 RETURN count(n), sum(n.value), avg(n.value), min(n.value), max(n.value)",&mut context)?;
+        let actual = output.result.batches[0]
+            .columns
+            .iter()
+            .map(|column| column.values[0].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![
+                ResultValue::Scalar(ScalarValue::Integer(1)),
+                ResultValue::Scalar(ScalarValue::Integer(3)),
+                number(3.0),
+                ResultValue::Scalar(ScalarValue::Integer(3)),
+                ResultValue::Scalar(ScalarValue::Integer(3))
+            ]
+        );
+        assert!(output.dependencies.entities.is_empty());
+        assert!(!output.dependencies.predicates.is_empty());
+        assert!(
+            output
+                .dependencies
+                .predicates
+                .values()
+                .all(|version| *version == context.bookmark.index)
+        );
+        let filtered = QueryEngine.execute(
+            "MATCH (n:Streamed) WHERE n.value >= 1 AND n.value < 3 RETURN count(n.value), count(n), sum(n.value)",
+            &mut context,
+        )?;
+        assert!(filtered.dependencies.entities.is_empty());
+        assert_eq!(
+            filtered.result.batches[0]
+                .columns
+                .iter()
+                .map(|column| column.values[0].clone())
+                .collect::<Vec<_>>(),
+            vec![ResultValue::Scalar(ScalarValue::Integer(1)); 3]
+        );
+        let source = "MATCH (n:Streamed) WHERE n.value >= 1 RETURN sum(n.value)";
+        let (mut plan, _) = prepared_plan(source, &context, None)?;
+        for dependency in &plan.dependencies {
+            context.predicate_versions.insert(dependency.clone(), 17);
+        }
+        let fenced = stream_integer_node_aggregates(&plan, &context, &mut None)?
+            .ok_or_else(|| Error::internal("integer scan did not use fence"))?;
+        assert!(
+            fenced
+                .dependencies
+                .predicates
+                .values()
+                .all(|version| *version == 17)
+        );
+        plan.dependencies.clear();
+        assert!(stream_integer_node_aggregates(&plan, &context, &mut None)?.is_none());
+        let output=QueryEngine.execute("MATCH (n:Streamed) WHERE n.value > 100 RETURN count(n), sum(n.value), avg(n.value), min(n.value), max(n.value)",&mut context)?;
+        let actual = output.result.batches[0]
+            .columns
+            .iter()
+            .map(|column| column.values[0].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![
+                ResultValue::Scalar(ScalarValue::Integer(0)),
+                ResultValue::Scalar(ScalarValue::Integer(0)),
+                ResultValue::Scalar(ScalarValue::Null),
+                ResultValue::Scalar(ScalarValue::Null),
+                ResultValue::Scalar(ScalarValue::Null)
+            ]
+        );
+        graph.set_node_property(NodeId(1), property, ScalarValue::Integer(i64::MAX), 2)?;
+        let error = QueryEngine
+            .execute("MATCH (n:Streamed) RETURN sum(n.value)", &mut context)
+            .err()
+            .ok_or_else(|| Error::internal("integer overflow accepted"))?;
+        assert_eq!(error.code, ErrorCode::QueryType);
+        assert!(error.message.contains("overflow"));
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_distinct_integer_count_ignores_nulls_and_keeps_filter_fences() -> Result<()> {
+        let graph = GraphStore::default();
+        let label = graph.catalog().intern_label("DistinctInteger")?;
+        let property = graph.catalog().intern_property("value")?;
+        for (index, value) in [
+            ScalarValue::Integer(1),
+            ScalarValue::Integer(1),
+            ScalarValue::Null,
+            ScalarValue::Integer(3),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            graph.insert_node(crate::graph::NodeInput {
+                id: NodeId(index as u64 + 1),
+                layer: Layer::Observed,
+                revision: 1,
+                labels: vec![label],
+                properties: vec![(property, value)],
+            })?;
+        }
+        let context = context(&graph);
+        for (filter, expected) in [
+            ("", 2),
+            (" WHERE n.value >= 2 AND n.value < 4", 1),
+            (" WHERE n.value > 9", 0),
+        ] {
+            let source = format!(
+                "MATCH (n:DistinctInteger){filter} RETURN count(DISTINCT n.value) AS count"
+            );
+            let (plan, _) = prepared_plan(&source, &context, None)?;
+            let output = stream_integer_node_aggregates(&plan, &context, &mut None)?
+                .ok_or_else(|| Error::internal("distinct scalar did not stream"))?;
+            assert_eq!(
+                output.result.batches[0].columns[0].values,
+                vec![ResultValue::Scalar(ScalarValue::Integer(expected))]
+            );
+            assert!(output.dependencies.entities.is_empty());
+            assert!(!output.dependencies.predicates.is_empty());
+        }
+        graph.set_node_property(NodeId(1), property, ScalarValue::String("mixed".into()), 2)?;
+        let source = "MATCH (n:DistinctInteger) RETURN count(DISTINCT n.value) AS count";
+        let (plan, _) = prepared_plan(source, &context, None)?;
+        assert!(stream_integer_node_aggregates(&plan, &context, &mut None)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_integer_groups_and_top_results_use_current_cells() -> Result<()> {
+        let graph = GraphStore::default();
+        let label = graph.catalog().intern_label("Bounded")?;
+        let property = graph.catalog().intern_property("value")?;
+        for (id, value) in [
+            (1, ScalarValue::Integer(3)),
+            (2, ScalarValue::Integer(1)),
+            (3, ScalarValue::Null),
+            (4, ScalarValue::Integer(3)),
+            (5, ScalarValue::Integer(i64::MIN)),
+            (6, ScalarValue::Integer(i64::MAX)),
+        ] {
+            graph.insert_node(crate::graph::NodeInput {
+                id: NodeId(id),
+                layer: Layer::Observed,
+                revision: 1,
+                labels: vec![label],
+                properties: vec![(property, value)],
+            })?;
+        }
+        let context = context(&graph);
+        let source = "MATCH (n:Bounded) RETURN n.value AS bucket, count(*) AS count";
+        let (plan, _) = prepared_plan(source, &context, None)?;
+        let output = stream_bounded_integer_nodes(&plan, &context, &mut None)?
+            .ok_or_else(|| Error::internal(format!("group shape missed: {plan:?}")))?;
+        assert!(output.dependencies.entities.is_empty());
+        assert!(!output.dependencies.predicates.is_empty());
+        let batch = &output.result.batches[0];
+        let actual = (0..batch.row_count)
+            .map(|row| {
+                let key = match &batch.columns[0].values[row] {
+                    ResultValue::Scalar(ScalarValue::Integer(value)) => Some(*value),
+                    _ => None,
+                };
+                let count = match &batch.columns[1].values[row] {
+                    ResultValue::Scalar(ScalarValue::Integer(value)) => *value,
+                    _ => 0,
+                };
+                (key, count)
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            actual,
+            BTreeMap::from([
+                (None, 1),
+                (Some(i64::MIN), 1),
+                (Some(1), 1),
+                (Some(3), 2),
+                (Some(i64::MAX), 1)
+            ])
+        );
+        for (direction, expected) in [
+            (
+                "ASC",
+                vec![ScalarValue::Integer(i64::MIN), ScalarValue::Integer(1)],
+            ),
+            (
+                "DESC",
+                vec![ScalarValue::Null, ScalarValue::Integer(i64::MAX)],
+            ),
+        ] {
+            let source = format!(
+                "MATCH (n:Bounded) RETURN n.value AS value ORDER BY value {direction} LIMIT 2"
+            );
+            let (plan, _) = prepared_plan(&source, &context, None)?;
+            let output = stream_bounded_integer_nodes(&plan, &context, &mut None)?
+                .ok_or_else(|| Error::internal(format!("top shape missed: {plan:?}")))?;
+            assert_eq!(
+                output.result.batches[0].columns[0].values,
+                expected
+                    .into_iter()
+                    .map(ResultValue::Scalar)
+                    .collect::<Vec<_>>()
+            );
+        }
+        Ok(())
     }
 
     fn key_order(ascending: bool) -> SortItem {
@@ -18910,8 +21516,6 @@ fn vector_search_with_selection(
             source.exact.row_count() > ann.config().candidate_budget.saturating_mul(4)
                 && limit <= ann.config().candidate_budget
                 && allowed_entities.is_none()
-                && current_backend(state, context)
-                    .is_some_and(|backend| backend.kind() != crate::execution::BackendKind::Cpu)
         });
         if let Some(ann) = ann {
             VectorAccessPath::IvfPq {
@@ -19268,6 +21872,84 @@ fn selected_execution_procedure_columns(
     Vec::new()
 }
 
+fn projection_is_only_count_star(projection: &Projection) -> bool {
+    !projection.distinct
+        && !projection.items.is_empty()
+        && projection.items.iter().all(|item| {
+            matches!(&item.expression,
+                Expression::Function { name, arguments, distinct: false, .. }
+                if name.len() == 1 && name[0].eq_ignore_ascii_case("count")
+                    && matches!(arguments.as_slice(), [Expression::Star])
+            )
+        })
+}
+
+/// Runs the same kernels and field conversions as a projected CALL, counting actual emitted
+/// records without allocating unused intermediate binding rows. Invalid arguments, cancellation
+/// and the intermediate row budget remain observable even though the terminal result has one row.
+fn builtin_graph_procedure_count(
+    rows: Vec<Row>,
+    call: &CallClause,
+    projection: &Projection,
+    state: &mut ExecutionState<'_>,
+    context: &ExecutionContext<'_>,
+) -> Result<Vec<Row>> {
+    let name = call.name.join(".").to_ascii_lowercase();
+    let mut count = 0_usize;
+    let mut emitted = 0_usize;
+    let yields_empty_marker = call.yield_mode == CallYieldMode::Explicit
+        && call
+            .yields
+            .iter()
+            .any(|item| item.alias.as_deref() == Some(INTERNAL_WINDOW_EMPTY));
+    if !rows.is_empty() {
+        let (outgoing, incoming, algorithm_nodes, ordinal_by_dense) =
+            state.graph.algorithm_adjacency(state.read_layers)?;
+        for input in rows {
+            check_execution(context)?;
+            let contributes = !yields_empty_marker && !input.contains_key(INTERNAL_WINDOW_EMPTY);
+            execute_graph_procedure(
+                name.as_str(),
+                call,
+                &input,
+                state,
+                context,
+                &outgoing,
+                &incoming,
+                &algorithm_nodes,
+                &ordinal_by_dense,
+                |_| {
+                    if emitted >= context.max_result_rows {
+                        return Err(Error::new(
+                            ErrorCode::ResultBudgetExceeded,
+                            "graph procedure result exceeds the query row budget",
+                        ));
+                    }
+                    emitted += 1;
+                    if contributes {
+                        count += 1;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+    }
+    check_execution(context)?;
+    let value = integer_binding(count)?;
+    let mut output = Row::new();
+    let mut columns = Vec::new();
+    for (index, item) in projection.items.iter().enumerate() {
+        let column = item.column_name(index);
+        output.insert(column.clone(), value.clone());
+        if !columns.contains(&column) {
+            columns.push(column);
+        }
+    }
+    state.scope_columns = columns.iter().cloned().collect();
+    state.final_columns = columns;
+    Ok(vec![output])
+}
+
 #[allow(clippy::too_many_lines)]
 fn builtin_graph_procedure(
     rows: Vec<Row>,
@@ -19295,7 +21977,6 @@ fn builtin_graph_procedure(
         && active_backend
             .is_some_and(|backend| backend.kind() != crate::execution::BackendKind::Cpu);
     if accelerator_active {
-        refresh_resident_overlay(state, context)?;
         let backend = current_backend(state, context).ok_or_else(|| {
             Error::new(
                 ErrorCode::GpuAdmissionFailure,
@@ -19328,20 +22009,19 @@ fn builtin_graph_procedure(
     if rows.is_empty() {
         return Ok(Vec::new());
     }
-    let estimated_scratch = algorithm_scratch_bytes(
-        algorithm_nodes.len(),
-        outgoing.neighbors().len(),
-        name.as_str(),
-    );
-    if !adaptive_cpu
-        && let Some(backend) = current_backend(state, context)
-        && estimated_scratch > backend.available_query_scratch_bytes()
-    {
-        return Err(Error::retryable(
-            ErrorCode::GpuAdmissionFailure,
-            "graph procedure scratch exceeds available execution memory",
-            Some(10),
-        ));
+    if !adaptive_cpu && let Some(backend) = current_backend(state, context) {
+        let estimated_scratch = algorithm_scratch_bytes(
+            algorithm_nodes.len(),
+            crate::graph::AdjacencyRead::edge_count(&outgoing),
+            name.as_str(),
+        );
+        if estimated_scratch > backend.available_query_scratch_bytes() {
+            return Err(Error::retryable(
+                ErrorCode::GpuAdmissionFailure,
+                "graph procedure scratch exceeds available execution memory",
+                Some(10),
+            ));
+        }
     }
 
     let mut result = Vec::new();
@@ -19349,7 +22029,7 @@ fn builtin_graph_procedure(
         if input_index & 255 == 0 {
             check_execution(context)?;
         }
-        let fields = execute_graph_procedure(
+        execute_graph_procedure(
             name.as_str(),
             call,
             &input,
@@ -19359,24 +22039,25 @@ fn builtin_graph_procedure(
             &incoming,
             &algorithm_nodes,
             &ordinal_by_dense,
+            |fields| {
+                if result.len() >= context.max_result_rows {
+                    return Err(Error::new(
+                        ErrorCode::ResultBudgetExceeded,
+                        "graph procedure result exceeds the query row budget",
+                    ));
+                }
+                let mut output = input.clone();
+                for (source, alias) in &selected_columns {
+                    let value = fields
+                        .iter()
+                        .find_map(|(name, value)| (*name == source.as_str()).then(|| value.clone()))
+                        .ok_or_else(|| Error::internal("procedure output column is absent"))?;
+                    output.insert(alias.clone(), value);
+                }
+                result.push(output);
+                Ok(())
+            },
         )?;
-        if fields.len() > context.max_result_rows.saturating_sub(result.len()) {
-            return Err(Error::new(
-                ErrorCode::ResultBudgetExceeded,
-                "graph procedure result exceeds the query row budget",
-            ));
-        }
-        for fields in fields {
-            let mut output = input.clone();
-            for (source, alias) in &selected_columns {
-                let value = fields
-                    .iter()
-                    .find_map(|(name, value)| (*name == source.as_str()).then(|| value.clone()))
-                    .ok_or_else(|| Error::internal("procedure output column is absent"))?;
-                output.insert(alias.clone(), value);
-            }
-            result.push(output);
-        }
     }
     check_execution(context)?;
     Ok(result)
@@ -19765,16 +22446,19 @@ fn execute_graph_procedure(
     input: &Row,
     state: &ExecutionState<'_>,
     context: &ExecutionContext<'_>,
-    outgoing: &crate::graph::Csr,
-    incoming: &crate::graph::Csr,
+    outgoing: &super::view::AlgorithmAdjacency<'_, '_>,
+    incoming: &super::view::AlgorithmAdjacency<'_, '_>,
     algorithm_nodes: &[u32],
     ordinal_by_dense: &[u32],
-) -> Result<Vec<ProcedureFields>> {
+    mut emit: impl FnMut(&[(&'static str, BindingValue)]) -> Result<()>,
+) -> Result<()> {
+    let mut emit = |fields: &[(&'static str, BindingValue)]| {
+        check_execution(context)?;
+        emit(fields)
+    };
     match name {
-        "graph.degree" => algorithm_nodes
-            .iter()
-            .enumerate()
-            .map(|(ordinal, dense)| {
+        "graph.degree" => {
+            for (ordinal, dense) in algorithm_nodes.iter().enumerate() {
                 let ordinal = u32::try_from(ordinal).map_err(|_| {
                     Error::new(
                         ErrorCode::ResultBudgetExceeded,
@@ -19783,7 +22467,7 @@ fn execute_graph_procedure(
                 })?;
                 let out_degree = adjacency_degree(outgoing, ordinal)?;
                 let in_degree = adjacency_degree(incoming, ordinal)?;
-                Ok(vec![
+                emit(&[
                     ("node", BindingValue::Node(*dense)),
                     ("outDegree", integer_binding(out_degree)?),
                     ("inDegree", integer_binding(in_degree)?),
@@ -19791,9 +22475,10 @@ fn execute_graph_procedure(
                         "degree",
                         integer_binding(out_degree.saturating_add(in_degree))?,
                     ),
-                ])
-            })
-            .collect(),
+                ])?;
+            }
+            Ok(())
+        }
         "graph.bfs" => {
             let source = procedure_node_argument(
                 &call.arguments[0],
@@ -19803,19 +22488,17 @@ fn execute_graph_procedure(
                 ordinal_by_dense,
             )?;
             let distances = bfs_cancellable(outgoing, source, || check_execution(context))?;
-            Ok(distances
-                .into_iter()
-                .enumerate()
-                .filter_map(|(ordinal, distance)| {
-                    Some(vec![
-                        ("node", BindingValue::Node(*algorithm_nodes.get(ordinal)?)),
-                        (
-                            "distance",
-                            integer_binding(usize::try_from(distance?).ok()?).ok()?,
-                        ),
-                    ])
-                })
-                .collect())
+            for (ordinal, distance) in distances.into_iter().enumerate() {
+                let Some(distance) = distance else { continue };
+                let dense = *algorithm_nodes
+                    .get(ordinal)
+                    .ok_or_else(|| Error::internal("BFS returned an invalid node ordinal"))?;
+                emit(&[
+                    ("node", BindingValue::Node(dense)),
+                    ("distance", integer_binding(distance as usize)?),
+                ])?;
+            }
+            Ok(())
         }
         "graph.dfs" => {
             let source = procedure_node_argument(
@@ -19826,19 +22509,16 @@ fn execute_graph_procedure(
                 ordinal_by_dense,
             )?;
             let order = dfs_cancellable(outgoing, source, || check_execution(context))?;
-            order
-                .into_iter()
-                .enumerate()
-                .map(|(position, ordinal)| {
-                    let dense = *algorithm_nodes
-                        .get(ordinal as usize)
-                        .ok_or_else(|| Error::internal("DFS returned an invalid node ordinal"))?;
-                    Ok(vec![
-                        ("node", BindingValue::Node(dense)),
-                        ("order", integer_binding(position)?),
-                    ])
-                })
-                .collect()
+            for (position, ordinal) in order.into_iter().enumerate() {
+                let dense = *algorithm_nodes
+                    .get(ordinal as usize)
+                    .ok_or_else(|| Error::internal("DFS returned an invalid node ordinal"))?;
+                emit(&[
+                    ("node", BindingValue::Node(dense)),
+                    ("order", integer_binding(position)?),
+                ])?;
+            }
+            Ok(())
         }
         "graph.shortestpath" => {
             let source = procedure_node_argument(
@@ -19858,16 +22538,22 @@ fn execute_graph_procedure(
             let Some(path) =
                 shortest_path_cancellable(outgoing, source, target, || check_execution(context))?
             else {
-                return Ok(Vec::new());
+                return Ok(());
             };
+            let mut neighbors = Vec::new();
             let relationships = path
                 .windows(2)
-                .map(|pair| {
-                    outgoing
-                        .row(pair[0])
-                        .and_then(|mut edges| {
-                            edges.find_map(|(target, edge)| (target == pair[1]).then_some(edge))
-                        })
+                .enumerate()
+                .map(|(index, pair)| {
+                    if index & 1023 == 0 {
+                        check_execution(context)?;
+                    }
+                    neighbors.clear();
+                    outgoing.append_row(pair[0], &mut neighbors);
+                    neighbors
+                        .iter()
+                        .filter_map(|&(target, edge)| (target == pair[1]).then_some(edge))
+                        .min()
                         .ok_or_else(|| Error::internal("shortest path edge is absent"))
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -19880,7 +22566,7 @@ fn execute_graph_procedure(
                         .ok_or_else(|| Error::internal("shortest path node is absent"))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(vec![vec![
+            emit(&[
                 (
                     "path",
                     BindingValue::Path {
@@ -19889,7 +22575,7 @@ fn execute_graph_procedure(
                     },
                 ),
                 ("cost", integer_binding(path.len().saturating_sub(1))?),
-            ]])
+            ])
         }
         "graph.dijkstra" => {
             let source = procedure_node_argument(
@@ -19906,29 +22592,26 @@ fn execute_graph_procedure(
                 |edge| edge_weight(state, edge, weight_property),
                 || check_execution(context),
             )?;
-            result
+            for (ordinal, (cost, predecessor)) in result
                 .distance
                 .into_iter()
                 .zip(result.predecessor)
                 .enumerate()
-                .filter_map(|(ordinal, (cost, predecessor))| {
-                    let cost = cost?;
-                    Some((ordinal, cost, predecessor))
-                })
-                .map(|(ordinal, cost, predecessor)| {
-                    let dense = *algorithm_nodes.get(ordinal).ok_or_else(|| {
-                        Error::internal("Dijkstra returned an invalid node ordinal")
-                    })?;
-                    let predecessor = predecessor
-                        .and_then(|ordinal| algorithm_nodes.get(ordinal as usize).copied())
-                        .map_or(BindingValue::Null, BindingValue::Node);
-                    Ok(vec![
-                        ("node", BindingValue::Node(dense)),
-                        ("cost", float_binding(cost)),
-                        ("predecessor", predecessor),
-                    ])
-                })
-                .collect()
+            {
+                let Some(cost) = cost else { continue };
+                let dense = *algorithm_nodes
+                    .get(ordinal)
+                    .ok_or_else(|| Error::internal("Dijkstra returned an invalid node ordinal"))?;
+                let predecessor = predecessor
+                    .and_then(|ordinal| algorithm_nodes.get(ordinal as usize).copied())
+                    .map_or(BindingValue::Null, BindingValue::Node);
+                emit(&[
+                    ("node", BindingValue::Node(dense)),
+                    ("cost", float_binding(cost)),
+                    ("predecessor", predecessor),
+                ])?;
+            }
+            Ok(())
         }
         "graph.wcc" | "graph.scc" | "graph.louvain" => {
             let components = match name {
@@ -19949,72 +22632,135 @@ fn execute_graph_procedure(
             } else {
                 "component"
             };
-            components
-                .component
-                .into_iter()
-                .enumerate()
-                .map(|(ordinal, component)| {
-                    let dense = *algorithm_nodes.get(ordinal).ok_or_else(|| {
-                        Error::internal("component algorithm returned an invalid node ordinal")
-                    })?;
-                    Ok(vec![
-                        ("node", BindingValue::Node(dense)),
-                        (output_name, integer_binding(component as usize)?),
-                    ])
-                })
-                .collect()
+            for (ordinal, component) in components.component.into_iter().enumerate() {
+                let dense = *algorithm_nodes.get(ordinal).ok_or_else(|| {
+                    Error::internal("component algorithm returned an invalid node ordinal")
+                })?;
+                emit(&[
+                    ("node", BindingValue::Node(dense)),
+                    (output_name, integer_binding(component as usize)?),
+                ])?;
+            }
+            Ok(())
         }
         "graph.pagerank" => {
             let config = page_rank_config(call, input, state, context)?;
             let ranks = page_rank_cancellable(outgoing, config, || check_execution(context))?;
-            ranks
-                .into_iter()
-                .enumerate()
-                .map(|(ordinal, rank)| {
-                    let dense = *algorithm_nodes.get(ordinal).ok_or_else(|| {
-                        Error::internal("PageRank returned an invalid node ordinal")
-                    })?;
-                    Ok(vec![
-                        ("node", BindingValue::Node(dense)),
-                        ("score", float_binding(rank)),
-                    ])
-                })
-                .collect()
+            for (ordinal, rank) in ranks.into_iter().enumerate() {
+                let dense = *algorithm_nodes
+                    .get(ordinal)
+                    .ok_or_else(|| Error::internal("PageRank returned an invalid node ordinal"))?;
+                emit(&[
+                    ("node", BindingValue::Node(dense)),
+                    ("score", float_binding(rank)),
+                ])?;
+            }
+            Ok(())
         }
-        "graph.trianglecount" => Ok(vec![vec![(
-            "triangleCount",
-            integer_binding_u64(triangle_count_cancellable(outgoing, incoming, || {
-                check_execution(context)
-            })?)?,
-        )]]),
+        "graph.trianglecount" => {
+            let count = outgoing.node_count();
+            let permit = (count >= 32768)
+                .then(integer_scan_pool)
+                .flatten()
+                .and_then(IntegerScanPool::try_claim);
+            let triangles = if let Some(permit) = permit {
+                #[cfg(test)]
+                PARALLEL_TRIANGLE_REDUCTIONS.with(|count| count.set(count.get() + 1));
+                let tasks = permit
+                    .0
+                    .workers
+                    .current_num_threads()
+                    .saturating_mul(4)
+                    .min(count.div_ceil(4096));
+                let width = count.div_ceil(tasks);
+                let parts = permit.0.workers.install(|| {
+                    (0..tasks)
+                        .into_par_iter()
+                        .with_max_len(1)
+                        .map(|task| {
+                            triangle_count_range_cancellable(
+                                outgoing,
+                                incoming,
+                                task * width..((task + 1) * width).min(count),
+                                || check_execution(context),
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })?;
+                parts.into_iter().try_fold(0_u64, |total, part| {
+                    total.checked_add(part).ok_or_else(|| {
+                        Error::new(ErrorCode::ResultBudgetExceeded, "triangle count overflow")
+                    })
+                })?
+            } else {
+                triangle_count_cancellable(outgoing, incoming, || check_execution(context))?
+            };
+            emit(&[("triangleCount", integer_binding_u64(triangles)?)])
+        }
         "graph.clusteringcoefficient" => {
-            clustering_coefficients_cancellable(outgoing, incoming, || check_execution(context))?
-                .into_iter()
-                .enumerate()
-                .map(|(ordinal, coefficient)| {
-                    let dense = *algorithm_nodes.get(ordinal).ok_or_else(|| {
-                        Error::internal("clustering coefficient returned an invalid node ordinal")
-                    })?;
-                    Ok(vec![
-                        ("node", BindingValue::Node(dense)),
-                        ("coefficient", float_binding(coefficient)),
-                    ])
-                })
-                .collect()
+            let count = outgoing.node_count();
+            let permit = (count >= 32768)
+                .then(integer_scan_pool)
+                .flatten()
+                .and_then(IntegerScanPool::try_claim);
+            let coefficients = if let Some(permit) = permit {
+                #[cfg(test)]
+                PARALLEL_CLUSTERING_REDUCTIONS.with(|count| count.set(count.get() + 1));
+                let tasks = permit
+                    .0
+                    .workers
+                    .current_num_threads()
+                    .saturating_mul(4)
+                    .min(count.div_ceil(4096));
+                let width = count.div_ceil(tasks);
+                let mut coefficients = vec![0.0; count];
+                permit.0.workers.install(|| {
+                    coefficients
+                        .par_chunks_mut(width)
+                        .enumerate()
+                        .try_for_each(|(task, output)| {
+                            clustering_coefficients_into_cancellable(
+                                outgoing,
+                                incoming,
+                                task * width,
+                                output,
+                                || check_execution(context),
+                            )
+                        })
+                })?;
+                coefficients
+            } else {
+                clustering_coefficients_cancellable(outgoing, incoming, || {
+                    check_execution(context)
+                })?
+            };
+            for (ordinal, coefficient) in coefficients.into_iter().enumerate() {
+                let dense = *algorithm_nodes.get(ordinal).ok_or_else(|| {
+                    Error::internal("clustering coefficient returned an invalid node ordinal")
+                })?;
+                emit(&[
+                    ("node", BindingValue::Node(dense)),
+                    ("coefficient", float_binding(coefficient)),
+                ])?;
+            }
+            Ok(())
         }
-        "graph.kcore" => k_core_cancellable(outgoing, incoming, || check_execution(context))?
-            .into_iter()
-            .enumerate()
-            .map(|(ordinal, core)| {
+        "graph.kcore" => {
+            for (ordinal, core) in
+                k_core_cancellable(outgoing, incoming, || check_execution(context))?
+                    .into_iter()
+                    .enumerate()
+            {
                 let dense = *algorithm_nodes
                     .get(ordinal)
                     .ok_or_else(|| Error::internal("k-core returned an invalid node ordinal"))?;
-                Ok(vec![
+                emit(&[
                     ("node", BindingValue::Node(dense)),
                     ("core", integer_binding(core as usize)?),
-                ])
-            })
-            .collect(),
+                ])?;
+            }
+            Ok(())
+        }
         _ => Err(Error::internal(
             "validated graph procedure is not executable",
         )),
@@ -20155,18 +22901,13 @@ fn edge_weight(state: &ExecutionState<'_>, edge: u32, property: Option<PropertyI
     }
 }
 
-fn adjacency_degree(adjacency: &crate::graph::Csr, node: u32) -> Result<usize> {
-    let start = *adjacency
-        .offsets()
-        .get(node as usize)
-        .ok_or_else(|| Error::internal("algorithm adjacency row is absent"))?
-        as usize;
-    let end = *adjacency
-        .offsets()
-        .get(node as usize + 1)
-        .ok_or_else(|| Error::internal("algorithm adjacency row end is absent"))?
-        as usize;
-    Ok(end.saturating_sub(start))
+fn adjacency_degree(
+    adjacency: &super::view::AlgorithmAdjacency<'_, '_>,
+    node: u32,
+) -> Result<usize> {
+    adjacency
+        .checked_degree(node)
+        .ok_or_else(|| Error::internal("algorithm adjacency row is absent"))
 }
 
 fn algorithm_scratch_bytes(nodes: usize, edges: usize, name: &str) -> usize {
@@ -20471,7 +23212,7 @@ fn evaluate_binding_with_temporal(
             visible_index,
         ),
         _ => evaluate_with_temporal(expression, row, graph, context, temporal, visible_index)
-            .map(untrusted_result_binding),
+            .and_then(|value| checked_result_binding(value, context)),
     }
 }
 
@@ -20869,7 +23610,7 @@ fn evaluate_entity_metadata_function(
             ResultValue::List(
                 node.labels()
                     .iter()
-                    .filter_map(|label| graph.label_name(*label).map(ToOwned::to_owned))
+                    .filter_map(|label| graph.label_name(*label).map(|name| name.to_string()))
                     .map(string_value)
                     .collect(),
             )
@@ -20894,8 +23635,7 @@ fn evaluate_entity_metadata_function(
             string_value(
                 graph
                     .relationship_type_name(relationship_type)
-                    .unwrap_or("")
-                    .to_owned(),
+                    .map_or_else(String::new, |name| name.to_string()),
             )
         }
         ("type", BindingValue::Value(ResultValue::Relationship(relationship))) => {
@@ -22007,7 +24747,7 @@ fn evaluate_function(
                 )),
             }
         }
-        "range" => cypher_range(&values, context.max_result_rows),
+        "range" => cypher_range(&values, context.max_result_rows, context),
         "isempty" => {
             require_arity(name, &values, 1)?;
             Ok(boolean(match &values[0] {
@@ -23057,7 +25797,7 @@ impl IntervalZone {
         if timezone.eq_ignore_ascii_case("UTC") || timezone.eq_ignore_ascii_case("Z") {
             return Ok(Self::Fixed(0));
         }
-        if let Ok(offset) = timezone.parse::<chrono::FixedOffset>() {
+        if let Ok(offset) = parse_fixed_timezone(timezone) {
             return Ok(Self::Fixed(offset.local_minus_utc()));
         }
         let zone = timezone.parse::<chrono_tz::Tz>().map_err(|_| {
@@ -24200,6 +26940,38 @@ const fn is_null_value(value: &ResultValue) -> bool {
 /// Container shape is retained so later list/map operations can preserve any statement-owned
 /// bindings alongside these leaves, but public node, relationship, and path values stay ordinary
 /// values even when their IDs happen to exist in the current graph.
+fn checked_result_binding(
+    value: ResultValue,
+    context: &ExecutionContext<'_>,
+) -> Result<BindingValue> {
+    fn convert(
+        value: ResultValue,
+        context: &ExecutionContext<'_>,
+        visited: &mut usize,
+    ) -> Result<BindingValue> {
+        if *visited & 4095 == 0 {
+            check_execution(context)?;
+        }
+        *visited = visited.saturating_add(1);
+        match value {
+            ResultValue::List(values) => Ok(BindingValue::List(
+                values
+                    .into_iter()
+                    .map(|value| convert(value, context, visited))
+                    .collect::<Result<_>>()?,
+            )),
+            ResultValue::Map(values) => Ok(BindingValue::Map(
+                values
+                    .into_iter()
+                    .map(|(name, value)| Ok((name, convert(value, context, visited)?)))
+                    .collect::<Result<_>>()?,
+            )),
+            value => Ok(BindingValue::Value(value)),
+        }
+    }
+    convert(value, context, &mut 0)
+}
+
 fn untrusted_result_binding(value: ResultValue) -> BindingValue {
     match value {
         ResultValue::List(values) => {
@@ -24274,7 +27046,7 @@ fn materialize_node(graph: &GraphReadView<'_>, dense: u32) -> Result<ResultNode>
     let labels = node
         .labels()
         .iter()
-        .filter_map(|label| graph.label_name(*label).map(ToOwned::to_owned))
+        .filter_map(|label| graph.label_name(*label).map(|name| name.to_string()))
         .collect();
     let properties = node
         .properties()
@@ -24282,7 +27054,7 @@ fn materialize_node(graph: &GraphReadView<'_>, dense: u32) -> Result<ResultNode>
         .filter_map(|(property, value)| {
             graph
                 .property_name(property)
-                .map(|name| (name.to_owned(), value))
+                .map(|name| (name.to_string(), value))
         })
         .collect();
     Ok(ResultNode {
@@ -24304,15 +27076,14 @@ fn materialize_edge(graph: &GraphReadView<'_>, dense: u32) -> Result<ResultEdge>
     })?;
     let relationship_type = graph
         .relationship_type_name(edge.relationship_type())
-        .unwrap_or("")
-        .to_owned();
+        .map_or_else(String::new, |name| name.to_string());
     let properties = edge
         .properties()
         .into_iter()
         .filter_map(|(property, value)| {
             graph
                 .property_name(property)
-                .map(|name| (name.to_owned(), value))
+                .map(|name| (name.to_string(), value))
         })
         .collect();
     Ok(ResultEdge {
@@ -24532,10 +27303,8 @@ fn intern_relationship_type(
 
 fn allocate_node_id(state: &mut ExecutionState<'_>) -> Result<NodeId> {
     loop {
-        let id = NodeId(state.next_node_id);
-        state.next_node_id = state.next_node_id.checked_add(1).ok_or_else(|| {
-            Error::new(ErrorCode::ResultBudgetExceeded, "node ID space exhausted")
-        })?;
+        let id = state.graph.reserve_node_id(state.next_node_id)?;
+        state.next_node_id = id.0 + 1;
         if !state.graph.contains_node_id(id) {
             return Ok(id);
         }
@@ -24544,13 +27313,8 @@ fn allocate_node_id(state: &mut ExecutionState<'_>) -> Result<NodeId> {
 
 fn allocate_edge_id(state: &mut ExecutionState<'_>) -> Result<EdgeId> {
     loop {
-        let id = EdgeId(state.next_edge_id);
-        state.next_edge_id = state.next_edge_id.checked_add(1).ok_or_else(|| {
-            Error::new(
-                ErrorCode::ResultBudgetExceeded,
-                "relationship ID space exhausted",
-            )
-        })?;
+        let id = state.graph.reserve_edge_id(state.next_edge_id)?;
+        state.next_edge_id = id.0 + 1;
         if !state.graph.contains_edge_id(id) {
             return Ok(id);
         }
@@ -24572,21 +27336,21 @@ fn evaluate_properties(
 }
 
 fn validate_node_properties(
-    graph: &GraphStore,
+    _graph: &GraphStore,
     properties: &[(PropertyId, ScalarValue)],
 ) -> Result<()> {
-    for (property, value) in properties {
-        graph.validate_node_property_value(*property, value)?;
+    for (_, value) in properties {
+        crate::graph::validate_property_value_shape(value)?;
     }
     Ok(())
 }
 
 fn validate_edge_properties(
-    graph: &GraphStore,
+    _graph: &GraphStore,
     properties: &[(PropertyId, ScalarValue)],
 ) -> Result<()> {
-    for (property, value) in properties {
-        graph.validate_edge_property_value(*property, value)?;
+    for (_, value) in properties {
+        crate::graph::validate_property_value_shape(value)?;
     }
     Ok(())
 }
@@ -24888,13 +27652,21 @@ fn format_zoned_datetime(seconds: i64, nanos: u32, timezone: &str) -> Result<Str
         return Ok(value.to_rfc3339());
     }
     if let Ok(zone) = timezone.parse::<chrono_tz::Tz>() {
+        let local = value.with_timezone(&zone);
         return Ok(format!(
-            "{}[{timezone}]",
-            value.with_timezone(&zone).to_rfc3339()
+            "{}{}[{timezone}]",
+            local.naive_local().format("%Y-%m-%dT%H:%M:%S%.f"),
+            local.offset().fix(),
         ));
     }
-    if let Ok(offset) = timezone.parse::<chrono::FixedOffset>() {
-        return Ok(offset.from_utc_datetime(&value.naive_utc()).to_rfc3339());
+    if let Ok(offset) = parse_fixed_timezone(timezone) {
+        return Ok(format!(
+            "{}{offset}",
+            value
+                .with_timezone(&offset)
+                .naive_local()
+                .format("%Y-%m-%dT%H:%M:%S%.f")
+        ));
     }
     Err(Error::new(
         ErrorCode::TemporalRange,
@@ -25097,14 +27869,19 @@ fn vector_normalize(value: &ResultValue) -> Result<ResultValue> {
     ))
 }
 
-fn cypher_range(values: &[ResultValue], maximum_rows: usize) -> Result<ResultValue> {
-    cypher_range_with_demand(values, maximum_rows, None)
+fn cypher_range(
+    values: &[ResultValue],
+    maximum_rows: usize,
+    context: &ExecutionContext<'_>,
+) -> Result<ResultValue> {
+    cypher_range_with_demand(values, maximum_rows, None, context)
 }
 
 fn cypher_range_with_demand(
     values: &[ResultValue],
     maximum_rows: usize,
     demand: Option<usize>,
+    context: &ExecutionContext<'_>,
 ) -> Result<ResultValue> {
     if !(2..=3).contains(&values.len()) {
         return Err(function_arity("range", "two or three", values.len()));
@@ -25121,6 +27898,9 @@ fn cypher_range_with_demand(
     let mut output = Vec::new();
     let mut value = start;
     loop {
+        if output.len() & 4095 == 0 {
+            check_execution(context)?;
+        }
         if demand.is_some_and(|demand| output.len() >= demand) {
             break;
         }
@@ -25873,15 +28653,50 @@ fn parse_fixed_timezone_seconds(timezone: &str) -> Result<i32> {
     if timezone.eq_ignore_ascii_case("UTC") || timezone.eq_ignore_ascii_case("Z") {
         return Ok(0);
     }
-    timezone
-        .parse::<chrono::FixedOffset>()
-        .map(|offset| offset.local_minus_utc())
-        .map_err(|_| {
-            Error::new(
-                ErrorCode::QueryType,
-                "InvalidArgumentValue: time timezone must be a fixed UTC offset",
-            )
+    let invalid = || {
+        Error::new(
+            ErrorCode::QueryType,
+            "InvalidArgumentValue: time timezone must be a fixed UTC offset",
+        )
+    };
+    let (sign, digits) = match timezone.as_bytes().split_first() {
+        Some((b'+', digits)) => (1_i32, digits),
+        Some((b'-', digits)) => (-1_i32, digits),
+        _ => return Err(invalid()),
+    };
+    let decimal = |digits: &[u8]| -> Option<i32> {
+        digits.iter().try_fold(0_i32, |value, digit| {
+            digit.is_ascii_digit().then_some(())?;
+            value.checked_mul(10)?.checked_add(i32::from(*digit - b'0'))
         })
+    };
+    let components = (|| match digits {
+        [_, _] => Some((decimal(digits)?, 0, 0)),
+        [_, _, _, _] => Some((decimal(&digits[..2])?, decimal(&digits[2..])?, 0)),
+        [_, _, b':', _, _] => Some((decimal(&digits[..2])?, decimal(&digits[3..])?, 0)),
+        [_, _, _, _, _, _] => Some((
+            decimal(&digits[..2])?,
+            decimal(&digits[2..4])?,
+            decimal(&digits[4..])?,
+        )),
+        [_, _, b':', _, _, b':', _, _] => Some((
+            decimal(&digits[..2])?,
+            decimal(&digits[3..5])?,
+            decimal(&digits[6..])?,
+        )),
+        _ => None,
+    })();
+    let (hours, minutes, seconds) = components.ok_or_else(invalid)?;
+    if hours > 18 || minutes > 59 || seconds > 59 || (hours == 18 && (minutes != 0 || seconds != 0))
+    {
+        return Err(invalid());
+    }
+    Ok(sign * (hours * 3_600 + minutes * 60 + seconds))
+}
+
+fn parse_fixed_timezone(timezone: &str) -> Result<chrono::FixedOffset> {
+    chrono::FixedOffset::east_opt(parse_fixed_timezone_seconds(timezone)?)
+        .ok_or_else(|| Error::new(ErrorCode::TemporalRange, "timezone offset is invalid"))
 }
 
 fn zoned_datetime_local(seconds: i64, nanos: u32, timezone: &str) -> Result<chrono::NaiveDateTime> {
@@ -25895,7 +28710,7 @@ fn zoned_datetime_local(seconds: i64, nanos: u32, timezone: &str) -> Result<chro
     if timezone.eq_ignore_ascii_case("UTC") || timezone.eq_ignore_ascii_case("Z") {
         return Ok(instant.naive_utc());
     }
-    if let Ok(offset) = timezone.parse::<chrono::FixedOffset>() {
+    if let Ok(offset) = parse_fixed_timezone(timezone) {
         return Ok(instant.with_timezone(&offset).naive_local());
     }
     let zone = timezone.parse::<chrono_tz::Tz>().map_err(|_| {
@@ -25911,7 +28726,7 @@ fn timezone_offset_at(seconds: i64, nanos: u32, timezone: &str) -> Result<i32> {
     if timezone.eq_ignore_ascii_case("UTC") || timezone.eq_ignore_ascii_case("Z") {
         return Ok(0);
     }
-    if let Ok(offset) = timezone.parse::<chrono::FixedOffset>() {
+    if let Ok(offset) = parse_fixed_timezone(timezone) {
         return Ok(offset.local_minus_utc());
     }
     let instant =
@@ -25943,7 +28758,7 @@ fn zoned_datetime_scalar(local: chrono::NaiveDateTime, timezone: &str) -> Result
                 value.timestamp_subsec_nanos(),
                 Arc::from("UTC"),
             )
-        } else if let Ok(offset) = timezone.parse::<chrono::FixedOffset>() {
+        } else if let Ok(offset) = parse_fixed_timezone(timezone) {
             let value = offset.from_local_datetime(&local).single().ok_or_else(|| {
                 Error::new(
                     ErrorCode::QueryType,
@@ -26000,7 +28815,7 @@ fn zoned_datetime_at_instant(seconds: i64, nanos: u32, timezone: &str) -> Result
     let timezone: Arc<str> =
         if timezone.eq_ignore_ascii_case("UTC") || timezone.eq_ignore_ascii_case("Z") {
             Arc::from("UTC")
-        } else if let Ok(offset) = timezone.parse::<chrono::FixedOffset>() {
+        } else if let Ok(offset) = parse_fixed_timezone(timezone) {
             Arc::from(offset.to_string())
         } else {
             let zone = timezone.parse::<chrono_tz::Tz>().map_err(|_| {
@@ -26617,6 +29432,10 @@ fn temporal_constructor_clock(
 }
 
 fn parse_iso_civil_date(text: &str) -> Result<CivilDate> {
+    // Keep the wide signed calendar-year path; the other ISO forms use four-digit years.
+    if let Some(date) = parse_iso_short_date(text) {
+        return CivilDate::new(i64::from(date.year()), date.month(), date.day());
+    }
     let (year_month, day) = text.rsplit_once('-').ok_or_else(|| {
         Error::new(
             ErrorCode::QueryType,
@@ -26656,6 +29475,70 @@ fn parse_iso_civil_date(text: &str) -> Result<CivilDate> {
     CivilDate::new(year, month, day)
 }
 
+fn parse_iso_short_date(text: &str) -> Option<chrono::NaiveDate> {
+    let bytes = text.as_bytes();
+    let decimal = |start: usize, width: usize| -> Option<i32> {
+        bytes
+            .get(start..start.checked_add(width)?)?
+            .iter()
+            .try_fold(0_i32, |value, digit| {
+                digit.is_ascii_digit().then_some(())?;
+                value.checked_mul(10)?.checked_add(i32::from(*digit - b'0'))
+            })
+    };
+    let weekday = |day: i32| match day {
+        1 => Some(chrono::Weekday::Mon),
+        2 => Some(chrono::Weekday::Tue),
+        3 => Some(chrono::Weekday::Wed),
+        4 => Some(chrono::Weekday::Thu),
+        5 => Some(chrono::Weekday::Fri),
+        6 => Some(chrono::Weekday::Sat),
+        7 => Some(chrono::Weekday::Sun),
+        _ => None,
+    };
+    match bytes {
+        [_, _, _, _, b'W', _, _, _] => chrono::NaiveDate::from_isoywd_opt(
+            decimal(0, 4)?,
+            u32::try_from(decimal(5, 2)?).ok()?,
+            weekday(decimal(7, 1)?)?,
+        ),
+        [_, _, _, _, b'-', b'W', _, _, b'-', _] => chrono::NaiveDate::from_isoywd_opt(
+            decimal(0, 4)?,
+            u32::try_from(decimal(6, 2)?).ok()?,
+            weekday(decimal(9, 1)?)?,
+        ),
+        [_, _, _, _, b'-', b'W', _, _] => chrono::NaiveDate::from_isoywd_opt(
+            decimal(0, 4)?,
+            u32::try_from(decimal(6, 2)?).ok()?,
+            chrono::Weekday::Mon,
+        ),
+        [_, _, _, _, b'W', _, _] => chrono::NaiveDate::from_isoywd_opt(
+            decimal(0, 4)?,
+            u32::try_from(decimal(5, 2)?).ok()?,
+            chrono::Weekday::Mon,
+        ),
+        [_, _, _, _, b'-', _, _, _] => {
+            chrono::NaiveDate::from_yo_opt(decimal(0, 4)?, u32::try_from(decimal(5, 3)?).ok()?)
+        }
+        [_, _, _, _, _, _, _, _] => chrono::NaiveDate::from_ymd_opt(
+            decimal(0, 4)?,
+            u32::try_from(decimal(4, 2)?).ok()?,
+            u32::try_from(decimal(6, 2)?).ok()?,
+        ),
+        [_, _, _, _, b'-', _, _] => {
+            chrono::NaiveDate::from_ymd_opt(decimal(0, 4)?, u32::try_from(decimal(5, 2)?).ok()?, 1)
+        }
+        [_, _, _, _, _, _, _] => {
+            chrono::NaiveDate::from_yo_opt(decimal(0, 4)?, u32::try_from(decimal(4, 3)?).ok()?)
+        }
+        [_, _, _, _, _, _] => {
+            chrono::NaiveDate::from_ymd_opt(decimal(0, 4)?, u32::try_from(decimal(4, 2)?).ok()?, 1)
+        }
+        [_, _, _, _] => chrono::NaiveDate::from_ymd_opt(decimal(0, 4)?, 1, 1),
+        _ => None,
+    }
+}
+
 fn parse_iso_local_datetime(text: &str) -> Result<(i64, u32)> {
     let (date, time) = text
         .split_once('T')
@@ -26675,22 +29558,6 @@ fn parse_iso_local_datetime(text: &str) -> Result<(i64, u32)> {
 }
 
 fn parse_compact_or_colon_offset(text: &str) -> Result<i32> {
-    let normalized;
-    let text = if text.len() == 5 {
-        let bytes = text.as_bytes();
-        if matches!(bytes.first(), Some(b'+') | Some(b'-'))
-            && bytes
-                .get(1..)
-                .is_some_and(|digits| digits.iter().all(u8::is_ascii_digit))
-        {
-            normalized = format!("{}:{}", &text[..3], &text[3..]);
-            normalized.as_str()
-        } else {
-            text
-        }
-    } else {
-        text
-    };
     parse_fixed_timezone_seconds(text)
 }
 
@@ -26764,6 +29631,24 @@ fn parse_iso_zoned_datetime(text: &str) -> Result<(i64, u32, Arc<str>)> {
     } else {
         (text, None)
     };
+    if let Some(timezone) = named_zone {
+        let clock = datetime.split_once('T').map(|(_, clock)| clock);
+        if clock.is_some_and(|clock| !clock.contains(['+', '-', 'Z', 'z'])) {
+            let (seconds, nanos) = parse_iso_local_datetime(datetime)?;
+            let local = local_datetime_from_stored(seconds, nanos)?;
+            let ResultValue::Scalar(ScalarValue::ZonedDateTime {
+                seconds,
+                nanos,
+                timezone,
+            }) = zoned_datetime_scalar(local, timezone)?
+            else {
+                return Err(Error::internal(
+                    "named datetime constructor returned another type",
+                ));
+            };
+            return Ok((seconds, nanos, timezone));
+        }
+    }
     let (local, offset_seconds, was_utc_designator) = split_datetime_offset(datetime)?;
     let (local_seconds, nanos) = parse_iso_local_datetime(local)?;
     let seconds = local_seconds
@@ -26937,6 +29822,9 @@ pub fn parse_duration(input: &str) -> Result<ScalarValue> {
             "duration must contain at least one component",
         ));
     }
+    if body.contains(':') {
+        return parse_extended_duration(body, sign);
+    }
     let mut months = 0_i128;
     let mut days = 0_i128;
     let mut clock_nanos = 0_i128;
@@ -27055,6 +29943,55 @@ pub fn parse_duration(input: &str) -> Result<ScalarValue> {
         .checked_add(clock_nanos)
         .ok_or_else(|| Error::new(ErrorCode::TemporalRange, "duration seconds overflow"))?;
     normalized_duration_scalar(whole_months, whole_days, 0, clock_nanos)
+}
+
+fn parse_extended_duration(body: &str, sign: i128) -> Result<ScalarValue> {
+    let invalid = || Error::new(ErrorCode::QueryType, "invalid extended ISO duration");
+    let (date, time) = body.split_once('T').ok_or_else(invalid)?;
+    let mut date_parts = date.split('-');
+    let mut time_parts = time.split(':');
+    let whole = |value: Option<&str>| -> Result<i128> {
+        let value = value.ok_or_else(invalid)?;
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(invalid());
+        }
+        value
+            .parse::<i128>()
+            .map_err(|_| Error::new(ErrorCode::TemporalRange, "duration component overflow"))
+    };
+    let years = whole(date_parts.next())?;
+    let months = whole(date_parts.next())?;
+    let days = whole(date_parts.next())?;
+    let hours = whole(time_parts.next())?;
+    let minutes = whole(time_parts.next())?;
+    let second = time_parts.next().ok_or_else(invalid)?;
+    if date_parts.next().is_some()
+        || time_parts.next().is_some()
+        || second.bytes().any(|byte| byte == b'+' || byte == b'-')
+    {
+        return Err(invalid());
+    }
+    let nanos = parse_duration_decimal(second)?;
+    let months = years
+        .checked_mul(12)
+        .and_then(|years| years.checked_add(months))
+        .and_then(|value| value.checked_mul(sign))
+        .ok_or_else(|| Error::new(ErrorCode::TemporalRange, "duration months overflow"))?;
+    let days = days
+        .checked_mul(sign)
+        .ok_or_else(|| Error::new(ErrorCode::TemporalRange, "duration days overflow"))?;
+    let clock_nanos = hours
+        .checked_mul(3_600)
+        .and_then(|hours| {
+            minutes
+                .checked_mul(60)
+                .and_then(|minutes| hours.checked_add(minutes))
+        })
+        .and_then(|value| value.checked_mul(DURATION_DECIMAL_SCALE))
+        .and_then(|value| value.checked_add(nanos))
+        .and_then(|value| value.checked_mul(sign))
+        .ok_or_else(|| Error::new(ErrorCode::TemporalRange, "duration seconds overflow"))?;
+    normalized_duration_scalar(months, days, 0, clock_nanos)
 }
 
 fn parse_duration_decimal(value: &str) -> Result<i128> {
@@ -27264,7 +30201,7 @@ mod resident_nullable_output_tests {
     }
 
     fn nullable_fixture_graph() -> Result<(GraphStore, u32, u32, RelationshipTypeId)> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let relationship_type = graph.catalog_mut().intern_relationship_type("LINK")?;
         let source = graph.insert_node(NodeInput {
             id: NodeId(1),
@@ -27522,6 +30459,170 @@ mod resident_nullable_output_tests {
 #[cfg(test)]
 mod temporal_duration_cpu_tests {
     use super::*;
+
+    #[test]
+    fn temporal_iso_date_forms_validate_calendar_week_and_ordinal_boundaries() -> Result<()> {
+        let expected = date_value("2015-07-21")?;
+        for text in ["20150721", "2015-W30-2", "2015W302", "2015-202", "2015202"] {
+            assert_eq!(date_value(text)?, expected, "{text}");
+        }
+        for (text, expected) in [
+            ("2015-07", "2015-07-01"),
+            ("201507", "2015-07-01"),
+            ("2015-W30", "2015-07-20"),
+            ("2015W30", "2015-07-20"),
+            ("2015", "2015-01-01"),
+            ("2015-W01-1", "2014-12-29"),
+            ("2016-366", "2016-12-31"),
+        ] {
+            assert_eq!(date_value(text)?, date_value(expected)?, "{text}");
+        }
+        for text in [
+            "2015-366",
+            "2015-W53-8",
+            "2014-W53-1",
+            "2015W001",
+            "2015-00",
+            "2015-13",
+            "20150229",
+            "2015-000",
+            "2015abc",
+            "é2015",
+        ] {
+            assert!(date_value(text).is_err(), "accepted invalid date {text}");
+        }
+        assert_eq!(
+            date_value("+100000000-01-01")?,
+            date_value("100000000-01-01")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn temporal_fixed_offsets_preserve_seconds_and_reject_invalid_components() -> Result<()> {
+        for (text, expected) in [
+            ("+02", 7_200),
+            ("-0205", -7_500),
+            ("+02:05:59", 7_559),
+            ("-020507", -7_507),
+            ("+18:00", 64_800),
+        ] {
+            assert_eq!(parse_fixed_timezone_seconds(text)?, expected);
+        }
+        for text in [
+            "+18:00:01",
+            "+19",
+            "+02:60",
+            "+02:05:60",
+            "+02:05:59junk",
+            "+2",
+            "+020",
+            "+é2",
+            "Europe/London",
+        ] {
+            assert!(
+                parse_fixed_timezone_seconds(text).is_err(),
+                "accepted offset {text}"
+            );
+        }
+        let value = zoned_datetime_value("1984-10-11T12:34:56+02:05:59")?;
+        let ResultValue::Scalar(ScalarValue::ZonedDateTime {
+            seconds,
+            nanos,
+            timezone,
+        }) = value
+        else {
+            return Err(Error::internal("expected zoned datetime"));
+        };
+        assert_eq!(timezone.as_ref(), "+02:05:59");
+        assert_eq!(timezone_offset_at(seconds, nanos, &timezone)?, 7_559);
+        assert_eq!(
+            format_zoned_datetime(seconds, nanos, &timezone)?,
+            "1984-10-11T12:34:56+02:05:59"
+        );
+        assert_eq!(
+            zoned_datetime_local(seconds, nanos, &timezone)?,
+            local_datetime_from_stored(parse_iso_local_datetime("1984-10-11T12:34:56")?.0, 0)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn temporal_named_timezones_resolve_history_and_validate_declared_offsets() -> Result<()> {
+        let (seconds, nanos, timezone) =
+            parse_iso_zoned_datetime("1818-07-21T21:40:32.142[Europe/Stockholm]")?;
+        assert_eq!(
+            format_zoned_datetime(seconds, nanos, &timezone)?,
+            "1818-07-21T21:40:32.142+00:53:28[Europe/Stockholm]"
+        );
+        assert_eq!(
+            zoned_datetime_value("1818-07-21T21:40:32.142[Europe/Stockholm]")?,
+            zoned_datetime_value("1818-07-21T21:40:32.142+00:53:28[Europe/Stockholm]")?
+        );
+        assert_eq!(
+            zoned_datetime_value("2015-07-21T21:40:32.142[Europe/London]")?,
+            zoned_datetime_value("2015-07-21T21:40:32.142+01[Europe/London]")?
+        );
+        assert!(zoned_datetime_value("2015-07-21T21:40:32+02[Europe/London]").is_err());
+        assert!(zoned_datetime_value("2024-03-10T02:30:00[America/New_York]").is_err());
+        assert!(zoned_datetime_value("2024-11-03T01:30:00[America/New_York]").is_err());
+        assert_ne!(
+            zoned_datetime_value("2024-11-03T01:30:00-04[America/New_York]")?,
+            zoned_datetime_value("2024-11-03T01:30:00-05[America/New_York]")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn temporal_extended_duration_preserves_large_components_and_signed_nanos() -> Result<()> {
+        let value = parse_duration("P2012-02-02T14:37:21.545")?;
+        assert_eq!(
+            value,
+            ScalarValue::Duration {
+                months: 24_146,
+                days: 2,
+                seconds: 52_641,
+                nanos: 545_000_000
+            }
+        );
+        let negative = parse_duration("-P2012-02-02T14:37:21.545")?;
+        assert_eq!(
+            negative,
+            ScalarValue::Duration {
+                months: -24_146,
+                days: -2,
+                seconds: -52_642,
+                nanos: 455_000_000
+            }
+        );
+        let ScalarValue::Duration { seconds, nanos, .. } = negative else {
+            return Err(Error::internal("negative duration changed its value type"));
+        };
+        assert_eq!(
+            i128::from(seconds) * 1_000_000_000 + i128::from(nanos),
+            -52_641_i128 * 1_000_000_000 - 545_000_000,
+            "normalization must preserve the signed elapsed nanoseconds"
+        );
+        assert_eq!(
+            parse_duration("P0000-00-00T00:00:00.000000001")?,
+            ScalarValue::Duration {
+                months: 0,
+                days: 0,
+                seconds: 0,
+                nanos: 1
+            }
+        );
+        for text in [
+            "P2012-02T14:37:21",
+            "P2012-02-02T14:37",
+            "P2012-02-02T14:37:21:00",
+            "P2012-02-02T14:37:-21",
+            "P2012-02-02T14:37:21.1234567890",
+        ] {
+            assert!(parse_duration(text).is_err(), "accepted duration {text}");
+        }
+        Ok(())
+    }
 
     fn date_value(text: &str) -> Result<ResultValue> {
         let days = parse_iso_civil_date(text)?.epoch_day()?;

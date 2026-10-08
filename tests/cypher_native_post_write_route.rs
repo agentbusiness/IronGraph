@@ -740,7 +740,7 @@ struct Fixture {
 
 impl Fixture {
     fn new(case: TckCase) -> Result<Self> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let n_label = graph.catalog_mut().intern_label("N")?;
         let relationship_type = graph.catalog_mut().intern_relationship_type("R")?;
         let num = graph.catalog_mut().intern_property("num")?;
@@ -832,7 +832,7 @@ impl Fixture {
     }
 
     fn image(&self) -> Result<ResidentProjectImage> {
-        ResidentProjectImage::build(
+        super::legacy_resident_build(
             PROJECT,
             self.bookmark,
             &self.graph,

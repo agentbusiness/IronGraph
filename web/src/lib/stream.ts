@@ -58,14 +58,16 @@ export async function* decodeResponse(response: Response): AsyncGenerator<Stream
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let fragments: string[] = [];
   const isSse = contentType.includes('text/event-stream');
 
   try {
     while (true) {
       const { done, value } = await reader.read();
-      buffer += decoder.decode(value, { stream: !done });
+      const chunk = decoder.decode(value, { stream: !done });
 
       if (isSse) {
+        buffer += chunk;
         let boundary = buffer.search(/\r?\n\r?\n/);
         while (boundary >= 0) {
           const block = buffer.slice(0, boundary);
@@ -76,17 +78,20 @@ export async function* decodeResponse(response: Response): AsyncGenerator<Stream
           boundary = buffer.search(/\r?\n\r?\n/);
         }
       } else {
-        let newline = buffer.indexOf('\n');
-        while (newline >= 0) {
-          const line = buffer.slice(0, newline).trim();
-          buffer = buffer.slice(newline + 1);
+        let start = 0;
+        for (let newline = chunk.indexOf('\n'); newline !== -1; newline = chunk.indexOf('\n', start)) {
+          fragments.push(chunk.slice(start, newline));
+          const line = (fragments.length === 1 ? fragments[0]! : fragments.join('')).trim();
+          fragments = [];
+          start = newline + 1;
           if (line) yield { data: parseJson(line) };
-          newline = buffer.indexOf('\n');
         }
+        if (start < chunk.length) fragments.push(chunk.slice(start));
       }
 
       if (done) break;
     }
+    if (!isSse) buffer = fragments.join('');
     if (buffer.trim()) {
       for (const envelope of decodeBlock(buffer)) yield envelope;
     }

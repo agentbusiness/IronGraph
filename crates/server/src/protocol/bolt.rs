@@ -1,9 +1,9 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     net::SocketAddr,
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
@@ -19,9 +19,7 @@ use uuid::Uuid;
 use crate::storage::ConnectionId;
 use crate::{Bookmark, CommitAcknowledgement, Error, ProjectId, Result};
 
-use super::{
-    QueryExecutor, QueryLimits, QueryRequest, QueryStreamEvent, QueryTransaction, TypedValue,
-};
+use super::{QueryExecutor, QueryRequest, QueryStreamEvent, QueryTransaction, TypedValue};
 
 const BOLT_MAGIC: u32 = 0x6060_B017;
 const BOLT_V5_0: u32 = 5;
@@ -42,13 +40,27 @@ const BOLT_ROUTE_SIGNATURE: u8 = 0x66;
 /// Membership here is fixed for the lifetime of a connection, so the value only controls how often
 /// a driver re-asks. Five minutes keeps that traffic negligible without pinning a stale table.
 const BOLT_ROUTING_TABLE_TTL_SECONDS: i64 = 300;
-const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_PIPELINED_MESSAGES: usize = 64;
-const MAX_PIPELINED_BYTES: usize = 32 * 1024 * 1024;
+static CODEC_WORKERS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(64)));
+
+async fn codec_work<T, F>(work: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    let permit = CODEC_WORKERS
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| Error::internal("Bolt codec admission closed"))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|error| Error::internal(format!("Bolt codec worker failed: {error}")))?
+}
 const MAX_VALUE_DEPTH: usize = 64;
-const MAX_COLLECTION_ITEMS: usize = 1_000_000;
 const CURSOR_EVENT_CAPACITY: usize = 2;
-const MAX_CONNECTIONS: usize = 512;
 
 /// Complete PackStream value representation used by the Bolt state machine.
 #[derive(Clone, Debug, PartialEq)]
@@ -87,20 +99,15 @@ impl BoltServer {
             ));
         }
         let listener = tokio::net::TcpListener::bind(self.address).await?;
-        let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         let mut connections = JoinSet::new();
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 accepted = listener.accept() => {
                     let (stream, _) = accepted?;
-                    let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
-                        drop(stream);
-                        continue;
-                    };
+                    stream.set_nodelay(true)?;
                     let executor = Arc::clone(&self.executor);
                     connections.spawn(async move {
-                        let _permit = permit;
                         let _ = BoltSession::new(executor).serve(stream).await;
                     });
                 }
@@ -184,10 +191,7 @@ impl InterruptRegistry {
 }
 
 enum IncomingMessage {
-    Message {
-        value: PackStreamValue,
-        encoded_bytes: usize,
-    },
+    Message(PackStreamValue),
     Error(Error),
     End,
 }
@@ -214,27 +218,17 @@ impl BoltSession {
         if !negotiate(&mut stream).await? {
             return Ok(());
         }
-        let (reader, mut writer) = tokio::io::split(stream);
+        let (reader, writer) = tokio::io::split(stream);
+        let mut writer = tokio::io::BufWriter::with_capacity(64 * 1024, writer);
         let (incoming_sender, mut incoming) = mpsc::unbounded_channel();
-        let queued_messages = Arc::new(AtomicUsize::new(0));
-        let queued_bytes = Arc::new(AtomicUsize::new(0));
         let reader_task = tokio::spawn(read_messages(
             reader,
             incoming_sender,
             Arc::clone(&self.interrupt),
-            Arc::clone(&queued_messages),
-            Arc::clone(&queued_bytes),
         ));
         while self.state != SessionState::Closed {
             let value = match incoming.recv().await {
-                Some(IncomingMessage::Message {
-                    value,
-                    encoded_bytes,
-                }) => {
-                    queued_messages.fetch_sub(1, Ordering::AcqRel);
-                    queued_bytes.fetch_sub(encoded_bytes, Ordering::AcqRel);
-                    value
-                }
+                Some(IncomingMessage::Message(value)) => value,
                 Some(IncomingMessage::End) | None => {
                     self.goodbye(Vec::new()).await?;
                     break;
@@ -308,7 +302,7 @@ impl BoltSession {
             &["user_agent", "scheme", "routing", "patch_bolt"],
             "HELLO",
         )?;
-        let user_agent = metadata
+        metadata
             .get("user_agent")
             .and_then(as_string_ref)
             .ok_or_else(|| {
@@ -317,12 +311,6 @@ impl BoltSession {
                     "HELLO requires user_agent",
                 )
             })?;
-        if user_agent.len() > 1_024 {
-            return Err(Error::new(
-                crate::ErrorCode::ProtocolViolation,
-                "user_agent is oversized",
-            ));
-        }
         if let Some(value) = metadata.get("scheme") {
             let Some(scheme) = as_string_ref(value) else {
                 return Err(Error::new(
@@ -436,15 +424,22 @@ impl BoltSession {
         {
             return Err(protocol_state("RUN", self.state));
         }
-        let query = as_string_ref(&fields[0])
-            .ok_or_else(|| {
-                Error::new(
-                    crate::ErrorCode::ProtocolViolation,
-                    "RUN query must be a string",
-                )
-            })?
-            .to_owned();
-        let parameters = pack_map_to_json(as_map(&fields[1])?)?;
+        let (fields, query, parameters) = codec_work(move || {
+            let mut fields = fields;
+            let query = as_string_ref(&fields[0])
+                .ok_or_else(|| {
+                    Error::new(
+                        crate::ErrorCode::ProtocolViolation,
+                        "RUN query must be a string",
+                    )
+                })?
+                .to_owned();
+            let parameters = pack_map_to_json(as_map(&fields[1])?)?;
+            fields[0] = PackStreamValue::Null;
+            fields[1] = PackStreamValue::Null;
+            Ok((fields, query, parameters))
+        })
+        .await?;
         let extra = as_map(&fields[2])?;
         reject_unknown_keys(
             extra,
@@ -489,9 +484,8 @@ impl BoltSession {
             parameters,
             consistency: CommitAcknowledgement::Published,
             bookmark,
-            limits: QueryLimits::default(),
             cancellation,
-            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(120)),
+            deadline: None,
             connection_id: self.connection_id,
         };
         request.validate()?;
@@ -552,14 +546,7 @@ impl BoltSession {
         for _ in 0..count {
             match cursor.next_record().await {
                 Ok(Some(record)) => {
-                    write_message(
-                        stream,
-                        &PackStreamValue::Structure {
-                            signature: 0x71,
-                            fields: vec![PackStreamValue::List(record)],
-                        },
-                    )
-                    .await?;
+                    write_encoded_message(stream, &record).await?;
                 }
                 Ok(None) => {
                     exhausted = true;
@@ -822,7 +809,8 @@ impl BoltSession {
 struct CursorBatch {
     row_count: usize,
     next_row: usize,
-    columns: Vec<super::BatchColumn>,
+    columns: Vec<std::vec::IntoIter<TypedValue>>,
+    encoded_records: VecDeque<Vec<u8>>,
 }
 
 struct WorkerCompletion {
@@ -842,7 +830,7 @@ struct BoltCursor {
     worker: Option<JoinHandle<WorkerCompletion>>,
     cancellation: CancellationToken,
     batch: Option<CursorBatch>,
-    pending_record: Option<Vec<PackStreamValue>>,
+    pending_record: Option<Vec<u8>>,
     field_count: Option<usize>,
     expected_sequence: u64,
     summary: Option<BTreeMap<String, PackStreamValue>>,
@@ -955,31 +943,65 @@ impl BoltCursor {
         }
     }
 
-    async fn next_record(&mut self) -> Result<Option<Vec<PackStreamValue>>> {
+    async fn next_record(&mut self) -> Result<Option<Vec<u8>>> {
         if let Some(record) = self.pending_record.take() {
             return Ok(Some(record));
         }
         loop {
-            if let Some(batch) = &mut self.batch {
-                if batch.next_row < batch.row_count {
-                    let row = batch.next_row;
-                    batch.next_row += 1;
-                    return batch
-                        .columns
-                        .iter()
-                        .map(|column| {
-                            let value = column.values.get(row).ok_or_else(|| {
-                                Error::new(
-                                    crate::ErrorCode::ProtocolViolation,
-                                    "query batch column is shorter than its row count",
-                                )
-                            })?;
-                            typed_to_pack(value)
-                        })
-                        .collect::<Result<Vec<_>>>()
-                        .map(Some);
+            if let Some(mut batch) = self.batch.take() {
+                if let Some(record) = batch.encoded_records.pop_front() {
+                    self.batch = Some(batch);
+                    return Ok(Some(record));
                 }
-                self.batch = None;
+                if batch.next_row < batch.row_count {
+                    let cancellation = self.cancellation.clone();
+                    let mut batch = codec_work(move || {
+                        let mut bytes = 0usize;
+                        while batch.next_row < batch.row_count && bytes < 64 * 1024 {
+                            if cancellation.is_cancelled() {
+                                return Err(Error::new(
+                                    crate::ErrorCode::Cancelled,
+                                    "Bolt result encoding cancelled",
+                                ));
+                            }
+                            let mut payload = Vec::new();
+                            payload.extend_from_slice(&[0xB1, 0x71]);
+                            encode_tiny_or_length(
+                                batch.columns.len(),
+                                0x90,
+                                0xD4,
+                                0xD5,
+                                0xD6,
+                                &mut payload,
+                            )?;
+                            for column in &mut batch.columns {
+                                let value = column.next().ok_or_else(|| {
+                                    Error::new(
+                                        crate::ErrorCode::ProtocolViolation,
+                                        "query batch column is shorter than its row count",
+                                    )
+                                })?;
+                                encode_typed_value(&value, &mut payload)?;
+                            }
+                            bytes = bytes.saturating_add(payload.len());
+                            batch.encoded_records.push_back(payload);
+                            batch.next_row += 1;
+                        }
+                        Ok(batch)
+                    })
+                    .await?;
+                    let record = batch
+                        .encoded_records
+                        .pop_front()
+                        .expect("nonempty cursor batch encoded a row");
+                    self.batch = Some(batch);
+                    return Ok(Some(record));
+                }
+                codec_work(move || {
+                    drop(batch);
+                    Ok(())
+                })
+                .await?;
             }
             if self.terminal {
                 return Ok(None);
@@ -1026,7 +1048,11 @@ impl BoltCursor {
                     self.batch = Some(CursorBatch {
                         row_count,
                         next_row: 0,
-                        columns,
+                        columns: columns
+                            .into_iter()
+                            .map(|column| column.values.into_iter())
+                            .collect(),
+                        encoded_records: VecDeque::new(),
                     });
                 }
                 QueryStreamEvent::Summary {
@@ -1204,8 +1230,6 @@ async fn read_messages<R>(
     mut reader: R,
     sender: mpsc::UnboundedSender<IncomingMessage>,
     interrupt: Arc<InterruptRegistry>,
-    queued_messages: Arc<AtomicUsize>,
-    queued_bytes: Arc<AtomicUsize>,
 ) where
     R: AsyncRead + Unpin,
 {
@@ -1223,8 +1247,7 @@ async fn read_messages<R>(
                 return;
             }
         };
-        let encoded_bytes = encoded.len();
-        let value = match decode_packstream(&encoded) {
+        let value = match codec_work(move || decode_packstream(&encoded)).await {
             Ok(value) => value,
             Err(error) => {
                 interrupt.cancel_active();
@@ -1243,26 +1266,7 @@ async fn read_messages<R>(
             // execution so a pipelined RESET can cancel a worker blocked before its first row.
             interrupt.signal_reset();
         }
-        let message_count = queued_messages.fetch_add(1, Ordering::AcqRel) + 1;
-        let byte_count = queued_bytes.fetch_add(encoded_bytes, Ordering::AcqRel) + encoded_bytes;
-        if message_count > MAX_PIPELINED_MESSAGES || byte_count > MAX_PIPELINED_BYTES {
-            queued_messages.fetch_sub(1, Ordering::AcqRel);
-            queued_bytes.fetch_sub(encoded_bytes, Ordering::AcqRel);
-            interrupt.cancel_active();
-            let _ = sender.send(IncomingMessage::Error(Error::retryable(
-                crate::ErrorCode::Backpressure,
-                "Bolt pipeline exceeds its bounded admission capacity",
-                Some(25),
-            )));
-            return;
-        }
-        if sender
-            .send(IncomingMessage::Message {
-                value,
-                encoded_bytes,
-            })
-            .is_err()
-        {
+        if sender.send(IncomingMessage::Message(value)).is_err() {
             interrupt.cancel_active();
             return;
         }
@@ -1281,13 +1285,14 @@ async fn read_chunked_message<S>(stream: &mut S) -> Result<Option<Vec<u8>>>
 where
     S: AsyncRead + Unpin,
 {
-    let mut message = Vec::new();
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    let mut message_bytes = 0usize;
     loop {
         let mut size = [0u8; 2];
         match stream.read_exact(&mut size).await {
             Ok(_) => {}
             Err(error)
-                if error.kind() == std::io::ErrorKind::UnexpectedEof && message.is_empty() =>
+                if error.kind() == std::io::ErrorKind::UnexpectedEof && message_bytes == 0 =>
             {
                 return Ok(None);
             }
@@ -1295,29 +1300,55 @@ where
         }
         let length = u16::from_be_bytes(size) as usize;
         if length == 0 {
-            if message.is_empty() {
+            if message_bytes == 0 {
                 continue;
             }
-            return Ok(Some(message));
+            return codec_work(move || {
+                let mut message = Vec::with_capacity(message_bytes);
+                for chunk in chunks {
+                    message.extend_from_slice(&chunk);
+                }
+                Ok(Some(message))
+            })
+            .await;
         }
-        if message.len().saturating_add(length) > MAX_MESSAGE_BYTES {
-            return Err(Error::new(
-                crate::ErrorCode::ProtocolViolation,
-                "Bolt message is oversized",
-            ));
-        }
-        let start = message.len();
-        message.resize(start + length, 0);
-        stream.read_exact(&mut message[start..]).await?;
+        let next_bytes = message_bytes
+            .checked_add(length)
+            .ok_or_else(|| Error::invalid_data("Bolt message length overflow"))?;
+        let mut chunk = vec![0u8; length];
+        stream.read_exact(&mut chunk).await?;
+        message_bytes = next_bytes;
+        chunks.push(chunk);
     }
 }
 
+#[cfg(test)]
 async fn write_message<S>(stream: &mut S, value: &PackStreamValue) -> Result<()>
 where
     S: AsyncWrite + Unpin,
 {
-    let mut payload = Vec::new();
-    encode_packstream(value, &mut payload)?;
+    write_owned_message(stream, value.clone()).await
+}
+
+async fn write_owned_message<S>(stream: &mut S, value: PackStreamValue) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let payload = codec_work(move || {
+        let mut payload = Vec::new();
+        encode_packstream(&value, &mut payload)?;
+        Ok(payload)
+    })
+    .await?;
+    write_encoded_message(stream, &payload).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn write_encoded_message<S>(stream: &mut S, payload: &[u8]) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     for chunk in payload.chunks(u16::MAX as usize) {
         stream
             .write_all(&(chunk.len() as u16).to_be_bytes())
@@ -1325,7 +1356,6 @@ where
         stream.write_all(chunk).await?;
     }
     stream.write_all(&[0, 0]).await?;
-    stream.flush().await?;
     Ok(())
 }
 
@@ -1333,9 +1363,9 @@ async fn write_success<S>(stream: &mut S, metadata: BTreeMap<String, PackStreamV
 where
     S: AsyncWrite + Unpin,
 {
-    write_message(
+    write_owned_message(
         stream,
-        &PackStreamValue::Structure {
+        PackStreamValue::Structure {
             signature: 0x70,
             fields: vec![PackStreamValue::Map(metadata)],
         },
@@ -1356,9 +1386,9 @@ where
         "message".to_owned(),
         PackStreamValue::String(error.message.to_string()),
     );
-    write_message(
+    write_owned_message(
         stream,
-        &PackStreamValue::Structure {
+        PackStreamValue::Structure {
             signature: 0x7F,
             fields: vec![PackStreamValue::Map(metadata)],
         },
@@ -1408,9 +1438,9 @@ async fn write_ignored<S>(stream: &mut S) -> Result<()>
 where
     S: AsyncWrite + Unpin,
 {
-    write_message(
+    write_owned_message(
         stream,
-        &PackStreamValue::Structure {
+        PackStreamValue::Structure {
             signature: 0x7E,
             fields: Vec::new(),
         },
@@ -1419,11 +1449,7 @@ where
 }
 
 fn decode_packstream(input: &[u8]) -> Result<PackStreamValue> {
-    let mut decoder = Decoder {
-        input,
-        offset: 0,
-        items: 0,
-    };
+    let mut decoder = Decoder { input, offset: 0 };
     let value = decoder.value(0)?;
     if decoder.offset != input.len() {
         return Err(Error::new(
@@ -1437,18 +1463,16 @@ fn decode_packstream(input: &[u8]) -> Result<PackStreamValue> {
 struct Decoder<'a> {
     input: &'a [u8],
     offset: usize,
-    items: usize,
 }
 
 impl Decoder<'_> {
     fn value(&mut self, depth: usize) -> Result<PackStreamValue> {
-        if depth > MAX_VALUE_DEPTH || self.items >= MAX_COLLECTION_ITEMS {
+        if depth > MAX_VALUE_DEPTH {
             return Err(Error::new(
                 crate::ErrorCode::ProtocolViolation,
-                "PackStream nesting/item limit exceeded",
+                "PackStream nesting limit exceeded",
             ));
         }
-        self.items += 1;
         let marker = self.byte()?;
         match marker {
             0x00..=0x7F => Ok(PackStreamValue::Integer(marker as i64)),
@@ -1590,10 +1614,10 @@ impl Decoder<'_> {
     }
 
     fn list(&mut self, length: usize, depth: usize) -> Result<PackStreamValue> {
-        if self.items.saturating_add(length) > MAX_COLLECTION_ITEMS {
+        if length > self.input.len() - self.offset {
             return Err(Error::new(
                 crate::ErrorCode::ProtocolViolation,
-                "PackStream list is oversized",
+                "truncated PackStream list",
             ));
         }
         let mut values = Vec::with_capacity(length);
@@ -1604,10 +1628,10 @@ impl Decoder<'_> {
     }
 
     fn map(&mut self, length: usize, depth: usize) -> Result<PackStreamValue> {
-        if self.items.saturating_add(length.saturating_mul(2)) > MAX_COLLECTION_ITEMS {
+        if length > (self.input.len() - self.offset) / 2 {
             return Err(Error::new(
                 crate::ErrorCode::ProtocolViolation,
-                "PackStream map is oversized",
+                "truncated PackStream map",
             ));
         }
         let mut values = BTreeMap::new();
@@ -1671,8 +1695,7 @@ fn encode_packstream(value: &PackStreamValue, output: &mut Vec<u8>) -> Result<()
             output.extend_from_slice(bytes);
         }
         PackStreamValue::String(value) => {
-            encode_tiny_or_length(value.len(), 0x80, 0xD0, 0xD1, 0xD2, output)?;
-            output.extend_from_slice(value.as_bytes());
+            encode_string(value, output)?;
         }
         PackStreamValue::List(values) => {
             encode_tiny_or_length(values.len(), 0x90, 0xD4, 0xD5, 0xD6, output)?;
@@ -1683,7 +1706,7 @@ fn encode_packstream(value: &PackStreamValue, output: &mut Vec<u8>) -> Result<()
         PackStreamValue::Map(values) => {
             encode_tiny_or_length(values.len(), 0xA0, 0xD8, 0xD9, 0xDA, output)?;
             for (key, value) in values {
-                encode_packstream(&PackStreamValue::String(key.clone()), output)?;
+                encode_string(key, output)?;
                 encode_packstream(value, output)?;
             }
         }
@@ -1741,6 +1764,71 @@ fn encode_length(
         })?;
         output.push(marker32);
         output.extend_from_slice(&value.to_be_bytes());
+    }
+    Ok(())
+}
+
+fn encode_string(value: &str, output: &mut Vec<u8>) -> Result<()> {
+    encode_tiny_or_length(value.len(), 0x80, 0xD0, 0xD1, 0xD2, output)?;
+    output.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn encode_typed_map(values: &BTreeMap<String, TypedValue>, output: &mut Vec<u8>) -> Result<()> {
+    encode_tiny_or_length(values.len(), 0xA0, 0xD8, 0xD9, 0xDA, output)?;
+    for (name, value) in values {
+        encode_string(name, output)?;
+        encode_typed_value(value, output)?;
+    }
+    Ok(())
+}
+
+fn encode_typed_value(value: &TypedValue, output: &mut Vec<u8>) -> Result<()> {
+    match value {
+        TypedValue::String(value) => encode_string(value, output)?,
+        TypedValue::Bytes(value) => {
+            encode_length(value.len(), 0xCC, 0xCD, 0xCE, output)?;
+            output.extend_from_slice(value);
+        }
+        TypedValue::List(values) => {
+            encode_tiny_or_length(values.len(), 0x90, 0xD4, 0xD5, 0xD6, output)?;
+            for value in values {
+                encode_typed_value(value, output)?;
+            }
+        }
+        TypedValue::Map(values) => encode_typed_map(values, output)?,
+        TypedValue::Vector(values) => {
+            encode_tiny_or_length(values.len(), 0x90, 0xD4, 0xD5, 0xD6, output)?;
+            for value in values {
+                encode_packstream(&PackStreamValue::Float(f64::from(*value)), output)?;
+            }
+        }
+        TypedValue::Node(node) => {
+            output.extend_from_slice(&[0xB4, 0x4E]);
+            encode_packstream(
+                &PackStreamValue::Integer(stable_numeric_id(&node.id)?),
+                output,
+            )?;
+            encode_tiny_or_length(node.labels.len(), 0x90, 0xD4, 0xD5, 0xD6, output)?;
+            for label in &node.labels {
+                encode_string(label, output)?;
+            }
+            encode_typed_map(&node.properties, output)?;
+            encode_string(&node.id, output)?;
+        }
+        TypedValue::Relationship(edge) => {
+            output.extend_from_slice(&[0xB8, 0x52]);
+            for id in [&edge.id, &edge.source, &edge.target] {
+                encode_packstream(&PackStreamValue::Integer(stable_numeric_id(id)?), output)?;
+            }
+            encode_string(&edge.relationship_type, output)?;
+            encode_typed_map(&edge.properties, output)?;
+            for id in [&edge.id, &edge.source, &edge.target] {
+                encode_string(id, output)?;
+            }
+        }
+        // Temporal and path mapping retains the established validation and native wire shapes.
+        _ => encode_packstream(&typed_to_pack(value)?, output)?,
     }
     Ok(())
 }
@@ -2379,6 +2467,65 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use uuid::Uuid;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn messages_and_collections_exceed_former_quotas_without_truncation() -> Result<()> {
+        let (mut sender, mut receiver) = tokio::io::duplex(64 * 1024);
+        let writer = tokio::spawn(async move {
+            super::write_owned_message(
+                &mut sender,
+                PackStreamValue::String("x".repeat(17 * 1024 * 1024)),
+            )
+            .await
+        });
+        let encoded = read_chunked_message(&mut receiver)
+            .await?
+            .expect("complete message");
+        writer.await.unwrap()?;
+        let decoded = super::codec_work(move || decode_packstream(&encoded)).await?;
+        assert!(
+            matches!(decoded, PackStreamValue::String(value) if value.len() == 17 * 1024 * 1024)
+        );
+        let values = super::codec_work(|| {
+            let length = 1_000_001_u32;
+            let mut encoded = vec![0xD6];
+            encoded.extend_from_slice(&length.to_be_bytes());
+            encoded.resize(5 + length as usize, 0xC0);
+            decode_packstream(&encoded)
+        })
+        .await?;
+        assert!(
+            matches!(values, PackStreamValue::List(values) if values.len() == 1_000_001 && values.iter().all(|value| matches!(value, PackStreamValue::Null)))
+        );
+        assert!(decode_packstream(&[0xD6, 0xFF, 0xFF, 0xFF, 0xFF]).is_err());
+        assert!(decode_packstream(&[0xDA, 0xFF, 0xFF, 0xFF, 0xFF]).is_err());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn large_codec_work_keeps_current_thread_timer_live() -> Result<()> {
+        let (release, blocked) = std::sync::mpsc::channel();
+        let timer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            release.send(()).unwrap();
+        });
+        let encoded = super::codec_work(move || {
+            blocked.recv().unwrap();
+            let mut encoded = Vec::new();
+            encode_packstream(
+                &PackStreamValue::String("x".repeat(8 * 1024 * 1024)),
+                &mut encoded,
+            )?;
+            Ok(encoded)
+        })
+        .await?;
+        timer.await.unwrap();
+        let decoded = super::codec_work(move || decode_packstream(&encoded)).await?;
+        assert!(
+            matches!(decoded, PackStreamValue::String(value) if value.len() == 8 * 1024 * 1024)
+        );
+        Ok(())
+    }
+
     async fn negotiate_and_hello(client: &mut tokio::io::DuplexStream) -> Result<()> {
         let mut handshake = Vec::from(BOLT_MAGIC.to_be_bytes());
         handshake.extend_from_slice(&0x0004_0405_u32.to_be_bytes());
@@ -2641,6 +2788,119 @@ mod tests {
     struct StreamingExecutor {
         emitted_batches: Arc<AtomicUsize>,
         cursor_closed: Arc<AtomicBool>,
+    }
+
+    #[test]
+    fn direct_typed_encoding_preserves_dirty_entities_and_nested_values() -> Result<()> {
+        let properties = BTreeMap::from([
+            (
+                "body".into(),
+                TypedValue::String("漢字\n\"\\".repeat(32768)),
+            ),
+            (
+                "bytes".into(),
+                TypedValue::Bytes([0, 255, 128, 1].repeat(32768)),
+            ),
+            (
+                "nested".into(),
+                TypedValue::List(vec![TypedValue::Map(BTreeMap::from([
+                    ("integer".into(), TypedValue::Integer(i64::MIN.to_string())),
+                    ("vector".into(), TypedValue::Vector(vec![1.0, -0.5, 0.0])),
+                ]))]),
+            ),
+        ]);
+        let values = vec![
+            TypedValue::Map(properties.clone()),
+            TypedValue::Node(ResultNode {
+                id: "7".into(),
+                labels: vec!["Document".into(), "Dirty".into()],
+                properties: properties.clone(),
+            }),
+            TypedValue::Relationship(RelationshipValue {
+                id: "11".into(),
+                source: "7".into(),
+                target: "9".into(),
+                relationship_type: "HAS".into(),
+                properties,
+            }),
+            TypedValue::Date(i64::MAX),
+            TypedValue::Time {
+                nanos: 42,
+                offset_seconds: Some(3600),
+            },
+            TypedValue::DateTime {
+                seconds: -42,
+                nanos: 999_999_999,
+                timezone: Some("Europe/London".into()),
+            },
+            TypedValue::Duration {
+                months: 1,
+                days: -3,
+                seconds: 4,
+                nanos: 5,
+            },
+        ];
+        for value in values {
+            let mut expected = Vec::new();
+            encode_packstream(&typed_to_pack(&value)?, &mut expected)?;
+            let mut actual = Vec::new();
+            super::encode_typed_value(&value, &mut actual)?;
+            assert_eq!(actual, expected);
+            decode_packstream(&actual)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn encoded_cursor_batches_preserve_large_values_and_partial_reads() -> Result<()> {
+        let request_id = Uuid::new_v4();
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        let values = (0..9)
+            .map(|row| TypedValue::String(format!("{row}:{}", "é".repeat(40 * 1024))))
+            .collect::<Vec<_>>();
+        sender
+            .send(QueryStreamEvent::Batch {
+                request_id,
+                sequence: 0,
+                row_count: values.len() as u64,
+                columns: vec![BatchColumn {
+                    name: "body".into(),
+                    value_type: "STRING".into(),
+                    values: values.clone(),
+                }],
+            })
+            .await
+            .unwrap();
+        drop(sender);
+        let mut cursor = super::BoltCursor {
+            request_id,
+            receiver,
+            worker: None,
+            cancellation: Default::default(),
+            batch: None,
+            pending_record: None,
+            field_count: Some(1),
+            expected_sequence: 0,
+            summary: None,
+            terminal: false,
+        };
+        for value in values {
+            assert!(cursor.has_more().await?);
+            assert!(cursor.has_more().await?);
+            let payload = cursor.next_record().await?.unwrap();
+            assert!(payload.len() > 64 * 1024);
+            assert_eq!(
+                decode_packstream(&payload)?,
+                PackStreamValue::Structure {
+                    signature: 0x71,
+                    fields: vec![PackStreamValue::List(vec![typed_to_pack(&value)?])],
+                }
+            );
+            assert!(cursor.batch.as_ref().unwrap().encoded_records.is_empty());
+        }
+        assert!(!cursor.has_more().await?);
+        assert!(cursor.batch.is_none());
+        Ok(())
     }
 
     struct CancellingExecutor {

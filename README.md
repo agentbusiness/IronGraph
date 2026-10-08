@@ -1,12 +1,12 @@
 # IronGraph
 
-**An embeddable, GPU-first temporal graph database with automatic local embeddings, streaming,
+**An embeddable, CPU graph database with automatic local embeddings, streaming,
 and queues.**
 
 Run IronGraph inside a Python, Node.js, or Rust application, or connect to it as a standalone
 single-node database. Store relationships and complete text documents in the same graph. Declare
 text and vector indexes, and IronGraph automatically installs, verifies, loads, and warms its local
-embedding model on the selected execution device.
+embedding model on its independently selected inference device.
 
 Use Cypher to query graph structure, search text and vectors, inspect property history, and
 administer the database. Built-in Kafka-compatible Streams and AMQP-compatible Queues handle event
@@ -15,12 +15,9 @@ open-source software released under the Apache License 2.0.
 
 ## Performance at a glance
 
-- **0.834 µs graph count** at 2 million nodes on Metal — sub-microsecond at scale.
-- **12× faster indexed range count** on Metal than CPU: 1.61 ms versus 19.38 ms.
-- **7.5× faster k-core analysis** on Metal than CPU: 326 ms versus 2,430 ms.
-
-Median results from five runs on an Apple M5 Pro with 2 million nodes and 8 million
-relationships. See [more performance results](https://irongraph.tech/).
+Performance depends on the query, graph size, indexes, and host. Graph queries execute on the CPU;
+local text inference can use Metal or CUDA independently. Measure complete queries separately from
+individual graph operations.
 
 ## Start the database and open the web console
 
@@ -55,8 +52,8 @@ npx irongraph logs
 npx irongraph status
 ```
 
-The process chooses its execution backend automatically. To explicitly use CPU, add
-`--execution-backend cpu`; on a supported Mac, use `--execution-backend metal`. To run in the
+Graph execution uses the CPU. Text inference selects its device independently; on a supported
+Mac, use `--embedding-backend metal`. To run in the
 foreground with live terminal output, use `npx irongraph start` without `--background`.
 
 ### 3. Open the web console
@@ -161,9 +158,9 @@ A project is an isolated graph with its own schema and indexes. `OBSERVED` holds
 `KNOWLEDGE` holds curated facts, and `WORKSPACE` holds provisional working data. There is no
 implicit default project.
 
-CPU is the reference backend, Metal is the primary local accelerator, and CUDA is an optional
-build target. GPU execution keeps admitted project graphs and their derived indexes resident
-on the selected device.
+Graph storage, queries, algorithms, and vector retrieval use one shared CPU graph. Parallel reads
+do not wait for a write and can observe changes from different points within a multi-record write.
+Text embeddings are generated asynchronously on the independently selected inference device.
 
 ## Choose your package
 
@@ -179,7 +176,7 @@ Install from the official package source or artifact bundle supplied with your r
 installation command requires the matching release to be available in that source. Native
 release targets are macOS 15+ ARM64 and Linux with glibc 2.28+ on ARM64 or AMD64. These are the
 package build baselines; deployment support depends on the qualification results supplied with
-your release. CUDA requires a package built with CUDA support.
+your release. CUDA text inference requires a package built with CUDA support.
 
 ## Start with a text document in Python
 
@@ -221,14 +218,13 @@ the example again to update and read the same text document. Its meaningful cont
 automatically, together with other nodes and relationships. Next, use
 [`SEARCH … RETURN`](docs/cypher/clauses/search/search.md) with `graph_semantic` for ranked retrieval.
 
-The example selects CPU so the same code works across native release targets, while automatic
-text embedding stays enabled. Select `device="metal"` on a supported Mac to use Metal acceleration.
+The graph always uses the CPU. Automatic text embedding remains enabled; select
+`embedding_device="metal"` on a supported Mac to accelerate text inference.
 
 ## Deploy deliberately
 
-Each database process selects one execution device. GPU admission fails explicitly when project
-data and indexes do not fit; canonical graph data is never silently paged or truncated. One
-embedded instance owns its directory exclusively. Keep it open for your application's lifetime
+Each database process holds one canonical graph in host memory and independently selects one text
+inference device. One embedded instance owns its directory exclusively. Keep it open for your application's lifetime
 and close it during orderly shutdown.
 
 The local embedding model processes text; IronGraph does not host or invoke generative language

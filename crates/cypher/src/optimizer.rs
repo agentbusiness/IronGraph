@@ -1243,8 +1243,9 @@ fn optimize_sequence(
             }
         }
         for (position, pattern) in ordered.into_iter().enumerate() {
-            let access =
-                choose_access_path(&pattern, &filters_after[position], &scope, layers, input);
+            // Access selection may use a pure ID equality even when the complete predicate
+            // remains at its original filter barrier. Correlated operands must already be bound.
+            let access = choose_access_path(&pattern, &filter_conjuncts, &scope, layers, input);
             // Through `access_estimated_rows`, because the chosen access path may already know far
             // more than the pattern does.
             //
@@ -1740,7 +1741,7 @@ fn choose_access_path(
     if let Some(variable) = pattern.start.variable.as_ref()
         && let Some(value) = filters
             .iter()
-            .find_map(|filter| stable_id_lookup(filter, variable))
+            .find_map(|filter| stable_id_lookup(filter, variable, scope))
     {
         return ScanAccessPath::StableId {
             variable: variable.clone(),
@@ -1851,7 +1852,11 @@ fn choose_access_path(
         })
 }
 
-fn stable_id_lookup(expression: &Expression, variable: &str) -> Option<Expression> {
+fn stable_id_lookup(
+    expression: &Expression,
+    variable: &str,
+    scope: &BTreeSet<String>,
+) -> Option<Expression> {
     let Expression::Binary {
         left,
         operation: BinaryOperator::Equal,
@@ -1860,10 +1865,13 @@ fn stable_id_lookup(expression: &Expression, variable: &str) -> Option<Expressio
     else {
         return None;
     };
-    if is_id_of(left, variable) && expression_variables(right).is_empty() {
+    let available = |value: &Expression| {
+        expression_variables(value).is_subset(scope) && is_pushdown_safe(value)
+    };
+    if is_id_of(left, variable) && available(right) {
         return Some(right.as_ref().clone());
     }
-    if is_id_of(right, variable) && expression_variables(left).is_empty() {
+    if is_id_of(right, variable) && available(left) {
         return Some(left.as_ref().clone());
     }
     None
@@ -2207,7 +2215,7 @@ fn optimize_pattern_anchor(
     if last.variable.as_ref().is_some_and(|variable| {
         filters
             .iter()
-            .any(|filter| stable_id_lookup(filter, variable).is_some())
+            .any(|filter| stable_id_lookup(filter, variable, &BTreeSet::new()).is_some())
     }) {
         return reverse_pattern(pattern);
     }
@@ -3073,7 +3081,7 @@ mod tests {
 
     #[test]
     fn selective_pattern_moves_before_cartesian_scan() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let common = graph.catalog_mut().intern_label("Common")?;
         let rare = graph.catalog_mut().intern_label("Rare")?;
         for id in 1..=10 {
@@ -3101,7 +3109,7 @@ mod tests {
 
     #[test]
     fn scan_reordering_stays_inside_each_match_group() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let common = graph.catalog_mut().intern_label("Common")?;
         let rare = graph.catalog_mut().intern_label("Rare")?;
         for id in 1..=10 {
@@ -3161,7 +3169,7 @@ mod tests {
 
     #[test]
     fn predicates_move_only_after_their_variables_exist() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         graph.catalog_mut().intern_label("A")?;
         graph.catalog_mut().intern_label("B")?;
         graph.catalog_mut().intern_property("x")?;
@@ -3353,7 +3361,7 @@ mod tests {
 
     #[test]
     fn return_orderby2_unique_node_distinct_uses_the_native_row_sorter() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let name = graph.catalog_mut().intern_property("name")?;
         let id = graph.catalog_mut().intern_property("id")?;
         for (node, text, number) in [(1, "A", 1), (2, "B", 10), (3, "C", 20)] {
@@ -3673,7 +3681,7 @@ mod tests {
 
     #[test]
     fn optimized_and_source_order_execution_are_equivalent() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let a = graph.catalog_mut().intern_label("A")?;
         let b = graph.catalog_mut().intern_label("B")?;
         let rare = graph.catalog_mut().intern_label("Rare")?;
@@ -3727,7 +3735,7 @@ mod tests {
 
     #[test]
     fn fixed_hop_cycle_uses_multiway_intersection_and_preserves_results() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let relationship = graph.catalog_mut().intern_relationship_type("LINK")?;
         for id in 1..=4_u64 {
             graph.apply(GraphMutation::InsertNode(NodeInput {
@@ -3786,7 +3794,7 @@ mod tests {
 
     #[test]
     fn cyclic_lowering_never_merges_separate_match_groups() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         graph.catalog_mut().intern_relationship_type("LINK")?;
         let plan = optimized_cpu(
             "MATCH (a)-[:LINK]->(b) MATCH (b)-[:LINK]->(c) MATCH (c)-[:LINK]->(a) RETURN a, b, c",
@@ -3814,7 +3822,7 @@ mod tests {
 
     #[test]
     fn stale_zero_cardinality_replans_once_before_output() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let label = graph.catalog_mut().intern_label("RuntimeEstimate")?;
         let stale = StatisticsSnapshot::collect(&graph);
         for id in 1..=32_u64 {
@@ -3847,7 +3855,7 @@ mod tests {
     /// question.
     #[test]
     fn the_where_spelling_estimates_the_same_rows_as_the_inline_spelling() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let label = graph.catalog_mut().intern_label("IndexedEntity")?;
         let property = graph.catalog_mut().intern_property("key")?;
         for id in 1..=512u64 {
@@ -3862,7 +3870,7 @@ mod tests {
                 )],
             }))?;
         }
-        let mut indexes = IndexCatalog::default();
+        let indexes = IndexCatalog::default();
         indexes.create(
             &graph,
             GraphIndexDefinition {
@@ -3921,8 +3929,105 @@ mod tests {
     }
 
     #[test]
+    fn correlated_node_ids_use_canonical_lookup_without_scan_products() -> Result<()> {
+        let content: Arc<str> = "complete owner text ".repeat(32768).into();
+        let fixture = || -> Result<GraphStore> {
+            let graph = GraphStore::default();
+            let label = graph.catalog().intern_label("Node")?;
+            let body = graph.catalog().intern_property("body")?;
+            for id in 1..=16 {
+                graph.insert_node(NodeInput {
+                    id: NodeId(id),
+                    layer: Layer::Observed,
+                    revision: 1,
+                    labels: vec![label],
+                    properties: vec![(body, ScalarValue::String(Arc::clone(&content)))],
+                })?;
+            }
+            Ok(graph)
+        };
+        let graph = fixture()?;
+        let bytes = graph.resident_bytes();
+        let capabilities = super::super::BindCapabilities {
+            write: true,
+            ..Default::default()
+        };
+        for source in [
+            "UNWIND range(0, 3) AS row UNWIND range(1, 4) AS step MATCH (source:Node) WHERE id(source) = row + 1 MATCH (target:Node) WHERE id(target) = ((row + step * 7) % 16) + 1 CREATE (source)-[:R]->(target) RETURN count(*)",
+            "UNWIND [{source:1,target:2},{source:3,target:4}] AS row MATCH (source:Node) WHERE id(source) = row.source MATCH (target:Node) WHERE id(target) = row.target RETURN id(source), id(target)",
+        ] {
+            let bound = bind(parse(source)?, graph.catalog(), capabilities)?;
+            let statistics = StatisticsSnapshot::count_summary(&graph, [0; 32]);
+            let (physical, _) = optimize(
+                plan(bound)?,
+                OptimizerInput {
+                    statistics: &statistics,
+                    catalog: graph.catalog(),
+                    indexes: None,
+                    parameters: &BTreeMap::new(),
+                    backend: BackendKind::Cpu,
+                    scratch_budget_bytes: usize::MAX,
+                    max_result_rows: usize::MAX,
+                    runtime_feedback: None,
+                    allow_runtime_checkpoint: false,
+                },
+            );
+            let scans = physical
+                .operators
+                .iter()
+                .filter_map(|operator| match operator {
+                    PhysicalOperator::ScanPattern { access, .. } => Some(access),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(scans.len(), 2);
+            assert!(
+                scans
+                    .iter()
+                    .all(|access| matches!(access, ScanAccessPath::StableId { .. })),
+                "{physical:?}"
+            );
+            let mut actual_context = test_context(&graph);
+            actual_context.capabilities = capabilities;
+            // Independent executions need independent ID reservations. Cloning GraphStore shares
+            // the canonical allocator, so a second plan on it correctly receives different IDs.
+            let generic_graph = fixture()?;
+            let mut generic_context = test_context(&generic_graph);
+            generic_context.capabilities = capabilities;
+            let actual = QueryEngine.execute(source, &mut actual_context)?;
+            let generic = QueryEngine.execute_unoptimized(source, &mut generic_context)?;
+            assert_eq!(actual.result, generic.result);
+            assert_eq!(
+                format!("{:?}", actual.graph_mutations),
+                format!("{:?}", generic.graph_mutations)
+            );
+            assert_eq!(graph.resident_bytes(), bytes);
+            assert_eq!(generic_graph.resident_bytes(), bytes);
+        }
+        for source in [
+            "UNWIND [-1, 0, 1, 17, null] AS wanted MATCH (n:Node) WHERE id(n) = wanted RETURN id(n)",
+            "UNWIND [1.0, 1.5, 2.0] AS wanted MATCH (n:Node) WHERE id(n) = wanted RETURN id(n)",
+            "UNWIND [0] AS wanted MATCH (n:Node) MATCH (missing:Absent) WHERE id(n) = 1 / wanted RETURN n",
+        ] {
+            let actual = QueryEngine.execute(source, &mut test_context(&graph));
+            let generic = QueryEngine.execute_unoptimized(source, &mut test_context(&graph));
+            match (actual, generic) {
+                (Ok(actual), Ok(generic)) => assert_eq!(actual.result, generic.result, "{source}"),
+                (Err(actual), Err(generic)) => {
+                    assert_eq!(actual.code, generic.code, "{source}")
+                }
+                (actual, generic) => {
+                    panic!("lookup changed semantics: {source}: {actual:?} / {generic:?}")
+                }
+            }
+            assert_eq!(graph.resident_bytes(), bytes);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn equality_index_access_matches_canonical_scan() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let label = graph.catalog_mut().intern_label("IndexedEntity")?;
         let property = graph.catalog_mut().intern_property("key")?;
         for (id, value) in [(1, "alpha"), (2, "beta"), (3, "alpha")] {
@@ -3934,7 +4039,7 @@ mod tests {
                 properties: vec![(property, ScalarValue::String(Arc::from(value)))],
             }))?;
         }
-        let mut indexes = IndexCatalog::default();
+        let indexes = IndexCatalog::default();
         indexes.create(
             &graph,
             GraphIndexDefinition {
@@ -3985,7 +4090,7 @@ mod tests {
 
     #[test]
     fn infeasible_resident_scratch_is_rejected_before_execution() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let label = graph.catalog_mut().intern_label("N")?;
         for id in 1..=32_u64 {
             graph.apply(GraphMutation::InsertNode(NodeInput {

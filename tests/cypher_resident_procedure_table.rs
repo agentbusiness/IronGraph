@@ -592,7 +592,7 @@ fn procedure_catalog() -> Result<ProcedureCatalog> {
 }
 
 fn image(graph: &GraphStore) -> Result<ResidentProjectImage> {
-    ResidentProjectImage::build(
+    super::legacy_resident_build(
         PROJECT,
         Bookmark {
             term: 0,

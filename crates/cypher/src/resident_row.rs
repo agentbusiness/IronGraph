@@ -46,7 +46,7 @@ use crate::{
         ResidentRowProgramManifest, ResidentRowProgramRequest, ResidentRowSortKey,
         ResidentRowValueType, ResidentStringPredicateOperation, ResidentTemporalAccessor,
     },
-    graph::{GraphStore, PropertyColumns, TypedColumn},
+    graph::GraphStore,
     types::{EntityKind, LabelId, RelationshipTypeId},
 };
 
@@ -3072,7 +3072,7 @@ fn exact_catalog_label_comprehension_membership_plan(
         leaves.push(Expression::Binary {
             left: Box::new(Expression::entity_label_predicate(
                 Expression::Variable(target_variable.clone()),
-                vec![label_name.to_owned()],
+                vec![label_name.to_string()],
             )),
             operation: BinaryOperator::And,
             right: Box::new(Expression::Binary {
@@ -5733,13 +5733,47 @@ fn nullable_predicate_slots(
     }
 }
 
+#[derive(Clone, Copy)]
+enum CanonicalPropertyKind {
+    Integer,
+    Float,
+    String,
+    Other,
+}
+#[derive(Clone, Copy)]
+struct CanonicalPropertyShape<'a> {
+    graph: &'a GraphStore,
+    kind: ResidentNullableRelationBindingKind,
+}
+impl CanonicalPropertyShape<'_> {
+    fn mask(self, property: crate::types::PropertyId) -> u16 {
+        let column = match self.kind {
+            ResidentNullableRelationBindingKind::Node => self.graph.node_property_column(property),
+            ResidentNullableRelationBindingKind::Relationship => {
+                self.graph.edge_property_column(property)
+            }
+        };
+        column.map_or(0, |column| column.kind_mask()) & !1
+    }
+    fn is_mixed(self, property: crate::types::PropertyId) -> bool {
+        self.mask(property).count_ones() > 1
+    }
+    fn column(self, property: crate::types::PropertyId) -> Option<CanonicalPropertyKind> {
+        match self.mask(property) {
+            0 => None,
+            4 => Some(CanonicalPropertyKind::Integer),
+            8 => Some(CanonicalPropertyKind::Float),
+            16 => Some(CanonicalPropertyKind::String),
+            _ => Some(CanonicalPropertyKind::Other),
+        }
+    }
+}
+
 #[allow(dead_code)]
 struct NullableRelationBuilder<'a> {
     catalog: &'a crate::graph::NameCatalog,
     graph: &'a GraphStore,
     parameters: &'a BTreeMap<String, ResultValue>,
-    node_properties: Option<PropertyColumns>,
-    relationship_properties: Option<PropertyColumns>,
     scope: BTreeMap<String, NullableRelationBinding>,
     stages: Vec<ResidentNullableRelationStage>,
     predicate_program: ResidentNullableRelationPredicateProgram,
@@ -5768,8 +5802,6 @@ impl<'a> NullableRelationBuilder<'a> {
             catalog,
             graph,
             parameters,
-            node_properties: None,
-            relationship_properties: None,
             scope: BTreeMap::new(),
             stages: Vec::new(),
             predicate_program: ResidentNullableRelationPredicateProgram::default(),
@@ -5846,60 +5878,42 @@ impl<'a> NullableRelationBuilder<'a> {
     }
 
     fn property_columns(
-        &mut self,
+        &self,
         kind: ResidentNullableRelationBindingKind,
-    ) -> Result<&PropertyColumns> {
-        if self.node_properties.is_none() || self.relationship_properties.is_none() {
-            let snapshot = self.graph.snapshot()?;
-            if self.node_properties.is_none() {
-                self.node_properties = Some(snapshot.node_properties);
-            }
-            if self.relationship_properties.is_none() {
-                self.relationship_properties = Some(snapshot.edge_properties);
-            }
-        }
-        match kind {
-            ResidentNullableRelationBindingKind::Node => self.node_properties.as_ref(),
-            ResidentNullableRelationBindingKind::Relationship => {
-                self.relationship_properties.as_ref()
-            }
-        }
-        .ok_or_else(|| Error::internal("resident nullable property columns vanished"))
+    ) -> Result<CanonicalPropertyShape<'a>> {
+        Ok(CanonicalPropertyShape {
+            graph: self.graph,
+            kind,
+        })
     }
 
     fn string_property_maximum_bytes(
-        properties: &PropertyColumns,
+        properties: CanonicalPropertyShape<'_>,
         property: crate::types::PropertyId,
     ) -> Result<u32> {
-        let Some(TypedColumn::String { values, validity }) = properties.column(property) else {
-            return Err(Error::internal(
-                "resident nullable string projection lost its canonical string column",
-            ));
-        };
-        let dictionary = properties.string_dictionary();
-        let mut maximum = 0_usize;
-        for row in 0..properties.rows() {
-            if !validity.is_present(row) {
-                continue;
-            }
-            let id = values.get(row).ok_or_else(|| {
-                Error::new(
-                    ErrorCode::CorruptStorage,
-                    "resident nullable string projection column is shorter than its validity",
-                )
-            })?;
-            let value = dictionary.resolve(*id).ok_or_else(|| {
-                Error::new(
-                    ErrorCode::CorruptStorage,
-                    "resident nullable string projection references an unknown dictionary entry",
-                )
-            })?;
-            maximum = maximum.max(value.len());
+        let maximum = match properties.kind {
+            ResidentNullableRelationBindingKind::Node => properties
+                .graph
+                .nodes()
+                .filter_map(|node| match node.property(property) {
+                    Some(ScalarValue::String(value)) => Some(value.len()),
+                    _ => None,
+                })
+                .max(),
+            ResidentNullableRelationBindingKind::Relationship => properties
+                .graph
+                .edges()
+                .filter_map(|edge| match edge.property(property) {
+                    Some(ScalarValue::String(value)) => Some(value.len()),
+                    _ => None,
+                })
+                .max(),
         }
+        .unwrap_or(0);
         u32::try_from(maximum).map_err(|_| {
             Error::new(
                 ErrorCode::ResultBudgetExceeded,
-                "resident nullable string property width exceeds u32",
+                "canonical string property width exceeds u32",
             )
         })
     }
@@ -5920,21 +5934,21 @@ impl<'a> NullableRelationBuilder<'a> {
             return Ok(None);
         }
         let source = match properties.column(property) {
-            Some(TypedColumn::Integer { .. }) => {
+            Some(CanonicalPropertyKind::Integer) => {
                 ResidentNullableRelationOutputSource::IntegerProperty {
                     slot: binding.slot,
                     kind: binding.kind,
                     property,
                 }
             }
-            Some(TypedColumn::Float { .. }) => {
+            Some(CanonicalPropertyKind::Float) => {
                 ResidentNullableRelationOutputSource::FloatProperty {
                     slot: binding.slot,
                     kind: binding.kind,
                     property,
                 }
             }
-            Some(TypedColumn::String { .. }) => {
+            Some(CanonicalPropertyKind::String) => {
                 ResidentNullableRelationOutputSource::StringProperty {
                     slot: binding.slot,
                     kind: binding.kind,
@@ -6029,14 +6043,14 @@ impl<'a> NullableRelationBuilder<'a> {
             return Ok(None);
         }
         let value = match properties.column(property) {
-            Some(TypedColumn::Integer { .. }) => {
+            Some(CanonicalPropertyKind::Integer) => {
                 ResidentNullableRelationPredicateValue::IntegerProperty {
                     slot: node,
                     kind: ResidentNullableRelationBindingKind::Node,
                     property,
                 }
             }
-            Some(TypedColumn::String { .. }) => {
+            Some(CanonicalPropertyKind::String) => {
                 ResidentNullableRelationPredicateValue::StringProperty {
                     slot: node,
                     kind: ResidentNullableRelationBindingKind::Node,
@@ -6146,14 +6160,14 @@ impl<'a> NullableRelationBuilder<'a> {
             return Ok(None);
         }
         let value = match properties.column(property) {
-            Some(TypedColumn::Integer { .. }) => {
+            Some(CanonicalPropertyKind::Integer) => {
                 ResidentNullableRelationPredicateValue::IntegerProperty {
                     slot: relationship,
                     kind: ResidentNullableRelationBindingKind::Relationship,
                     property,
                 }
             }
-            Some(TypedColumn::String { .. }) => {
+            Some(CanonicalPropertyKind::String) => {
                 ResidentNullableRelationPredicateValue::StringProperty {
                     slot: relationship,
                     kind: ResidentNullableRelationBindingKind::Relationship,
@@ -6880,7 +6894,7 @@ impl<'a> NullableRelationBuilder<'a> {
         };
         self.graph
             .nodes()
-            .filter(|node| Self::node_domain_contains(&domain, node.labels()))
+            .filter(|node| Self::node_domain_contains(&domain, &node.labels()))
             .all(|node| {
                 node.property(property)
                     .is_none_or(|value| matches!(value, ScalarValue::String(_)))
@@ -8229,15 +8243,10 @@ impl<'a> RowProgramBuilder<'a> {
             && let Expression::Variable(variable) = source.as_ref()
             && let Some(RowSymbol::Node(binding)) = scope.get(variable).copied()
             && let Some(property) = self.catalog.property(name)
-            && self.graph.node_property_accepts(
-                property,
-                &ScalarValue::Duration {
-                    months: 0,
-                    days: 0,
-                    seconds: 0,
-                    nanos: 0,
-                },
-            ) == Some(true)
+            && self
+                .graph
+                .node_property_column(property)
+                .is_some_and(|column| column.kind_mask() & !1 == 1 << 11)
         {
             return Ok(Some(RowSymbol::DurationProperty {
                 binding: ResidentEntityBinding::Node(binding),
@@ -8954,10 +8963,10 @@ impl<'a> RowProgramBuilder<'a> {
         &self,
         property: crate::types::PropertyId,
     ) -> Result<Option<u32>> {
-        if self.graph.node_property_accepts(
-            property,
-            &ScalarValue::List(crate::DocumentList::new(Vec::new())?),
-        ) != Some(true)
+        if !self
+            .graph
+            .node_property_column(property)
+            .is_some_and(|column| column.kind_mask() & !1 == 1 << 12)
         {
             return Ok(None);
         }
@@ -9383,7 +9392,7 @@ mod tests {
             ResidentNullableRelationStage, ResidentNullableRelationTarget,
             ResidentNullableRelationshipDomain, ResidentProjectImage,
         },
-        graph::{EdgeInput, IndexCatalog, NodeInput, StatisticsSnapshot, TemporalStore},
+        graph::{EdgeInput, IndexCatalog, NodeInput, StatisticsSnapshot},
     };
 
     use super::*;
@@ -9507,7 +9516,7 @@ mod tests {
     }
 
     fn optional_fixture_graph() -> Result<GraphStore> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let single = graph.catalog_mut().intern_label("Single")?;
         let a = graph.catalog_mut().intern_label("A")?;
         let b = graph.catalog_mut().intern_label("B")?;
@@ -9544,7 +9553,7 @@ mod tests {
     }
 
     fn fixed_optional_predicate_fixture_graph() -> Result<GraphStore> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let single = graph.catalog_mut().intern_label("Single")?;
         let a = graph.catalog_mut().intern_label("A")?;
         let b = graph.catalog_mut().intern_label("B")?;
@@ -9627,7 +9636,7 @@ mod tests {
     }
 
     fn relationship_property_fixture_graph() -> Result<GraphStore> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let a = graph.catalog_mut().intern_label("A")?;
         let b = graph.catalog_mut().intern_label("B")?;
         let relationship = graph.catalog_mut().intern_relationship_type("REL")?;
@@ -9663,7 +9672,7 @@ mod tests {
     }
 
     fn nullable_typed_projection_fixture_graph() -> Result<GraphStore> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let a = graph.catalog_mut().intern_relationship_type("A")?;
         let b = graph.catalog_mut().intern_relationship_type("B")?;
         let name = graph.catalog_mut().intern_property("name")?;
@@ -9756,7 +9765,7 @@ mod tests {
 
     #[test]
     fn two_label_entity_union_uses_one_complete_native_or_scan() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let a = graph.catalog_mut().intern_label("A")?;
         let b = graph.catalog_mut().intern_label("B")?;
         for (id, labels) in [(1_u64, vec![a]), (2, vec![b])] {
@@ -10092,7 +10101,7 @@ mod tests {
 
     #[test]
     fn graph4_null_type_reuses_only_a_known_empty_relationship_type_source() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         graph.insert_node(NodeInput {
             id: NodeId(1),
             layer: Layer::Observed,
@@ -10168,7 +10177,7 @@ mod tests {
     #[test]
     fn graph4_mixed_relationship_type_keeps_token_and_null_sentinel_on_one_native_column()
     -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let relationship_type = graph.catalog_mut().intern_relationship_type("T")?;
         for id in 1..=2 {
             graph.insert_node(NodeInput {
@@ -10249,7 +10258,7 @@ mod tests {
 
     #[test]
     fn graph4_any_list_zero_type_reuses_the_projected_relationship_slot() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let relationship_type = graph.catalog_mut().intern_relationship_type("T")?;
         for id in 1..=2 {
             graph.insert_node(NodeInput {
@@ -10396,7 +10405,7 @@ mod tests {
 
     #[test]
     fn exact_six_case_scalar_scope_manifest_executes_and_near_misses_fail_closed() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let begin = graph.catalog_mut().intern_label("Begin")?;
         let end = graph.catalog_mut().intern_label("End")?;
         let name2 = graph.catalog_mut().intern_property("name2")?;
@@ -10790,7 +10799,7 @@ mod tests {
 
     #[test]
     fn nullable_property_conversions_compile_exact_tck_shapes_and_preserve_nulls() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let person = graph.catalog_mut().intern_label("Person")?;
         let movie = graph.catalog_mut().intern_label("Movie")?;
         let other = graph.catalog_mut().intern_label("Other")?;
@@ -10927,7 +10936,7 @@ mod tests {
     #[test]
     fn return2_property_projections_use_exact_nullable_native_sources_and_cpu_values() -> Result<()>
     {
-        let mut missing_node_graph = GraphStore::default();
+        let missing_node_graph = GraphStore::default();
         let node_num = missing_node_graph.catalog_mut().intern_property("num")?;
         missing_node_graph.insert_node(NodeInput {
             id: NodeId(1),
@@ -10966,7 +10975,7 @@ mod tests {
             }] if source_rows == &[0]
         ));
 
-        let mut relationship_graph = GraphStore::default();
+        let relationship_graph = GraphStore::default();
         let relationship_type = relationship_graph
             .catalog_mut()
             .intern_relationship_type("T")?;
@@ -11025,7 +11034,7 @@ mod tests {
                 && validity == &[1]
         ));
 
-        let mut missing_relationship_graph = GraphStore::default();
+        let missing_relationship_graph = GraphStore::default();
         let relationship_type = missing_relationship_graph
             .catalog_mut()
             .intern_relationship_type("T")?;
@@ -11139,7 +11148,7 @@ mod tests {
     #[test]
     fn graph6_unanchored_optional_relationship_properties_are_one_atomic_native_group() -> Result<()>
     {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let relationship_type = graph.catalog_mut().intern_relationship_type("REL")?;
         let existing = graph.catalog_mut().intern_property("existing")?;
         // A property explicitly assigned null is retained in the catalog but has no canonical
@@ -11562,7 +11571,7 @@ mod tests {
             "unsupported floating relationship map escaped fail-closed admission"
         );
 
-        let mut mixed = relationship_property_fixture_graph()?;
+        let mixed = relationship_property_fixture_graph()?;
         let relationship = mixed
             .catalog()
             .relationship_type("REL")
@@ -11583,7 +11592,11 @@ mod tests {
             revision: 5,
             properties: vec![(weight, ScalarValue::String("seven".into()))],
         })?;
-        assert!(mixed.snapshot()?.edge_properties.is_mixed(weight));
+        assert!(
+            mixed
+                .edge_property_column(weight)
+                .is_some_and(|column| (column.kind_mask() & !1).count_ones() > 1)
+        );
         assert!(
             compile_nullable_query("MATCH (a)-[r:REL {weight: 7}]->(b) RETURN r", &mixed, 64,)?
                 .is_none(),
@@ -11595,7 +11608,7 @@ mod tests {
     #[test]
     fn nullable_compiler_declines_is_null_on_a_mixed_property_without_aborting_other_routes()
     -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let root = graph.catalog_mut().intern_label("Root")?;
         let child = graph.catalog_mut().intern_label("Child")?;
         let relationship = graph.catalog_mut().intern_relationship_type("R")?;
@@ -11630,7 +11643,11 @@ mod tests {
                 properties: Vec::new(),
             })?;
         }
-        assert!(graph.snapshot()?.node_properties.is_mixed(property));
+        assert!(
+            graph
+                .node_property_column(property)
+                .is_some_and(|column| (column.kind_mask() & !1).count_ones() > 1)
+        );
 
         for query in [
             "MATCH (:Root)-->(i:Child) WHERE i.var IS NOT NULL AND i.var > 'x' RETURN i.var",
@@ -11697,7 +11714,7 @@ mod tests {
     #[test]
     fn nullable_relation_deforests_non_null_entity_collect_unwind_and_executes_on_cpu() -> Result<()>
     {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let id = graph.catalog_mut().intern_property("id")?;
         for value in 1..=2 {
             graph.insert_node(NodeInput {
@@ -11757,7 +11774,7 @@ mod tests {
 
     #[test]
     fn nullable_relation_deforestation_preserves_group_keys_for_correlated_match() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let s = graph.catalog_mut().intern_label("S")?;
         let e = graph.catalog_mut().intern_label("E")?;
         let x = graph.catalog_mut().intern_relationship_type("X")?;
@@ -11894,7 +11911,7 @@ mod tests {
     }
 
     fn graph_with_temporal_and_document_properties() -> Result<GraphStore> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let label_a = graph.catalog_mut().intern_label("A")?;
         let label_b = graph.catalog_mut().intern_label("B")?;
         let created = graph.catalog_mut().intern_property("created")?;
@@ -11967,8 +11984,8 @@ mod tests {
         let image = ResidentProjectImage::build(
             PROJECT,
             bookmark,
-            graph,
-            &TemporalStore::default(),
+            &crate::legacy_graph_fixture(&graph)?,
+            &crate::graph::legacy::TemporalStore::default(),
             &IndexCatalog::default(),
         )?;
         let mut cpu = CpuBackend::new(64 * 1024 * 1024, 8 * 1024 * 1024);
@@ -12220,7 +12237,7 @@ mod tests {
     }
 
     fn fixed_path_delete_graph() -> Result<GraphStore> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let x = graph.catalog_mut().intern_label("X")?;
         let r = graph.catalog_mut().intern_relationship_type("R")?;
         for (id, labels) in [
@@ -12305,7 +12322,7 @@ mod tests {
 
     #[test]
     fn bound_optional_relationship_delete_is_one_complete_resident_command() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         graph.insert_node(NodeInput {
             id: NodeId(1),
             layer: Layer::Observed,
@@ -12355,7 +12372,7 @@ mod tests {
 
     #[test]
     fn deleted_relationship_type_is_captured_from_the_prewrite_generation() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let relationship_type = graph.catalog_mut().intern_relationship_type("T")?;
         for id in 1..=2 {
             graph.insert_node(NodeInput {
@@ -12407,7 +12424,7 @@ mod tests {
     }
 
     fn collected_path_delete_graph() -> Result<GraphStore> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let user = graph.catalog_mut().intern_label("User")?;
         let r = graph.catalog_mut().intern_relationship_type("R")?;
         for id in 1..=2 {
@@ -12546,8 +12563,8 @@ mod tests {
         let image = ResidentProjectImage::build(
             PROJECT,
             compiled.request.expected_bookmark,
-            graph,
-            &TemporalStore::default(),
+            &crate::legacy_graph_fixture(&graph)?,
+            &crate::graph::legacy::TemporalStore::default(),
             &IndexCatalog::default(),
         )?;
         let mut cpu = CpuBackend::new(64 * 1024 * 1024, 8 * 1024 * 1024);
@@ -12559,7 +12576,7 @@ mod tests {
 
     #[test]
     fn constant_false_entity_return_with_skip_zero_is_one_sealed_empty_row_program() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         for id in 1..=2 {
             graph.insert_node(NodeInput {
                 id: NodeId(id),
@@ -12591,7 +12608,7 @@ mod tests {
 
     #[test]
     fn return_order_by4_2_keeps_pattern_string_filter_and_two_order_keys_native() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let crew = graph.catalog_mut().intern_label("Crew")?;
         let name = graph.catalog_mut().intern_property("name")?;
         let rank = graph.catalog_mut().intern_property("rank")?;
@@ -12667,8 +12684,8 @@ mod tests {
         let image = ResidentProjectImage::build(
             PROJECT,
             compiled.request.generation.bookmark,
-            graph,
-            &TemporalStore::default(),
+            &crate::legacy_graph_fixture(&graph)?,
+            &crate::graph::legacy::TemporalStore::default(),
             &IndexCatalog::default(),
         )?;
         let mut cpu = CpuBackend::new(64 * 1024 * 1024, 8 * 1024 * 1024);
@@ -12679,7 +12696,7 @@ mod tests {
 
     #[test]
     fn mandatory_start_predicate_is_placed_before_unrelated_expansions() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let property = graph.catalog_mut().intern_property("value")?;
         let parameters = BTreeMap::new();
         let mut builder = NullableRelationBuilder::new(graph.catalog(), &graph, &parameters);
@@ -12843,7 +12860,7 @@ mod tests {
 
     #[test]
     fn return3_1_lowers_only_statically_proven_null_tests_to_boolean_constants() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         graph.insert_node(NodeInput {
             id: NodeId(1),
             layer: Layer::Observed,
@@ -12912,7 +12929,7 @@ mod tests {
 
     #[test]
     fn static_null_test_route_stays_fail_closed_for_per_row_or_nullable_inputs() -> Result<()> {
-        let mut declared = GraphStore::default();
+        let declared = GraphStore::default();
         let id = declared.catalog_mut().intern_property("id")?;
         declared.insert_node(NodeInput {
             id: NodeId(1),
@@ -12946,7 +12963,7 @@ mod tests {
     #[test]
     fn return2_6_lowers_integer_property_literal_addition_and_executes_on_cpu_reference()
     -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let num = graph.catalog_mut().intern_property("num")?;
         graph.insert_node(NodeInput {
             id: NodeId(1),
@@ -13027,7 +13044,7 @@ mod tests {
 
     #[test]
     fn boolean_property_to_string_is_one_typed_row_conversion_with_exact_capacity() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let movie = graph.catalog_mut().intern_label("Movie")?;
         let watched = graph.catalog_mut().intern_property("watched")?;
         let rating = graph.catalog_mut().intern_property("rating")?;
@@ -13246,7 +13263,7 @@ mod tests {
 
     #[test]
     fn mathematical2_1_filters_then_adds_in_one_native_row_command() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let id = graph.catalog_mut().intern_property("id")?;
         let version = graph.catalog_mut().intern_property("version")?;
         graph.insert_node(NodeInput {
@@ -13340,7 +13357,7 @@ mod tests {
 
     #[test]
     fn mathematical2_filter_keeps_zero_multi_null_and_overflow_semantics() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let id = graph.catalog_mut().intern_property("id")?;
         let version = graph.catalog_mut().intern_property("version")?;
         for (node, properties) in [
@@ -13413,7 +13430,7 @@ mod tests {
                 )
         ));
 
-        let mut overflow_graph = GraphStore::default();
+        let overflow_graph = GraphStore::default();
         let overflow_id = overflow_graph.catalog_mut().intern_property("id")?;
         let overflow_version = overflow_graph.catalog_mut().intern_property("version")?;
         overflow_graph.insert_node(NodeInput {
@@ -13440,7 +13457,7 @@ mod tests {
 
     #[test]
     fn mathematical2_filter_adapter_stays_fail_closed() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let id = graph.catalog_mut().intern_property("id")?;
         let version = graph.catalog_mut().intern_property("version")?;
         graph.insert_node(NodeInput {
@@ -13466,7 +13483,7 @@ mod tests {
             );
         }
 
-        let mut string_graph = GraphStore::default();
+        let string_graph = GraphStore::default();
         let string_id = string_graph.catalog_mut().intern_property("id")?;
         let string_version = string_graph.catalog_mut().intern_property("version")?;
         string_graph.insert_node(NodeInput {
@@ -13603,8 +13620,8 @@ mod tests {
         let image = ResidentProjectImage::build(
             PROJECT,
             bookmark,
-            &graph,
-            &TemporalStore::default(),
+            &crate::legacy_graph_fixture(&graph)?,
+            &crate::graph::legacy::TemporalStore::default(),
             &IndexCatalog::default(),
         )?;
         let mut cpu = CpuBackend::new(64 * 1024 * 1024, 8 * 1024 * 1024);
@@ -13739,7 +13756,7 @@ mod tests {
 
     #[test]
     fn match7_15_eliminates_only_a_variable_traversal_from_a_proven_null_source() -> Result<()> {
-        let mut graph = optional_fixture_graph()?;
+        let graph = optional_fixture_graph()?;
         let bar = graph.catalog_mut().intern_relationship_type("BAR")?;
         graph.insert_edge(EdgeInput {
             id: EdgeId(3),
@@ -13929,8 +13946,8 @@ mod tests {
         let image = ResidentProjectImage::build(
             PROJECT,
             bookmark,
-            &graph,
-            &TemporalStore::default(),
+            &crate::legacy_graph_fixture(&graph)?,
+            &crate::graph::legacy::TemporalStore::default(),
             &IndexCatalog::default(),
         )?;
         let mut cpu = CpuBackend::new(64 * 1024 * 1024, 8 * 1024 * 1024);
@@ -14036,7 +14053,11 @@ mod tests {
             .catalog()
             .property("var")
             .ok_or_else(|| Error::internal("fixed OPTIONAL fixture omitted `var`"))?;
-        assert!(graph.snapshot()?.node_properties.is_mixed(var));
+        assert!(
+            graph
+                .node_property_column(var)
+                .is_some_and(|column| (column.kind_mask() & !1).count_ones() > 1)
+        );
 
         for (scenario, query, expected) in [
             (
@@ -14362,7 +14383,7 @@ mod tests {
             )));
         }
 
-        let mut existing = GraphStore::default();
+        let existing = GraphStore::default();
         let x = existing.catalog_mut().intern_label("X")?;
         let name = existing.catalog_mut().intern_property("name")?;
         existing.insert_node(NodeInput {
@@ -14405,7 +14426,7 @@ mod tests {
 
     #[test]
     fn labels_render_extensions_fail_closed_without_their_exact_static_proofs() -> Result<()> {
-        let mut declared = GraphStore::default();
+        let declared = GraphStore::default();
         declared.catalog_mut().intern_label("Existing")?;
         for query in [
             "OPTIONAL MATCH (a:Existing) REMOVE a:L RETURN a",
@@ -14494,7 +14515,7 @@ mod tests {
             CompiledResidentOutputRender::NullableNodeProperties
         );
 
-        let mut declared = GraphStore::default();
+        let declared = GraphStore::default();
         declared.catalog_mut().intern_label("Existing")?;
         for query in [
             "MATCH (n) WITH n AS alias RETURN properties(alias)",
@@ -14576,7 +14597,7 @@ mod tests {
             );
         }
 
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         graph.insert_node(NodeInput {
             id: NodeId(1),
             layer: Layer::Observed,
@@ -14635,7 +14656,7 @@ mod tests {
                 .collect())
         }
 
-        let mut graph8 = GraphStore::default();
+        let graph8 = GraphStore::default();
         let exists = graph8.catalog_mut().intern_property("exists")?;
         graph8.insert_node(NodeInput {
             id: NodeId(1),
@@ -14669,7 +14690,7 @@ mod tests {
             super::super::StatementStats::default()
         );
 
-        let mut graph9 = GraphStore::default();
+        let graph9 = GraphStore::default();
         let person = graph9.catalog_mut().intern_label("Person")?;
         let relationship_type = graph9.catalog_mut().intern_relationship_type("R")?;
         let name = graph9.catalog_mut().intern_property("name")?;
@@ -14748,7 +14769,7 @@ mod tests {
     #[test]
     fn requested_labels_family_executes_exact_results_on_cpu() -> Result<()> {
         fn graph_with_labels(labels: &[&str]) -> Result<GraphStore> {
-            let mut graph = GraphStore::default();
+            let graph = GraphStore::default();
             let labels = labels
                 .iter()
                 .map(|label| graph.catalog_mut().intern_label(label))
@@ -14845,7 +14866,7 @@ mod tests {
             assert_eq!(output.result.statistics.labels_added, added, "{query}");
         }
 
-        let mut any_graph = GraphStore::default();
+        let any_graph = GraphStore::default();
         let foo = any_graph.catalog_mut().intern_label("Foo")?;
         let bar = any_graph.catalog_mut().intern_label("Bar")?;
         any_graph.insert_node(NodeInput {
@@ -14926,7 +14947,7 @@ mod tests {
 
     #[test]
     fn comparison1_first_three_literal_list_seeds_are_exact_native_entity_filters() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let id = graph.catalog_mut().intern_property("id")?;
         graph.insert_node(NodeInput {
             id: NodeId(1),
@@ -15020,7 +15041,7 @@ mod tests {
             );
         }
 
-        let mut string_graph = GraphStore::default();
+        let string_graph = GraphStore::default();
         let string_id = string_graph.catalog_mut().intern_property("id")?;
         string_graph.insert_node(NodeInput {
             id: NodeId(1),
@@ -15044,7 +15065,7 @@ mod tests {
 
     #[test]
     fn comparison4_chained_filter_retains_native_predicates_before_labels_render() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let a = graph.catalog_mut().intern_label("A")?;
         let b = graph.catalog_mut().intern_label("B")?;
         let c = graph.catalog_mut().intern_label("C")?;
@@ -15178,7 +15199,7 @@ mod tests {
 
     #[test]
     fn conditional1_string_coalesce_is_ordered_nullable_typed_row_execution() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let title = graph.catalog_mut().intern_property("title")?;
         let name = graph.catalog_mut().intern_property("name")?;
         let id = graph.catalog_mut().intern_property("id")?;

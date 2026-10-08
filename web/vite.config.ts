@@ -4,7 +4,7 @@ import { defineConfig } from 'vitest/config';
 import { localHttpProxyGuard } from './localHttpProxy';
 
 /** The graph-data endpoint plus the loopback-only Settings control plane. */
-const API_PREFIXES = ['/api', '/system/local-ai-integrations'];
+const API_PREFIXES = ['/api', '/system/local-ai-integrations', '/system/startup'];
 
 /**
  * In production the server embeds and serves `dist`, so the client speaks in relative paths. The

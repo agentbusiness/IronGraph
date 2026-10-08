@@ -64,7 +64,7 @@ const RESERVED_MEMORY: usize = 4 * 1024 * 1024;
     allow(dead_code)
 )]
 fn chain_graph() -> irongraph::Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let node = graph.catalog_mut().intern_label("N")?;
     let rel = graph.catalog_mut().intern_relationship_type("R")?;
     for id in 1..=4_u64 {
@@ -176,7 +176,7 @@ fn aggregates_over_a_variable_length_pattern_answer_on_a_gpu_node() -> irongraph
     let graph = chain_graph()?;
     let governor = irongraph::gpu::DeviceMemoryGovernor::new(MEMORY_LIMIT, RESERVED_MEMORY);
     let mut metal = MetalBackend::with_governor(0, governor)?;
-    metal.admit_graph(Arc::new(graph.snapshot()?))?;
+    metal.admit_graph(Arc::new(super::legacy_fixture_snapshot(&graph)?))?;
 
     // Each bound checked on its own, so a count that is merely plausible in total still fails.
     for (query, expected) in [
@@ -220,10 +220,10 @@ fn a_gpu_node_and_a_cpu_node_agree_on_variable_length_aggregates() -> irongraph:
     // must produce identical answers. If they ever diverge, the fallback is not a fallback.
     let graph = chain_graph()?;
     let mut cpu = irongraph::gpu::CpuBackend::new(MEMORY_LIMIT, RESERVED_MEMORY);
-    cpu.admit_graph(Arc::new(graph.snapshot()?))?;
+    cpu.admit_graph(Arc::new(super::legacy_fixture_snapshot(&graph)?))?;
     let governor = irongraph::gpu::DeviceMemoryGovernor::new(MEMORY_LIMIT, RESERVED_MEMORY);
     let mut metal = MetalBackend::with_governor(0, governor)?;
-    metal.admit_graph(Arc::new(graph.snapshot()?))?;
+    metal.admit_graph(Arc::new(super::legacy_fixture_snapshot(&graph)?))?;
 
     for query in [
         "MATCH p=(a:N)-[:R*1..3]->(b:N) RETURN count(*) AS n",

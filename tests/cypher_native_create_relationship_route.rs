@@ -854,7 +854,7 @@ fn context<'a>(
 }
 
 fn resident_image(graph: &GraphStore) -> Result<ResidentProjectImage> {
-    ResidentProjectImage::build(
+    super::legacy_resident_build(
         PROJECT,
         bookmark(graph),
         graph,
@@ -1055,7 +1055,7 @@ fn assert_relationship_shape(
         .ok_or_else(|| Error::internal("created relationship type is undeclared"))?;
     if edge.source() != source
         || edge.target() != target
-        || relationship_type != expected.relationship_type
+        || relationship_type.as_ref() != expected.relationship_type
         || edge.layer() != Layer::Observed
     {
         return Err(Error::internal(format!(
@@ -1070,7 +1070,7 @@ fn assert_relationship_shape(
                 let name = after.catalog().property_name(property).ok_or_else(|| {
                     Error::internal("created relationship property is undeclared")
                 })?;
-                Ok((name.to_owned(), value))
+                Ok((name.to_string(), value))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
     let expected_properties = expected

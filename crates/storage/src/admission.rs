@@ -79,7 +79,7 @@ struct AdmissionState {
 /// Thread-safe count/byte/deadline admission controller with control-plane reserve.
 #[derive(Clone, Debug)]
 pub struct AdmissionController {
-    limits: AdmissionLimits,
+    limits: Option<AdmissionLimits>,
     state: Arc<Mutex<AdmissionState>>,
 }
 
@@ -96,9 +96,17 @@ impl AdmissionController {
             return Err(Error::invalid_data("invalid write-admission limits"));
         }
         Ok(Self {
-            limits,
+            limits: Some(limits),
             state: Arc::new(Mutex::new(AdmissionState::default())),
         })
+    }
+
+    #[must_use]
+    pub fn unrestricted() -> Self {
+        Self {
+            limits: None,
+            state: Arc::new(Mutex::new(AdmissionState::default())),
+        }
     }
 
     pub fn try_admit(
@@ -108,14 +116,28 @@ impl AdmissionController {
         encoded_bytes: usize,
         deadline: Instant,
     ) -> Result<AdmissionPermit> {
-        if Instant::now() >= deadline {
+        self.try_admit_until(connection, class, encoded_bytes, Some(deadline))
+    }
+
+    pub fn try_admit_until(
+        &self,
+        connection: ConnectionId,
+        class: AdmissionClass,
+        encoded_bytes: usize,
+        deadline: Option<Instant>,
+    ) -> Result<AdmissionPermit> {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(Error::retryable(
                 ErrorCode::DeadlineExceeded,
                 "write deadline expired before admission",
                 None,
             ));
         }
-        if encoded_bytes == 0 || encoded_bytes > self.limits.max_encoded_bytes {
+        if encoded_bytes == 0
+            || self
+                .limits
+                .is_some_and(|limits| encoded_bytes > limits.max_encoded_bytes)
+        {
             return Err(Error::invalid_data("invalid admitted mutation byte size"));
         }
         if !connection.is_valid() {
@@ -129,28 +151,22 @@ impl AdmissionController {
             .get(&connection)
             .copied()
             .unwrap_or_default();
-        if !class.is_control() && usage.requests >= self.limits.max_requests_per_connection {
+        if !class.is_control()
+            && self
+                .limits
+                .is_some_and(|limits| usage.requests >= limits.max_requests_per_connection)
+        {
             return Err(self.full_error("connection write-admission share is full"));
         }
         if !class.is_control()
-            && usage
-                .bytes
-                .checked_add(encoded_bytes)
-                .is_none_or(|bytes| bytes > self.limits.max_encoded_bytes_per_connection)
+            && usage.bytes.checked_add(encoded_bytes).is_none_or(|bytes| {
+                self.limits
+                    .is_some_and(|limits| bytes > limits.max_encoded_bytes_per_connection)
+            })
         {
             return Err(self.full_error("connection write-admission byte share is full"));
         }
 
-        let request_limit = if class.is_control() {
-            self.limits.max_requests
-        } else {
-            self.limits.max_requests - self.limits.reserved_control_requests
-        };
-        let byte_limit = if class.is_control() {
-            self.limits.max_encoded_bytes
-        } else {
-            self.limits.max_encoded_bytes - self.limits.reserved_control_bytes
-        };
         let next_requests = state
             .requests
             .checked_add(1)
@@ -159,7 +175,19 @@ impl AdmissionController {
             .bytes
             .checked_add(encoded_bytes)
             .ok_or_else(|| Error::internal("write-admission byte count overflow"))?;
-        if next_requests > request_limit || next_bytes > byte_limit {
+        if self.limits.is_some_and(|limits| {
+            let request_limit = if class.is_control() {
+                limits.max_requests
+            } else {
+                limits.max_requests - limits.reserved_control_requests
+            };
+            let byte_limit = if class.is_control() {
+                limits.max_encoded_bytes
+            } else {
+                limits.max_encoded_bytes - limits.reserved_control_bytes
+            };
+            next_requests > request_limit || next_bytes > byte_limit
+        }) {
             return Err(self.full_error("write-admission capacity is full"));
         }
 
@@ -191,14 +219,17 @@ impl AdmissionController {
 
     #[must_use]
     pub const fn maximum_encoded_bytes(&self) -> usize {
-        self.limits.max_encoded_bytes
+        match self.limits {
+            Some(limits) => limits.max_encoded_bytes,
+            None => usize::MAX,
+        }
     }
 
     fn full_error(&self, message: &'static str) -> Error {
         Error::retryable(
             ErrorCode::WriteAdmissionFull,
             message,
-            Some(self.limits.retry_after_ms),
+            self.limits.map(|limits| limits.retry_after_ms),
         )
     }
 }

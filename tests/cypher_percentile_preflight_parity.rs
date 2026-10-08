@@ -5,7 +5,7 @@
 // enforceable instead of switched off globally.
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use std::{collections::BTreeMap, sync::Arc, time::Instant};
+use std::{collections::BTreeMap, time::Instant};
 
 use irongraph::{
     Bookmark, Error, ErrorCode, ProjectId, Result, ScalarValue,
@@ -13,17 +13,19 @@ use irongraph::{
         BindCapabilities, ExecutionContext, ExecutionOutput, QueryEngine, ResultValue,
         bind_with_parameters, parse, plan,
     },
-    gpu::{CpuBackend, ExecutionBackend},
+    gpu::ExecutionBackend,
     graph::GraphStore,
 };
 use tokio_util::sync::CancellationToken;
 
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 const MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 const RESERVED_MEMORY: usize = 1024 * 1024;
 
 fn context<'a>(
     graph: &'a GraphStore,
-    backend: &'a dyn ExecutionBackend,
+    backend: Option<&'a dyn ExecutionBackend>,
     parameters: BTreeMap<String, ResultValue>,
     require_native_execution: bool,
 ) -> ExecutionContext<'a> {
@@ -54,22 +56,16 @@ fn context<'a>(
         max_result_rows: 1_024,
         max_batch_rows: 1_024,
         optimizer_statistics: None,
-        backend: Some(backend),
+        backend,
         cancellation: CancellationToken::new(),
         deadline: Some(Instant::now() + std::time::Duration::from_secs(10)),
         resolved_query_at_time_nanos: None,
     }
 }
 
-fn cpu_backend(graph: &GraphStore) -> Result<CpuBackend> {
-    let mut backend = CpuBackend::new(MEMORY_LIMIT, RESERVED_MEMORY);
-    backend.admit_graph(Arc::new(graph.snapshot()?))?;
-    Ok(backend)
-}
-
 fn assert_runtime_number_out_of_range(
     graph: &GraphStore,
-    backend: &dyn ExecutionBackend,
+    backend: Option<&dyn ExecutionBackend>,
     query: &str,
     parameters: BTreeMap<String, ResultValue>,
 ) -> Result<()> {
@@ -106,7 +102,6 @@ fn one_value(output: &ExecutionOutput, column: &str) -> Result<ResultValue> {
 #[test]
 fn cpu_preflights_context_free_percentile_literals_parameters_and_expressions() -> Result<()> {
     let graph = GraphStore::default();
-    let cpu = cpu_backend(&graph)?;
     let cases = [
         ("percentileCont", "-0.25", BTreeMap::new()),
         (
@@ -140,7 +135,7 @@ fn cpu_preflights_context_free_percentile_literals_parameters_and_expressions() 
             "UNWIND [10.0, 20.0, 30.0] AS value \
              RETURN {function}(value, {percentile}) AS result"
         );
-        assert_runtime_number_out_of_range(&graph, &cpu, &query, parameters)?;
+        assert_runtime_number_out_of_range(&graph, None, &query, parameters)?;
     }
     Ok(())
 }
@@ -148,7 +143,6 @@ fn cpu_preflights_context_free_percentile_literals_parameters_and_expressions() 
 #[test]
 fn cpu_valid_context_free_percentile_expressions_keep_results_unchanged() -> Result<()> {
     let graph = GraphStore::default();
-    let cpu = cpu_backend(&graph)?;
     let parameters = BTreeMap::from([(
         "quarter".to_owned(),
         ResultValue::Scalar(ScalarValue::Float(0.25.into())),
@@ -157,7 +151,7 @@ fn cpu_valid_context_free_percentile_expressions_keep_results_unchanged() -> Res
         "UNWIND [10.0, 20.0, 30.0, 40.0] AS value \
          RETURN percentileCont(value, $quarter + 0.0) AS continuous, \
                 percentileDisc(value, CASE WHEN true THEN $quarter ELSE 2.0 END) AS discrete",
-        &mut context(&graph, &cpu, parameters, false),
+        &mut context(&graph, None, parameters, false),
     )?;
 
     assert_eq!(
@@ -174,7 +168,6 @@ fn cpu_valid_context_free_percentile_expressions_keep_results_unchanged() -> Res
 #[test]
 fn row_dependent_aggregation6_percentile_remains_on_normal_cpu_execution_path() -> Result<()> {
     let graph = GraphStore::default();
-    let cpu = cpu_backend(&graph)?;
     for function in ["percentileCont", "percentileDisc"] {
         let query = format!(
             "UNWIND range(3, 5) AS deg \
@@ -182,7 +175,7 @@ fn row_dependent_aggregation6_percentile_remains_on_normal_cpu_execution_path() 
              WITH deg LIMIT 100 \
              RETURN {function}(0.90, deg) AS percentile, deg"
         );
-        assert_runtime_number_out_of_range(&graph, &cpu, &query, BTreeMap::new())?;
+        assert_runtime_number_out_of_range(&graph, None, &query, BTreeMap::new())?;
     }
     Ok(())
 }
@@ -206,7 +199,7 @@ fn rand_dependent_percentile_is_rejected_before_runtime_preflight() -> Result<()
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn invalid_parameter_precedes_real_metal_resident_admission() -> Result<()> {
@@ -224,7 +217,7 @@ fn invalid_parameter_precedes_real_metal_resident_admission() -> Result<()> {
             ResultValue::Scalar(ScalarValue::Float(1.25.into())),
         )]);
         let error = QueryEngine
-            .execute(&query, &mut context(&graph, &metal, parameters, true))
+            .execute(&query, &mut context(&graph, Some(&metal), parameters, true))
             .expect_err("Metal accepted an out-of-range percentile");
         assert_eq!(error.code, ErrorCode::QueryType, "query: {query}");
         assert_eq!(

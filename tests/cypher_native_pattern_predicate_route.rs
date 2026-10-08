@@ -283,7 +283,7 @@ struct Fixture {
 }
 
 fn fixture() -> Result<Fixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let labels = [
         graph.catalog_mut().intern_label("A")?,
         graph.catalog_mut().intern_label("B")?,
@@ -327,7 +327,7 @@ fn fixture() -> Result<Fixture> {
 }
 
 fn resident_image(fixture: &Fixture) -> Result<ResidentProjectImage> {
-    ResidentProjectImage::build(
+    super::legacy_resident_build(
         fixture.project,
         fixture.bookmark,
         &fixture.graph,
@@ -547,7 +547,7 @@ fn stale_snapshot_or_layout_emits_no_stream_items() -> Result<()> {
     assert_eq!(emitted, 0);
     assert_eq!(observations.pattern_calls.load(Ordering::SeqCst), 0);
 
-    let mut revision_fixture = fixture()?;
+    let revision_fixture = fixture()?;
     let backend = ObservedBackend::new(cpu_backend(&revision_fixture)?);
     let observations = backend.observations();
     revision_fixture.graph.insert_node(NodeInput {
@@ -572,7 +572,7 @@ fn stale_snapshot_or_layout_emits_no_stream_items() -> Result<()> {
     assert_eq!(emitted, 0);
     assert_eq!(observations.pattern_calls.load(Ordering::SeqCst), 0);
 
-    let mut layout_fixture = fixture()?;
+    let layout_fixture = fixture()?;
     let backend = ObservedBackend::new(cpu_backend(&layout_fixture)?);
     let observations = backend.observations();
     let prior_layout = layout_fixture.graph.layout_version();
@@ -600,7 +600,7 @@ fn stale_canonical_catalog_emits_nothing_before_fused_dispatch() -> Result<()> {
     let fixture = fixture()?;
     let backend = ObservedBackend::new(cpu_backend(&fixture)?);
     let observations = backend.observations();
-    let mut stale_catalog = fixture.graph.catalog().clone();
+    let stale_catalog = fixture.graph.catalog().clone();
     stale_catalog.intern_property("stale_only")?;
     let mut execution = context(&fixture, Some(&backend), true);
     execution.binding_catalog = &stale_catalog;

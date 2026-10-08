@@ -494,7 +494,7 @@ fn fixture_graph(source: &SourceScenario) -> Result<GraphStore> {
 }
 
 fn resident_image(graph: &GraphStore) -> Result<ResidentProjectImage> {
-    ResidentProjectImage::build(
+    super::legacy_resident_build(
         PROJECT,
         Bookmark {
             term: 43,
@@ -517,7 +517,7 @@ struct GraphMetrics {
 fn graph_metrics(graph: &GraphStore) -> GraphMetrics {
     let represented_labels = graph
         .nodes()
-        .flat_map(|node| node.labels().iter().copied())
+        .flat_map(|node| node.labels().to_vec())
         .collect::<BTreeSet<_>>()
         .len();
     GraphMetrics {

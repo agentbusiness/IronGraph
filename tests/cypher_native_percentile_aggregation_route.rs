@@ -331,7 +331,7 @@ impl ExecutionBackend for ObservedCpuBackend {
 }
 
 fn fixture_graph() -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let price = graph.catalog_mut().intern_property("price")?;
     for (id, value) in [(1, 10.0), (2, 20.0), (3, 30.0)] {
         graph.insert_node(NodeInput {
@@ -411,7 +411,7 @@ fn aggregation6_exact_six_percentiles_use_one_float_graph_command_each() -> Resu
     let graph = fixture_graph()?;
     let mut backend = ObservedCpuBackend::new();
     backend.admit_project(ResidentProjectImage::graph_only(Arc::new(
-        graph.snapshot()?,
+        super::legacy_fixture_snapshot(&graph)?,
     )))?;
     let trace = backend.trace();
     let cases: [(usize, &str, ResidentSegmentedAggregateKind, f64, f64); 6] = [

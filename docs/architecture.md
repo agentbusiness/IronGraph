@@ -1,6 +1,6 @@
 # Architecture
 
-IronGraph is a standalone, GPU-first, single-node graph database. It combines a property graph,
+IronGraph is a standalone, CPU, single-node graph database. It combines a property graph,
 Cypher, transactions, durable storage, graph analytics, vector search, and compatible streaming
 protocols in one database process.
 
@@ -19,7 +19,7 @@ Application
                   |-- Explicit projects
                   |-- OBSERVED, KNOWLEDGE, and WORKSPACE layers
                   |-- Cypher query and administration surface
-                  |-- CPU, Metal, or CUDA execution device
+                  |-- CPU graph and independent text inference device
                   |-- Graph, temporal, text, and vector indexes
                   `-- Canonical WAL and periodic snapshots
                          |
@@ -90,21 +90,15 @@ Documents, Training, Docs, and Settings. Graph exploration is the Plot result vi
 The browser interface and SDK clients use the database's supported query surface; they do not own a
 second copy of graph data.
 
-## Execution and residency
+## Execution and memory
 
-Every process selects exactly one execution device:
+Graph storage, indexes, queries, algorithms, and vector retrieval use shared host memory and CPU
+execution. Threads access the same canonical graph. Parallel readers do not wait for writers and
+may observe a mixture of values during a multi-record write.
 
-- **CPU** is the reference backend and the portable choice.
-- **Metal** is the primary local accelerator on supported Apple hardware.
-- **CUDA** is an optional build target for supported NVIDIA environments.
-
-In a GPU-backed process, each admitted project's canonical graph rows and derived indexes remain
-resident on the selected device. IronGraph reports an admission failure when the available device
-capacity cannot hold the project. It does not silently page or truncate canonical graph rows.
-
-Plan GPU capacity for the combined resident graph, its indexes, and the enabled text encoder. If a
-workload cannot satisfy that requirement, use a larger device, reduce the admitted data set, or use
-the CPU backend.
+Local text inference runs asynchronously on an independently selected CPU, Metal, or CUDA device,
+subject to packaged support. Plan host memory for the graph and its derived indexes, and inference
+device memory for the encoder and its working allocations.
 
 ## Transactions and durability
 
@@ -135,12 +129,12 @@ owner; generated vectors remain derived state. Applications can declare addition
 embedding indexes when they need explicit content selection.
 
 The `graph_semantic` search returns ranked nodes and relationships through the same Cypher surface
-used by the Query API, Bolt, and SDKs. GPU-backed instances execute vector retrieval on the selected
-GPU; CPU instances use the CPU backend.
+used by the Query API, Bolt, and SDKs. Vector retrieval executes on the CPU against the shared
+graph and indexes. Text inference uses its independently selected device.
 
-Encoder startup and index residency contribute to startup time and device-memory requirements. A
+Encoder startup contributes to startup time and device-memory requirements. A
 production readiness check should therefore include encoder availability, warm-up completion, index
-status, and device admission—not only listener availability.
+status, and encoder readiness as well as listener availability.
 
 ## Streams and queues
 

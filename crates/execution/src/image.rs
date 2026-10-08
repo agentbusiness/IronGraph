@@ -8,9 +8,9 @@ use uuid::Uuid;
 use crate::{
     Bookmark, ProjectId, Result, ScalarValue,
     graph::{
-        GraphDeviceDelta, GraphSharedBacking, GraphSnapshot, GraphStore, IndexCatalog,
-        IndexDeviceImage, PersistentMap, ResolvedVectorMutation, SharedVectorBacking,
-        TemporalCanonicalColumn, TemporalDeviceImage, TemporalSample, TemporalStore, stable_id_key,
+        GraphDeviceDelta, GraphSharedBacking, GraphSnapshot, IndexCatalog, IndexDeviceImage,
+        PersistentMap, ResolvedVectorMutation, SharedVectorBacking, TemporalCanonicalColumn,
+        TemporalDeviceImage, TemporalSample, TemporalStore, legacy::GraphStore, stable_id_key,
     },
     types::EntityKind,
 };
@@ -159,7 +159,7 @@ impl ResidentProjectImage {
             edge_id_rows,
             temporal: temporal.device_image()?,
             temporal_canonical: temporal.canonical_columns()?,
-            indexes: indexes.device_image()?,
+            indexes: indexes.inactive_device_image(graph)?,
         })
     }
 

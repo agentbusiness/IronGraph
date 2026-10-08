@@ -105,7 +105,7 @@ fn map_item() -> DocumentItem {
 
 #[test]
 fn every_canonical_graph_write_rejects_non_property_shapes() -> Result<()> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let property = graph.catalog_mut().intern_property("value")?;
     let relationship_type = graph.catalog_mut().intern_relationship_type("REL")?;
 
@@ -206,7 +206,7 @@ fn every_canonical_graph_write_rejects_non_property_shapes() -> Result<()> {
 
 #[test]
 fn property_lists_reject_null_and_mixed_scalar_elements() -> Result<()> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let property = graph.catalog_mut().intern_property("value")?;
 
     for (description, value) in [
@@ -243,7 +243,7 @@ fn property_lists_reject_null_and_mixed_scalar_elements() -> Result<()> {
 
 #[test]
 fn root_maps_with_nested_document_content_remain_valid_properties() -> Result<()> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let property = graph.catalog_mut().intern_property("payload")?;
     let relationship_type = graph.catalog_mut().intern_relationship_type("REL")?;
     let value = map()?;
@@ -290,7 +290,7 @@ fn root_maps_with_nested_document_content_remain_valid_properties() -> Result<()
 
 #[test]
 fn homogeneous_scalar_lists_remain_valid_on_nodes_and_relationships() -> Result<()> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let property = graph.catalog_mut().intern_property("values")?;
     let relationship_type = graph.catalog_mut().intern_relationship_type("REL")?;
     let integers = list(vec![

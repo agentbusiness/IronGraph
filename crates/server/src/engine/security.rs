@@ -17,10 +17,6 @@ impl SecurityState {
         &self.client_credentials
     }
 
-    pub fn client_credentials_mut(&mut self) -> &mut CredentialRegistry {
-        &mut self.client_credentials
-    }
-
     pub fn validate(&self) -> Result<()> {
         self.client_credentials.validate()
     }

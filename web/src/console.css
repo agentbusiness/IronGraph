@@ -7,6 +7,20 @@
  * tokens, which is what lets the plate/page switch reach the whole console at once.
  */
 
+.startup-body { padding: 36px 24px; }
+.startup-body h1 { font-family: 'Source Serif 4', serif; font-weight: 400; color: var(--ink); }
+.startup-progress { width: 100%; height: 8px; border: 1px solid var(--rule-2); appearance: none; background: var(--ground); color: var(--rubric); }
+.startup-progress::-webkit-progress-bar { background: var(--ground); }
+.startup-progress::-webkit-progress-value { background: var(--rubric); }
+.startup-progress::-moz-progress-bar { background: var(--rubric); }
+.startup-leaf > .col-i { padding: 24px 16px; }
+.startup-leaf > .marg { padding: 24px 16px; }
+@media (max-width: 1180px) {
+  .startup-leaf { display: flex; flex-direction: column; }
+  .startup-leaf > .rail, .startup-leaf > .marg-rule { display: none; }
+  .startup-leaf > .marg { display: block; border-top: 1px solid var(--rule); }
+}
+
 /* ── The register cross, sized where it appears ─────────────────────────────
  * The glyph itself lives in design/parts.tsx; these are the design's sizes for it. Without them
  * the SVG has no intrinsic size and fills its container — an 11px mark rendered a hundred wide. */

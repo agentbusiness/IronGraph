@@ -709,8 +709,8 @@ fn resident_direct_literal_map_set_items(
         entries.extend(
             catalog
                 .properties()
-                .filter(|(_, name)| !supplied.contains(*name))
-                .map(|(_, name)| (name.to_owned(), ScalarValue::Null)),
+                .filter(|(_, name)| !supplied.contains(name.as_ref()))
+                .map(|(_, name)| (name.to_string(), ScalarValue::Null)),
         );
     } else if entries.len() != 1 || pattern.start.properties.is_empty() {
         // Empty += is erased by the nullable/direct read compiler. The first effectful merge-map
@@ -5264,7 +5264,7 @@ fn compile_segmented_relationship_key_value_list(
         properties.push((
             ResidentSegmentedPropertyKeyDescriptor {
                 property,
-                name: name.to_owned(),
+                name: name.to_string(),
             },
             maximum_string_bytes,
         ));
@@ -5920,7 +5920,7 @@ fn compile_segmented_property_keys_distinct(
         .properties()
         .map(|(property, name)| ResidentSegmentedPropertyKeyDescriptor {
             property,
-            name: name.to_owned(),
+            name: name.to_string(),
         })
         .collect::<Vec<_>>();
     if descriptors.len() > RESIDENT_QUANTIFIER_MAX_LITERAL_ITEMS
@@ -21290,7 +21290,7 @@ impl<'a> ResidentBoundRelationshipBuilder<'a> {
                     let Some(value) =
                         self.merge_property_source(ResidentPropertyPatchValue::Property {
                             variable: source.clone(),
-                            property: property.clone(),
+                            property: property.to_string(),
                         })?
                     else {
                         return Ok(false);
@@ -24233,7 +24233,7 @@ impl<'a> ResidentBoundRelationshipBuilder<'a> {
         self.exact_ordered_overlay_relationships &= exact_ordered_overlay_relationship;
         if let Some(name) = path_name {
             self.path = Some(ResidentBoundRelationshipPathBinding {
-                name: name.to_owned(),
+                name: name.to_string(),
                 start_entity: left.entity,
                 relationship_entity,
                 end_entity: right.entity,
@@ -31239,7 +31239,7 @@ mod tests {
 
     #[test]
     fn selective_integer_start_filter_precedes_resident_expansion() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let label = graph.catalog_mut().intern_label("Node")?;
         let property = graph.catalog_mut().intern_property("value")?;
         let relationship = graph.catalog_mut().intern_relationship_type("R")?;
@@ -31281,7 +31281,7 @@ mod tests {
 
     #[test]
     fn match_create_delete_uses_one_statement_local_row_mutation_schedule() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         graph.insert_node(NodeInput {
             id: NodeId(1),
             layer: Layer::Observed,
@@ -31349,7 +31349,7 @@ mod tests {
 
         let mut cpu = CpuBackend::new(32 * 1024 * 1024, 1024 * 1024);
         cpu.admit_project(ResidentProjectImage::graph_only(Arc::new(
-            graph.snapshot()?,
+            crate::legacy_graph_fixture(&graph)?.snapshot()?,
         )))?;
         let result = cpu.execute_row_mutation(&compiled.request, &CancellationToken::new())?;
         let validated = result.validate_for_publication(&compiled.request, BackendKind::Cpu)?;
@@ -31365,7 +31365,7 @@ mod tests {
     }
 
     fn literal_map_graph(properties: &[(&str, ScalarValue)]) -> Result<GraphStore> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let label = graph.catalog_mut().intern_label("X")?;
         let mut resident_properties = Vec::with_capacity(properties.len());
         for (name, value) in properties {
@@ -31484,7 +31484,7 @@ mod tests {
 
         let mut cpu = CpuBackend::new(32 * 1024 * 1024, 1024 * 1024);
         cpu.admit_project(ResidentProjectImage::graph_only(Arc::new(
-            graph.snapshot()?,
+            crate::legacy_graph_fixture(&graph)?.snapshot()?,
         )))?;
         let result =
             cpu.execute_segmented_aggregation(&compiled.request, &CancellationToken::new())?;
@@ -31606,7 +31606,7 @@ mod tests {
 
     #[test]
     fn aggregation6_percentile_compiler_preserves_parameter_bits_and_float_source() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let price = graph.catalog_mut().intern_property("price")?;
         for (id, value) in [(1, 10.0), (2, 20.0), (3, 30.0)] {
             graph.insert_node(NodeInput {
@@ -31755,7 +31755,7 @@ mod tests {
 
     #[test]
     fn return4_11_metal_optimized_plan_compiles_one_ordered_scalar_collect() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let person = graph.catalog_mut().intern_label("Person")?;
         let message = graph.catalog_mut().intern_label("Message")?;
         let id = graph.catalog_mut().intern_property("id")?;
@@ -31871,7 +31871,7 @@ mod tests {
 
     #[test]
     fn with_order_by2_23_compiles_hidden_small_string_suffix_as_direct_order() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let name = graph.catalog_mut().intern_property("name")?;
         for (id, value) in [(1_u64, "A"), (2, "A"), (3, "C"), (4, "C")] {
             graph.insert_node(NodeInput {
@@ -31979,7 +31979,7 @@ mod tests {
         let query = "MATCH (n) WITH n SKIP toInteger(rand()*9) \
                      WITH count(*) AS count RETURN count > 0 AS nonEmpty";
         let parameters = BTreeMap::new();
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         for id in 1..=10_u64 {
             graph.insert_node(NodeInput {
                 id: NodeId(id),
@@ -32082,7 +32082,7 @@ mod tests {
                 )
         )));
 
-        let mut below_bound = GraphStore::default();
+        let below_bound = GraphStore::default();
         for id in 1..=9_u64 {
             below_bound.insert_node(NodeInput {
                 id: NodeId(id),
@@ -32103,7 +32103,7 @@ mod tests {
 
     #[test]
     fn return6_16_reuses_identical_match_rows_across_two_aggregate_boundaries() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let name = graph.catalog_mut().intern_property("name")?;
         let entity_type = graph.catalog_mut().intern_property("type")?;
         let times = graph.catalog_mut().intern_property("times")?;
@@ -32431,7 +32431,7 @@ mod tests {
 
         let mut cpu = CpuBackend::new(32 * 1024 * 1024, 1024 * 1024);
         cpu.admit_project(ResidentProjectImage::graph_only(Arc::new(
-            graph.snapshot()?,
+            crate::legacy_graph_fixture(&graph)?.snapshot()?,
         )))?;
         let result =
             cpu.execute_segmented_aggregation(&compiled.request, &CancellationToken::new())?;
@@ -32547,7 +32547,7 @@ mod tests {
         })?;
         let mut cpu = CpuBackend::new(32 * 1024 * 1024, 1024 * 1024);
         cpu.admit_project(ResidentProjectImage::graph_only(Arc::new(
-            graph.snapshot()?,
+            crate::legacy_graph_fixture(&graph)?.snapshot()?,
         )))?;
         let result =
             cpu.execute_segmented_aggregation(&compiled.request, &CancellationToken::new())?;
@@ -32783,14 +32783,14 @@ mod tests {
             let compiled = compile_keys(graph, query)?;
             let mut cpu = CpuBackend::new(64 * 1024 * 1024, 8 * 1024 * 1024);
             cpu.admit_project(ResidentProjectImage::graph_only(Arc::new(
-                graph.snapshot()?,
+                crate::legacy_graph_fixture(&graph)?.snapshot()?,
             )))?;
             Ok(execute_compiled_keys(&cpu, &compiled)?
                 .into_iter()
                 .collect())
         }
 
-        let mut one_node = GraphStore::default();
+        let one_node = GraphStore::default();
         let name = one_node.catalog_mut().intern_property("name")?;
         let surname = one_node.catalog_mut().intern_property("surname")?;
         let null_property = one_node.catalog_mut().intern_property("missing")?;
@@ -32811,7 +32811,7 @@ mod tests {
             "canonical NULL property was exposed by keys()"
         );
 
-        let mut delta_graph = GraphStore::default();
+        let delta_graph = GraphStore::default();
         let zeta = delta_graph.catalog_mut().intern_property("zeta")?;
         let alpha = delta_graph.catalog_mut().intern_property("alpha")?;
         let removed = delta_graph.catalog_mut().intern_property("removed")?;
@@ -32832,7 +32832,7 @@ mod tests {
         })?;
         let mut delta_cpu = CpuBackend::new(64 * 1024 * 1024, 8 * 1024 * 1024);
         delta_cpu.admit_project(ResidentProjectImage::graph_only(Arc::new(
-            delta_graph.snapshot()?,
+            crate::legacy_graph_fixture(&delta_graph)?.snapshot()?,
         )))?;
         delta_graph.set_node_property(stable_node, removed, ScalarValue::Null, 2)?;
         delta_graph.set_node_property(
@@ -32844,7 +32844,7 @@ mod tests {
         delta_cpu.apply_project_delta(ResidentProjectDelta {
             project: ProjectId(uuid::Uuid::nil()),
             bookmark: Bookmark { term: 0, index: 3 },
-            graph: delta_graph.device_delta(3)?,
+            graph: crate::legacy_graph_fixture(&delta_graph)?.device_delta(3)?,
             temporal: Vec::new(),
             vectors: Vec::new(),
             invalidate_derived: true,
@@ -32878,7 +32878,7 @@ mod tests {
             "complete delta replacement did not add/remove keys through canonical NodeId mapping"
         );
 
-        let mut multiple_nodes = GraphStore::default();
+        let multiple_nodes = GraphStore::default();
         let properties = ["name", "surname", "otherName", "otherSurname"]
             .into_iter()
             .map(|name| {
@@ -32910,7 +32910,7 @@ mod tests {
             ])
         );
 
-        let mut propertyless_node = GraphStore::default();
+        let propertyless_node = GraphStore::default();
         propertyless_node.catalog_mut().intern_property("unused")?;
         propertyless_node.insert_node(NodeInput {
             id: NodeId(1),
@@ -32925,7 +32925,7 @@ mod tests {
             "propertyless optional node did not unwind to zero rows"
         );
 
-        let mut null_node = GraphStore::default();
+        let null_node = GraphStore::default();
         null_node.catalog_mut().intern_property("unused")?;
         assert!(
             execute_keys(&null_node, OPTIONAL_NODE_QUERY)?.is_empty(),
@@ -32933,7 +32933,7 @@ mod tests {
         );
 
         fn relationship_graph(with_properties: bool) -> Result<GraphStore> {
-            let mut graph = GraphStore::default();
+            let graph = GraphStore::default();
             let knows = graph.catalog_mut().intern_relationship_type("KNOWS")?;
             let status = graph.catalog_mut().intern_property("status")?;
             let year = graph.catalog_mut().intern_property("year")?;
@@ -32973,7 +32973,7 @@ mod tests {
         let propertyless_relationship = relationship_graph(false)?;
         assert!(execute_keys(&propertyless_relationship, RELATIONSHIP_QUERY)?.is_empty());
         assert!(execute_keys(&propertyless_relationship, OPTIONAL_RELATIONSHIP_QUERY)?.is_empty());
-        let mut no_relationship = GraphStore::default();
+        let no_relationship = GraphStore::default();
         no_relationship
             .catalog_mut()
             .intern_relationship_type("KNOWS")?;
@@ -33011,7 +33011,7 @@ mod tests {
 
     #[test]
     fn return_orderby2_08_expands_wildcard_into_native_node_sort() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let id = graph.catalog_mut().intern_property("id")?;
         for (node, value) in [(NodeId(1), 10), (NodeId(2), 1)] {
             graph.insert_node(NodeInput {
@@ -33059,7 +33059,7 @@ mod tests {
 
         let mut backend = CpuBackend::new(32 * 1024 * 1024, 1024 * 1024);
         backend.admit_project(ResidentProjectImage::graph_only(Arc::new(
-            graph.snapshot()?,
+            crate::legacy_graph_fixture(&graph)?.snapshot()?,
         )))?;
         let resident =
             backend.execute_node_pipeline(&compiled.request, &CancellationToken::new())?;
@@ -33081,7 +33081,7 @@ mod tests {
 
     #[test]
     fn nullable_relationship_is_null_groups_and_counts_on_cpu_without_host_input() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let player = graph.catalog_mut().intern_label("Player")?;
         let team = graph.catalog_mut().intern_label("Team")?;
         let plays_for = graph.catalog_mut().intern_relationship_type("PLAYS_FOR")?;
@@ -33130,7 +33130,7 @@ mod tests {
 
         let mut cpu = CpuBackend::new(64 * 1024 * 1024, 8 * 1024 * 1024);
         cpu.admit_project(ResidentProjectImage::graph_only(Arc::new(
-            graph.snapshot()?,
+            crate::legacy_graph_fixture(&graph)?.snapshot()?,
         )))?;
         let result =
             cpu.execute_segmented_aggregation(&compiled.request, &CancellationToken::new())?;
@@ -33230,7 +33230,7 @@ mod tests {
         // no rows and the distinct path count is zero. The important proof is that the compiler
         // emits the existing native distinct-relationship aggregate instead of rejecting the
         // semantically irrelevant path name or materializing path values on the host.
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         graph.insert_node(NodeInput {
             id: NodeId(1),
             layer: Layer::Observed,
@@ -33264,7 +33264,7 @@ mod tests {
 
         let mut backend = CpuBackend::new(32 * 1024 * 1024, 1024 * 1024);
         backend.admit_project(ResidentProjectImage::graph_only(Arc::new(
-            graph.snapshot()?,
+            crate::legacy_graph_fixture(&graph)?.snapshot()?,
         )))?;
         let groups = backend.execute_node_group_pipeline(grouping, &CancellationToken::new())?;
         assert_eq!(groups.len(), 1);
@@ -33275,7 +33275,7 @@ mod tests {
 
     #[test]
     fn named_path_grouping_keeps_non_equivalent_path_shapes_fail_closed() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         graph.insert_node(NodeInput {
             id: NodeId(1),
             layer: Layer::Observed,
@@ -33298,7 +33298,7 @@ mod tests {
 
     #[test]
     fn multiple_global_integer_reductions_share_the_resident_group_shape() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let label = graph.catalog_mut().intern_label("Node")?;
         let property = graph.catalog_mut().intern_property("value")?;
         for (id, value) in [(1_u64, 9_i64), (2, -4), (3, 17)] {
@@ -33342,7 +33342,7 @@ mod tests {
 
         let mut backend = CpuBackend::new(32 * 1024 * 1024, 1024 * 1024);
         backend.admit_project(ResidentProjectImage::graph_only(Arc::new(
-            graph.snapshot()?,
+            crate::legacy_graph_fixture(&graph)?.snapshot()?,
         )))?;
         let minimum = backend.execute_node_group_pipeline(minimum, &CancellationToken::new())?;
         let maximum = backend.execute_node_group_pipeline(maximum, &CancellationToken::new())?;
@@ -33356,7 +33356,7 @@ mod tests {
         // Exact openCypher Comparison1 [4] fixture and query. Equality over two scans of the same
         // bare node domain leaves one pair per node identity, so the retained native scan owns the
         // cardinality and the backend computes the count.
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         graph.insert_node(NodeInput {
             id: NodeId(1),
             layer: Layer::Observed,
@@ -33382,7 +33382,7 @@ mod tests {
 
         let mut backend = CpuBackend::new(32 * 1024 * 1024, 1024 * 1024);
         backend.admit_project(ResidentProjectImage::graph_only(Arc::new(
-            graph.snapshot()?,
+            crate::legacy_graph_fixture(&graph)?.snapshot()?,
         )))?;
         let groups = backend.execute_node_group_pipeline(grouping, &CancellationToken::new())?;
         assert_eq!(groups.len(), 1);
@@ -33396,7 +33396,7 @@ mod tests {
         // Exact openCypher Comparison1 [5] fixture and query. Each directed pattern emits the one
         // relationship once; identity equality therefore leaves one row, still computed from the
         // resident expansion rather than from a compiler-provided expected value.
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let relationship_type = graph.catalog_mut().intern_relationship_type("T")?;
         for id in [NodeId(1), NodeId(2)] {
             graph.insert_node(NodeInput {
@@ -33441,7 +33441,7 @@ mod tests {
 
         let mut backend = CpuBackend::new(32 * 1024 * 1024, 1024 * 1024);
         backend.admit_project(ResidentProjectImage::graph_only(Arc::new(
-            graph.snapshot()?,
+            crate::legacy_graph_fixture(&graph)?.snapshot()?,
         )))?;
         let groups = backend.execute_node_group_pipeline(grouping, &CancellationToken::new())?;
         assert_eq!(groups.len(), 1);
@@ -33470,7 +33470,7 @@ mod tests {
 
     #[test]
     fn lowers_bounded_pattern1_existential_predicates_to_postfix_programs() -> Result<()> {
-        let mut catalog = NameCatalog::default();
+        let catalog = NameCatalog::default();
         let rel1 = catalog.intern_relationship_type("REL1")?;
         catalog.intern_relationship_type("REL2")?;
         catalog.intern_relationship_type("REL3")?;
@@ -33539,7 +33539,7 @@ mod tests {
 
     #[test]
     fn normalizes_all_nine_official_existential_subqueries_to_one_hop_leaf_shapes() -> Result<()> {
-        let mut catalog = NameCatalog::default();
+        let catalog = NameCatalog::default();
         let property = catalog.intern_property("prop")?;
         let relationship_type = catalog.intern_relationship_type("R")?;
         let cases = [
@@ -33672,7 +33672,7 @@ mod tests {
 
     #[test]
     fn existential_normalization_keeps_neighboring_unproved_shapes_fail_closed() -> Result<()> {
-        let mut catalog = NameCatalog::default();
+        let catalog = NameCatalog::default();
         catalog.intern_property("prop")?;
         catalog.intern_relationship_type("R")?;
         for query in [
@@ -33692,7 +33692,7 @@ mod tests {
 
     #[test]
     fn pattern1_compiler_ignores_unknown_union_alternatives_and_fails_closed() -> Result<()> {
-        let mut catalog = NameCatalog::default();
+        let catalog = NameCatalog::default();
         let known = catalog.intern_relationship_type("KNOWN")?;
         let mixed = compile_pattern_query(
             "MATCH (n) WHERE (n)-[:MISSING|KNOWN|ALSO_MISSING]->() RETURN n",
@@ -33732,7 +33732,7 @@ mod tests {
     #[test]
     fn pattern1_lowering_enforces_leaf_instruction_recursion_and_syntactic_type_limits_early()
     -> Result<()> {
-        let mut catalog = NameCatalog::default();
+        let catalog = NameCatalog::default();
         catalog.intern_relationship_type("KNOWN")?;
         let leaf = pattern_filter_expression("MATCH (n) WHERE (n)-[:KNOWN]-() RETURN n", &catalog)?;
 
@@ -33807,7 +33807,7 @@ mod tests {
 
     #[test]
     fn lowers_only_official_bound_endpoint_pattern1_pair_components() -> Result<()> {
-        let mut catalog = NameCatalog::default();
+        let catalog = NameCatalog::default();
         let rel1 = catalog.intern_relationship_type("REL1")?;
         catalog.intern_relationship_type("REL2")?;
         catalog.intern_relationship_type("REL3")?;
@@ -33879,7 +33879,7 @@ mod tests {
 
     #[test]
     fn paired_pattern1_lowering_is_early_bounded_and_fail_closed() -> Result<()> {
-        let mut catalog = NameCatalog::default();
+        let catalog = NameCatalog::default();
         catalog.intern_relationship_type("REL1")?;
         catalog.intern_label("Tagged")?;
         for query in [
@@ -34151,7 +34151,7 @@ mod tests {
             )
         };
 
-        let mut node_graph = GraphStore::default();
+        let node_graph = GraphStore::default();
         let person = node_graph.catalog_mut().intern_label("Person")?;
         let city = node_graph.catalog_mut().intern_label("City")?;
         let born_in = node_graph.catalog_mut().intern_property("bornIn")?;
@@ -34229,7 +34229,7 @@ mod tests {
             compiled.request.validate()?;
         }
 
-        let mut relationship_graph = GraphStore::default();
+        let relationship_graph = GraphStore::default();
         let name = relationship_graph.catalog_mut().intern_property("name")?;
         let relationship_type = relationship_graph
             .catalog_mut()
@@ -34335,7 +34335,7 @@ mod tests {
              ON MATCH SET r.name = 'RUN' \
              RETURN count(r)";
 
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let a = graph.catalog_mut().intern_label("A")?;
         let b = graph.catalog_mut().intern_label("B")?;
         let relationship_type = graph.catalog_mut().intern_relationship_type("TYPE")?;
@@ -34449,7 +34449,7 @@ mod tests {
 
         let mut cpu = CpuBackend::new(64 * 1024 * 1024, 8 * 1024 * 1024);
         cpu.admit_project(ResidentProjectImage::graph_only(Arc::new(
-            graph.snapshot()?,
+            crate::legacy_graph_fixture(&graph)?.snapshot()?,
         )))?;
         let result = cpu.execute_row_mutation(&compiled.request, &CancellationToken::new())?;
         let validated = result.validate_for_publication(&compiled.request, BackendKind::Cpu)?;
@@ -34504,7 +34504,7 @@ mod tests {
 
     #[test]
     fn lowers_set_phase_before_result_limit_with_exact_obligations() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let label = graph.catalog_mut().intern_label("A")?;
         let num = graph.catalog_mut().intern_property("num")?;
         for id in 1..=5 {
@@ -34622,7 +34622,7 @@ mod tests {
 
     #[test]
     fn list12_collected_entity_mutations_compile_one_prewrite_graph_program() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let label = graph.catalog_mut().intern_label("Label1")?;
         let name = graph.catalog_mut().intern_property("name")?;
         graph.insert_node(NodeInput {
@@ -34715,7 +34715,7 @@ mod tests {
 
     #[test]
     fn lowers_set_parameter_to_immutable_mutation_constant() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         graph.catalog_mut().intern_label("A")?;
         let query = crate::cypher::parse("MATCH (n:A) SET n.num = $num RETURN n")?;
         let bound = crate::cypher::bind(
@@ -34912,7 +34912,7 @@ mod tests {
 
     #[test]
     fn lowers_remove_only_property_existence_and_key_count_continuations() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let label = graph.catalog_mut().intern_label("L")?;
         let relationship_type = graph.catalog_mut().intern_relationship_type("X")?;
         let num = graph.catalog_mut().intern_property("num")?;
@@ -35064,7 +35064,7 @@ mod tests {
 
     #[test]
     fn result_mutation_admits_typed_scalar_rhs_only_for_entity_only_continuations() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let a = graph.catalog_mut().intern_label("A")?;
         let x = graph.catalog_mut().intern_label("X")?;
         let rel = graph.catalog_mut().intern_relationship_type("REL")?;
@@ -35503,7 +35503,7 @@ mod tests {
 
     #[test]
     fn lowers_heterogeneous_double_unwind_to_native_value_matrix() -> Result<()> {
-        let mut catalog = NameCatalog::default();
+        let catalog = NameCatalog::default();
         catalog.intern_relationship_type("T")?;
         let query = crate::cypher::parse(
             "MATCH p = (n)-[r:T]->() \

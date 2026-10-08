@@ -224,21 +224,34 @@ where
             .ok_or_else(|| Error::internal("Kafka request workspace overflow"))?;
         let governor = process_broker_memory();
         let mut memory = governor.reserve(initial_bytes).await?;
-        let mut body = vec![0u8; body_length];
+        let mut body = memory
+            .spawn_blocking(move || vec![0u8; body_length])
+            .await
+            .map_err(|error| {
+                Error::internal(format!("Kafka frame allocation worker failed: {error}"))
+            })?;
         stream.read_exact(&mut body).await?;
+        let body = Bytes::from(body);
         if matches!(api_key, 0 | 1) {
-            let request_workspace = if api_key == 0 {
-                produce_workspace_bytes(api_version, &body)?
-            } else {
-                fetch_workspace_bytes(api_version, &body)?
-            };
+            let workspace_body = body.clone();
+            let request_workspace = memory
+                .spawn_blocking(move || {
+                    if api_key == 0 {
+                        produce_workspace_bytes(api_version, &workspace_body)
+                    } else {
+                        fetch_workspace_bytes(api_version, &workspace_body)
+                    }
+                })
+                .await
+                .map_err(|error| {
+                    Error::internal(format!("Kafka workspace worker failed: {error}"))
+                })??;
             memory.try_grow_to(body_length.checked_add(request_workspace).ok_or_else(|| {
                 Error::internal("Kafka request workspace reservation overflow")
             })?)?;
         }
         // `Bytes::from(Vec)` transfers the request allocation without copying its full contents.
         // Clones handed to blocking request execution then increment only the shared owner.
-        let body = Bytes::from(body);
         let mut changes = (api_key == 1).then(|| coordinator.subscribe_changes());
         let request_started = tokio::time::Instant::now();
         let mut fetch_deadline = None;
@@ -756,7 +769,9 @@ fn produce(
                     "produce message set is null",
                 )
             })?;
-            let decoded = if version >= PRODUCE_RECORD_BATCH_VERSION {
+            let decoded = if version >= PRODUCE_RECORD_BATCH_VERSION
+                && message_set.get(16) == Some(&(RECORD_BATCH_MAGIC as u8))
+            {
                 decode_record_batches(message_set)
             } else {
                 decode_message_set(message_set, version)
@@ -1044,7 +1059,9 @@ fn produce_workspace_bytes(version: i16, body: &[u8]) -> Result<usize> {
             let message_set = reader.bytes()?.ok_or_else(|| {
                 Error::new(ErrorCode::ProtocolViolation, "produce message set is null")
             })?;
-            compressed |= if version >= PRODUCE_RECORD_BATCH_VERSION {
+            compressed |= if version >= PRODUCE_RECORD_BATCH_VERSION
+                && message_set.get(16) == Some(&(RECORD_BATCH_MAGIC as u8))
+            {
                 record_batches_use_compression(message_set)?
             } else {
                 message_set_uses_compression(message_set)?
@@ -2717,10 +2734,6 @@ mod compression_tests {
             engine::{
                 ExecutionClass, SingleNodeBootstrapConfig, WriteStorageLimits, open_standalone,
             },
-            gpu::{
-                BackendKind, DeviceMemoryGovernor, ResolvedComputeDevice,
-                create_execution_backend_with_governor,
-            },
             protocol::{QueryExecutor, QueryRequest, QueryStreamEvent},
             server::Database,
         };
@@ -2751,13 +2764,6 @@ mod compression_tests {
             database.bind_runtime(Arc::downgrade(boot.runtime()))?;
             let snapshot = directory.path().join("standalone-snapshots");
             database.standalone_recover(&snapshot).await?;
-            database.bind_execution_backend(create_execution_backend_with_governor(
-                ResolvedComputeDevice {
-                    backend: BackendKind::Cpu,
-                    ordinal: 0,
-                },
-                DeviceMemoryGovernor::new(usize::MAX, 0),
-            )?)?;
             boot.runtime().replay_standalone_wal().await?;
             let query = |statement: &str| -> Result<Option<ProjectId>> {
                 let request: QueryRequest = serde_json::from_value(
@@ -2906,6 +2912,27 @@ mod compression_tests {
 
     fn message_set(value: &[u8], attributes: u8, timestamp: i64) -> Result<Vec<u8>> {
         nullable_message_set(Some(value), attributes, timestamp)
+    }
+    #[test]
+    fn produce_v3_admits_legacy_null_and_empty_message_sets() -> Result<()> {
+        let mut records = nullable_message_set(None, 0, 1)?;
+        records.extend_from_slice(&nullable_message_set(Some(b""), 0, 2)?);
+        let mut request = Writer::new();
+        request.nullable_string(None)?;
+        request.nullable_string(None)?;
+        request.i16(-1);
+        request.i32(5_000);
+        request.array_len(1);
+        request.string("events")?;
+        request.array_len(1);
+        request.i32(0);
+        request.bytes(Some(&records))?;
+        assert!(produce_workspace_bytes(3, request.as_slice()).is_ok());
+        let messages = decode_message_set(&records, 3)?;
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].value.is_none());
+        assert_eq!(messages[1].value.as_deref(), Some(b"".as_slice()));
+        Ok(())
     }
 
     fn gzip(bytes: &[u8]) -> Result<Vec<u8>> {
@@ -4347,7 +4374,7 @@ endpoint = os.environ["IG_KAFKA_ENDPOINT"]
 producer = KafkaProducer(
     bootstrap_servers=[endpoint],
     acks="all",
-    api_version_auto_timeout_ms=5000,
+    bootstrap_timeout_ms=5000,
     max_block_ms=10000,
     request_timeout_ms=10000,
 )
@@ -4361,7 +4388,7 @@ consumer = KafkaConsumer(
     bootstrap_servers=[endpoint],
     group_id=None,
     enable_auto_commit=False,
-    api_version_auto_timeout_ms=5000,
+    bootstrap_timeout_ms=5000,
     request_timeout_ms=10000,
 )
 partition = TopicPartition("events", 0)

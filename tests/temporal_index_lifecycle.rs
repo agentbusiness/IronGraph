@@ -20,7 +20,7 @@ use irongraph::{
 use ordered_float::OrderedFloat;
 
 fn indexed_graph() -> Result<(GraphStore, LabelId, PropertyId, PropertyId)> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let label = graph.catalog_mut().intern_label("Document")?;
     let source = graph.catalog_mut().intern_property("text")?;
     let target = graph.catalog_mut().intern_property("embedding")?;
@@ -53,14 +53,14 @@ fn quantized_vector_mutation_replays_identical_bits() -> Result<()> {
         model: "default".to_owned(),
     };
     let initial = profile.quantize(&[1.0, 0.0, 0.0, 0.0])?;
-    let mut first = IndexCatalog::default();
+    let first = IndexCatalog::default();
     first.create_embedding(
         &graph,
         definition.clone(),
         profile.clone(),
         vec![(7, initial.clone(), 1)],
     )?;
-    let mut second = IndexCatalog::default();
+    let second = IndexCatalog::default();
     second.create_embedding(&graph, definition, profile.clone(), vec![(7, initial, 1)])?;
 
     let bits = profile.quantize(&[0.25, -0.5, 0.75, 1.0])?;
@@ -91,8 +91,8 @@ fn quantized_vector_mutation_replays_identical_bits() -> Result<()> {
 
 #[test]
 fn index_lifecycle_survives_checkpoint_roundtrip() -> Result<()> {
-    let (mut graph, label, source, _) = indexed_graph()?;
-    let mut indexes = IndexCatalog::default();
+    let (graph, label, source, _) = indexed_graph()?;
+    let indexes = IndexCatalog::default();
     indexes.create(
         &graph,
         GraphIndexDefinition {
@@ -109,7 +109,7 @@ fn index_lifecycle_survives_checkpoint_roundtrip() -> Result<()> {
     );
     let encoded = postcard::to_stdvec(&indexes)
         .map_err(|error| Error::internal(format!("test encoding failed: {error}")))?;
-    let mut restored: IndexCatalog = postcard::from_bytes(&encoded)
+    let restored: IndexCatalog = postcard::from_bytes(&encoded)
         .map_err(|error| Error::internal(format!("test decoding failed: {error}")))?;
     let mutation = GraphMutation::SetNodeProperty {
         node: NodeId(7),
@@ -133,7 +133,7 @@ fn index_lifecycle_survives_checkpoint_roundtrip() -> Result<()> {
 #[test]
 fn late_rollup_repair_matches_rebuild_and_restart() -> Result<()> {
     let property = PropertyId(3);
-    let mut store = TemporalStore::default();
+    let store = TemporalStore::default();
     store.declare(
         TemporalDeclaration {
             entity_kind: EntityKind::Node,
@@ -167,7 +167,7 @@ fn late_rollup_repair_matches_rebuild_and_restart() -> Result<()> {
         )?;
     }
     let incremental = store.rollup_buckets("ten_nanos", 9, 0, 40)?;
-    let mut rebuilt = store.clone();
+    let rebuilt = store.clone();
     rebuilt.rebuild_rollup("ten_nanos")?;
     assert_eq!(incremental, rebuilt.rollup_buckets("ten_nanos", 9, 0, 40)?);
     assert_eq!(incremental[0].count, 2);

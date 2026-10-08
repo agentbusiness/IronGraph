@@ -15,7 +15,7 @@ use irongraph::{
 use tokio_util::sync::CancellationToken;
 
 fn graph_with_incident_relationship() -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let source = graph.catalog_mut().intern_label("Source")?;
     let target = graph.catalog_mut().intern_label("Target")?;
     let link = graph.catalog_mut().intern_relationship_type("LINK")?;
@@ -112,7 +112,7 @@ fn statement_overlay_allows_detach_delete() -> Result<()> {
 
 #[test]
 fn canonical_store_reports_attached_node_delete_as_query_type() -> Result<()> {
-    let mut graph = graph_with_incident_relationship()?;
+    let graph = graph_with_incident_relationship()?;
     let error = graph
         .delete_node(NodeId(1), false, 4)
         .err()
@@ -127,7 +127,7 @@ fn canonical_store_reports_attached_node_delete_as_query_type() -> Result<()> {
 
 #[test]
 fn canonical_store_allows_detach_delete() -> Result<()> {
-    let mut graph = graph_with_incident_relationship()?;
+    let graph = graph_with_incident_relationship()?;
     graph.delete_node(NodeId(1), true, 4)?;
 
     assert!(graph.node(NodeId(1)).is_none());

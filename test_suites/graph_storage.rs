@@ -2,6 +2,9 @@
 
 //! Consolidated graph and storage integration-test harness.
 
+#[path = "../tests/canonical_graph_query_contract.rs"]
+mod canonical_graph_query_contract;
+
 #[path = "../tests/canonical_property_shape_validation.rs"]
 mod canonical_property_shape_validation;
 #[path = "../tests/mixed_property_types.rs"]

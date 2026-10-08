@@ -158,8 +158,8 @@ graph properties, MCP tool arguments, query results, or documents.
 
 - The stdio MCP process must be able to reach the running IronGraph instance. The local Streamable
   HTTP listener starts and stops with the IronGraph database process.
-- Query output is bounded for host safety. A truncated result says so explicitly; narrow the Cypher
-  or raise the tool's bounded row limit instead of treating a partial result as complete.
+- Query output has no database-imposed result quota. Use an explicit Cypher `LIMIT` when you want
+  fewer rows.
 - The host must confirm destructive statements such as `DROP`, `CLEAR`, `PURGE`, and `DELETE` before
   calling the unified Cypher tool.
 - MCP uses one selected IronGraph instance. Each Cypher operation still names its project explicitly.

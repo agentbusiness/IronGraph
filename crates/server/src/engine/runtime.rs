@@ -1,14 +1,16 @@
 use std::{
     collections::VecDeque,
     path::Path,
-    sync::Arc,
-    sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError},
+    sync::mpsc::{self, RecvTimeoutError, SyncSender},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::storage::{
-    AdmissionClass, AdmissionController, AdmissionLimits, AdmissionPermit, ConnectionId,
-    DurableLog, MutationEntry,
+    AdmissionClass, AdmissionController, AdmissionPermit, ConnectionId, DurableLog, MutationEntry,
 };
 use crate::{Bookmark, Error, ErrorCode, Result};
 
@@ -18,7 +20,6 @@ use super::{
     WriteStorageLimits,
 };
 
-const MAX_CLIENT_WAIT_MILLIS: u64 = 10 * 60 * 1_000;
 // Keep the no-delay single-write path, but do not impose an artificial throughput ceiling when
 // thousands of already-admitted independent writes arrive together. This bound remains finite,
 // every queued payload already owns an admission permit, and a graph backend may end a batch
@@ -63,7 +64,7 @@ struct PreparedWrite {
 }
 
 fn standalone_writer_loop(
-    receiver: mpsc::Receiver<WriterMessage>,
+    mut receiver: tokio::sync::mpsc::Receiver<WriterMessage>,
     persistence: SyncSender<PersistenceMessage>,
     backend: Arc<dyn MutationStateBackend>,
     gate: Arc<parking_lot::Mutex<()>>,
@@ -74,13 +75,13 @@ fn standalone_writer_loop(
     loop {
         if pending.is_empty() {
             let received = if let Some(message) = deferred_control.take() {
-                Ok(message)
+                Some(message)
             } else {
-                receiver.recv().map_err(|_| RecvTimeoutError::Disconnected)
+                receiver.blocking_recv()
             };
             match received {
-                Ok(WriterMessage::Write(write)) => pending.push_back(write),
-                Ok(WriterMessage::Flush(reply)) => {
+                Some(WriterMessage::Write(write)) => pending.push_back(write),
+                Some(WriterMessage::Flush(reply)) => {
                     let (flush, completed) = mpsc::sync_channel(1);
                     let result = persistence
                         .send(PersistenceMessage::Flush(flush))
@@ -93,7 +94,7 @@ fn standalone_writer_loop(
                     let _ = reply.send(result);
                     continue;
                 }
-                Ok(WriterMessage::Shutdown(reply)) => {
+                Some(WriterMessage::Shutdown(reply)) => {
                     let (shutdown, completed) = mpsc::sync_channel(1);
                     let result = persistence
                         .send(PersistenceMessage::Shutdown(shutdown))
@@ -106,8 +107,7 @@ fn standalone_writer_loop(
                     let _ = reply.send(result);
                     return;
                 }
-                Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => {
+                None => {
                     let (shutdown, completed) = mpsc::sync_channel(1);
                     let _ = persistence.send(PersistenceMessage::Shutdown(shutdown));
                     let _ = completed.recv();
@@ -122,12 +122,14 @@ fn standalone_writer_loop(
                     deferred_control = Some(control);
                     break;
                 }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => break,
+                Err(
+                    tokio::sync::mpsc::error::TryRecvError::Empty
+                    | tokio::sync::mpsc::error::TryRecvError::Disconnected,
+                ) => break,
             }
         }
         match process_writer_batch(
-            &receiver,
+            &mut receiver,
             &mut deferred_control,
             &mut pending,
             &backend,
@@ -241,7 +243,7 @@ fn standalone_persistence_loop(
 }
 
 fn process_writer_batch(
-    receiver: &mpsc::Receiver<WriterMessage>,
+    receiver: &mut tokio::sync::mpsc::Receiver<WriterMessage>,
     deferred_control: &mut Option<WriterMessage>,
     pending: &mut VecDeque<QueuedWrite>,
     backend: &Arc<dyn MutationStateBackend>,
@@ -259,7 +261,11 @@ fn process_writer_batch(
         }
         return Ok(Vec::new());
     };
-    let Some(_batch_gate) = gate.try_lock_for(remaining) else {
+    let batch_gate = match remaining {
+        Some(remaining) => gate.try_lock_for(remaining),
+        None => Some(gate.lock()),
+    };
+    let Some(_batch_gate) = batch_gate else {
         if let Some(item) = pending.pop_front() {
             let _ = item.reply.send(Err(client_deadline_exceeded(
                 "standalone write admission timed out",
@@ -385,7 +391,10 @@ fn process_writer_batch(
                     *deferred_control = Some(control);
                     break;
                 }
-                Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+                Err(
+                    tokio::sync::mpsc::error::TryRecvError::Empty
+                    | tokio::sync::mpsc::error::TryRecvError::Disconnected,
+                ) => break,
             }
         }
     }
@@ -689,6 +698,7 @@ mod tests {
             limits,
         )
         .await?;
+        let recovered_runtime = Arc::new(recovered_runtime);
         let recovered = recovered_runtime.replay_standalone_wal().await?;
         assert_eq!(recovered.index, WRITES as u64);
         assert_eq!(
@@ -761,6 +771,7 @@ mod tests {
             limits,
         )
         .await?;
+        let recovered_runtime = Arc::new(recovered_runtime);
         let recovered = recovered_runtime.replay_standalone_wal().await?;
         assert_eq!(recovered, Bookmark { term: 1, index: 5 });
         assert_eq!(recovered_backend.applied.load(Ordering::Acquire), 5);
@@ -852,8 +863,9 @@ pub struct WriteRuntime {
     // This gate excludes snapshot recovery/compaction from an active publish/append boundary.
     standalone_gate: Arc<parking_lot::Mutex<()>>,
     standalone_wal: Arc<parking_lot::Mutex<DurableLog>>,
+    embedding_replay_floor: OnceLock<Arc<AtomicU64>>,
     persistence_tx: SyncSender<PersistenceMessage>,
-    writer_tx: SyncSender<WriterMessage>,
+    writer_tx: tokio::sync::mpsc::Sender<WriterMessage>,
     workers: parking_lot::Mutex<Option<(std::thread::JoinHandle<()>, std::thread::JoinHandle<()>)>>,
     #[cfg(test)]
     eventual_durability_test_hook: Arc<EventualDurabilityTestHook>,
@@ -882,11 +894,9 @@ impl WriteRuntime {
         })
         .await
         .map_err(|error| Error::internal(format!("WAL startup task failed: {error}")))??;
-        let sequencer_bytes = storage_limits.max_log_record_bytes.saturating_mul(64);
-        let sequencer_control_bytes = (sequencer_bytes / 16).max(1);
         let standalone_gate = Arc::new(parking_lot::Mutex::new(()));
         let standalone_wal = Arc::new(parking_lot::Mutex::new(standalone_wal));
-        let (writer_tx, writer_rx) = mpsc::sync_channel(MAX_WRITE_BATCH);
+        let (writer_tx, writer_rx) = tokio::sync::mpsc::channel(MAX_WRITE_BATCH);
         let (persistence_tx, persistence_rx) = mpsc::sync_channel(MAX_PENDING_WAL_BATCHES);
         let writer_backend = Arc::clone(&backend);
         let writer_gate = Arc::clone(&standalone_gate);
@@ -926,20 +936,10 @@ impl WriteRuntime {
             node_id,
             node,
             backend,
-            sequencer_admission: AdmissionController::new(AdmissionLimits {
-                max_requests: 1_024,
-                max_encoded_bytes: sequencer_bytes,
-                reserved_control_requests: 64,
-                reserved_control_bytes: sequencer_control_bytes,
-                max_requests_per_connection: 64,
-                max_encoded_bytes_per_connection: storage_limits
-                    .max_log_record_bytes
-                    .saturating_mul(16)
-                    .min(sequencer_bytes),
-                retry_after_ms: 25,
-            })?,
+            sequencer_admission: AdmissionController::unrestricted(),
             standalone_gate,
             standalone_wal,
+            embedding_replay_floor: OnceLock::new(),
             persistence_tx,
             writer_tx,
             workers: parking_lot::Mutex::new(Some((writer_worker, persistence_worker))),
@@ -974,38 +974,39 @@ impl WriteRuntime {
             command_prepared: false,
             reply,
         };
-        match self.writer_tx.try_send(WriterMessage::Write(queued)) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                return Err(Error::retryable(
-                    ErrorCode::WriteAdmissionFull,
-                    "standalone writer queue is full",
-                    Some(1),
-                ));
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                return Err(Error::internal("standalone writer is unavailable"));
-            }
-        }
+        self.writer_tx
+            .send(WriterMessage::Write(queued))
+            .await
+            .map_err(|_| Error::internal("standalone writer is unavailable"))?;
         let remaining = deadline.remaining().map_err(|_| {
             Error::new(
                 ErrorCode::DeadlineExceeded,
                 "write was dispatched; its outcome is uncertain; do not retry automatically",
             )
         })?;
-        tokio::time::timeout(remaining, response)
-            .await
-            .map_err(|_| Error::new(ErrorCode::DeadlineExceeded,
-                "write completion timed out after dispatch; its outcome is uncertain; do not retry automatically"))?
+        let completed = match remaining {
+            Some(remaining) => tokio::time::timeout(remaining, response)
+                .await.map_err(|_| Error::new(ErrorCode::DeadlineExceeded,
+                    "write completion timed out after dispatch; its outcome is uncertain; do not retry automatically"))?,
+            None => response.await,
+        };
+        completed
             .map_err(|_| Error::internal("writer stopped after dispatch; write outcome is uncertain; do not retry automatically"))?
     }
 
     /// Replays every WAL mutation above the backend's restored snapshot bookmark.
     ///
     /// This must run after snapshot installation and before listeners start accepting work.
-    pub async fn replay_standalone_wal(&self) -> Result<Bookmark> {
+    pub async fn replay_standalone_wal(self: &Arc<Self>) -> Result<Bookmark> {
+        let runtime = Arc::clone(self);
+        tokio::task::spawn_blocking(move || runtime.replay_standalone_wal_on_worker())
+            .await
+            .map_err(|error| Error::internal(format!("WAL recovery worker failed: {error}")))?
+    }
+
+    fn replay_standalone_wal_on_worker(&self) -> Result<Bookmark> {
         let _gate = self.standalone_gate.lock();
-        let applied = self.backend.applied_bookmark().await;
+        let applied = futures::executor::block_on(self.backend.applied_bookmark());
         let (wal_base, wal_tail, wal_is_empty) = {
             let wal = self.standalone_wal.lock();
             (wal.compacted_through(), wal.last_bookmark(), wal.is_empty())
@@ -1043,16 +1044,20 @@ impl WriteRuntime {
             .index
             .checked_add(1)
             .ok_or_else(|| Error::new(ErrorCode::CorruptStorage, "applied bookmark overflow"))?;
-        let entries = self.standalone_wal.lock().replay_from(first);
         let mut recovered = applied;
-        for entry in entries {
+        let mut next = first;
+        loop {
+            let entry = self.standalone_wal.lock().lookup(next)?;
+            let Some(entry) = entry else {
+                break;
+            };
             if entry.index() != recovered.index.saturating_add(1) {
                 return Err(Error::new(
                     ErrorCode::CorruptStorage,
                     "standalone WAL does not continue the restored snapshot",
                 ));
             }
-            if let Err(error) = self.backend.apply_mutation(&entry).await {
+            if let Err(error) = futures::executor::block_on(self.backend.apply_mutation(&entry)) {
                 // Older standalone builds prepared concurrent graph writes outside the write gate
                 // and could fsync a transaction that the state-dependent preflight then rejected.
                 // Such an entry was never visible or acknowledged, and no later index could be
@@ -1071,6 +1076,9 @@ impl WriteRuntime {
                 return Err(error);
             }
             recovered = entry.bookmark();
+            next = entry.index().checked_add(1).ok_or_else(|| {
+                Error::new(ErrorCode::CorruptStorage, "WAL replay index overflow")
+            })?;
         }
         if recovered != wal_tail {
             return Err(Error::new(
@@ -1079,6 +1087,17 @@ impl WriteRuntime {
             ));
         }
         Ok(recovered)
+    }
+
+    /// Drops WAL records included in an atomically published snapshot.
+    pub(crate) fn committed_embedding_entry(&self, index: u64) -> Result<Option<MutationEntry>> {
+        self.standalone_wal.lock().lookup(index)
+    }
+
+    pub(crate) fn register_embedding_replay_floor(&self, floor: Arc<AtomicU64>) -> Result<()> {
+        self.embedding_replay_floor
+            .set(floor)
+            .map_err(|_| Error::internal("embedding WAL cursor is already registered"))
     }
 
     /// Drops WAL records included in an atomically published snapshot.
@@ -1092,6 +1111,19 @@ impl WriteRuntime {
             .recv()
             .map_err(|_| Error::internal("WAL persistence flush response was lost"))??;
         let mut wal = self.standalone_wal.lock();
+        let included = if let Some(floor) = self.embedding_replay_floor.get() {
+            let index = included.index.min(floor.load(Ordering::Acquire));
+            if index <= wal.compacted_through().index {
+                return Ok(());
+            }
+            wal.lookup(index)?
+                .map(|entry| entry.bookmark())
+                .ok_or_else(|| {
+                    Error::internal("embedding compaction boundary is absent from the WAL")
+                })?
+        } else {
+            included
+        };
         wal.compact_prefix(included)
     }
 
@@ -1106,11 +1138,13 @@ impl WriteRuntime {
             .len()
             .checked_add(128)
             .ok_or_else(|| Error::invalid_data("sequencer admission size overflow"))?;
-        self.sequencer_admission.try_admit(
+        self.sequencer_admission.try_admit_until(
             request.connection_id,
             request.admission_class,
             encoded_bytes,
-            std::time::Instant::now() + deadline.remaining()?,
+            deadline
+                .remaining()?
+                .map(|remaining| std::time::Instant::now() + remaining),
         )
     }
 
@@ -1118,7 +1152,8 @@ impl WriteRuntime {
     pub async fn flush_wal(&self) -> Result<()> {
         let (reply, response) = tokio::sync::oneshot::channel();
         self.writer_tx
-            .try_send(WriterMessage::Flush(reply))
+            .send(WriterMessage::Flush(reply))
+            .await
             .map_err(|error| Error::internal(format!("failed to request WAL flush: {error}")))?;
         response
             .await
@@ -1133,9 +1168,9 @@ impl WriteRuntime {
         };
         let (reply, response) = tokio::sync::oneshot::channel();
         let sender = self.writer_tx.clone();
-        let sent = tokio::task::spawn_blocking(move || sender.send(WriterMessage::Shutdown(reply)))
+        let sent = sender
+            .send(WriterMessage::Shutdown(reply))
             .await
-            .map_err(|error| Error::internal(format!("WAL shutdown send task failed: {error}")))?
             .map_err(|_| Error::internal("standalone writer is unavailable during shutdown"));
         let completed = response
             .await
@@ -1169,7 +1204,8 @@ impl Drop for WriteRuntime {
     fn drop(&mut self) {
         if let Some(workers) = self.workers.get_mut().take() {
             let (reply, _response) = tokio::sync::oneshot::channel();
-            let _ = self.writer_tx.send(WriterMessage::Shutdown(reply));
+            let _ =
+                futures::executor::block_on(self.writer_tx.send(WriterMessage::Shutdown(reply)));
             let _ = join_workers(workers, &self.persistence_tx);
         }
     }
@@ -1191,31 +1227,35 @@ fn validate_write_request(request: &WriteRequest) -> Result<()> {
     Ok(())
 }
 
-fn request_timeout(millis: u64) -> Result<Duration> {
-    if millis == 0 || millis > MAX_CLIENT_WAIT_MILLIS {
-        return Err(Error::invalid_data(
-            "client consistency timeout is out of range",
-        ));
-    }
-    Ok(Duration::from_millis(millis))
+fn request_timeout(millis: u64) -> Result<Option<Duration>> {
+    Ok((millis != 0).then(|| Duration::from_millis(millis)))
 }
 
 #[derive(Clone, Copy)]
 struct ClientDeadline {
-    at: tokio::time::Instant,
+    at: Option<tokio::time::Instant>,
 }
 
 impl ClientDeadline {
     fn new(timeout_millis: u64) -> Result<Self> {
         Ok(Self {
-            at: tokio::time::Instant::now() + request_timeout(timeout_millis)?,
+            at: request_timeout(timeout_millis)?
+                .map(|duration| {
+                    tokio::time::Instant::now()
+                        .checked_add(duration)
+                        .ok_or_else(|| Error::invalid_data("client deadline exceeds clock range"))
+                })
+                .transpose()?,
         })
     }
 
-    fn remaining(self) -> Result<Duration> {
-        self.at
-            .checked_duration_since(tokio::time::Instant::now())
+    fn remaining(self) -> Result<Option<Duration>> {
+        let Some(at) = self.at else {
+            return Ok(None);
+        };
+        at.checked_duration_since(tokio::time::Instant::now())
             .filter(|remaining| !remaining.is_zero())
+            .map(Some)
             .ok_or_else(|| client_deadline_exceeded("client deadline exhausted"))
     }
 }

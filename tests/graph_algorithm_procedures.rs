@@ -7,7 +7,7 @@
 
 use std::{collections::BTreeMap, time::Instant};
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 use std::sync::Arc;
 
 use irongraph::{
@@ -17,13 +17,13 @@ use irongraph::{
 };
 use tokio_util::sync::CancellationToken;
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 use irongraph::gpu::{ExecutionBackend, MetalBackend};
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 use irongraph::graph::GraphMutation;
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn metal_backend() -> Result<Option<MetalBackend>> {
     match MetalBackend::new(0, 128 * 1024 * 1024, 1024 * 1024) {
         Ok(backend) => Ok(Some(backend)),
@@ -37,8 +37,53 @@ fn metal_backend() -> Result<Option<MetalBackend>> {
     }
 }
 
+// Only the explicitly inactive Metal comparison materializes a graph image.
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
+fn legacy_snapshot(graph: &GraphStore) -> Result<irongraph::graph::GraphSnapshot> {
+    let mut fixture = irongraph::graph::legacy::GraphStore::default();
+    for (id, name) in graph.catalog().labels() {
+        fixture.apply(GraphMutation::DeclareLabel {
+            name: name.to_string(),
+            id,
+        })?;
+    }
+    for (id, name) in graph.catalog().properties() {
+        fixture.apply(GraphMutation::DeclareProperty {
+            name: name.to_string(),
+            id,
+        })?;
+    }
+    for (id, name) in graph.catalog().relationship_types() {
+        fixture.apply(GraphMutation::DeclareRelationshipType {
+            name: name.to_string(),
+            id,
+        })?;
+    }
+    for node in graph.nodes() {
+        fixture.apply(GraphMutation::InsertNode(NodeInput {
+            id: node.id(),
+            layer: node.layer(),
+            revision: node.revision(),
+            labels: node.labels().to_vec(),
+            properties: node.properties(),
+        }))?;
+    }
+    for edge in graph.edges() {
+        fixture.apply(GraphMutation::InsertEdge(EdgeInput {
+            id: edge.id(),
+            source: edge.source(),
+            target: edge.target(),
+            relationship_type: edge.relationship_type(),
+            layer: edge.layer(),
+            revision: edge.revision(),
+            properties: edge.properties(),
+        }))?;
+    }
+    fixture.snapshot()
+}
+
 fn graph() -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let node = graph.catalog_mut().intern_label("Node")?;
     let connected = graph.catalog_mut().intern_relationship_type("CONNECTED")?;
     let weight = graph.catalog_mut().intern_property("weight")?;
@@ -208,14 +253,14 @@ fn procedure_signatures_reject_unknown_outputs_and_wrong_arity() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 fn metal_degree_and_bfs_match_the_cpu_reference() -> Result<()> {
     let graph = graph()?;
     let Some(mut metal) = metal_backend()? else {
         return Ok(());
     };
-    metal.admit_graph(Arc::new(graph.snapshot()?))?;
+    metal.admit_graph(Arc::new(legacy_snapshot(&graph)?))?;
     for query in [
         "CALL graph.degree() YIELD node, outDegree, inDegree, degree RETURN id(node) AS id, outDegree, inDegree, degree ORDER BY id",
         "CALL graph.bfs(1) YIELD node, distance RETURN id(node) AS id, distance ORDER BY id",
@@ -230,7 +275,7 @@ fn metal_degree_and_bfs_match_the_cpu_reference() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 fn prior_transaction_insert_node_and_edge_are_visible_to_metal_degree_and_bfs() -> Result<()> {
     let graph = graph()?;
@@ -267,7 +312,7 @@ fn prior_transaction_insert_node_and_edge_are_visible_to_metal_degree_and_bfs() 
     let Some(mut metal) = metal_backend()? else {
         return Ok(());
     };
-    metal.admit_graph(Arc::new(graph.snapshot()?))?;
+    metal.admit_graph(Arc::new(legacy_snapshot(&graph)?))?;
 
     for query in [
         "CALL graph.degree() YIELD node, outDegree, inDegree, degree \
@@ -301,10 +346,10 @@ fn prior_transaction_insert_node_and_edge_are_visible_to_metal_degree_and_bfs() 
     Ok(())
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 fn layer_subset_budget_uses_visible_cardinality_for_cpu_and_metal() -> Result<()> {
-    let mut graph = graph()?;
+    let graph = graph()?;
     let node = graph
         .catalog()
         .label("Node")
@@ -343,7 +388,7 @@ fn layer_subset_budget_uses_visible_cardinality_for_cpu_and_metal() -> Result<()
     let Some(mut metal) = metal_backend()? else {
         return Ok(());
     };
-    metal.admit_graph(Arc::new(graph.snapshot()?))?;
+    metal.admit_graph(Arc::new(legacy_snapshot(&graph)?))?;
     let query = "USE LAYER KNOWLEDGE\nWRITE LAYER KNOWLEDGE\n\
                  CALL graph.degree() YIELD node, degree \
                  RETURN id(node) AS id, degree ORDER BY id";

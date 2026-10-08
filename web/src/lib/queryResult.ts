@@ -50,42 +50,40 @@ function collectGraphValue(
   Object.values(value).forEach((item) => collectGraphValue(item, nodes, edges));
 }
 
-export function applyQueryEvent(result: QueryResult, event: QueryStreamEvent): QueryResult {
-  if (event.type === 'catalog' || event.type === 'error') return result;
-  if (event.type === 'schema') return { ...result, columns: event.columns };
-  if (event.type === 'summary') {
-    return {
-      ...result,
-      bookmark: event.bookmark,
-      statistics: event.statistics,
-      truncated: event.truncated ?? result.truncated,
-      truncationReason: event.truncationReason ?? result.truncationReason,
-    };
+/** Owns one in-flight answer. Rows are appended once; entity indexes borrow their properties. */
+export class QueryResultCollector {
+  private readonly nodes = new Map<string, GraphNode>();
+  private readonly edges = new Map<string, GraphEdge>();
+  private readonly answer: QueryResult = { columns: [], rows: [], nodes: [], edges: [], truncated: false };
+
+  append(event: QueryStreamEvent): void {
+    if (event.type === 'catalog' || event.type === 'error') return;
+    if (event.type === 'schema') {
+      this.answer.columns = event.columns;
+    } else if (event.type === 'summary') {
+      this.answer.bookmark = event.bookmark;
+      this.answer.statistics = event.statistics;
+      this.answer.truncated = event.truncated ?? this.answer.truncated;
+      this.answer.truncationReason = event.truncationReason ?? this.answer.truncationReason;
+    } else if (event.type === 'batch') {
+      const rows = event.rows ?? columnsToRows(event.columns ?? []);
+      for (const row of rows) {
+        for (const value of row) collectGraphValue(value, this.nodes, this.edges);
+        this.answer.rows.push(row);
+      }
+    } else {
+      for (const node of event.nodes ?? []) this.nodes.set(node.id, node);
+      for (const edge of event.edges ?? []) this.edges.set(edge.id, edge);
+    }
   }
 
-  const nodeMap = new Map(result.nodes.map((node) => [node.id, node]));
-  const edgeMap = new Map(result.edges.map((edge) => [edge.id, edge]));
-  let rows = result.rows;
-
-  if (event.type === 'batch') {
-    const incoming = event.rows ?? columnsToRows(event.columns ?? []);
-    incoming.forEach((row) => row.forEach((value) => collectGraphValue(value, nodeMap, edgeMap)));
-    rows = [...rows, ...incoming];
-  } else {
-    (event.nodes ?? []).forEach((node) => {
-      nodeMap.set(node.id, node);
-    });
-    (event.edges ?? []).forEach((edge) => {
-      edgeMap.set(edge.id, edge);
-    });
+  finish(): QueryResult {
+    this.answer.nodes = [...this.nodes.values()];
+    this.answer.edges = [...this.edges.values()];
+    this.nodes.clear();
+    this.edges.clear();
+    return this.answer;
   }
-
-  return {
-    ...result,
-    rows,
-    nodes: [...nodeMap.values()],
-    edges: [...edgeMap.values()],
-  };
 }
 
 /**

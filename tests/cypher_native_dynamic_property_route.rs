@@ -64,7 +64,7 @@ struct StrictDynamicPropertyBackend {
 
 impl StrictDynamicPropertyBackend {
     fn new(graph: &GraphStore) -> Result<Self> {
-        let image = ResidentProjectImage::build(
+        let image = super::legacy_resident_build(
             PROJECT,
             BOOKMARK,
             graph,
@@ -363,7 +363,7 @@ impl ExecutionBackend for StrictDynamicPropertyBackend {
 }
 
 fn read_fixture() -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let name = graph.catalog_mut().intern_property("name")?;
     graph.insert_node(NodeInput {
         id: NodeId(1),
@@ -376,7 +376,7 @@ fn read_fixture() -> Result<GraphStore> {
 }
 
 fn graph6_node_expression_fixture() -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let existing = graph.catalog_mut().intern_property("existing")?;
     graph.catalog_mut().intern_property("missing")?;
     graph.insert_node(NodeInput {
@@ -390,7 +390,7 @@ fn graph6_node_expression_fixture() -> Result<GraphStore> {
 }
 
 fn graph6_relationship_expression_fixture() -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let relationship_type = graph.catalog_mut().intern_relationship_type("REL")?;
     let existing = graph.catalog_mut().intern_property("existing")?;
     graph.catalog_mut().intern_property("missing")?;

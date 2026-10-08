@@ -31,7 +31,11 @@ pub mod temporal;
 pub mod execution {
     pub use crate::*;
 }
-pub use irongraph_graph as graph;
+/// Graph storage used exclusively by the retained inactive resident implementation.
+pub mod graph {
+    pub use irongraph_graph::legacy::{GraphStore, TemporalStore};
+    pub use irongraph_graph::*;
+}
 pub use irongraph_types as types;
 
 pub mod backend;

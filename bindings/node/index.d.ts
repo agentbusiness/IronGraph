@@ -6,17 +6,10 @@ export interface Bookmark {
 export interface QueryOptions {
   bookmark?: Bookmark
   consistency?: 'PUBLISHED'
-  limits?: { rows?: number; bytes?: number; nodes?: number; edges?: number }
 }
 export interface OperationOptions { operation_id?: string; timeout_ms?: number }
 export interface ResourceBudgets {
-  device_memory_limit_bytes?: number
-  device_reserved_bytes?: number
-  max_write_bytes?: number
-  max_concurrent_operations?: number
   worker_threads?: number
-  request_timeout_ms?: number
-  startup_timeout_ms?: number
   snapshot_interval_ms?: number
 }
 export interface StreamRecord {
@@ -34,7 +27,7 @@ export interface StreamPage {
   next_offset: number
   truncated: boolean
 }
-export interface RuntimeStatus { data_dir: string; ready: boolean; active_operations: number; max_concurrent_operations: number; worker_threads: number }
+export interface RuntimeStatus { data_dir: string; ready: boolean; active_operations: number; worker_threads: number }
 
 export type TypedValue =
   | { type: 'null' }
@@ -82,7 +75,7 @@ export declare class Client {
 }
 
 export declare class EmbeddedDatabase {
-  static open(dataDir: string, device?: 'auto' | 'cpu' | 'metal' | 'cuda' | null, deviceOrdinal?: number | null, loadModels?: boolean | null, budgets?: ResourceBudgets | null): Promise<EmbeddedDatabase>
+  static open(dataDir: string, device?: 'auto' | 'cpu' | null, deviceOrdinal?: number | null, loadModels?: boolean | null, budgets?: ResourceBudgets | null, embeddingDevice?: 'auto' | 'cpu' | 'metal' | 'cuda' | null, embeddingDeviceOrdinal?: number | null): Promise<EmbeddedDatabase>
   query(cypher: string, projectId?: string | null, parameters?: Record<string, unknown> | null, options?: QueryOptions | null, operation?: OperationOptions | null): Promise<QueryResult>
   streamAppend(request: StreamAppend, options?: OperationOptions | null): Promise<StreamAcknowledgement>
   streamFetch(request: StreamFetch, options?: OperationOptions | null): Promise<StreamPage>

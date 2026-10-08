@@ -5,7 +5,7 @@
 // enforceable instead of switched off globally.
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-//! Full-corpus openCypher TCK inventory and parser gate.
+//! Full-corpus openCypher TCK canonical CPU conformance and optional Metal comparison.
 //!
 //! The upstream files are intentionally loaded with a small TCK-specific structural reader. The
 //! corpus contains valid Cypher strings in table cells that generic Gherkin parsers reject as
@@ -27,14 +27,15 @@ use irongraph::{
         ProcedureValueType, QueryEngine, QueryResult, ResultValue, bind_with_parameters,
         bind_with_procedures, parse, plan,
     },
-    gpu::{BackendKind, CpuBackend, ExecutionBackend, ResidentProjectImage},
+    gpu::{BackendKind, ExecutionBackend},
     graph::{GraphMutation, GraphStore},
 };
 use tokio_util::sync::CancellationToken;
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 use irongraph::gpu::MetalBackend;
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(feature = "legacy-graph")]
+use irongraph::gpu::{CpuBackend, ResidentProjectImage};
 use serde::Serialize;
 
 const EXPECTED_FEATURE_FILES: usize = 220;
@@ -491,7 +492,7 @@ impl FixtureProcedureType {
     }
 
     #[cfg_attr(
-        not(all(feature = "accelerator", target_os = "macos")),
+        not(all(feature = "legacy-graph", target_os = "macos")),
         allow(dead_code)
     )]
     const fn procedure_type(self) -> ProcedureValueType {
@@ -506,7 +507,7 @@ impl FixtureProcedureType {
 }
 
 #[cfg_attr(
-    not(all(feature = "accelerator", target_os = "macos")),
+    not(all(feature = "legacy-graph", target_os = "macos")),
     allow(dead_code)
 )]
 fn fixture_procedure_catalog(case: &TckCase) -> irongraph::Result<ProcedureCatalog> {
@@ -562,7 +563,7 @@ struct FixtureProcedure {
 
 impl FixtureProcedure {
     #[cfg_attr(
-        not(all(feature = "accelerator", target_os = "macos")),
+        not(all(feature = "legacy-graph", target_os = "macos")),
         allow(dead_code)
     )]
     fn describe(&self) -> String {
@@ -1088,7 +1089,7 @@ enum TckValue {
 
 impl TckValue {
     #[cfg_attr(
-        not(all(feature = "accelerator", target_os = "macos")),
+        not(all(feature = "legacy-graph", target_os = "macos")),
         allow(dead_code)
     )]
     fn into_parameter(self) -> irongraph::Result<ResultValue> {
@@ -1946,7 +1947,9 @@ fn tck_path_parser_consumes_arrowheads_and_preserves_directions() -> irongraph::
 }
 
 const TCK_PROJECT: ProjectId = ProjectId(uuid::Uuid::nil());
+#[cfg(feature = "legacy-graph")]
 const TCK_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
+#[cfg(feature = "legacy-graph")]
 const TCK_RESERVED_MEMORY: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1982,9 +1985,9 @@ impl GraphObservability {
         let mut observability = Self::default();
         for node in graph.nodes() {
             observability.nodes.insert(node.id().0);
-            for label in node.labels() {
+            for label in node.labels().iter() {
                 if let Some(name) = catalog.label_name(*label) {
-                    observability.labels.insert(name.to_owned());
+                    observability.labels.insert(name.to_string());
                 }
             }
             for (property, value) in node.properties() {
@@ -2088,7 +2091,7 @@ fn tck_context<'a>(
 }
 
 #[cfg_attr(
-    not(all(feature = "accelerator", target_os = "macos")),
+    not(all(feature = "legacy-graph", target_os = "macos")),
     allow(dead_code)
 )]
 fn parameter_values(case: &TckCase) -> irongraph::Result<BTreeMap<String, ResultValue>> {
@@ -2117,7 +2120,7 @@ fn execute_setup_query(graph: &mut GraphStore, query: &str) -> irongraph::Result
 }
 
 #[cfg_attr(
-    not(all(feature = "accelerator", target_os = "macos")),
+    not(all(feature = "legacy-graph", target_os = "macos")),
     allow(dead_code)
 )]
 fn setup_graph(root: &Path, case: &TckCase) -> irongraph::Result<GraphStore> {
@@ -2172,6 +2175,55 @@ fn preflight_phase(
         .map_or(ExpectedErrorPhase::Compile, |_| ExpectedErrorPhase::Runtime)
 }
 
+// Only the retained accelerator comparison builds a fixture image. The canonical CPU runner
+// bypasses this helper and borrows the one live store directly.
+#[cfg(feature = "legacy-graph")]
+fn legacy_fixture_snapshot(
+    graph: &GraphStore,
+) -> irongraph::Result<irongraph::graph::GraphSnapshot> {
+    let mut fixture = irongraph::graph::legacy::GraphStore::default();
+    for (id, name) in graph.catalog().labels() {
+        fixture.apply(GraphMutation::DeclareLabel {
+            name: name.to_string(),
+            id,
+        })?;
+    }
+    for (id, name) in graph.catalog().properties() {
+        fixture.apply(GraphMutation::DeclareProperty {
+            name: name.to_string(),
+            id,
+        })?;
+    }
+    for (id, name) in graph.catalog().relationship_types() {
+        fixture.apply(GraphMutation::DeclareRelationshipType {
+            name: name.to_string(),
+            id,
+        })?;
+    }
+    for node in graph.nodes() {
+        fixture.apply(GraphMutation::InsertNode(irongraph::graph::NodeInput {
+            id: node.id(),
+            layer: node.layer(),
+            revision: node.revision(),
+            labels: node.labels().to_vec(),
+            properties: node.properties(),
+        }))?;
+    }
+    for edge in graph.edges() {
+        fixture.apply(GraphMutation::InsertEdge(irongraph::graph::EdgeInput {
+            id: edge.id(),
+            source: edge.source(),
+            target: edge.target(),
+            relationship_type: edge.relationship_type(),
+            layer: edge.layer(),
+            revision: edge.revision(),
+            properties: edge.properties(),
+        }))?;
+    }
+    fixture.snapshot()
+}
+
+#[cfg(feature = "legacy-graph")]
 fn execute_operation(
     graph: &mut GraphStore,
     backend: &mut dyn ExecutionBackend,
@@ -2184,11 +2236,23 @@ fn execute_operation(
     // any prior resident project, delta overlay, temporal/index image, bookmark, and physical
     // layout even when two unrelated fixtures happen to have the same graph revision.
     backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-        graph.snapshot()?,
+        legacy_fixture_snapshot(graph)?,
     ))])?;
+    execute_borrowed_operation(graph, Some(backend), operation, parameters, procedures)
+}
+
+// With no backend this executes directly against the canonical graph. In particular, it must
+// never construct an execution image as a prerequisite for the CPU conformance gate.
+fn execute_borrowed_operation(
+    graph: &mut GraphStore,
+    backend: Option<&dyn ExecutionBackend>,
+    operation: &TckOperation,
+    parameters: &BTreeMap<String, ResultValue>,
+    procedures: Option<&ProcedureCatalog>,
+) -> irongraph::Result<ObservedOutcome> {
     let before = GraphObservability::capture(graph);
     let phase = preflight_phase(&operation.query, graph, parameters.clone(), procedures);
-    let mut context = tck_context(graph, Some(backend), parameters.clone());
+    let mut context = tck_context(graph, backend, parameters.clone());
     let execution = match procedures {
         Some(procedures) => {
             let scoped = context.with_procedures(procedures);
@@ -2235,7 +2299,7 @@ fn rows(result: &QueryResult) -> irongraph::Result<Vec<Vec<ResultValue>>> {
 }
 
 #[cfg_attr(
-    not(all(feature = "accelerator", target_os = "macos")),
+    not(all(feature = "legacy-graph", target_os = "macos")),
     allow(dead_code)
 )]
 fn row_matches(expected: &[TckValue], actual: &[ResultValue], ignore_list_order: bool) -> bool {
@@ -2247,7 +2311,7 @@ fn row_matches(expected: &[TckValue], actual: &[ResultValue], ignore_list_order:
 }
 
 #[cfg_attr(
-    not(all(feature = "accelerator", target_os = "macos")),
+    not(all(feature = "legacy-graph", target_os = "macos")),
     allow(dead_code)
 )]
 fn result_matches(
@@ -2384,7 +2448,7 @@ fn result_matches(
 }
 
 #[cfg_attr(
-    not(all(feature = "accelerator", target_os = "macos")),
+    not(all(feature = "legacy-graph", target_os = "macos")),
     allow(dead_code)
 )]
 fn side_effects_match(
@@ -2408,7 +2472,7 @@ fn side_effects_match(
 }
 
 #[cfg_attr(
-    not(all(feature = "accelerator", target_os = "macos")),
+    not(all(feature = "legacy-graph", target_os = "macos")),
     allow(dead_code)
 )]
 fn compare_cpu_and_gpu(cpu: &ObservedOutcome, gpu: &ObservedOutcome) -> irongraph::Result<()> {
@@ -2421,11 +2485,12 @@ fn compare_cpu_and_gpu(cpu: &ObservedOutcome, gpu: &ObservedOutcome) -> irongrap
     }
 }
 
+#[cfg(feature = "legacy-graph")]
 fn new_tck_cpu_backend() -> CpuBackend {
     CpuBackend::new(TCK_MEMORY_LIMIT, TCK_RESERVED_MEMORY)
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn new_tck_metal_backend() -> irongraph::Result<MetalBackend> {
     let governor = irongraph::gpu::DeviceMemoryGovernor::new(TCK_MEMORY_LIMIT, TCK_RESERVED_MEMORY);
     MetalBackend::with_governor(0, governor)
@@ -2457,6 +2522,7 @@ fn successful_rows(outcome: &ObservedOutcome) -> irongraph::Result<Vec<Vec<Resul
     }
 }
 
+#[cfg(feature = "legacy-graph")]
 fn assert_same_revision_graph_replacement(
     backend: &mut dyn ExecutionBackend,
 ) -> irongraph::Result<()> {
@@ -2465,11 +2531,16 @@ fn assert_same_revision_graph_replacement(
     let mut replacement = harness_graph("CREATE (:NewFixture {marker: 3})")?;
     replacement.compact()?;
     assert_eq!(previous.revision(), replacement.revision());
-    assert_ne!(previous.layout_version(), replacement.layout_version());
+    assert_ne!(
+        GraphObservability::capture(&previous),
+        GraphObservability::capture(&replacement),
+        "same-revision fixtures must contain distinct canonical data"
+    );
 
     // Prove complete-set replacement, not merely replacement of the nil TCK project.
     let poison_project = ProjectId(uuid::Uuid::from_u128(1));
-    let mut poison = ResidentProjectImage::graph_only(Arc::new(previous.snapshot()?));
+    let mut poison =
+        ResidentProjectImage::graph_only(Arc::new(legacy_fixture_snapshot(&previous)?));
     poison.project = poison_project;
     backend.admit_project(poison)?;
     assert!(backend.resident_project_bytes(poison_project).is_some());
@@ -2620,6 +2691,7 @@ fn assert_harness_outcome(
     Ok(())
 }
 
+#[cfg(feature = "legacy-graph")]
 fn assert_reusable_matches_fresh<B, F>(
     reusable: &mut B,
     mut fresh_backend: F,
@@ -2628,8 +2700,12 @@ where
     B: ExecutionBackend,
     F: FnMut() -> irongraph::Result<B>,
 {
-    for case in harness_lifecycle_cases()? {
-        let mut reusable_graph = case.graph.clone();
+    for (case, fresh_case) in harness_lifecycle_cases()?
+        .into_iter()
+        .zip(harness_lifecycle_cases()?)
+    {
+        assert_eq!(case.name, fresh_case.name);
+        let mut reusable_graph = case.graph;
         let reusable_outcome = execute_operation(
             &mut reusable_graph,
             reusable,
@@ -2641,7 +2717,7 @@ where
         let reusable_scratch = reusable.available_query_scratch_bytes();
 
         let mut fresh = fresh_backend()?;
-        let mut fresh_graph = case.graph;
+        let mut fresh_graph = fresh_case.graph;
         let fresh_outcome = execute_operation(
             &mut fresh_graph,
             &mut fresh,
@@ -2675,13 +2751,98 @@ where
 }
 
 #[test]
-fn reusable_cpu_tck_harness_replaces_state_and_matches_fresh_backends() -> irongraph::Result<()> {
+fn canonical_cpu_tck_harness_replaces_fixtures_and_matches_fresh_stores() -> irongraph::Result<()> {
+    let mut current = harness_graph("CREATE (:OldFixture {marker: 1}), (:OldFixture {marker: 2})")?;
+    let old_observability = GraphObservability::capture(&current);
+    let prior = execute_borrowed_operation(
+        &mut current,
+        None,
+        &harness_operation("MATCH (n:OldFixture) RETURN n.marker"),
+        &BTreeMap::new(),
+        None,
+    )?;
+    assert_eq!(successful_rows(&prior)?.len(), 2);
+
+    let replacement = harness_graph("CREATE (:NewFixture {marker: 3})")?;
+    assert_eq!(current.revision(), replacement.revision());
+    assert_ne!(old_observability, GraphObservability::capture(&replacement));
+    let previous = std::mem::replace(&mut current, replacement);
+    assert_eq!(GraphObservability::capture(&previous), old_observability);
+    let query = harness_operation("MATCH (n:NewFixture) RETURN n.marker");
+    let next = execute_borrowed_operation(&mut current, None, &query, &BTreeMap::new(), None)?;
+    assert_eq!(
+        successful_rows(&next)?,
+        vec![vec![ResultValue::Scalar(ScalarValue::Integer(3))]]
+    );
+    let old_labels = execute_borrowed_operation(
+        &mut current,
+        None,
+        &harness_operation("MATCH (n:OldFixture) RETURN n"),
+        &BTreeMap::new(),
+        None,
+    )?;
+    assert!(successful_rows(&old_labels)?.is_empty());
+
+    // Identical schema, revision, stable IDs and query text must still read the replacement
+    // store's values; a reusable plan must never retain the preceding fixture's data.
+    let same_schema = harness_graph("CREATE (:NewFixture {marker: 99})")?;
+    assert_eq!(current.revision(), same_schema.revision());
+    assert_eq!(
+        current.catalog().optimizer_generation(),
+        same_schema.catalog().optimizer_generation()
+    );
+    current = same_schema;
+    let replaced = execute_borrowed_operation(&mut current, None, &query, &BTreeMap::new(), None)?;
+    assert_eq!(
+        successful_rows(&replaced)?,
+        vec![vec![ResultValue::Scalar(ScalarValue::Integer(99))]]
+    );
+    assert_eq!(GraphObservability::capture(&previous), old_observability);
+
+    for (case, fresh_case) in harness_lifecycle_cases()?
+        .into_iter()
+        .zip(harness_lifecycle_cases()?)
+    {
+        assert_eq!(case.name, fresh_case.name);
+        let mut reusable_graph = case.graph;
+        let mut fresh_graph = fresh_case.graph;
+        assert_eq!(reusable_graph.revision(), fresh_graph.revision());
+        let reusable_outcome = execute_borrowed_operation(
+            &mut reusable_graph,
+            None,
+            &case.operation,
+            &case.parameters,
+            None,
+        )?;
+        let fresh_outcome = execute_borrowed_operation(
+            &mut fresh_graph,
+            None,
+            &fresh_case.operation,
+            &fresh_case.parameters,
+            None,
+        )?;
+        assert_eq!(reusable_outcome, fresh_outcome, "{}", case.name);
+        assert_eq!(
+            GraphObservability::capture(&reusable_graph),
+            GraphObservability::capture(&fresh_graph),
+            "{}",
+            case.name
+        );
+        assert_harness_outcome(case.name, case.expected, &reusable_outcome)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "legacy-graph")]
+#[test]
+fn reusable_legacy_cpu_tck_harness_replaces_state_and_matches_fresh_backends()
+-> irongraph::Result<()> {
     let mut reusable = new_tck_cpu_backend();
     assert_same_revision_graph_replacement(&mut reusable)?;
     assert_reusable_matches_fresh(&mut reusable, || Ok(new_tck_cpu_backend()))
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires an available physical Metal device"]
 fn reusable_metal_tck_harness_replaces_state_and_matches_fresh_backends() -> irongraph::Result<()> {
@@ -2690,7 +2851,7 @@ fn reusable_metal_tck_harness_replaces_state_and_matches_fresh_backends() -> iro
     assert_reusable_matches_fresh(&mut reusable, new_tck_metal_backend)
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[derive(Default)]
 struct CaseReport {
     shared_failures: Vec<String>,
@@ -2701,13 +2862,13 @@ struct CaseReport {
     operation_count: usize,
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 struct ReusableTckBackends {
     cpu: CpuBackend,
     metal: MetalBackend,
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 impl ReusableTckBackends {
     fn new() -> irongraph::Result<Self> {
         let cpu = new_tck_cpu_backend();
@@ -2718,7 +2879,7 @@ impl ReusableTckBackends {
     }
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 impl CaseReport {
     fn passed(&self) -> bool {
         self.shared_failures.is_empty()
@@ -2768,7 +2929,7 @@ impl CaseReport {
 /// Optional machine-readable result for a complete strict run. Keeping all four dimensions
 /// makes the report useful for prioritizing semantic CPU defects separately from missing native
 /// GPU execution, without treating either category as an exemption.
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[derive(Serialize)]
 struct TckScenarioReport {
     path: String,
@@ -2784,7 +2945,7 @@ struct TckScenarioReport {
     divergences: Vec<String>,
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[derive(Serialize)]
 struct TckRunReport {
     total: usize,
@@ -2795,7 +2956,6 @@ struct TckRunReport {
     scenarios: Vec<TckScenarioReport>,
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
 fn operation_name(operation: &TckOperation, index: usize) -> String {
     let kind = if operation.control {
         "control"
@@ -2817,7 +2977,6 @@ fn operation_name(operation: &TckOperation, index: usize) -> String {
     format!("{kind} operation {} `{excerpt}{suffix}`", index + 1)
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
 fn validate_backend_outcome(operation: &TckOperation, outcome: &ObservedOutcome) -> Vec<String> {
     let mut failures = Vec::new();
     let Some(expectation) = operation.expectation.as_ref() else {
@@ -2833,7 +2992,178 @@ fn validate_backend_outcome(operation: &TckOperation, outcome: &ObservedOutcome)
     failures
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[derive(Serialize)]
+struct CanonicalCpuScenarioReport {
+    path: String,
+    name: String,
+    operation_count: usize,
+    passed: bool,
+    failures: Vec<String>,
+}
+
+fn run_canonical_cpu_case(root: &Path, scenario: &ExpandedScenario) -> CanonicalCpuScenarioReport {
+    let mut report = CanonicalCpuScenarioReport {
+        path: scenario.path.display().to_string(),
+        name: scenario.name.clone(),
+        operation_count: 0,
+        passed: false,
+        failures: Vec::new(),
+    };
+    let fixture = (|| {
+        let case = parse_case(scenario)?;
+        let procedures = fixture_procedure_catalog(&case)?;
+        let parameters = parameter_values(&case)?;
+        let graph = setup_graph(root, &case)?;
+        Ok::<_, irongraph::Error>((case, procedures, parameters, graph))
+    })();
+    let (case, procedure_catalog, parameters, mut graph) = match fixture {
+        Ok(fixture) => fixture,
+        Err(error) => {
+            report.failures.push(format!("fixture: {}", error.message));
+            return report;
+        }
+    };
+    report.operation_count = case.operations.len();
+    let procedures = (!procedure_catalog.is_empty()).then_some(&procedure_catalog);
+    for (index, operation) in case.operations.iter().enumerate() {
+        let name = operation_name(operation, index);
+        match execute_borrowed_operation(&mut graph, None, operation, &parameters, procedures) {
+            Ok(outcome) => {
+                report.failures.extend(
+                    validate_backend_outcome(operation, &outcome)
+                        .into_iter()
+                        .map(|failure| format!("{name}: {failure}")),
+                );
+            }
+            Err(error) => report.failures.push(format!(
+                "{name}: execution harness failure: {}",
+                error.message
+            )),
+        }
+    }
+    report.passed = report.failures.is_empty();
+    report
+}
+
+#[derive(Serialize)]
+struct CanonicalCpuRunReport {
+    total: usize,
+    passed: usize,
+    operations: usize,
+    scenarios: Vec<CanonicalCpuScenarioReport>,
+}
+
+#[test]
+fn canonical_cpu_harness_checks_results_side_effects_and_error_phase() -> irongraph::Result<()> {
+    let mut graph = GraphStore::default();
+    let parameters = BTreeMap::new();
+    let mut operation = harness_operation("RETURN 1 AS value");
+    operation.expectation = Some(ResultExpectation::Table {
+        headers: vec!["value".to_owned()],
+        rows: vec![vec!["1".to_owned()]],
+        ordered: true,
+        ignore_list_order: false,
+    });
+    operation.side_effects = Some(SideEffects::default());
+    let outcome = execute_borrowed_operation(&mut graph, None, &operation, &parameters, None)?;
+    assert!(validate_backend_outcome(&operation, &outcome).is_empty());
+    if let Some(ResultExpectation::Table { rows, .. }) = operation.expectation.as_mut() {
+        rows[0][0] = "2".to_owned();
+    }
+    assert!(!validate_backend_outcome(&operation, &outcome).is_empty());
+
+    let mut write = harness_operation("CREATE (:Person)");
+    write.expectation = Some(ResultExpectation::Empty);
+    write.side_effects = Some(SideEffects::default());
+    let outcome = execute_borrowed_operation(&mut graph, None, &write, &parameters, None)?;
+    assert!(!validate_backend_outcome(&write, &outcome).is_empty());
+
+    let invalid = harness_operation("RETURN missing_variable");
+    let outcome = execute_borrowed_operation(&mut graph, None, &invalid, &parameters, None)?;
+    assert!(matches!(
+        outcome,
+        ObservedOutcome::Error(ObservedError {
+            phase: ExpectedErrorPhase::Compile,
+            ..
+        })
+    ));
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the pinned upstream openCypher checkout"]
+fn full_opencypher_tck_canonical_cpu_conformance() -> irongraph::Result<()> {
+    let root = env::var_os("OPENCYPHER_TCK_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| irongraph::Error::invalid_data("OPENCYPHER_TCK_DIR is required"))?;
+    assert_eq!(feature_files(&root)?.len(), EXPECTED_FEATURE_FILES);
+    let scenarios = load_scenarios(&root)?;
+    assert_eq!(scenarios.len(), EXPECTED_EXPANDED_SCENARIOS);
+    let filter = env::var("OPENCYPHER_TCK_FILTER").ok();
+    let progress = env::var_os("OPENCYPHER_TCK_PROGRESS").is_some();
+    let report_path = env::var_os("OPENCYPHER_TCK_REPORT").map(PathBuf::from);
+    let mut reports = Vec::new();
+    for scenario in &scenarios {
+        let identity = format!("{} / {}", scenario.path.display(), scenario.name);
+        if filter
+            .as_ref()
+            .is_some_and(|filter| !identity.contains(filter))
+        {
+            continue;
+        }
+        if progress {
+            eprintln!("TCK RUN {}: {identity}", reports.len() + 1);
+        }
+        reports.push(run_canonical_cpu_case(&root, scenario));
+    }
+    let total = reports.len();
+    assert!(total > 0, "TCK filter matched no scenarios");
+    if filter.is_none() {
+        assert_eq!(total, EXPECTED_EXPANDED_SCENARIOS);
+    }
+    let passed = reports.iter().filter(|report| report.passed).count();
+    let operations = reports.iter().map(|report| report.operation_count).sum();
+    let failures = reports
+        .iter()
+        .filter(|report| !report.passed)
+        .map(|report| {
+            format!(
+                "{} / {}: {}",
+                report.path,
+                report.name,
+                report.failures.join("; ")
+            )
+        })
+        .collect::<Vec<_>>();
+    let report = CanonicalCpuRunReport {
+        total,
+        passed,
+        operations,
+        scenarios: reports,
+    };
+    if let Some(path) = report_path.as_ref() {
+        let contents = serde_json::to_vec_pretty(&report).map_err(|error| {
+            irongraph::Error::internal(format!("cannot serialize TCK report: {error}"))
+        })?;
+        fs::write(path, contents).map_err(|error| {
+            irongraph::Error::internal(format!(
+                "cannot write TCK report {}: {error}",
+                path.display()
+            ))
+        })?;
+    }
+    eprintln!(
+        "TCK canonical CPU: {passed}/{total} scenarios passed; {operations} operations executed"
+    );
+    assert!(
+        failures.is_empty(),
+        "canonical CPU: {passed}/{total} scenarios passed; {operations} operations.\n{}",
+        failures.join("\n")
+    );
+    Ok(())
+}
+
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 fn run_case(
     root: &Path,
     scenario: &ExpandedScenario,
@@ -2937,7 +3267,7 @@ fn run_case(
     report
 }
 
-#[cfg(all(feature = "accelerator", target_os = "macos"))]
+#[cfg(all(feature = "legacy-graph", target_os = "macos"))]
 #[test]
 #[ignore = "requires a pinned upstream openCypher checkout and a real Metal device"]
 fn full_opencypher_tck_gpu_conformance() -> irongraph::Result<()> {
@@ -3046,7 +3376,7 @@ fn full_opencypher_tck_gpu_conformance() -> irongraph::Result<()> {
     Ok(())
 }
 
-#[cfg(not(all(feature = "accelerator", target_os = "macos")))]
+#[cfg(not(all(feature = "legacy-graph", target_os = "macos")))]
 #[test]
 #[ignore = "the full TCK GPU gate must run on a real Metal runner"]
 fn full_opencypher_tck_gpu_conformance_requires_metal() -> irongraph::Result<()> {

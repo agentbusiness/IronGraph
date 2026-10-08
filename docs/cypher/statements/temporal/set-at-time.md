@@ -13,7 +13,7 @@
 
 Appending `AT TIME` to a `SET` item records a temporal sample at that instant instead of at the current time. It is how data arrives with the timestamp it actually had, rather than the timestamp of the load.
 
-The write goes to history only. The property's canonical value is untouched, which is what allows a backfill to run without disturbing what the graph currently says.
+The sample joins the temporal series. An ordinary read returns the latest sample in event-time order, so inserting an older sample leaves the current read unchanged unless it changes which sample is latest.
 
 ## How it behaves
 
@@ -31,13 +31,13 @@ Use it for any load or correction whose data carries its own timestamps: importi
 
 ## How it differs from its neighbours
 
-An ordinary `SET` on a temporal property records a sample at write time *and* updates the canonical value. `SET … AT TIME` records a sample at the given time and leaves the canonical value alone. Reaching for one when you meant the other is the usual cause of a canonical value that disagrees with history.
+An ordinary `SET` on a temporal property records a sample at write time. `SET … AT TIME` records a sample at the supplied event time. Current reads use the latest retained event-time sample; historical reads use the sample in effect at their selected instant.
 
 The query-level `AT TIME` that precedes a query body is a different thing entirely: it chooses a read instant and never affects writes.
 
 ## Simple example
 
-One backdated sample, written and read straight back. The canonical value is unchanged by it.
+Read one backdated sample at its event time.
 
 ```cypher
 USE backfill_example
@@ -97,7 +97,7 @@ at                   | celsius | canonical_value
 
 - The property must be declared temporal.
 - The instant must fall inside the declared retention window.
-- The canonical value is not updated. A backfilled property reads as its old current value until an ordinary `SET` changes it.
+- A backfilled sample can change current reads if it becomes the latest retained event-time sample.
 - Nothing enforces that a backdated sample is plausible. The database records the time it is told.
 
 ## See also

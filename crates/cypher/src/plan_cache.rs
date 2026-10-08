@@ -264,14 +264,14 @@ pub fn get(
     key: &PlanCacheKey,
     parameters: &BTreeMap<String, ResultValue>,
 ) -> Option<(PhysicalPlan, bool)> {
-    cache().get(key, parameters)
+    cache()?.get(key, parameters)
 }
 
 pub fn get_early(
     key: &EarlyPlanCacheKey,
     parameters: &BTreeMap<String, ResultValue>,
 ) -> Option<(PhysicalPlan, bool)> {
-    cache().get_early(key, parameters)
+    cache()?.get_early(key, parameters)
 }
 
 pub fn insert(
@@ -281,7 +281,10 @@ pub fn insert(
     force_host_adaptive: bool,
     specialized_parameters: BTreeMap<String, ResultValue>,
 ) {
-    cache().insert(
+    let Some(mut cache) = cache() else {
+        return;
+    };
+    cache.insert(
         early_key,
         key,
         plan,
@@ -290,10 +293,14 @@ pub fn insert(
     );
 }
 
-fn cache() -> std::sync::MutexGuard<'static, PlanCache> {
-    CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// Cache access is optional. A busy cache never delays canonical reads or planning;
+/// admission is dropped and lookup falls back to ordinary bounded planning scratch.
+fn cache() -> Option<std::sync::MutexGuard<'static, PlanCache>> {
+    match CACHE.try_lock() {
+        Ok(cache) => Some(cache),
+        Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
 }
 
 fn estimated_plan_bytes(key: &PlanCacheKey, plan: &PhysicalPlan) -> usize {
@@ -499,6 +506,69 @@ mod tests {
     use crate::{ProjectId, ScalarValue, cypher::ResultValue, execution::BackendKind};
 
     use super::{BindCapabilities, EarlyPlanCacheKey, PlanCacheKey};
+
+    #[test]
+    fn canonical_query_finishes_while_cache_writer_is_paused() -> crate::Result<()> {
+        let graph = crate::graph::GraphStore::default();
+        graph.insert_node(crate::graph::NodeInput {
+            id: crate::NodeId(1),
+            layer: crate::Layer::Observed,
+            revision: 1,
+            labels: Vec::new(),
+            properties: Vec::new(),
+        })?;
+        // Deliberately hold the cache writer across the complete canonical query.
+        let guard = super::CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(super::cache().is_none());
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| -> crate::Result<()> {
+            let reader = scope.spawn(|| {
+                let mut context = super::super::ExecutionContext {
+                    project_id: ProjectId(uuid::Uuid::nil()),
+                    graph: &graph,
+                    binding_catalog: graph.catalog(),
+                    prior_graph_mutations: &[],
+                    temporal: None,
+                    prior_temporal_mutations: &[],
+                    vector_indexes: BTreeMap::new(),
+                    scalar_indexes: None,
+                    text_embedding: None,
+                    parameters: BTreeMap::new(),
+                    bookmark: crate::Bookmark { term: 0, index: 0 },
+                    mutation_revision: 2,
+                    resolved_time_nanos: 0,
+                    next_node_id: 2,
+                    next_edge_id: 1,
+                    predicate_versions: BTreeMap::new(),
+                    capabilities: BindCapabilities::default(),
+                    max_result_rows: 100,
+                    max_batch_rows: 100,
+                    optimizer_statistics: None,
+                    backend: None,
+                    cancellation: tokio_util::sync::CancellationToken::new(),
+                    deadline: None,
+                    resolved_query_at_time_nanos: None,
+                };
+                let result =
+                    super::super::QueryEngine.execute("MATCH (n) RETURN count(n)", &mut context);
+                let _ = send.send(result);
+            });
+            let result = receive.recv_timeout(std::time::Duration::from_secs(2));
+            drop(guard);
+            reader
+                .join()
+                .map_err(|_| crate::Error::internal("cache reader panicked"))?;
+            let output = result
+                .map_err(|_| crate::Error::internal("canonical query waited for cache writer"))??;
+            assert_eq!(
+                output.result.batches[0].columns[0].values,
+                vec![ResultValue::Scalar(ScalarValue::Integer(1))]
+            );
+            Ok(())
+        })
+    }
 
     #[test]
     fn prepared_plan_cache_hot_path_guards_early_lookup() -> crate::Result<()> {

@@ -533,7 +533,7 @@ struct Pattern2CountFixture {
 }
 
 fn pattern2_count_fixture() -> Result<Pattern2CountFixture> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let a = graph.catalog_mut().intern_label("A")?;
     let has = graph.catalog_mut().intern_relationship_type("HAS")?;
     for id in 1..=3 {
@@ -569,7 +569,7 @@ fn install_pattern2_count_fixture(
     fixture: &Pattern2CountFixture,
 ) -> Result<()> {
     backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-        fixture.graph.snapshot()?,
+        super::legacy_fixture_snapshot(&fixture.graph)?,
     ))])
 }
 
@@ -670,12 +670,12 @@ fn pattern2_06_counts_every_non_null_list_through_one_native_parent_scan() -> Re
 
 #[test]
 fn pattern2_06_zero_known_parents_returns_one_integer_zero() -> Result<()> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let a = graph.catalog_mut().intern_label("A")?;
     let has = graph.catalog_mut().intern_relationship_type("HAS")?;
     let mut backend = ObservedPatternCountBackend::reporting(BackendKind::Cpu);
     backend.replace_all_projects(vec![ResidentProjectImage::graph_only(Arc::new(
-        graph.snapshot()?,
+        super::legacy_fixture_snapshot(&graph)?,
     ))])?;
     let observations = backend.observations();
 

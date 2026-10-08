@@ -65,7 +65,7 @@ fn canonical_query_covers_embedded_package_capabilities() -> Result<(), Box<dyn 
     for layer in ["KNOWLEDGE", "WORKSPACE"] {
         database.query(Query::new(format!(
             "USE package_app USE LAYER {layer} WRITE LAYER {layer} \
-             CREATE (:Document {{id: '{layer}', body: 'Layer document'}})"
+             CREATE (:Document {{id: '{layer}', name: '{layer} document', body: 'Layer document'}})"
         )))?;
         let result = database.query(Query::new(format!(
             "USE package_app USE LAYER {layer} MATCH (d:Document) RETURN d.id"

@@ -1,5 +1,6 @@
 mod database;
 mod dataset_loader;
+mod embedding_jobs;
 mod http;
 mod remote;
 mod tls;

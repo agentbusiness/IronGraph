@@ -15,6 +15,12 @@ use super::{
 };
 
 /// Compact sparse row adjacency carrying edge ordinals and neighbor ordinals.
+pub type CsrRow<'a> = std::iter::Zip<
+    std::iter::Copied<std::slice::Iter<'a, u32>>,
+    std::iter::Copied<std::slice::Iter<'a, u32>>,
+>;
+
+/// Compact sparse row adjacency carrying edge ordinals and neighbor ordinals.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Csr {
     offsets: FlatColumn<u32>,
@@ -369,10 +375,7 @@ impl Csr {
     }
 
     #[must_use]
-    pub fn row(
-        &self,
-        node: u32,
-    ) -> Option<impl DoubleEndedIterator<Item = (u32, u32)> + ExactSizeIterator + '_> {
+    pub fn row(&self, node: u32) -> Option<CsrRow<'_>> {
         let row = node as usize;
         let start = *self.offsets.as_slice().get(row)? as usize;
         let end = *self.offsets.as_slice().get(row + 1)? as usize;

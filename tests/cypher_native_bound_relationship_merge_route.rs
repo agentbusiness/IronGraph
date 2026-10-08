@@ -538,7 +538,7 @@ struct Fixture {
 
 impl Fixture {
     fn build(case: &ScenarioCase) -> Result<Self> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         if !case.setup.trim().is_empty() {
             let setup = QueryEngine.execute(case.setup, &mut context(&graph, None, false))?;
             if !setup.temporal_mutations.is_empty()
@@ -565,7 +565,7 @@ impl Fixture {
     }
 
     fn resident_image(&self) -> Result<ResidentProjectImage> {
-        ResidentProjectImage::build(
+        super::legacy_resident_build(
             PROJECT,
             self.bookmark,
             &self.graph,
@@ -830,7 +830,7 @@ fn assert_created_relationship(
                         "{label}: created relationship property was not STRING"
                     )));
                 };
-                Ok((name.to_owned(), value.to_string()))
+                Ok((name.to_string(), value.to_string()))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
     let expected_properties = expected
@@ -838,7 +838,7 @@ fn assert_created_relationship(
         .iter()
         .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
         .collect::<BTreeMap<_, _>>();
-    if actual_type != expected.relationship_type
+    if actual_type.as_ref() != expected.relationship_type
         || edge.layer() != Layer::Observed
         || actual_properties != expected_properties
         || !node_matches(after, edge.source(), expected.source)
@@ -930,7 +930,7 @@ fn assert_case_output(
     }
 
     let before_metrics = graph_metrics(&fixture.graph);
-    let mut after = fixture.graph.clone();
+    let after = fixture.graph.clone();
     for mutation in &output.graph_mutations {
         after.apply(mutation.clone())?;
     }
@@ -1080,7 +1080,7 @@ fn assert_scenario_20_output(fixture: &Fixture, output: &ExecutionOutput) -> Res
             "Merge5 [20] changed its one-command result or effects: {output:#?}"
         )));
     }
-    let mut after = fixture.graph.clone();
+    let after = fixture.graph.clone();
     for mutation in &output.graph_mutations {
         after.apply(mutation.clone())?;
     }
@@ -1158,7 +1158,7 @@ fn assert_scenario_21_output(fixture: &Fixture, output: &ExecutionOutput) -> Res
             "Merge5 [21] changed its result or effects: {output:#?}"
         )));
     }
-    let mut after = fixture.graph.clone();
+    let after = fixture.graph.clone();
     for mutation in &output.graph_mutations {
         after.apply(mutation.clone())?;
     }
@@ -1224,7 +1224,7 @@ fn assert_deleted_endpoint_case_output(fixture: &Fixture, output: &ExecutionOutp
         )));
     }
 
-    let mut after = fixture.graph.clone();
+    let after = fixture.graph.clone();
     for mutation in &output.graph_mutations {
         after.apply(mutation.clone())?;
     }
@@ -1343,7 +1343,7 @@ fn assert_scheduled_list_property_output(
         )));
     }
 
-    let mut after = fixture.graph.clone();
+    let after = fixture.graph.clone();
     for mutation in &output.graph_mutations {
         after.apply(mutation.clone())?;
     }
@@ -1557,7 +1557,7 @@ fn assert_two_node_ordered_overlay(
         )));
     }
 
-    let mut after = fixture.graph.clone();
+    let after = fixture.graph.clone();
     for mutation in output.graph_mutations {
         after.apply(mutation)?;
     }
@@ -1585,7 +1585,7 @@ fn assert_two_node_ordered_overlay(
                 case.id
             )));
         };
-        if relationship_type != Some("T")
+        if relationship_type.as_deref() != Some("T")
             || edge.layer() != Layer::Observed
             || !edge.properties().is_empty()
         {

@@ -123,7 +123,7 @@ const CASES: [Case; 3] = [
 ];
 
 fn fixture(case: Case) -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     if case.scenario == 5 {
         let a = graph.catalog_mut().intern_label("A")?;
         graph.insert_node(NodeInput {

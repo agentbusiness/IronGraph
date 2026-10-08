@@ -545,7 +545,7 @@ impl Fixture {
     }
 
     fn backend(&self) -> Result<StrictTemporalConsistencyBackend> {
-        let image = ResidentProjectImage::build(
+        let image = super::legacy_resident_build(
             PROJECT,
             BOOKMARK,
             &self.graph,

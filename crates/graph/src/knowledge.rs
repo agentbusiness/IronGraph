@@ -14,7 +14,7 @@
 //! `insert_edge`) for `Layer::Knowledge` writes.
 //! The `Observed` layer is deliberately left unconstrained — that is the user's business data.
 
-use super::store::{GraphMutation, GraphStore, NameCatalog};
+use super::{GraphMutation, GraphStore, NameCatalog};
 use crate::types::{PropertyId, ScalarValue};
 use crate::{Error, Layer, Result};
 
@@ -159,6 +159,103 @@ enum ReservedTarget {
     Edge,
 }
 
+/// Validates a bounded mutation journal without publishing its schema or data.
+pub fn validate_batch(graph: &GraphStore, mutations: &[GraphMutation]) -> Result<()> {
+    let mut names = std::collections::BTreeMap::<PropertyId, &str>::new();
+    let mut node_layers = std::collections::BTreeMap::new();
+    let mut edge_layers = std::collections::BTreeMap::new();
+    for mutation in mutations {
+        if let GraphMutation::DeclareProperty { name, id } = mutation {
+            names.insert(*id, name.as_str());
+            continue;
+        }
+        let property_name = |property: PropertyId| -> Option<std::sync::Arc<str>> {
+            names
+                .get(&property)
+                .map(|name| std::sync::Arc::from(*name))
+                .or_else(|| graph.catalog().property_name(property))
+        };
+        let validate = |property: PropertyId, value: &ScalarValue, node: bool| -> Result<()> {
+            let Some(name) = property_name(property) else {
+                return Ok(());
+            };
+            if node
+                && name.eq_ignore_ascii_case(NAME)
+                && !matches!(value, ScalarValue::String(value) if !value.trim().is_empty())
+            {
+                return Err(Error::invalid_data(
+                    "KNOWLEDGE node `name` must be a non-blank STRING",
+                ));
+            }
+            if !node && name.eq_ignore_ascii_case(TEXT) && !matches!(value, ScalarValue::String(_))
+            {
+                return Err(Error::invalid_data(
+                    "KNOWLEDGE edge `text` must be a STRING",
+                ));
+            }
+            if name.eq_ignore_ascii_case(AT) && !is_temporal_scalar(value) {
+                return Err(Error::invalid_data(
+                    "KNOWLEDGE `at` must be a temporal value",
+                ));
+            }
+            Ok(())
+        };
+        match mutation {
+            GraphMutation::InsertNode(input) => {
+                node_layers.insert(input.id, input.layer);
+                if input.layer == Layer::Knowledge {
+                    if !input.properties.iter().any(|(property, _)| {
+                        property_name(*property).is_some_and(|name| name.eq_ignore_ascii_case(NAME))
+                    }) {
+                        return Err(Error::invalid_data(
+                            "KNOWLEDGE node requires a `name` property",
+                        ));
+                    }
+                    for (property, value) in &input.properties {
+                        validate(*property, value, true)?;
+                    }
+                }
+            }
+            GraphMutation::InsertEdge(input) => {
+                edge_layers.insert(input.id, input.layer);
+                if input.layer == Layer::Knowledge {
+                    for (property, value) in &input.properties {
+                        validate(*property, value, false)?;
+                    }
+                }
+            }
+            GraphMutation::SetNodeProperty {
+                node,
+                property,
+                value,
+                ..
+            } if node_layers
+                .get(node)
+                .copied()
+                .or_else(|| graph.node(*node).map(|row| row.layer()))
+                == Some(Layer::Knowledge) =>
+            {
+                validate(*property, value, true)?
+            }
+            GraphMutation::SetEdgeProperty {
+                edge,
+                property,
+                value,
+                ..
+            } if edge_layers
+                .get(edge)
+                .copied()
+                .or_else(|| graph.edge(*edge).map(|row| row.layer()))
+                == Some(Layer::Knowledge) =>
+            {
+                validate(*property, value, false)?
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn validate_reserved_update(
     catalog: &NameCatalog,
     property: PropertyId,
@@ -203,7 +300,7 @@ mod tests {
 
     impl Schema {
         fn new() -> Self {
-            let mut catalog = NameCatalog::default();
+            let catalog = NameCatalog::default();
             for reserved in [NAME, TEXT, AT, "city"] {
                 catalog.intern_property(reserved).expect("intern reserved");
             }

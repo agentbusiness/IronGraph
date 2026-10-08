@@ -29,6 +29,43 @@ describe('Client', () => {
     expect(() => new Client('http://example.com')).toThrow(/Plain remote/)
   })
 
+  it('returns a complete value above the former 64 MiB event cap', async () => {
+    const length = 64 * 1024 * 1024 + 1
+    const encoder = new TextEncoder()
+    vi.stubGlobal('fetch', async () => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(JSON.stringify({ type: 'batch', row_count: 1,
+          columns: [{ values: [{ type: 'string', value: 'x'.repeat(length) }] }] })))
+        controller.enqueue(encoder.encode('\n{"type":"summary","truncated":false}\n'))
+        controller.close()
+      },
+    })))
+    vi.stubGlobal('crypto', { randomUUID: () => '00000000-0000-4000-8000-000000000000' })
+    const result = await new Client('http://localhost:18484').query({ cypher: 'RETURN $body' })
+    expect(String(result.rows[0][0].value).length).toBe(length)
+    expect(result.summary.truncated).toBe(false)
+  })
+
+  it('decodes fragmented UTF-8, blank lines and an unterminated final event', async () => {
+    const value = '東京 ✈ café\n'.repeat(32768)
+    const bytes = new TextEncoder().encode('\r\n' + JSON.stringify({ type: 'batch', row_count: 1,
+      columns: [{ values: [{ type: 'string', value }] }] }) + '\n\n{"type":"summary","truncated":false}')
+    let offset = 0
+    vi.stubGlobal('fetch', async () => new Response(new ReadableStream({
+      pull(controller) {
+        if (offset === bytes.length) { controller.close(); return }
+        const end = Math.min(bytes.length, offset + 257)
+        controller.enqueue(bytes.subarray(offset, end))
+        offset = end
+      },
+    })))
+    vi.stubGlobal('crypto', { randomUUID: () => '00000000-0000-4000-8000-000000000000' })
+    const result = await new Client('http://localhost:18484').query({ cypher: 'RETURN $body' })
+    expect(result.rows).toHaveLength(1)
+    expect(result.rows[0][0].value).toBe(value)
+    expect(result.summary.truncated).toBe(false)
+  })
+
   it.each([
     'MATCH (d:Document) RETURN d.body',
     'CREATE (:Document {body: $body})',

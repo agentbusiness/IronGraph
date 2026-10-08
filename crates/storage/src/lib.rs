@@ -4,7 +4,6 @@
 
 mod admission;
 mod checkpoint;
-mod cow;
 mod frame;
 mod fs;
 mod log;
@@ -16,8 +15,6 @@ pub use admission::{
 pub use checkpoint::{
     CheckpointManifest, CheckpointSource, CheckpointStore, ManifestId, RecoveredCheckpoint,
 };
-#[doc(hidden)]
-pub use cow::CowArc;
 pub use frame::{Durability, FramedFile, FramedRecord, RecoveryReport};
 #[doc(hidden)]
 pub use fs::{atomic_create, atomic_write, read_bounded, sync_durable};

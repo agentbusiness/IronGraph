@@ -12,7 +12,7 @@ use irongraph::{
     cypher::{BindCapabilities, ExecutionContext, QueryEngine, ResultValue},
     graph::{
         EdgeInput, GraphStore, NodeInput, TemporalDeclaration, TemporalSample, TemporalStore,
-        TemporalType, TypedColumn,
+        TemporalType,
     },
     types::{EntityKind, PropertyId},
 };
@@ -106,7 +106,7 @@ fn canonical_map() -> Result<DocumentMap> {
 
 #[test]
 fn cypher_parameter_literal_equality_and_projection_round_trip_documents() -> Result<()> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let mut parameters = BTreeMap::new();
     parameters.insert("payload".to_owned(), result_document());
     let output = QueryEngine.execute(
@@ -134,7 +134,7 @@ fn cypher_parameter_literal_equality_and_projection_round_trip_documents() -> Re
 
 #[test]
 fn node_and_relationship_document_columns_survive_restart_bytes_exactly() -> Result<()> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let entity = graph.catalog_mut().intern_label("Entity")?;
     let relation = graph.catalog_mut().intern_relationship_type("LINK")?;
     let payload = graph.catalog_mut().intern_property("payload")?;
@@ -158,15 +158,29 @@ fn node_and_relationship_document_columns_survive_restart_bytes_exactly() -> Res
         properties: vec![(payload, ScalarValue::Map(document.clone()))],
     })?;
 
-    let snapshot = graph.snapshot()?;
-    for columns in [&snapshot.node_properties, &snapshot.edge_properties] {
-        if !matches!(columns.column(payload), Some(TypedColumn::Map { .. })) {
+    for value in [
+        graph
+            .node(NodeId(1))
+            .and_then(|node| node.property(payload)),
+        graph
+            .node(NodeId(2))
+            .and_then(|node| node.property(payload)),
+        graph
+            .edge(EdgeId(1))
+            .and_then(|edge| edge.property(payload)),
+    ] {
+        let Some(ScalarValue::Map(value)) = value else {
             return Err(irongraph::Error::internal(
-                "document property is not a flat map column",
+                "canonical document map is absent",
             ));
-        }
+        };
+        assert!(std::ptr::eq(
+            value.as_bytes().as_ptr(),
+            document.as_bytes().as_ptr()
+        ));
+        assert_eq!(value.as_bytes(), document.as_bytes());
     }
-    assert!(snapshot.resident_bytes() >= document.as_bytes().len().saturating_mul(3));
+    assert!(graph.resident_bytes() >= document.as_bytes().len());
 
     let encoded = postcard::to_stdvec(&graph)
         .map_err(|error| irongraph::Error::invalid_data(error.to_string()))?;
@@ -188,7 +202,7 @@ fn node_and_relationship_document_columns_survive_restart_bytes_exactly() -> Res
 
 #[test]
 fn temporal_samples_reject_documents_before_mutation() -> Result<()> {
-    let mut temporal = TemporalStore::default();
+    let temporal = TemporalStore::default();
     temporal.declare(
         TemporalDeclaration {
             entity_kind: EntityKind::Node,

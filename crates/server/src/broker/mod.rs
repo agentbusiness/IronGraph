@@ -6,6 +6,7 @@
 //! payloads are stored once in the same content-addressed table. The product names are used
 //! everywhere except where a wire format dictates otherwise.
 
+pub(crate) mod concurrent;
 mod engine;
 mod memory;
 mod queue;

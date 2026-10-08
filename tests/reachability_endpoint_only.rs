@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 use irongraph::{
     Bookmark, EdgeId, Layer, ProjectId, ScalarValue,
     cypher::{BindCapabilities, ExecutionContext, ExecutionOutput, QueryEngine, ResultValue},
-    gpu::{CpuBackend, ExecutionBackend, ResidentProjectImage},
     graph::{EdgeInput, GraphStore, IndexCatalog, NodeInput, StatisticsSnapshot, TemporalStore},
     types::NodeId,
 };
@@ -26,7 +25,7 @@ const BOOKMARK: Bookmark = Bookmark { term: 1, index: 1 };
 
 /// Builds a `:Node` graph with `:R` edges and returns the single integer a scalar query produces.
 fn scalar(node_count: u64, edges: &[(u64, u64)], query: &str) -> i64 {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let label = graph.catalog_mut().intern_label("Node").unwrap();
     let rel = graph.catalog_mut().intern_relationship_type("R").unwrap();
     for id in 1..=node_count {
@@ -53,22 +52,11 @@ fn scalar(node_count: u64, edges: &[(u64, u64)], query: &str) -> i64 {
             })
             .unwrap();
     }
-    let image = ResidentProjectImage::build(
-        PROJECT,
-        BOOKMARK,
-        &graph,
-        &TemporalStore::default(),
-        &IndexCatalog::default(),
-    )
-    .unwrap();
-    let mut cpu = CpuBackend::new(irongraph::config::UNBOUNDED_DEVICE_MEMORY_BYTES, 0);
-    cpu.admit_project(image).unwrap();
     let statistics = StatisticsSnapshot::collect_project(
         &graph,
         Some(&TemporalStore::default()),
         Some(&IndexCatalog::default()),
     );
-    let backend: &dyn ExecutionBackend = &cpu;
     let mut context = ExecutionContext {
         project_id: PROJECT,
         graph: &graph,
@@ -90,7 +78,7 @@ fn scalar(node_count: u64, edges: &[(u64, u64)], query: &str) -> i64 {
         max_result_rows: 8_000_000,
         max_batch_rows: 65_536,
         optimizer_statistics: Some(&statistics),
-        backend: Some(backend),
+        backend: None,
         cancellation: CancellationToken::new(),
         deadline: Some(Instant::now() + Duration::from_secs(60)),
         resolved_query_at_time_nanos: None,

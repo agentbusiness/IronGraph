@@ -9,7 +9,7 @@ You need:
 
 - an official IronGraph distribution installed on your machine;
 - a running standalone IronGraph instance; and
-- a modern browser with access to the node's local web address.
+- a modern browser with access to the instance's local web address.
 
 If IronGraph is not running yet, follow [Install IronGraph](installation.md).
 

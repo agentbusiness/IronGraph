@@ -174,14 +174,13 @@ impl FramedFile {
     /// Reads one known immutable record extent without scanning unrelated records. The caller
     /// obtains the extent from canonical segment metadata; this method still validates the frame
     /// header, declared length, and payload CRC before returning bytes.
-    pub(crate) fn read_record_at(
-        path: impl AsRef<Path>,
+    pub(crate) fn read_record_from_file(
+        file: &mut File,
         magic: [u8; 8],
         max_payload_bytes: usize,
         offset: u64,
         expected_physical_bytes: u64,
     ) -> Result<FramedRecord> {
-        let mut file = File::open(path)?;
         let file_bytes = file.metadata()?.len();
         let header_bytes = u64::try_from(HEADER_BYTES)
             .map_err(|_| Error::internal("framed header length does not fit u64"))?;
@@ -357,6 +356,42 @@ impl FramedFile {
             Ok(())
         })?;
         Ok(result)
+    }
+
+    /// Opens an independent read cursor for streaming a rewrite from the old file.
+    pub(crate) fn open_reader(&self) -> Result<File> {
+        Ok(File::open(&self.path)?)
+    }
+
+    pub(crate) fn read_record_at(&self, offset: u64) -> Result<Vec<u8>> {
+        let mut reader = self.open_reader()?;
+        reader.seek(SeekFrom::Start(offset))?;
+        let mut header = [0; HEADER_BYTES];
+        reader.read_exact(&mut header)?;
+        let length = decode_header(&header, self.magic, self.max_payload_bytes)?;
+        let length = usize::try_from(length).map_err(|_| {
+            Error::new(
+                ErrorCode::CorruptStorage,
+                "frame length does not fit memory",
+            )
+        })?;
+        let mut payload = vec![0; length];
+        reader.read_exact(&mut payload)?;
+        let mut digest = Hasher::new();
+        digest.update(&payload);
+        if digest.finalize()
+            != u32::from_le_bytes(
+                header[20..24]
+                    .try_into()
+                    .map_err(|_| Error::internal("invalid checksum field"))?,
+            )
+        {
+            return Err(Error::new(
+                ErrorCode::CorruptStorage,
+                "framed payload checksum mismatch",
+            ));
+        }
+        Ok(payload)
     }
 
     /// Reads and validates one recovered payload at a time without materializing the full file.

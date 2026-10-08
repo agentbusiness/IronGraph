@@ -884,7 +884,7 @@ impl ExecutionBackend for ObservedBackend {
 }
 
 fn project_image(graph: &GraphStore) -> Result<ResidentProjectImage> {
-    ResidentProjectImage::build(
+    super::legacy_resident_build(
         PROJECT,
         BOOKMARK,
         graph,

@@ -51,7 +51,7 @@ fn context(graph: &GraphStore, write: bool, revision: u64) -> ExecutionContext<'
 
 #[test]
 fn cpu_create_read_and_checkpoint_support_mixed_property_types() -> Result<()> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let created = QueryEngine.execute(
         "CREATE (a:Mixed {slot: 1, var: 0}), \
                 (b:Mixed {slot: 2, var: 'xx'}), \
@@ -81,9 +81,11 @@ fn cpu_create_read_and_checkpoint_support_mixed_property_types() -> Result<()> {
         .catalog()
         .property("var")
         .ok_or_else(|| irongraph::Error::internal("var property was not declared"))?;
-    let snapshot = graph.snapshot()?;
-    assert!(snapshot.node_properties.is_mixed(property));
-    assert!(snapshot.node_properties.column(property).is_none());
+    let column = graph
+        .node_property_column(property)
+        .ok_or_else(|| irongraph::Error::internal("canonical mixed column is absent"))?;
+    assert_eq!(column.kind_mask().count_ones(), 2);
+    assert!(!graph.node_property_is_integer(property));
     assert_eq!(
         graph.node_property_accepts(property, &ScalarValue::Boolean(true)),
         Some(true)
@@ -125,13 +127,22 @@ fn cpu_create_read_and_checkpoint_support_mixed_property_types() -> Result<()> {
     let restored: GraphStore = ciborium::de::from_reader(cbor.as_slice())
         .map_err(|error| irongraph::Error::internal(format!("CBOR failed: {error}")))?;
     assert_eq!(
-        restored.snapshot()?.node_properties.get(0, property),
+        restored
+            .node_dense(0)
+            .and_then(|node| node.property(property)),
         Some(ScalarValue::Integer(0))
     );
     assert_eq!(
-        restored.snapshot()?.node_properties.get(1, property),
+        restored
+            .node_dense(1)
+            .and_then(|node| node.property(property)),
         Some(ScalarValue::String("xx".into()))
     );
-    assert_eq!(restored.snapshot()?.node_properties.get(2, property), None);
+    assert_eq!(
+        restored
+            .node_dense(2)
+            .and_then(|node| node.property(property)),
+        None
+    );
     Ok(())
 }

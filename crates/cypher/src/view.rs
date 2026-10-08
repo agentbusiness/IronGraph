@@ -1,11 +1,15 @@
 //! Borrowed canonical graph/temporal reads with sparse statement-local write overlays.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::Deref,
+    sync::Arc,
+};
 
 use crate::{
     EdgeId, Error, ErrorCode, Layer, NodeId, Result, ScalarValue,
     graph::{
-        Csr, EdgeInput, EdgeView, GraphMutation, GraphStore, LayerMask, NodeInput, NodeView,
+        EdgeInput, EdgeView, GraphMutation, GraphStore, LayerMask, NodeInput, NodeView,
         TemporalSample, TemporalStore,
     },
     types::{EntityKind, LabelId, PropertyId, RelationshipTypeId},
@@ -27,6 +31,123 @@ enum ScalarKind {
     List,
     Map,
     Mixed,
+}
+
+/// Live direction accessor sharing only the algorithm's ordinal working arrays.
+/// No canonical topology, properties or payloads are copied into an execution image.
+pub struct AlgorithmAdjacency<'view, 'graph> {
+    view: &'view GraphReadView<'graph>,
+    layers: LayerMask,
+    nodes: Arc<Vec<u32>>,
+    ordinals: Arc<Vec<u32>>,
+    outgoing: bool,
+}
+impl AlgorithmAdjacency<'_, '_> {
+    pub(crate) fn checked_degree(&self, ordinal: u32) -> Option<usize> {
+        if self.view.nodes.is_empty() && self.view.edges.is_empty() {
+            let node = self
+                .nodes
+                .get(ordinal as usize)
+                .and_then(|dense| self.view.base.node_dense(*dense))?;
+            let mut degree = 0;
+            let live = self.view.base.visit_neighbor_denses(
+                node,
+                self.outgoing,
+                self.layers,
+                |dense, _| {
+                    if self
+                        .ordinals
+                        .get(dense as usize)
+                        .is_some_and(|ordinal| *ordinal != u32::MAX)
+                    {
+                        degree += 1;
+                    }
+                },
+            );
+            return live.then_some(degree);
+        }
+        crate::graph::AdjacencyRead::row(self, ordinal).map(|row| row.len())
+    }
+}
+
+impl crate::graph::AdjacencyRead for AlgorithmAdjacency<'_, '_> {
+    type Row<'a>
+        = std::vec::IntoIter<(u32, u32)>
+    where
+        Self: 'a;
+    fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+    fn degree(&self, node: u32) -> usize {
+        self.checked_degree(node).unwrap_or(0)
+    }
+    fn append_row(&self, ordinal: u32, output: &mut Vec<(u32, u32)>) -> bool {
+        if self.view.nodes.is_empty() && self.view.edges.is_empty() {
+            let Some(node) = self
+                .nodes
+                .get(ordinal as usize)
+                .and_then(|dense| self.view.base.node_dense(*dense))
+            else {
+                return false;
+            };
+            let start = output.len();
+            if !self
+                .view
+                .base
+                .append_neighbor_denses(node, self.outgoing, self.layers, output)
+            {
+                return false;
+            }
+            let mut write = start;
+            for read in start..output.len() {
+                let (dense, edge) = output[read];
+                if let Some(ordinal) = self
+                    .ordinals
+                    .get(dense as usize)
+                    .copied()
+                    .filter(|ordinal| *ordinal != u32::MAX)
+                {
+                    output[write] = (ordinal, edge);
+                    write += 1;
+                }
+            }
+            output.truncate(write);
+            return true;
+        }
+        if let Some(row) = crate::graph::AdjacencyRead::row(self, ordinal) {
+            output.extend(row);
+            true
+        } else {
+            false
+        }
+    }
+    fn row(&self, ordinal: u32) -> Option<Self::Row<'_>> {
+        let dense = *self.nodes.get(ordinal as usize)?;
+        let mut row = if self.view.nodes.is_empty() && self.view.edges.is_empty() {
+            let mut row = Vec::new();
+            if !crate::graph::AdjacencyRead::append_row(self, ordinal, &mut row) {
+                return None;
+            }
+            row
+        } else {
+            let node = self.view.node_dense(dense)?;
+            let edges = if self.outgoing {
+                self.view.expand_out(node.id(), None, self.layers)
+            } else {
+                self.view.expand_in(node.id(), None, self.layers)
+            }
+            .ok()?;
+            edges
+                .into_iter()
+                .filter_map(|(edge, node)| {
+                    let ordinal = *self.ordinals.get(node.dense() as usize)?;
+                    (ordinal != u32::MAX).then_some((ordinal, edge.dense()))
+                })
+                .collect::<Vec<_>>()
+        };
+        row.sort_unstable();
+        Some(row.into_iter())
+    }
 }
 
 impl ScalarKind {
@@ -101,24 +222,24 @@ impl<'a> CatalogOverlay<'a> {
             .or_else(|| self.base.relationship_type(name))
     }
 
-    fn label_name(&self, id: LabelId) -> Option<&str> {
+    fn label_name(&self, id: LabelId) -> Option<Arc<str>> {
         self.label_names
             .get(&id)
-            .map(String::as_str)
+            .map(|name| Arc::from(name.as_str()))
             .or_else(|| self.base.label_name(id))
     }
 
-    fn property_name(&self, id: PropertyId) -> Option<&str> {
+    fn property_name(&self, id: PropertyId) -> Option<Arc<str>> {
         self.property_names
             .get(&id)
-            .map(String::as_str)
+            .map(|name| Arc::from(name.as_str()))
             .or_else(|| self.base.property_name(id))
     }
 
-    fn relationship_type_name(&self, id: RelationshipTypeId) -> Option<&str> {
+    fn relationship_type_name(&self, id: RelationshipTypeId) -> Option<Arc<str>> {
         self.relationship_names
             .get(&id)
-            .map(String::as_str)
+            .map(|name| Arc::from(name.as_str()))
             .or_else(|| self.base.relationship_type_name(id))
     }
 
@@ -170,7 +291,9 @@ impl<'a> CatalogOverlay<'a> {
 
     fn declare_label(&mut self, name: &str, id: LabelId) -> Result<()> {
         if self.label(name).is_some_and(|existing| existing != id)
-            || self.label_name(id).is_some_and(|existing| existing != name)
+            || self
+                .label_name(id)
+                .is_some_and(|existing| existing.as_ref() != name)
         {
             return Err(Error::new(
                 ErrorCode::TransactionConflict,
@@ -189,7 +312,7 @@ impl<'a> CatalogOverlay<'a> {
         if self.property(name).is_some_and(|existing| existing != id)
             || self
                 .property_name(id)
-                .is_some_and(|existing| existing != name)
+                .is_some_and(|existing| existing.as_ref() != name)
         {
             return Err(Error::new(
                 ErrorCode::TransactionConflict,
@@ -213,7 +336,7 @@ impl<'a> CatalogOverlay<'a> {
             .is_some_and(|existing| existing != id)
             || self
                 .relationship_type_name(id)
-                .is_some_and(|existing| existing != name)
+                .is_some_and(|existing| existing.as_ref() != name)
         {
             return Err(Error::new(
                 ErrorCode::TransactionConflict,
@@ -264,6 +387,20 @@ pub enum NodeReadView<'a> {
     Overlay(&'a OverlayNode, Option<NodeView<'a>>),
 }
 
+pub enum ReadLabels<'a> {
+    Base(crate::graph::LabelsHandle),
+    Overlay(&'a [LabelId]),
+}
+impl Deref for ReadLabels<'_> {
+    type Target = [LabelId];
+    fn deref(&self) -> &[LabelId] {
+        match self {
+            Self::Base(labels) => labels,
+            Self::Overlay(labels) => labels,
+        }
+    }
+}
+
 impl<'a> NodeReadView<'a> {
     pub fn id(self) -> NodeId {
         match self {
@@ -293,10 +430,10 @@ impl<'a> NodeReadView<'a> {
         }
     }
 
-    pub fn labels(self) -> &'a [LabelId] {
+    pub fn labels(self) -> ReadLabels<'a> {
         match self {
-            Self::Base(node) => node.labels(),
-            Self::Overlay(node, _) => &node.labels,
+            Self::Base(node) => ReadLabels::Base(node.labels()),
+            Self::Overlay(node, _) => ReadLabels::Overlay(&node.labels),
         }
     }
 
@@ -438,6 +575,14 @@ pub struct GraphReadView<'a> {
 }
 
 impl<'a> GraphReadView<'a> {
+    pub fn reserve_node_id(&self, minimum: u64) -> Result<NodeId> {
+        self.base.reserve_node_id(minimum)
+    }
+
+    pub fn reserve_edge_id(&self, minimum: u64) -> Result<EdgeId> {
+        self.base.reserve_edge_id(minimum)
+    }
+
     pub fn new(base: &'a GraphStore) -> Self {
         Self {
             base,
@@ -472,15 +617,15 @@ impl<'a> GraphReadView<'a> {
         self.revision
     }
 
-    pub fn label_name(&self, id: LabelId) -> Option<&str> {
+    pub fn label_name(&self, id: LabelId) -> Option<Arc<str>> {
         self.catalog.label_name(id)
     }
 
-    pub fn property_name(&self, id: PropertyId) -> Option<&str> {
+    pub fn property_name(&self, id: PropertyId) -> Option<Arc<str>> {
         self.catalog.property_name(id)
     }
 
-    pub fn relationship_type_name(&self, id: RelationshipTypeId) -> Option<&str> {
+    pub fn relationship_type_name(&self, id: RelationshipTypeId) -> Option<Arc<str>> {
         self.catalog.relationship_type_name(id)
     }
 
@@ -663,6 +808,36 @@ impl<'a> GraphReadView<'a> {
             .collect()
     }
 
+    /// Returns live canonical edge/neighbor ordinals without reconstructing endpoint handles.
+    /// Statement-local edits retain the existing merged expansion and its validation semantics.
+    pub fn expand_denses(
+        &self,
+        dense: u32,
+        outgoing: bool,
+        layers: LayerMask,
+    ) -> Result<Vec<(u32, u32)>> {
+        if self.nodes.is_empty() && self.edges.is_empty() {
+            let node = self
+                .base
+                .node_dense(dense)
+                .ok_or_else(|| Error::new(ErrorCode::QueryType, "node does not exist"))?;
+            let mut output = Vec::new();
+            self.base
+                .visit_neighbor_denses(node, outgoing, layers, |neighbor, edge| {
+                    output.push((edge, neighbor));
+                });
+            return Ok(output);
+        }
+        let node = self
+            .node_dense(dense)
+            .ok_or_else(|| Error::new(ErrorCode::QueryType, "node does not exist"))?;
+        Ok(self
+            .expand(node.id(), None, layers, outgoing)?
+            .into_iter()
+            .map(|(edge, node)| (edge.dense(), node.dense()))
+            .collect())
+    }
+
     pub fn expand_out(
         &self,
         node: NodeId,
@@ -688,6 +863,17 @@ impl<'a> GraphReadView<'a> {
         layers: LayerMask,
         outgoing: bool,
     ) -> Result<Vec<(EdgeReadView<'_>, NodeReadView<'_>)>> {
+        if self.nodes.is_empty() && self.edges.is_empty() {
+            let edges = if outgoing {
+                self.base.expand_out(node, relationship_type, layers)
+            } else {
+                self.base.expand_in(node, relationship_type, layers)
+            }?;
+            return Ok(edges
+                .into_iter()
+                .map(|(edge, node)| (EdgeReadView::Base(edge), NodeReadView::Base(node)))
+                .collect());
+        }
         let start = self
             .node(node)
             .ok_or_else(|| Error::new(ErrorCode::QueryType, "node does not exist"))?;
@@ -743,68 +929,54 @@ impl<'a> GraphReadView<'a> {
         Ok(result)
     }
 
-    pub fn algorithm_adjacency(&self, layers: LayerMask) -> Result<(Csr, Csr, Vec<u32>, Vec<u32>)> {
-        let node_capacity = self
+    pub fn algorithm_adjacency(
+        &self,
+        layers: LayerMask,
+    ) -> Result<(
+        AlgorithmAdjacency<'_, 'a>,
+        AlgorithmAdjacency<'_, 'a>,
+        Arc<Vec<u32>>,
+        Arc<Vec<u32>>,
+    )> {
+        let capacity = self
             .base
             .node_slot_count()
             .saturating_add(self.inserted_node_count());
-        let visible_nodes = (0..node_capacity)
-            .filter_map(|row| {
-                let dense = u32::try_from(row).ok()?;
-                let node = self.node_dense(dense)?;
-                layers.contains_layer(node.layer()).then_some(dense)
-            })
-            .collect::<Vec<_>>();
-        // Dense IDs are already bounded integer indices. A tree map here made preparation
-        // O(N log N), and the executor then rebuilt the same map a second time. This one compact
-        // vector is produced with the filtered CSR and reused by argument resolution; unrelated
-        // property payloads do not affect its shape or work.
-        let mut ordinal_by_dense = vec![u32::MAX; node_capacity];
-        for (ordinal, dense) in visible_nodes.iter().copied().enumerate() {
-            ordinal_by_dense[dense as usize] = u32::try_from(ordinal).map_err(|_| {
+        let nodes = Arc::new(
+            (0..capacity)
+                .filter_map(|row| {
+                    let dense = u32::try_from(row).ok()?;
+                    self.node_dense(dense)
+                        .filter(|node| layers.contains_layer(node.layer()))
+                        .map(|_| dense)
+                })
+                .collect::<Vec<_>>(),
+        );
+        let mut ordinals = vec![u32::MAX; capacity];
+        for (ordinal, dense) in nodes.iter().copied().enumerate() {
+            ordinals[dense as usize] = u32::try_from(ordinal).map_err(|_| {
                 Error::new(
                     ErrorCode::ResultBudgetExceeded,
-                    "algorithm node ordinal space exhausted",
+                    "algorithm ordinal space exhausted",
                 )
             })?;
         }
-        let mut visible = Vec::new();
-        let capacity = self
-            .base
-            .edge_slot_count()
-            .saturating_add(self.inserted_edge_count());
-        for row in 0..capacity {
-            let dense = u32::try_from(row).map_err(|_| {
-                Error::new(
-                    ErrorCode::ResultBudgetExceeded,
-                    "dense relationship ID space exhausted",
-                )
-            })?;
-            let Some(edge) = self.edge_dense(dense) else {
-                continue;
-            };
-            if !layers.contains_layer(edge.layer()) {
-                continue;
-            }
-            let Some(source) = self
-                .node(edge.source())
-                .and_then(|node| ordinal_by_dense.get(node.dense() as usize).copied())
-                .filter(|ordinal| *ordinal != u32::MAX)
-            else {
-                continue;
-            };
-            let Some(target) = self
-                .node(edge.target())
-                .and_then(|node| ordinal_by_dense.get(node.dense() as usize).copied())
-                .filter(|ordinal| *ordinal != u32::MAX)
-            else {
-                continue;
-            };
-            visible.push((source, target, dense));
-        }
-        let outgoing = Csr::build(visible_nodes.len(), &visible)?;
-        let incoming = Csr::build_transposed(visible_nodes.len(), &visible)?;
-        Ok((outgoing, incoming, visible_nodes, ordinal_by_dense))
+        let ordinals = Arc::new(ordinals);
+        let outgoing = AlgorithmAdjacency {
+            view: self,
+            layers,
+            nodes: Arc::clone(&nodes),
+            ordinals: Arc::clone(&ordinals),
+            outgoing: true,
+        };
+        let incoming = AlgorithmAdjacency {
+            view: self,
+            layers,
+            nodes: Arc::clone(&nodes),
+            ordinals: Arc::clone(&ordinals),
+            outgoing: false,
+        };
+        Ok((outgoing, incoming, nodes, ordinals))
     }
 
     pub fn apply(&mut self, mutation: &GraphMutation) -> Result<()> {
@@ -1067,24 +1239,12 @@ impl<'a> GraphReadView<'a> {
             .node(node)
             .ok_or_else(|| Error::new(ErrorCode::QueryType, "node does not exist"))?
             .dense();
-        let mut incident = Vec::new();
-        let capacity = self
-            .base
-            .edge_slot_count()
-            .saturating_add(self.inserted_edge_count());
-        for row in 0..capacity {
-            let edge_dense = u32::try_from(row).map_err(|_| {
-                Error::new(
-                    ErrorCode::ResultBudgetExceeded,
-                    "dense relationship ID space exhausted",
-                )
-            })?;
-            if let Some(edge) = self.edge_dense(edge_dense)
-                && (edge.source() == node || edge.target() == node)
-            {
-                incident.push(edge.id());
-            }
-        }
+        let incident = self
+            .expand_out(node, None, LayerMask::ALL)?
+            .into_iter()
+            .chain(self.expand_in(node, None, LayerMask::ALL)?)
+            .map(|(edge, _)| edge.id())
+            .collect::<BTreeSet<_>>();
         if !detach && !incident.is_empty() {
             return Err(Error::new(
                 ErrorCode::QueryType,
@@ -1150,12 +1310,18 @@ impl<'a> GraphReadView<'a> {
     }
 
     fn validate_node_property(&mut self, property: PropertyId, value: &ScalarValue) -> Result<()> {
-        self.base.validate_node_property_value(property, value)?;
+        if self.catalog.property_name(property).is_none() {
+            return Err(Error::invalid_data("undeclared property ID"));
+        }
+        crate::graph::validate_property_value_shape(value)?;
         validate_overlay_property(&mut self.node_property_types, property, value)
     }
 
     fn validate_edge_property(&mut self, property: PropertyId, value: &ScalarValue) -> Result<()> {
-        self.base.validate_edge_property_value(property, value)?;
+        if self.catalog.property_name(property).is_none() {
+            return Err(Error::invalid_data("undeclared property ID"));
+        }
+        crate::graph::validate_property_value_shape(value)?;
         validate_overlay_property(&mut self.edge_property_types, property, value)
     }
 
@@ -1407,7 +1573,7 @@ mod tests {
     use crate::graph::{TemporalDeclaration, TemporalType};
 
     fn graph_fixture() -> Result<(GraphStore, LabelId, PropertyId, RelationshipTypeId)> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let label = graph.catalog_mut().intern_label("Item")?;
         let property = graph.catalog_mut().intern_property("value")?;
         let relationship_type = graph.catalog_mut().intern_relationship_type("NEXT")?;
@@ -1439,7 +1605,7 @@ mod tests {
 
     #[test]
     fn bounded_canonical_scan_filters_layers_labels_and_tombstones_before_cap() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let first = graph.catalog_mut().intern_label("First")?;
         let second = graph.catalog_mut().intern_label("Second")?;
         for (row, (layer, labels)) in [
@@ -1510,7 +1676,7 @@ mod tests {
 
     #[test]
     fn read_only_view_borrows_canonical_rows_and_write_materializes_one_row() -> Result<()> {
-        let (mut graph, label, property, _) = graph_fixture()?;
+        let (graph, label, property, _) = graph_fixture()?;
         let body = graph.catalog_mut().intern_property("body")?;
         let payload = ScalarValue::Bytes(vec![0x5a; 256 * 1_024].into());
         graph.set_node_property(NodeId(1), body, payload.clone(), 1)?;
@@ -1596,8 +1762,153 @@ mod tests {
     }
 
     #[test]
+    fn deletion_uses_incident_rows_without_copying_unrelated_dirty_edges() -> Result<()> {
+        let (graph, label, property, kind) = graph_fixture()?;
+        graph.insert_node(NodeInput {
+            id: NodeId(4),
+            layer: Layer::Observed,
+            revision: 1,
+            labels: vec![label],
+            properties: vec![],
+        })?;
+        let payload = ScalarValue::String("complete unrelated owner content ".repeat(2048).into());
+        for id in 1000..11000 {
+            graph.insert_edge(EdgeInput {
+                id: EdgeId(id),
+                source: NodeId(1),
+                target: NodeId(2),
+                relationship_type: kind,
+                layer: Layer::Observed,
+                revision: 1,
+                properties: vec![(property, payload.clone())],
+            })?;
+        }
+        for (id, source, target) in [(20000, 4, 4), (20001, 1, 4)] {
+            graph.insert_edge(EdgeInput {
+                id: EdgeId(id),
+                source: NodeId(source),
+                target: NodeId(target),
+                relationship_type: kind,
+                layer: Layer::Observed,
+                revision: 1,
+                properties: vec![],
+            })?;
+        }
+        let bytes = graph.resident_bytes();
+        let mut view = GraphReadView::new(&graph);
+        view.apply(&GraphMutation::InsertEdge(EdgeInput {
+            id: EdgeId(30000),
+            source: NodeId(4),
+            target: NodeId(2),
+            relationship_type: kind,
+            layer: Layer::Observed,
+            revision: 2,
+            properties: vec![],
+        }))?;
+        assert!(
+            view.apply(&GraphMutation::DeleteNode {
+                node: NodeId(4),
+                detach: false,
+                revision: 2
+            })
+            .is_err()
+        );
+        view.apply(&GraphMutation::DeleteNode {
+            node: NodeId(4),
+            detach: true,
+            revision: 2,
+        })?;
+        assert_eq!(view.overlay_row_counts(), (1, 3));
+        assert!(view.node(NodeId(4)).is_none());
+        for id in [20000, 20001, 30000] {
+            assert!(view.edge(EdgeId(id)).is_none());
+        }
+        assert_eq!(
+            view.edge(EdgeId(1000)).unwrap().property(property),
+            Some(payload)
+        );
+        assert_eq!(graph.resident_bytes(), bytes);
+        assert!(graph.node(NodeId(4)).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_adjacency_forwarding_matches_sparse_overlay_and_live_deletion() -> Result<()> {
+        let (graph, _, property, kind) = graph_fixture()?;
+        let direct = GraphReadView::new(&graph);
+        let mut overlay = GraphReadView::new(&graph);
+        overlay.apply(&GraphMutation::SetNodeProperty {
+            node: NodeId(1),
+            property,
+            value: ScalarValue::Integer(10),
+            revision: 2,
+        })?;
+        for layers in [LayerMask::ALL, LayerMask::OBSERVED, LayerMask::KNOWLEDGE] {
+            for kind in [None, Some(kind)] {
+                for outgoing in [true, false] {
+                    for node in [NodeId(1), NodeId(2)] {
+                        let rows = |view: &GraphReadView<'_>| -> Result<Vec<_>> {
+                            Ok(view
+                                .expand(node, kind, layers, outgoing)?
+                                .into_iter()
+                                .map(|(edge, node)| {
+                                    (edge.id(), node.id(), edge.dense(), node.dense())
+                                })
+                                .collect())
+                        };
+                        assert_eq!(rows(&direct)?, rows(&overlay)?);
+                    }
+                }
+            }
+            let (direct_out, direct_in, direct_nodes, _) = direct.algorithm_adjacency(layers)?;
+            let (overlay_out, overlay_in, overlay_nodes, _) =
+                overlay.algorithm_adjacency(layers)?;
+            assert_eq!(direct_nodes, overlay_nodes);
+            for row in 0..u32::try_from(direct_nodes.len())
+                .map_err(|error| Error::internal(error.to_string()))?
+            {
+                for (direct, overlay) in [(&direct_out, &overlay_out), (&direct_in, &overlay_in)] {
+                    for adjacency in [direct, overlay] {
+                        let mut scratch = vec![(u32::MAX, u32::MAX)];
+                        assert!(crate::graph::AdjacencyRead::append_row(
+                            adjacency,
+                            row,
+                            &mut scratch
+                        ));
+                        assert_eq!(scratch[0], (u32::MAX, u32::MAX));
+                        scratch[1..].sort_unstable();
+                        assert_eq!(
+                            Some(scratch[1..].to_vec()),
+                            crate::graph::AdjacencyRead::row(adjacency, row)
+                                .map(Iterator::collect::<Vec<_>>)
+                        );
+                    }
+                    assert_eq!(
+                        crate::graph::AdjacencyRead::row(direct, row)
+                            .map(Iterator::collect::<Vec<_>>),
+                        crate::graph::AdjacencyRead::row(overlay, row)
+                            .map(Iterator::collect::<Vec<_>>)
+                    );
+                }
+            }
+        }
+        graph.delete_edge(EdgeId(1), 3)?;
+        assert!(
+            direct
+                .expand_out(NodeId(1), None, LayerMask::ALL)?
+                .is_empty()
+        );
+        assert!(
+            overlay
+                .expand_out(NodeId(1), None, LayerMask::ALL)?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn algorithm_adjacency_dense_mapping_tracks_rows_not_dirty_property_bytes() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let graph = GraphStore::default();
         let label = graph.catalog_mut().intern_label("Item")?;
         let body = graph.catalog_mut().intern_property("body")?;
         let relationship_type = graph.catalog_mut().intern_relationship_type("NEXT")?;
@@ -1632,8 +1943,8 @@ mod tests {
         assert_eq!(ordinal_by_dense.len(), 400);
         assert_eq!(ordinal_by_dense[0], 0);
         assert_eq!(ordinal_by_dense[399], 399);
-        assert_eq!(outgoing.neighbors().len(), 399);
-        assert_eq!(incoming.neighbors().len(), 399);
+        assert_eq!(crate::graph::AdjacencyRead::edge_count(&outgoing), 399);
+        assert_eq!(crate::graph::AdjacencyRead::edge_count(&incoming), 399);
         Ok(())
     }
 
@@ -1839,7 +2150,7 @@ mod tests {
     #[test]
     fn temporal_overlay_reads_new_samples_without_cloning_or_mutating_base() -> Result<()> {
         let property = PropertyId(7);
-        let mut temporal = TemporalStore::default();
+        let temporal = TemporalStore::default();
         temporal.declare(
             TemporalDeclaration {
                 entity_kind: EntityKind::Node,

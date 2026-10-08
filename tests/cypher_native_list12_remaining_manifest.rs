@@ -174,7 +174,7 @@ struct StrictSegmentedBackend {
 impl StrictSegmentedBackend {
     fn new(graph: &GraphStore) -> Result<Self> {
         let mut inner = CpuBackend::new(MEMORY_LIMIT_BYTES, RESERVED_BYTES);
-        inner.admit_project(ResidentProjectImage::build(
+        inner.admit_project(super::legacy_resident_build(
             PROJECT,
             bookmark(graph),
             graph,
@@ -494,7 +494,7 @@ fn bookmark(graph: &GraphStore) -> Bookmark {
 }
 
 fn populated_graph() -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let a = graph.catalog_mut().intern_label("A")?;
     let b = graph.catalog_mut().intern_label("B")?;
     let c = graph.catalog_mut().intern_label("C")?;
@@ -523,7 +523,7 @@ fn populated_graph() -> Result<GraphStore> {
 }
 
 fn collected_entity_graph() -> Result<GraphStore> {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let label = graph.catalog_mut().intern_label("Label1")?;
     let name = graph.catalog_mut().intern_property("name")?;
     graph.insert_node(NodeInput {

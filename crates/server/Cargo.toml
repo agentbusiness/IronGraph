@@ -10,6 +10,7 @@ default = ["accelerator"]
 # The write path applies directly to one local backend.
 accelerator = ["dep:candle-core", "irongraph-embedding/accelerator", "irongraph-graph/accelerator", "irongraph-gpu/accelerator"]
 metal = ["accelerator"]
+legacy-graph = ["accelerator", "irongraph-gpu/legacy-graph"]
 cuda = ["accelerator", "candle-core/cuda", "irongraph-gpu/cuda"]
 
 [dependencies]
@@ -21,6 +22,8 @@ irongraph-graph = { path = "../graph" }
 irongraph-gpu = { path = "../gpu", default-features = false }
 irongraph-embedding = { path = "../embedding", default-features = false }
 anyhow = "1.0.100"
+arc-swap = "1.9.2"
+papaya = "0.2.5"
 async-trait = "0.1.89"
 axum = { version = "0.8.9", features = ["http2", "json", "macros", "tokio"] }
 bitflags = { version = "2.10.0", features = ["serde"] }

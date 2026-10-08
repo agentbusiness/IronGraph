@@ -1,3 +1,6 @@
+//! Inactive graph accelerator implementation retained for future removal.
+//! Active canonical CPU data is implemented by the concurrent module.
+
 //! Canonical structure-of-arrays graph state and deterministic mutation application.
 
 use std::{
@@ -20,7 +23,7 @@ use super::{
 
 /// Canonical schema-name dictionaries. IDs are stable within a project.
 #[derive(Clone, Debug, Default)]
-pub struct NameCatalog {
+pub struct LegacyNameCatalog {
     labels: SchemaNames,
     properties: SchemaNames,
     relationship_types: SchemaNames,
@@ -163,13 +166,13 @@ struct NameCatalogWire {
     next_relationship_type: u64,
 }
 
-impl Serialize for NameCatalog {
+impl Serialize for LegacyNameCatalog {
     fn serialize<S: serde::Serializer>(
         &self,
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("NameCatalog", 9)?;
+        let mut state = serializer.serialize_struct("LegacyNameCatalog", 9)?;
         state.serialize_field(
             "labels",
             &self
@@ -207,7 +210,7 @@ impl Serialize for NameCatalog {
     }
 }
 
-impl<'de> Deserialize<'de> for NameCatalog {
+impl<'de> Deserialize<'de> for LegacyNameCatalog {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
@@ -263,7 +266,7 @@ impl<'de> Deserialize<'de> for NameCatalog {
     }
 }
 
-impl NameCatalog {
+impl LegacyNameCatalog {
     /// Stable schema generation used only by ephemeral plan/statistics caches.
     #[must_use]
     pub fn optimizer_generation(&self) -> [u8; 32] {
@@ -469,12 +472,12 @@ pub enum GraphMutation {
 
 /// Borrowed node view over canonical columns.
 #[derive(Clone, Copy, Debug)]
-pub struct NodeView<'a> {
-    graph: &'a GraphStore,
+pub struct LegacyNodeView<'a> {
+    graph: &'a LegacyGraphStore,
     dense: u32,
 }
 
-impl<'a> NodeView<'a> {
+impl<'a> LegacyNodeView<'a> {
     #[must_use]
     pub fn id(self) -> NodeId {
         self.graph.node_ids[self.dense as usize]
@@ -517,12 +520,12 @@ impl<'a> NodeView<'a> {
 
 /// Borrowed relationship view over canonical columns.
 #[derive(Clone, Copy, Debug)]
-pub struct EdgeView<'a> {
-    graph: &'a GraphStore,
+pub struct LegacyEdgeView<'a> {
+    graph: &'a LegacyGraphStore,
     dense: u32,
 }
 
-impl EdgeView<'_> {
+impl LegacyEdgeView<'_> {
     #[must_use]
     pub fn id(self) -> EdgeId {
         self.graph.edge_ids[self.dense as usize]
@@ -1050,9 +1053,9 @@ impl GraphSnapshot {
 
 /// Mutable canonical project graph. Dense ordinals change only during explicit compaction.
 #[derive(Clone, Debug, Default, Serialize)]
-pub struct GraphStore {
+pub struct LegacyGraphStore {
     revision: u64,
-    catalog: Arc<NameCatalog>,
+    catalog: Arc<LegacyNameCatalog>,
     node_lookup: PersistentMap<u32>,
     node_ids: PagedVec<NodeId>,
     node_layers: PagedVec<Layer>,
@@ -1094,14 +1097,14 @@ pub struct GraphStore {
     device_changes: Arc<GraphChangeJournal>,
 }
 
-impl<'de> Deserialize<'de> for GraphStore {
+impl<'de> Deserialize<'de> for LegacyGraphStore {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         #[derive(Deserialize)]
         struct StoredGraph {
             revision: u64,
-            catalog: Arc<NameCatalog>,
+            catalog: Arc<LegacyNameCatalog>,
             node_lookup: PersistentMap<u32>,
             node_ids: PagedVec<NodeId>,
             node_layers: PagedVec<Layer>,
@@ -1240,7 +1243,7 @@ fn count_layers(counts: &[u64; LAYER_COUNT], mask: LayerMask) -> u64 {
         .fold(0_u64, u64::saturating_add)
 }
 
-impl GraphStore {
+impl LegacyGraphStore {
     /// Returns the O(1) physical dense-layout epoch used to fence resident row ordinals.
     #[must_use]
     pub const fn layout_version(&self) -> u64 {
@@ -1374,11 +1377,11 @@ impl GraphStore {
     }
 
     #[must_use]
-    pub fn catalog(&self) -> &NameCatalog {
+    pub fn catalog(&self) -> &LegacyNameCatalog {
         &self.catalog
     }
 
-    pub fn catalog_mut(&mut self) -> &mut NameCatalog {
+    pub fn catalog_mut(&mut self) -> &mut LegacyNameCatalog {
         Arc::make_mut(&mut self.catalog)
     }
 
@@ -1847,7 +1850,7 @@ impl GraphStore {
     }
 
     /// Iterates every live node in stable dense-row order without allocating an object graph.
-    pub fn nodes(&self) -> impl Iterator<Item = NodeView<'_>> {
+    pub fn nodes(&self) -> impl Iterator<Item = LegacyNodeView<'_>> {
         (0..self.node_ids.len()).filter_map(|dense| {
             let dense = u32::try_from(dense).ok()?;
             self.node_dense(dense)
@@ -1855,7 +1858,7 @@ impl GraphStore {
     }
 
     /// Iterates every live relationship in stable dense-row order.
-    pub fn edges(&self) -> impl Iterator<Item = EdgeView<'_>> {
+    pub fn edges(&self) -> impl Iterator<Item = LegacyEdgeView<'_>> {
         (0..self.edge_ids.len()).filter_map(|dense| {
             let dense = u32::try_from(dense).ok()?;
             self.edge_dense(dense)
@@ -2305,38 +2308,38 @@ impl GraphStore {
     }
 
     #[must_use]
-    pub fn node(&self, id: NodeId) -> Option<NodeView<'_>> {
+    pub fn node(&self, id: NodeId) -> Option<LegacyNodeView<'_>> {
         let dense = *stable_id_row(&self.node_lookup, id.0)?;
-        (!self.node_is_deleted(dense as usize)).then_some(NodeView { graph: self, dense })
+        (!self.node_is_deleted(dense as usize)).then_some(LegacyNodeView { graph: self, dense })
     }
 
     #[must_use]
-    pub fn node_dense(&self, dense: u32) -> Option<NodeView<'_>> {
+    pub fn node_dense(&self, dense: u32) -> Option<LegacyNodeView<'_>> {
         if dense as usize >= self.node_ids.len() || self.node_is_deleted(dense as usize) {
             return None;
         }
-        Some(NodeView { graph: self, dense })
+        Some(LegacyNodeView { graph: self, dense })
     }
 
     #[must_use]
-    pub fn edge(&self, id: EdgeId) -> Option<EdgeView<'_>> {
+    pub fn edge(&self, id: EdgeId) -> Option<LegacyEdgeView<'_>> {
         let dense = *stable_id_row(&self.edge_lookup, id.0)?;
         self.edge_dense(dense)
     }
 
     #[must_use]
-    pub fn edge_dense(&self, dense: u32) -> Option<EdgeView<'_>> {
+    pub fn edge_dense(&self, dense: u32) -> Option<LegacyEdgeView<'_>> {
         if dense as usize >= self.edge_ids.len() || self.edge_is_deleted(dense as usize) {
             return None;
         }
-        Some(EdgeView { graph: self, dense })
+        Some(LegacyEdgeView { graph: self, dense })
     }
 
     pub fn scan_nodes(
         &self,
         label: Option<LabelId>,
         layers: LayerMask,
-    ) -> impl Iterator<Item = NodeView<'_>> {
+    ) -> impl Iterator<Item = LegacyNodeView<'_>> {
         let mut changed_labels = self.node_label_deltas.iter().peekable();
         let all_layers_visible = layers == LayerMask::ALL
             || self.label_counts.get().is_some_and(|counts| {
@@ -2376,7 +2379,7 @@ impl GraphStore {
         node: NodeId,
         relationship_type: Option<RelationshipTypeId>,
         layers: LayerMask,
-    ) -> Result<Vec<(EdgeView<'_>, NodeView<'_>)>> {
+    ) -> Result<Vec<(LegacyEdgeView<'_>, LegacyNodeView<'_>)>> {
         let source = self.live_node_dense(node)?;
         let mut merged = Vec::new();
         self.adjacency.expand_out(source, &mut merged);
@@ -2409,7 +2412,7 @@ impl GraphStore {
         relationship_type: Option<RelationshipTypeId>,
         layers: LayerMask,
         limit: usize,
-    ) -> Result<Vec<(EdgeView<'_>, NodeView<'_>)>> {
+    ) -> Result<Vec<(LegacyEdgeView<'_>, LegacyNodeView<'_>)>> {
         let source = self.live_node_dense(node)?;
         let mut merged = Vec::new();
         self.adjacency
@@ -2445,7 +2448,7 @@ impl GraphStore {
         node: NodeId,
         relationship_type: Option<RelationshipTypeId>,
         layers: LayerMask,
-    ) -> Result<Vec<(EdgeView<'_>, NodeView<'_>)>> {
+    ) -> Result<Vec<(LegacyEdgeView<'_>, LegacyNodeView<'_>)>> {
         let target = self.live_node_dense(node)?;
         let mut merged = Vec::new();
         self.adjacency.expand_in(target, &mut merged);
@@ -2477,7 +2480,7 @@ impl GraphStore {
         relationship_type: Option<RelationshipTypeId>,
         layers: LayerMask,
         limit: usize,
-    ) -> Result<Vec<(EdgeView<'_>, NodeView<'_>)>> {
+    ) -> Result<Vec<(LegacyEdgeView<'_>, LegacyNodeView<'_>)>> {
         let target = self.live_node_dense(node)?;
         let mut merged = Vec::new();
         self.adjacency
@@ -2832,13 +2835,13 @@ impl GraphStore {
 
     fn live_node_dense(&self, id: NodeId) -> Result<u32> {
         self.node(id)
-            .map(NodeView::dense)
+            .map(LegacyNodeView::dense)
             .ok_or_else(|| Error::new(ErrorCode::QueryType, "node does not exist"))
     }
 
     fn live_edge_dense(&self, id: EdgeId) -> Result<u32> {
         self.edge(id)
-            .map(EdgeView::dense)
+            .map(LegacyEdgeView::dense)
             .ok_or_else(|| Error::new(ErrorCode::QueryType, "relationship does not exist"))
     }
 
@@ -2881,7 +2884,7 @@ mod cow_tests {
 
     #[test]
     fn schema_optimizer_generation_changes_only_with_declared_names() -> Result<()> {
-        let mut catalog = NameCatalog::default();
+        let mut catalog = LegacyNameCatalog::default();
         let empty = catalog.optimizer_generation();
         assert_eq!(catalog.optimizer_generation(), empty);
         let pinned = catalog.clone();
@@ -2917,7 +2920,7 @@ mod cow_tests {
                     "fixture",
                 )?;
             }
-            let mut catalog = NameCatalog {
+            let mut catalog = LegacyNameCatalog {
                 labels: names.clone(),
                 properties: names.clone(),
                 relationship_types: names,
@@ -3010,7 +3013,7 @@ mod cow_tests {
 
     #[test]
     fn surgical_label_overlay_keeps_large_neighbor_payload_shared() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let mut graph = LegacyGraphStore::default();
         let mut labels = Vec::new();
         for id in 0..16_384 {
             labels.push(graph.catalog_mut().intern_label(&format!("label-{id}"))?);
@@ -3065,8 +3068,8 @@ mod cow_tests {
 
     #[test]
     fn surgical_schema_merkle_is_order_independent_and_preserves_nine_field_wire() -> Result<()> {
-        let mut first = NameCatalog::default();
-        let mut second = NameCatalog::default();
+        let mut first = LegacyNameCatalog::default();
+        let mut second = LegacyNameCatalog::default();
         let entries = [
             (0, "zero"),
             (37, "unicode-名"),
@@ -3120,7 +3123,7 @@ mod cow_tests {
         let old_bytes = postcard::to_stdvec(&wire).map_err(|e| Error::internal(e.to_string()))?;
         let new_bytes = postcard::to_stdvec(&first).map_err(|e| Error::internal(e.to_string()))?;
         assert_eq!(old_bytes, new_bytes);
-        let recovered: NameCatalog =
+        let recovered: LegacyNameCatalog =
             postcard::from_bytes(&old_bytes).map_err(|e| Error::internal(e.to_string()))?;
         assert_eq!(
             recovered.optimizer_generation(),
@@ -3133,7 +3136,7 @@ mod cow_tests {
         ciborium::ser::into_writer(&first, &mut new_cbor)
             .map_err(|e| Error::internal(e.to_string()))?;
         assert_eq!(old_cbor, new_cbor);
-        let recovered: NameCatalog = ciborium::de::from_reader(old_cbor.as_slice())
+        let recovered: LegacyNameCatalog = ciborium::de::from_reader(old_cbor.as_slice())
             .map_err(|e| Error::internal(e.to_string()))?;
         assert_eq!(
             recovered.optimizer_generation(),
@@ -3142,9 +3145,9 @@ mod cow_tests {
         let mut corrupt = wire;
         corrupt.labels.insert("forged".to_owned(), LabelId(0));
         let corrupt = postcard::to_stdvec(&corrupt).map_err(|e| Error::internal(e.to_string()))?;
-        assert!(postcard::from_bytes::<NameCatalog>(&corrupt).is_err());
-        let mut label_only = NameCatalog::default();
-        let mut property_only = NameCatalog::default();
+        assert!(postcard::from_bytes::<LegacyNameCatalog>(&corrupt).is_err());
+        let mut label_only = LegacyNameCatalog::default();
+        let mut property_only = LegacyNameCatalog::default();
         label_only.intern_label("same")?;
         property_only.intern_property("same")?;
         assert_ne!(
@@ -3188,9 +3191,9 @@ mod cow_tests {
 
     /// Exact database-checkpoint CBOR shape from before the dense-layout epoch was introduced.
     #[derive(Serialize)]
-    struct LegacyGraphStore<'a> {
+    struct PreLayoutGraphWire<'a> {
         revision: u64,
-        catalog: &'a Arc<NameCatalog>,
+        catalog: &'a Arc<LegacyNameCatalog>,
         node_lookup: &'a PersistentMap<u32>,
         node_ids: &'a PagedVec<NodeId>,
         node_layers: &'a PagedVec<Layer>,
@@ -3213,8 +3216,8 @@ mod cow_tests {
         adjacency: &'a Arc<Adjacency>,
     }
 
-    fn graph_with_integer_rows(rows: u64) -> Result<(GraphStore, PropertyId)> {
-        let mut graph = GraphStore::default();
+    fn graph_with_integer_rows(rows: u64) -> Result<(LegacyGraphStore, PropertyId)> {
+        let mut graph = LegacyGraphStore::default();
         let label = graph.catalog_mut().intern_label("Row")?;
         let property = graph.catalog_mut().intern_property("value")?;
         for id in 1..=rows {
@@ -3229,8 +3232,8 @@ mod cow_tests {
         Ok((graph, property))
     }
 
-    fn graph_with_one_relationship() -> Result<GraphStore> {
-        let mut graph = GraphStore::default();
+    fn graph_with_one_relationship() -> Result<LegacyGraphStore> {
+        let mut graph = LegacyGraphStore::default();
         let label = graph.catalog_mut().intern_label("Person")?;
         let relationship_type = graph.catalog_mut().intern_relationship_type("KNOWS")?;
         for (id, revision) in [(NodeId(1), 1), (NodeId(2), 2)] {
@@ -3321,7 +3324,7 @@ mod cow_tests {
             Some(ScalarValue::Integer(2))
         );
 
-        let legacy_store = LegacyGraphStore {
+        let legacy_store = PreLayoutGraphWire {
             revision: graph.revision,
             catalog: &graph.catalog,
             node_lookup: &graph.node_lookup,
@@ -3348,7 +3351,7 @@ mod cow_tests {
         let mut legacy_store_bytes = Vec::new();
         ciborium::ser::into_writer(&legacy_store, &mut legacy_store_bytes)
             .map_err(|error| Error::new(ErrorCode::CorruptStorage, error.to_string()))?;
-        let mut decoded_store: GraphStore =
+        let mut decoded_store: LegacyGraphStore =
             ciborium::de::from_reader(legacy_store_bytes.as_slice())
                 .map_err(|error| Error::new(ErrorCode::CorruptStorage, error.to_string()))?;
         assert_eq!(decoded_store.layout_version(), 0);
@@ -3365,8 +3368,9 @@ mod cow_tests {
         let mut current_bytes = Vec::new();
         ciborium::ser::into_writer(&decoded_store, &mut current_bytes)
             .map_err(|error| Error::new(ErrorCode::CorruptStorage, error.to_string()))?;
-        let round_tripped: GraphStore = ciborium::de::from_reader(current_bytes.as_slice())
-            .map_err(|error| Error::new(ErrorCode::CorruptStorage, error.to_string()))?;
+        let round_tripped: LegacyGraphStore =
+            ciborium::de::from_reader(current_bytes.as_slice())
+                .map_err(|error| Error::new(ErrorCode::CorruptStorage, error.to_string()))?;
         assert_eq!(round_tripped.revision(), revision);
         assert_eq!(round_tripped.layout_version(), 1);
         Ok(())
@@ -3399,7 +3403,7 @@ mod cow_tests {
         paged
     }
 
-    fn shared_backing(graph: &GraphStore) -> Result<GraphSharedBacking> {
+    fn shared_backing(graph: &LegacyGraphStore) -> Result<GraphSharedBacking> {
         let snapshot = graph.snapshot()?;
         Ok(GraphSharedBacking {
             revision: snapshot.revision,
@@ -3642,17 +3646,17 @@ mod cow_tests {
         let error = graph.rebind_shared(stale_layout).unwrap_err();
         assert_eq!(error.code, ErrorCode::CorruptStorage);
         assert_eq!(graph.layout_version(), 0);
-        assert_eq!(graph.node(NodeId(1)).map(NodeView::dense), Some(0));
+        assert_eq!(graph.node(NodeId(1)).map(LegacyNodeView::dense), Some(0));
 
         graph.rebind_shared(backing)?;
         assert_eq!(graph.layout_version(), 0);
-        assert_eq!(graph.node(NodeId(1)).map(NodeView::dense), Some(0));
+        assert_eq!(graph.node(NodeId(1)).map(LegacyNodeView::dense), Some(0));
         Ok(())
     }
 
     #[test]
     fn shared_rebind_preserves_canonical_reversed_edge_adjacency() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let mut graph = LegacyGraphStore::default();
         let label = graph.catalog_mut().intern_label("IcijNode")?;
         let relationship = graph.catalog_mut().intern_relationship_type("ICIJ_LINK")?;
         for (row, id) in [NodeId(165_428), NodeId(51_122)].into_iter().enumerate() {
@@ -3663,7 +3667,7 @@ mod cow_tests {
                 labels: vec![label],
                 properties: Vec::new(),
             })?;
-            assert_eq!(graph.node(id).map(NodeView::dense), Some(row as u32));
+            assert_eq!(graph.node(id).map(LegacyNodeView::dense), Some(row as u32));
         }
         graph.insert_edge(EdgeInput {
             id: EdgeId(1),
@@ -3732,7 +3736,7 @@ mod cow_tests {
 
     #[test]
     fn change_ids_keep_detached_relationship_tombstones_for_local_derived_views() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let mut graph = LegacyGraphStore::default();
         let label = graph.catalog_mut().intern_label("Person")?;
         let relationship_type = graph.catalog_mut().intern_relationship_type("KNOWS")?;
         for (id, revision) in [(NodeId(1), 1), (NodeId(2), 2)] {
@@ -3773,7 +3777,7 @@ mod cow_tests {
     #[test]
     fn surgical_statement_delta_does_not_republish_prior_same_revision_rows() -> Result<()> {
         for rows in [4_096_u64, 32_768] {
-            let mut graph = GraphStore::default();
+            let mut graph = LegacyGraphStore::default();
             let property = graph.catalog_mut().intern_property("value")?;
             for id in 1..=rows {
                 graph.insert_node(NodeInput {
@@ -3808,7 +3812,7 @@ mod cow_tests {
 
     #[test]
     fn surgical_counts_update_only_affected_entries_on_dirty_pinned_graphs() -> Result<()> {
-        fn check(graph: &GraphStore) {
+        fn check(graph: &LegacyGraphStore) {
             for mask in [
                 LayerMask::OBSERVED,
                 LayerMask::KNOWLEDGE,
@@ -3853,7 +3857,7 @@ mod cow_tests {
         }
         let mut detached = Vec::new();
         for rows in [4_096_u64, 16_384] {
-            let mut graph = GraphStore::default();
+            let mut graph = LegacyGraphStore::default();
             let common = graph.catalog_mut().intern_label("Common")?;
             let marker = graph.catalog_mut().intern_label("Marker")?;
             let body = graph.catalog_mut().intern_property("body")?;
@@ -3973,7 +3977,7 @@ mod cow_tests {
         graph.add_node_labels(NodeId(1), vec![label], 65)?;
         let bytes =
             postcard::to_stdvec(&graph).map_err(|error| Error::internal(error.to_string()))?;
-        let mut recovered: GraphStore =
+        let mut recovered: LegacyGraphStore =
             postcard::from_bytes(&bytes).map_err(|error| Error::internal(error.to_string()))?;
         for compact in [false, true] {
             if compact {
@@ -3994,7 +3998,7 @@ mod cow_tests {
 
     #[test]
     fn live_label_counters_track_every_node_and_label_mutation() -> Result<()> {
-        let mut graph = GraphStore::default();
+        let mut graph = LegacyGraphStore::default();
         let person = graph.catalog_mut().intern_label("Person")?;
         let admin = graph.catalog_mut().intern_label("Admin")?;
 
@@ -4063,7 +4067,7 @@ mod cow_tests {
         staged.set_node_property(NodeId(2_048), property, ScalarValue::Integer(9), 4_097)?;
         let bytes = postcard::to_stdvec(&staged)
             .map_err(|error| Error::new(ErrorCode::CorruptStorage, error.to_string()))?;
-        let recovered: GraphStore = postcard::from_bytes(&bytes)
+        let recovered: LegacyGraphStore = postcard::from_bytes(&bytes)
             .map_err(|error| Error::new(ErrorCode::CorruptStorage, error.to_string()))?;
         assert_eq!(
             recovered
@@ -4085,7 +4089,7 @@ mod cow_tests {
     -> Result<()> {
         let mut copied = Vec::new();
         for rows in [4_096_u64, 32_768] {
-            let mut graph = GraphStore::default();
+            let mut graph = LegacyGraphStore::default();
             let label = graph.catalog_mut().intern_label("Vertex")?;
             let second_label = graph.catalog_mut().intern_label("Selected")?;
             let property = graph.catalog_mut().intern_property("body")?;
@@ -4174,7 +4178,7 @@ mod cow_tests {
     fn surgical_adjacency_threshold_preserves_cold_rows_pinned_generation_and_restart() -> Result<()>
     {
         const ADJACENCY_SEAL_MIN_DELTAS: usize = 1_024;
-        let mut graph = GraphStore::default();
+        let mut graph = LegacyGraphStore::default();
         let label = graph.catalog_mut().intern_label("Vertex")?;
         let relationship_type = graph.catalog_mut().intern_relationship_type("LINK")?;
         for (id, revision) in [(NodeId(1), 1), (NodeId(2), 2)] {
@@ -4238,7 +4242,7 @@ mod cow_tests {
         let mut checkpoint = Vec::new();
         ciborium::ser::into_writer(&graph, &mut checkpoint)
             .map_err(|error| Error::internal(format!("test encoding failed: {error}")))?;
-        let restored: GraphStore = ciborium::de::from_reader(checkpoint.as_slice())
+        let restored: LegacyGraphStore = ciborium::de::from_reader(checkpoint.as_slice())
             .map_err(|error| Error::internal(format!("test decoding failed: {error}")))?;
         assert_eq!(restored.adjacency.delta_len(), ADJACENCY_SEAL_MIN_DELTAS);
         assert!(
@@ -4265,7 +4269,7 @@ mod cow_tests {
             ])?))
         }
 
-        let mut graph = GraphStore::default();
+        let mut graph = LegacyGraphStore::default();
         let label = graph.catalog_mut().intern_label("Document")?;
         let property = graph.catalog_mut().intern_property("payload")?;
         let original = document('a')?;
@@ -4311,7 +4315,7 @@ mod cow_tests {
         let mut checkpoint = Vec::new();
         ciborium::ser::into_writer(&graph, &mut checkpoint)
             .map_err(|error| Error::internal(format!("test encoding failed: {error}")))?;
-        let restored: GraphStore = ciborium::de::from_reader(checkpoint.as_slice())
+        let restored: LegacyGraphStore = ciborium::de::from_reader(checkpoint.as_slice())
             .map_err(|error| Error::internal(format!("test decoding failed: {error}")))?;
         let (allocated, live) = restored
             .node_properties

@@ -1,6 +1,63 @@
 #![allow(clippy::all, clippy::nursery, clippy::pedantic)]
 
 //! Consolidated GPU integration-test harness.
+
+// Explicitly inactive fixture translation for differential comparison. The active database never
+// calls this helper or constructs the resident fixture that supplies its input.
+fn canonical_fixture(
+    legacy: &irongraph::graph::legacy::GraphStore,
+) -> irongraph::Result<irongraph::graph::GraphStore> {
+    use irongraph::graph::{EdgeInput, GraphMutation, GraphStore, NodeInput};
+    let graph = GraphStore::default();
+    for (id, name) in legacy.catalog().labels() {
+        graph.apply(GraphMutation::DeclareLabel {
+            name: name.to_owned(),
+            id,
+        })?;
+    }
+    for (id, name) in legacy.catalog().properties() {
+        graph.apply(GraphMutation::DeclareProperty {
+            name: name.to_owned(),
+            id,
+        })?;
+    }
+    for (id, name) in legacy.catalog().relationship_types() {
+        graph.apply(GraphMutation::DeclareRelationshipType {
+            name: name.to_owned(),
+            id,
+        })?;
+    }
+    for node in legacy.nodes() {
+        graph.insert_node(NodeInput {
+            id: node.id(),
+            layer: node.layer(),
+            revision: node.revision(),
+            labels: node.labels().to_vec(),
+            properties: node.properties(),
+        })?;
+    }
+    for edge in legacy.edges() {
+        graph.insert_edge(EdgeInput {
+            id: edge.id(),
+            source: edge.source(),
+            target: edge.target(),
+            relationship_type: edge.relationship_type(),
+            layer: edge.layer(),
+            revision: edge.revision(),
+            properties: edge.properties(),
+        })?;
+    }
+    Ok(graph)
+}
+
+fn canonical_temporal_fixture(
+    legacy: &irongraph::graph::legacy::TemporalStore,
+) -> irongraph::Result<irongraph::graph::TemporalStore> {
+    let encoded = postcard::to_stdvec(legacy)
+        .map_err(|error| irongraph::Error::internal(error.to_string()))?;
+    postcard::from_bytes(&encoded).map_err(|error| irongraph::Error::internal(error.to_string()))
+}
+
 #[path = "../tests/gpu_float_arithmetic_differential.rs"]
 mod gpu_float_arithmetic_differential;
 #[path = "../tests/gpu_graph_algorithm_contract.rs"]

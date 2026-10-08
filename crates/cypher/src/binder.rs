@@ -824,9 +824,11 @@ impl Binder<'_> {
             if mode.is_write() {
                 self.validate_write_relationship(&step.relationship, mode)?;
             }
-            self.dependency(DependencyKind::FullRelationshipScan, "*");
-            for relationship_type in &step.relationship.types {
-                self.dependency(DependencyKind::RelationshipType, relationship_type);
+            if mode != PatternBindingMode::Create {
+                self.dependency(DependencyKind::FullRelationshipScan, "*");
+                for relationship_type in &step.relationship.types {
+                    self.dependency(DependencyKind::RelationshipType, relationship_type);
+                }
             }
             if let Some(variable) = &step.relationship.variable {
                 if mode.is_write() {
@@ -921,13 +923,17 @@ impl Binder<'_> {
             }
         }
         for label in &node.labels {
-            self.dependency(DependencyKind::Label, label);
+            if mode != PatternBindingMode::Create {
+                self.dependency(DependencyKind::Label, label);
+            }
             if !mode.is_write() {
                 let _ = self.catalog.label(label);
             }
         }
         for (property, expression) in &node.properties {
-            self.dependency(DependencyKind::Property, property);
+            if mode != PatternBindingMode::Create {
+                self.dependency(DependencyKind::Property, property);
+            }
             self.bind_expression(expression)?;
         }
         Ok(())
@@ -1009,7 +1015,8 @@ impl Binder<'_> {
                 event_time,
             } => {
                 self.require_variable(&target.variable)?;
-                self.dependency(DependencyKind::Property, &target.property);
+                // The destination is a write, not a predicate read across other owners.
+                // Reading its old value on the RHS still records the ordinary dependency.
                 self.bind_expression(value)?;
                 if self.capabilities.require_native_execution {
                     self.validate_native_property_value_type_precedence(value)?;
@@ -3602,6 +3609,57 @@ mod tests {
                 ..BindCapabilities::default()
             },
         )
+    }
+
+    #[test]
+    fn blind_create_and_set_do_not_depend_on_unrelated_records() -> Result<()> {
+        for source in [
+            "UNWIND range(1,32) AS value CREATE (n:Parallel) SET n.value=value RETURN count(*)",
+            "CREATE (a:First {value:1})-[r:NEXT {weight:2}]->(b:Second) SET r.weight=3 RETURN r",
+        ] {
+            let bound = bind_writable_source(source, false)?;
+            assert!(!bound.read_only);
+            assert!(
+                bound.dependencies.is_empty(),
+                "{source}: {:?}",
+                bound.dependencies
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn write_values_and_merge_retain_actual_read_dependencies() -> Result<()> {
+        let bound = bind_writable_source(
+            "MATCH (n:Source) CREATE (m:Target {value:n.value}) SET m.copy=n.other RETURN m",
+            false,
+        )?;
+        for (kind, name) in [
+            (DependencyKind::Label, "Source"),
+            (DependencyKind::Property, "value"),
+            (DependencyKind::Property, "other"),
+        ] {
+            assert!(bound.dependencies.contains(&DependencyStamp {
+                kind,
+                name: name.to_owned()
+            }));
+        }
+        assert!(
+            !bound
+                .dependencies
+                .iter()
+                .any(|dependency| matches!(dependency.name.as_str(), "Target" | "copy"))
+        );
+        let merged = bind_writable_source("MERGE (n:Item {value:1}) RETURN n", false)?;
+        assert!(merged.dependencies.contains(&DependencyStamp {
+            kind: DependencyKind::Label,
+            name: "Item".to_owned()
+        }));
+        assert!(merged.dependencies.contains(&DependencyStamp {
+            kind: DependencyKind::Property,
+            name: "value".to_owned()
+        }));
+        Ok(())
     }
 
     #[test]

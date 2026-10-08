@@ -1,6 +1,7 @@
 #![allow(clippy::all, clippy::nursery, clippy::pedantic)]
 
 //! Consolidated Cypher integration-test harness.
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/aggregate_over_aggregate_declines_to_the_host.rs"]
 mod aggregate_over_aggregate_declines_to_the_host;
 #[path = "../tests/cypher_aggregate_expressions.rs"]
@@ -53,132 +54,196 @@ mod cypher_merge_entity_map_path_null_cpu;
 mod cypher_modulo_cpu;
 #[path = "../tests/cypher_nan_equality.rs"]
 mod cypher_nan_equality;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_bound_relationship_merge_route.rs"]
 mod cypher_native_bound_relationship_merge_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_computed_order_route.rs"]
 mod cypher_native_computed_order_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_create_node_route.rs"]
 mod cypher_native_create_node_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_create_post_write_route.rs"]
 mod cypher_native_create_post_write_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_create_relationship_route.rs"]
 mod cypher_native_create_relationship_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_create_temporal_array_route.rs"]
 mod cypher_native_create_temporal_array_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_delete5_selector_route.rs"]
 mod cypher_native_delete5_selector_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_delete_continuation_route.rs"]
 mod cypher_native_delete_continuation_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_delete_remaining_contract.rs"]
 mod cypher_native_delete_remaining_contract;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_dynamic_property_route.rs"]
 mod cypher_native_dynamic_property_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_entity_keys_pattern_comprehension_route.rs"]
 mod cypher_native_entity_keys_pattern_comprehension_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_entity_label_predicate_output_route.rs"]
 mod cypher_native_entity_label_predicate_output_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_fused_aggregation_tck_route.rs"]
 mod cypher_native_fused_aggregation_tck_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_label_comprehension_membership_route.rs"]
 mod cypher_native_label_comprehension_membership_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_list12_remaining_manifest.rs"]
 mod cypher_native_list12_remaining_manifest;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_list_add_route.rs"]
 mod cypher_native_list_add_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_list_size_route.rs"]
 mod cypher_native_list_size_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_list_slice_bounds_route.rs"]
 mod cypher_native_list_slice_bounds_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_literal_map_set_route.rs"]
 mod cypher_native_literal_map_set_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_map_aggregate_freeze_route.rs"]
 mod cypher_native_map_aggregate_freeze_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_map_keys_route.rs"]
 mod cypher_native_map_keys_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_map_property_route.rs"]
 mod cypher_native_map_property_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_merge9_interoperation_route.rs"]
 mod cypher_native_merge9_interoperation_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_merge_on_create_route.rs"]
 mod cypher_native_merge_on_create_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_merge_on_match_literal_route.rs"]
 mod cypher_native_merge_on_match_literal_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_mutation_continuation_route.rs"]
 mod cypher_native_mutation_continuation_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_mutation_route.rs"]
 mod cypher_native_mutation_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_null_property_mutation_route.rs"]
 mod cypher_native_null_property_mutation_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_optional_conformance_route.rs"]
 mod cypher_native_optional_conformance_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_ordered_create_merge_route.rs"]
 mod cypher_native_ordered_create_merge_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_pattern_comprehension_route.rs"]
 mod cypher_native_pattern_comprehension_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_pattern_pair_predicate_route.rs"]
 mod cypher_native_pattern_pair_predicate_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_pattern_predicate_route.rs"]
 mod cypher_native_pattern_predicate_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_percentile_aggregation_route.rs"]
 mod cypher_native_percentile_aggregation_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_post_write_route.rs"]
 mod cypher_native_post_write_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_procedure_table_route.rs"]
 mod cypher_native_procedure_table_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_quantifier_conformance_route.rs"]
 mod cypher_native_quantifier_conformance_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_relationship_remove_continuation_route.rs"]
 mod cypher_native_relationship_remove_continuation_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_relationship_type_route.rs"]
 mod cypher_native_relationship_type_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_scalar_precedence_route.rs"]
 mod cypher_native_scalar_precedence_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_segmented_aggregation_execution.rs"]
 mod cypher_native_segmented_aggregation_execution;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_segmented_aggregation_route.rs"]
 mod cypher_native_segmented_aggregation_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_set1_list_remaining_contract.rs"]
 mod cypher_native_set1_list_remaining_contract;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_set_property_route.rs"]
 mod cypher_native_set_property_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_simple_case_route.rs"]
 mod cypher_native_simple_case_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_string_predicate_route.rs"]
 mod cypher_native_string_predicate_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_string_predicate_scalar_route.rs"]
 mod cypher_native_string_predicate_scalar_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_substring_scalar_route.rs"]
 mod cypher_native_substring_scalar_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_temporal_arithmetic_route.rs"]
 mod cypher_native_temporal_arithmetic_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_temporal_clock_null_route.rs"]
 mod cypher_native_temporal_clock_null_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_temporal_comparison_route.rs"]
 mod cypher_native_temporal_comparison_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_temporal_duration_order_route.rs"]
 mod cypher_native_temporal_duration_order_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_temporal_property_order_route.rs"]
 mod cypher_native_temporal_property_order_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_temporal_serialization_route.rs"]
 mod cypher_native_temporal_serialization_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_temporal_unwind_route.rs"]
 mod cypher_native_temporal_unwind_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_type_conversion4_boolean_property_to_string_route.rs"]
 mod cypher_native_type_conversion4_boolean_property_to_string_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_type_conversion4_to_string_route.rs"]
 mod cypher_native_type_conversion4_to_string_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_unwind_match_merge_relationship_route.rs"]
 mod cypher_native_unwind_match_merge_relationship_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_unwind_merge_route.rs"]
 mod cypher_native_unwind_merge_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_variable_length_match_route.rs"]
 mod cypher_native_variable_length_match_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_variable_path_outputs_route.rs"]
 mod cypher_native_variable_path_outputs_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_with_order_consistency_manifest.rs"]
 mod cypher_native_with_order_consistency_manifest;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_with_order_scalar_consistency_route.rs"]
 mod cypher_native_with_order_scalar_consistency_route;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_native_with_order_temporal_consistency_route.rs"]
 mod cypher_native_with_order_temporal_consistency_route;
 #[path = "../tests/cypher_node_label_predicate_parser.rs"]
@@ -227,6 +292,7 @@ mod cypher_random;
 mod cypher_remaining_runtime_semantics_cpu;
 #[path = "../tests/cypher_remove_null_semantics_cpu.rs"]
 mod cypher_remove_null_semantics_cpu;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_resident_procedure_table.rs"]
 mod cypher_resident_procedure_table;
 #[path = "../tests/cypher_set_semantics_cpu.rs"]
@@ -247,6 +313,7 @@ mod cypher_temporal_clock_function_binding;
 mod cypher_union_mode_parser;
 #[path = "../tests/cypher_union_schema_planner.rs"]
 mod cypher_union_schema_planner;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/cypher_variable_length_aggregate_route.rs"]
 mod cypher_variable_length_aggregate_route;
 #[path = "../tests/cypher_variable_length_relationship_binding.rs"]
@@ -261,5 +328,80 @@ mod cypher_write_pattern_binding;
 mod opencypher_conformance;
 #[path = "../tests/opencypher_tck.rs"]
 mod opencypher_tck;
+#[cfg(feature = "legacy-graph")]
 #[path = "../tests/temporal_property_read_agrees_across_paths.rs"]
 mod temporal_property_read_agrees_across_paths;
+
+// Fixture mirrors exist only in the explicitly retained resident comparison harness.
+#[cfg(feature = "legacy-graph")]
+fn legacy_fixture_graph(
+    graph: &irongraph::graph::GraphStore,
+) -> irongraph::Result<irongraph::graph::legacy::GraphStore> {
+    use irongraph::graph::GraphMutation;
+    let mut fixture = irongraph::graph::legacy::GraphStore::default();
+    for (id, name) in graph.catalog().labels() {
+        fixture.apply(GraphMutation::DeclareLabel {
+            name: name.to_string(),
+            id,
+        })?;
+    }
+    for (id, name) in graph.catalog().properties() {
+        fixture.apply(GraphMutation::DeclareProperty {
+            name: name.to_string(),
+            id,
+        })?;
+    }
+    for (id, name) in graph.catalog().relationship_types() {
+        fixture.apply(GraphMutation::DeclareRelationshipType {
+            name: name.to_string(),
+            id,
+        })?;
+    }
+    for node in graph.nodes() {
+        fixture.apply(GraphMutation::InsertNode(irongraph::graph::NodeInput {
+            id: node.id(),
+            layer: node.layer(),
+            revision: node.revision(),
+            labels: node.labels().to_vec(),
+            properties: node.properties(),
+        }))?;
+    }
+    for edge in graph.edges() {
+        fixture.apply(GraphMutation::InsertEdge(irongraph::graph::EdgeInput {
+            id: edge.id(),
+            source: edge.source(),
+            target: edge.target(),
+            relationship_type: edge.relationship_type(),
+            layer: edge.layer(),
+            revision: edge.revision(),
+            properties: edge.properties(),
+        }))?;
+    }
+    Ok(fixture)
+}
+
+#[cfg(feature = "legacy-graph")]
+fn legacy_fixture_snapshot(
+    graph: &irongraph::graph::GraphStore,
+) -> irongraph::Result<irongraph::graph::GraphSnapshot> {
+    legacy_fixture_graph(graph)?.snapshot()
+}
+
+#[cfg(feature = "legacy-graph")]
+fn legacy_resident_build(
+    project: irongraph::ProjectId,
+    bookmark: irongraph::Bookmark,
+    graph: &irongraph::graph::GraphStore,
+    temporal: &irongraph::graph::TemporalStore,
+    indexes: &irongraph::graph::IndexCatalog,
+) -> irongraph::Result<irongraph::gpu::ResidentProjectImage> {
+    let fixture = legacy_fixture_graph(graph)?;
+    let bytes = postcard::to_stdvec(temporal).map_err(|error| {
+        irongraph::Error::internal(format!("temporal fixture encoding: {error}"))
+    })?;
+    let temporal: irongraph::graph::legacy::TemporalStore =
+        postcard::from_bytes(&bytes).map_err(|error| {
+            irongraph::Error::internal(format!("temporal fixture decoding: {error}"))
+        })?;
+    irongraph::gpu::ResidentProjectImage::build(project, bookmark, &fixture, &temporal, indexes)
+}

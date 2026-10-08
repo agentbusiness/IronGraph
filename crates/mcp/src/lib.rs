@@ -9,15 +9,16 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::State,
-    http::{HeaderMap, StatusCode, header::ORIGIN},
+    extract::{DefaultBodyLimit, Request, State},
+    http::{
+        HeaderMap, StatusCode,
+        header::{CONTENT_TYPE, ORIGIN},
+    },
     response::{IntoResponse, Response},
     routing::post,
 };
 use irongraph_client::{ApiClient, Query, QueryResult};
-use irongraph_server::protocol::{
-    PathValue, QueryLimits, RelationshipValue, ResultNode, TypedValue,
-};
+use irongraph_server::protocol::{PathValue, RelationshipValue, ResultNode, TypedValue};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -26,9 +27,6 @@ pub mod integrations;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const RESOURCE_PREFIX: &str = "irongraph://cypher/";
-const DEFAULT_MAX_ROWS: u64 = 200;
-const MAX_MAX_ROWS: u64 = 10_000;
-const MAX_RESULT_BYTES: u64 = 4 * 1024 * 1024;
 
 /// One embedded public Cypher reference page.
 pub struct CypherDoc {
@@ -186,10 +184,8 @@ impl<D: Database> McpServer<D> {
 
     fn run_cypher(&self, arguments: Value) -> Result<Value, String> {
         let input: RunCypherInput = parse_arguments(arguments)?;
-        let max_rows = bounded_rows(input.max_rows)?;
         let mut query = Query::new(input.cypher);
         query.parameters = input.parameters;
-        query.limits = result_limits(max_rows);
         self.database
             .query(query)
             .map(query_result_json)
@@ -205,8 +201,7 @@ impl<D: Database> McpServer<D> {
             ),
             None => "SHOW PROJECTS".to_owned(),
         };
-        let mut query = Query::new(cypher);
-        query.limits = result_limits(DEFAULT_MAX_ROWS);
+        let query = Query::new(cypher);
         self.database
             .query(query)
             .map(query_result_json)
@@ -229,7 +224,6 @@ impl<D: Database> McpServer<D> {
             ("body".to_owned(), json!(input.body)),
             ("source".to_owned(), json!(input.source)),
         ]);
-        query.limits = result_limits(1);
         self.database
             .query(query)
             .map(|result| {
@@ -243,7 +237,7 @@ impl<D: Database> McpServer<D> {
 
     fn search(&self, arguments: Value) -> Result<Value, String> {
         let input: SearchInput = parse_arguments(arguments)?;
-        let limit = bounded_rows(Some(input.limit.unwrap_or(10)))?.min(100);
+        let limit = input.limit.unwrap_or(10);
         let project = cypher_identifier(&input.project)?;
         let index_name = input.index.as_deref().unwrap_or("graph_semantic");
         let index = cypher_identifier(index_name)?;
@@ -275,7 +269,6 @@ impl<D: Database> McpServer<D> {
         );
         let mut query = Query::new(cypher);
         query.parameters = BTreeMap::from([("query".to_owned(), json!(input.query))]);
-        query.limits = result_limits(limit);
         let result = self
             .database
             .query(query)
@@ -284,7 +277,7 @@ impl<D: Database> McpServer<D> {
             return Ok(query_result_json(result));
         }
         // The semantic result can contain both entity kinds. Traverse each kind through its
-        // proper Cypher pattern, retaining the original ranking and each context read's limits.
+        // proper Cypher pattern, retaining the original ranking and complete connections.
         let mut node_ids = Vec::new();
         let mut relationship_ids = Vec::new();
         let entity_column = result
@@ -327,7 +320,6 @@ impl<D: Database> McpServer<D> {
             let mut query = Query::new(format!("USE {project} {pattern}"));
             query.parameters.insert("ids".to_owned(), json!(ids));
             query.bookmark = result.summary.bookmark;
-            query.limits = result_limits(limit);
             let context = self
                 .database
                 .query(query)
@@ -347,6 +339,7 @@ where
 {
     Router::new()
         .route("/mcp", post(http_mcp::<D>))
+        .layer(DefaultBodyLimit::disable())
         .with_state(Arc::new(McpServer::new(database)))
 }
 
@@ -363,24 +356,43 @@ where
     Ok(())
 }
 
-async fn http_mcp<D>(
-    State(server): State<Arc<McpServer<D>>>,
-    headers: HeaderMap,
-    Json(request): Json<Value>,
-) -> Response
+async fn http_mcp<D>(State(server): State<Arc<McpServer<D>>>, request: Request) -> Response
 where
     D: Database + Send + Sync + 'static,
 {
-    if !origin_is_local(&headers) {
+    if !origin_is_local(request.headers()) {
         return (
             StatusCode::FORBIDDEN,
             "MCP HTTP accepts only loopback origins",
         )
             .into_response();
     }
-    match tokio::task::spawn_blocking(move || server.handle_value(request)).await {
-        Ok(Some(response)) => Json(response).into_response(),
-        Ok(None) => StatusCode::ACCEPTED.into_response(),
+    let json = request
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|mime| {
+            mime.trim().eq_ignore_ascii_case("application/json")
+                || mime.trim().to_ascii_lowercase().ends_with("+json")
+        });
+    if !json {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
+    let body = match axum::body::to_bytes(request.into_body(), usize::MAX).await {
+        Ok(body) => body,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    match tokio::task::spawn_blocking(move || match Json::<Value>::from_bytes(&body) {
+        Ok(Json(request)) => match server.handle_value(request) {
+            Some(response) => Json(response).into_response(),
+            None => StatusCode::ACCEPTED.into_response(),
+        },
+        Err(error) => error.into_response(),
+    })
+    .await
+    {
+        Ok(response) => response,
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("MCP request task failed: {error}"),
@@ -430,7 +442,6 @@ struct RunCypherInput {
     cypher: String,
     #[serde(default)]
     parameters: BTreeMap<String, Value>,
-    max_rows: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -508,8 +519,7 @@ fn tool_definitions() -> Vec<Value> {
                 "required": ["cypher"],
                 "properties": {
                     "cypher": { "type": "string", "description": "Exactly one IronGraph Cypher statement. Include USE <project> unless the statement manages or lists projects." },
-                    "parameters": { "type": "object", "description": "Named $parameter values. Use these for all user data and document text." },
-                    "max_rows": { "type": "integer", "minimum": 1, "maximum": MAX_MAX_ROWS, "default": DEFAULT_MAX_ROWS, "description": "Maximum rows returned to the host. This bounds output, not execution intermediates." }
+                    "parameters": { "type": "object", "description": "Named $parameter values. Use these for all user data and document text." }
                 },
                 "additionalProperties": false
             },
@@ -556,7 +566,7 @@ fn tool_definitions() -> Vec<Value> {
                     "index": { "type": "string", "description": "Omit for all nodes and relationships. Use semantic_nodes or semantic_relationships to select one entity kind, or provide a declared node embedding index together with label." },
                     "label": { "type": "string", "description": "Node label for an explicitly declared embedding index. Omit for automatic semantic search." },
                     "query": { "type": "string", "description": "Natural-language meaning to retrieve." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 10 },
+                    "limit": { "type": "integer", "minimum": 1, "default": 10 },
                     "include_connections": { "type": "boolean", "default": true, "description": "Include bounded node adjacency and relationship endpoint context. Mixed search returns separate connections query results; each reports truncation." }
                 },
                 "additionalProperties": false
@@ -572,7 +582,7 @@ fn tool_definitions() -> Vec<Value> {
                 "required": ["query"],
                 "properties": {
                     "query": { "type": "string", "description": "Capability, syntax name, error phrase or goal in natural language." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 10, "default": 5 }
+                    "limit": { "type": "integer", "minimum": 1, "default": 5 }
                 },
                 "additionalProperties": false
             },
@@ -625,7 +635,7 @@ fn search_cypher_docs(arguments: Value) -> Result<Value, String> {
     if terms.is_empty() {
         return Err("documentation search query has no searchable terms".to_owned());
     }
-    let limit = input.limit.unwrap_or(5).clamp(1, 10);
+    let limit = input.limit.unwrap_or(5);
     let mut matches = CYPHER_DOCS
         .iter()
         .filter_map(|doc| {
@@ -674,28 +684,10 @@ fn parse_arguments<T: for<'de> Deserialize<'de>>(arguments: Value) -> Result<T, 
     serde_json::from_value(arguments).map_err(|error| format!("invalid tool arguments: {error}"))
 }
 
-fn bounded_rows(value: Option<u64>) -> Result<u64, String> {
-    let value = value.unwrap_or(DEFAULT_MAX_ROWS);
-    if value == 0 || value > MAX_MAX_ROWS {
-        return Err(format!("max_rows must be between 1 and {MAX_MAX_ROWS}"));
-    }
-    Ok(value)
-}
-
-const fn result_limits(rows: u64) -> QueryLimits {
-    QueryLimits {
-        rows,
-        bytes: MAX_RESULT_BYTES,
-        nodes: rows.saturating_mul(10),
-        edges: rows.saturating_mul(20),
-    }
-}
-
 fn cypher_identifier(value: &str) -> Result<String, String> {
-    if value.is_empty() || value.len() > 255 || value.chars().any(char::is_control) {
+    if value.is_empty() || value.chars().any(char::is_control) {
         return Err(
-            "project and index names must be 1-255 characters without control characters"
-                .to_owned(),
+            "project and index names must be nonempty without control characters".to_owned(),
         );
     }
     Ok(format!("`{}`", value.replace('`', "``")))
@@ -931,6 +923,32 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_transport_accepts_complete_content_above_former_body_cap() {
+        struct LargeDatabase;
+        impl Database for LargeDatabase {
+            fn query(&self, query: Query) -> irongraph_client::Result<QueryResult> {
+                assert_eq!(
+                    query.parameters["body"].as_str().map(str::len),
+                    Some(3 * 1024 * 1024)
+                );
+                Ok(QueryResult::default())
+            }
+        }
+        let response = http_router(LargeDatabase).oneshot(
+            Request::post("/mcp").header("content-type", "application/json")
+                .body(Body::from(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+                    "name":"irongraph_save_document","arguments":{"project":"flights","title":"complete source","body":"x".repeat(3 * 1024 * 1024)}
+                }}).to_string())).expect("request")
+        ).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let value: Value = serde_json::from_slice(&bytes).expect("JSON");
+        assert_ne!(value["result"]["isError"], json!(true));
     }
 
     #[test]
@@ -1215,7 +1233,12 @@ mod tests {
         assert!(queries[2].cypher.contains("[source, target] AS neighbors"));
         for query in queries.iter().skip(1) {
             assert_eq!(query.parameters["ids"], json!([11]));
-            assert_eq!(query.limits.rows, 10);
+            assert!(
+                serde_json::to_value(query)
+                    .expect("query")
+                    .get("limits")
+                    .is_none()
+            );
             assert_eq!(query.bookmark.map(|bookmark| bookmark.index), Some(7));
             assert!(irongraph_cypher::parse(&query.cypher).is_ok());
         }

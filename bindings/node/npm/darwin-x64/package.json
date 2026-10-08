@@ -12,7 +12,7 @@
     "LICENSE.txt",
     "THIRD_PARTY_NOTICES.txt"
   ],
-  "description": "GPU-first temporal graph database with Cypher, text documents, text/vector search, graph analytics, built-in Kafka-compatible streaming and AMQP-compatible queues.",
+  "description": "CPU temporal graph database with Cypher, asynchronous text embeddings, text/vector search, graph analytics, Kafka-compatible streaming and AMQP-compatible queues.",
   "license": "Apache-2.0",
   "engines": {
     "node": ">=20.17"

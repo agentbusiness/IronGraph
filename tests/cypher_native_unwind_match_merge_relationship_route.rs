@@ -130,7 +130,7 @@ impl Fixture {
     }
 
     fn resident_image(&self) -> Result<ResidentProjectImage> {
-        ResidentProjectImage::build(
+        super::legacy_resident_build(
             PROJECT,
             self.bookmark,
             &self.graph,
@@ -340,7 +340,7 @@ fn graph_signature(graph: &GraphStore) -> Result<GraphSignature> {
                     graph
                         .catalog()
                         .label_name(*label)
-                        .map(str::to_owned)
+                        .map(|name| name.to_string())
                         .ok_or_else(|| Error::internal("node label has no catalog name"))
                 })
                 .collect::<Result<BTreeSet<_>>>()?;
@@ -352,7 +352,7 @@ fn graph_signature(graph: &GraphStore) -> Result<GraphSignature> {
                         graph
                             .catalog()
                             .property_name(property)
-                            .map(str::to_owned)
+                            .map(|name| name.to_string())
                             .ok_or_else(|| Error::internal("node property has no catalog name"))?,
                         value,
                     ))
@@ -378,7 +378,7 @@ fn graph_signature(graph: &GraphStore) -> Result<GraphSignature> {
                         graph
                             .catalog()
                             .property_name(property)
-                            .map(str::to_owned)
+                            .map(|name| name.to_string())
                             .ok_or_else(|| {
                                 Error::internal("relationship property has no catalog name")
                             })?,
@@ -393,7 +393,7 @@ fn graph_signature(graph: &GraphStore) -> Result<GraphSignature> {
                 relationship_type: graph
                     .catalog()
                     .relationship_type_name(edge.relationship_type())
-                    .map(str::to_owned)
+                    .map(|name| name.to_string())
                     .ok_or_else(|| Error::internal("relationship has no catalog type name"))?,
                 layer: edge.layer(),
                 revision: edge.revision(),
@@ -405,17 +405,17 @@ fn graph_signature(graph: &GraphStore) -> Result<GraphSignature> {
         label_names: graph
             .catalog()
             .labels()
-            .map(|(_, name)| name.to_owned())
+            .map(|(_, name)| name.to_string())
             .collect(),
         property_names: graph
             .catalog()
             .properties()
-            .map(|(_, name)| name.to_owned())
+            .map(|(_, name)| name.to_string())
             .collect(),
         relationship_type_names: graph
             .catalog()
             .relationship_types()
-            .map(|(_, name)| name.to_owned())
+            .map(|(_, name)| name.to_string())
             .collect(),
         nodes,
         edges,
@@ -423,7 +423,7 @@ fn graph_signature(graph: &GraphStore) -> Result<GraphSignature> {
 }
 
 fn published_graph(fixture: &Fixture, output: &ExecutionOutput) -> Result<GraphStore> {
-    let mut graph = fixture.graph.clone();
+    let graph = fixture.graph.clone();
     for mutation in &output.graph_mutations {
         graph.apply(mutation.clone())?;
     }

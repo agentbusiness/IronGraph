@@ -66,27 +66,6 @@ impl EmbeddedDatabase {
         if request.records.is_empty() {
             return Err(Error::invalid_data("stream append requires at least one record").into());
         }
-        let bytes = request.records.iter().fold(0usize, |total, record| {
-            record.headers.iter().fold(
-                total
-                    .saturating_add(64)
-                    .saturating_add(record.key.as_ref().map_or(0, Vec::len))
-                    .saturating_add(record.value.as_ref().map_or(0, Vec::len)),
-                |bytes, (name, value)| {
-                    bytes
-                        .saturating_add(16)
-                        .saturating_add(name.len())
-                        .saturating_add(value.len())
-                },
-            )
-        });
-        if bytes > self.options.max_write_bytes {
-            return Err(Error::new(
-                ErrorCode::Backpressure,
-                "stream append exceeds the configured write budget before dispatch",
-            )
-            .into());
-        }
         let core = self
             .core
             .as_ref()
@@ -111,14 +90,15 @@ impl EmbeddedDatabase {
         operation.check()?;
         // After dispatch, wait for the authoritative outcome. Cancellation must not turn an
         // acknowledged append into a retryable error or fabricate a rollback.
-        let timeout = u32::try_from(
-            operation
-                .deadline
-                .saturating_duration_since(std::time::Instant::now())
-                .as_millis(),
-        )
-        .unwrap_or(u32::MAX)
-        .max(1);
+        let timeout = operation.deadline.map_or(0, |deadline| {
+            u32::try_from(
+                deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis(),
+            )
+            .unwrap_or(u32::MAX)
+            .max(1)
+        });
         let commit = core.database.submit_with_timeout(
             command,
             CommitAcknowledgement::Published,
@@ -137,11 +117,8 @@ impl EmbeddedDatabase {
     ) -> Result<StreamPage> {
         let operation = self.begin_operation(options)?;
         operation.check()?;
-        if request.max_records == 0
-            || request.max_bytes == 0
-            || request.max_bytes > self.options.max_write_bytes
-        {
-            return Err(Error::invalid_data("stream fetch requires positive bounds and max_bytes no greater than max_write_bytes").into());
+        if request.max_records == 0 || request.max_bytes == 0 {
+            return Err(Error::invalid_data("stream fetch requires positive bounds").into());
         }
         let core = self
             .core
