@@ -76,10 +76,19 @@ async function main() {
     const deadline = Date.now() + 600000
     let lastError
     while (Date.now() < deadline) {
+      let progress
       try {
+        const response = await fetch(`${base}/system/startup`, { signal: AbortSignal.timeout(5000) })
+        assert.equal(response.status, 200)
+        progress = await response.json()
+      } catch (error) { lastError = error; await sleep(1000); continue }
+      assert.notEqual(progress.phase, 'failed', `Embedding startup failed: ${progress.error}`)
+      if (progress.phase === 'ready') {
         await query('SHOW PROJECTS')
         return
-      } catch (error) { lastError = error; await sleep(1000) }
+      }
+      lastError = new Error(`Embedding startup phase: ${progress.phase}`)
+      await sleep(1000)
     }
     throw new Error(`Standalone did not become ready: ${lastError}`)
   }
