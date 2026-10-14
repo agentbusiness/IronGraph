@@ -9,6 +9,8 @@ class EmbeddedDatabase:
         load_embeddings: bool = True, budgets: Optional[Dict[str, Any]] = None,
         embedding_device: Literal["auto", "cpu", "metal", "cuda"] = "auto",
         embedding_device_ordinal: int = 0,
+        model_dir: Optional[Union[str, PathLike[str]]] = None,
+        embedding_cache_dir: Optional[Union[str, PathLike[str]]] = None,
     ) -> EmbeddedDatabase: ...
     async def query_async(
         self, cypher: str, *, project_id: Optional[str] = None,
@@ -35,6 +37,8 @@ class EmbeddedDatabase:
         budgets: Optional[Dict[str, Any]] = None,
         embedding_device: Literal["auto", "cpu", "metal", "cuda"] = "auto",
         embedding_device_ordinal: int = 0,
+        model_dir: Optional[Union[str, PathLike[str]]] = None,
+        embedding_cache_dir: Optional[Union[str, PathLike[str]]] = None,
     ) -> None: ...
     def query(
         self,

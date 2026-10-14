@@ -407,7 +407,7 @@ impl EmbeddedDatabase {
             .call1((slf.into_pyobject(py)?,))
     }
     #[new]
-    #[pyo3(signature = (data_dir, *, device="auto", device_ordinal=0, load_embeddings=true, budgets=None, embedding_device="auto", embedding_device_ordinal=0))]
+    #[pyo3(signature = (data_dir, *, device="auto", device_ordinal=0, load_embeddings=true, budgets=None, embedding_device="auto", embedding_device_ordinal=0, model_dir=None, embedding_cache_dir=None))]
     // Python exposes these as independent keyword options rather than a positional Rust interface.
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -419,6 +419,8 @@ impl EmbeddedDatabase {
         budgets: Option<Bound<'_, PyAny>>,
         embedding_device: &str,
         embedding_device_ordinal: u32,
+        model_dir: Option<PathBuf>,
+        embedding_cache_dir: Option<PathBuf>,
     ) -> PyResult<Self> {
         let execution_device = match device {
             "auto" => ExecutionDevice::Auto,
@@ -453,6 +455,8 @@ impl EmbeddedDatabase {
             } else {
                 EmbeddingPolicy::Disabled
             });
+        options.model_dir = model_dir;
+        options.embedding_cache_dir = embedding_cache_dir;
         if let Some(budgets) = budgets {
             irongraph_embedded::configure_budgets(
                 &mut options,

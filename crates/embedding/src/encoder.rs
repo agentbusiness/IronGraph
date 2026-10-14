@@ -1,466 +1,341 @@
-//! Owned bidirectional encoder used by the pinned retrieval model.
-
-use std::f32::consts::PI;
-
-use candle_core::{DType, Device, Result as CandleResult, Tensor};
+//! Bekko a8m's four-layer ModernBERT encoder. Padding is masked in every attention layer.
+use crate::{Error, ErrorCode, Result};
+use candle_core::{D, DType, IndexOp, Result as CandleResult, Tensor};
 use candle_nn::{
-    Embedding, Linear, Module, RmsNorm, VarBuilder, embedding, linear_no_bias, rms_norm,
+    Embedding, LayerNorm, Linear, VarBuilder, embedding, layer_norm_no_bias, linear_no_bias,
 };
 use serde::Deserialize;
 
-use crate::{Error, ErrorCode, Result};
-
-use super::embedding::{PINNED_HIDDEN_SIZE, PINNED_MAXIMUM_INPUT_TOKENS};
-
 #[derive(Clone, Debug, Deserialize)]
-pub(super) struct BidirectionalEncoderConfig {
+pub(super) struct EncoderConfig {
     hidden_size: usize,
     intermediate_size: usize,
     vocab_size: usize,
     num_hidden_layers: usize,
     num_attention_heads: usize,
-    num_key_value_heads: usize,
-    head_dim: usize,
-    rms_norm_eps: f64,
-    rope_theta: f32,
     max_position_embeddings: usize,
-    hidden_act: String,
+    layer_norm_eps: f64,
+    global_attn_every_n_layers: usize,
+    global_rope_theta: f64,
+    local_attention: usize,
+    local_rope_theta: f64,
+    hidden_activation: String,
+    pad_token_id: u32,
     attention_bias: bool,
     mlp_bias: bool,
-    pooling: String,
-    use_bidirectional_attention: bool,
-    tie_word_embeddings: bool,
-    rope_scaling: RopeScaling,
+    norm_bias: bool,
 }
-
-#[derive(Clone, Debug, Deserialize)]
-struct RopeScaling {
-    factor: f32,
-    high_freq_factor: f32,
-    low_freq_factor: f32,
-    original_max_position_embeddings: usize,
-    rope_type: String,
-}
-
-impl BidirectionalEncoderConfig {
-    pub(super) fn validate_pinned(&self, maximum_input_tokens: usize) -> Result<()> {
-        let exact_shape = self.hidden_size == PINNED_HIDDEN_SIZE
-            && self.intermediate_size == 8_192
-            && self.vocab_size == 128_256
-            && self.num_hidden_layers == 16
-            && self.num_attention_heads == 32
-            && self.num_key_value_heads == 8
-            && self.head_dim == 64
-            && self.hidden_act == "silu"
-            && !self.attention_bias
-            && !self.mlp_bias
-            && self.pooling == "avg"
-            && self.use_bidirectional_attention
-            && self.tie_word_embeddings
-            && self.rms_norm_eps.to_bits() == 1e-5_f64.to_bits()
-            && self.rope_theta.to_bits() == 500_000_f32.to_bits()
-            && self.rope_scaling.factor.to_bits() == 32_f32.to_bits()
-            && self.rope_scaling.high_freq_factor.to_bits() == 4_f32.to_bits()
-            && self.rope_scaling.low_freq_factor.to_bits() == 1_f32.to_bits()
-            && self.rope_scaling.original_max_position_embeddings == 8_192
-            && self.rope_scaling.rope_type == "llama3"
-            && maximum_input_tokens == PINNED_MAXIMUM_INPUT_TOKENS
-            && maximum_input_tokens <= self.max_position_embeddings;
-        if !exact_shape {
+impl EncoderConfig {
+    pub(super) fn validate(&self, maximum_input_tokens: usize) -> Result<()> {
+        if self.hidden_size != 384
+            || self.intermediate_size != 1152
+            || self.vocab_size != 256_000
+            || self.num_hidden_layers != 4
+            || self.num_attention_heads != 6
+            || self.max_position_embeddings != 8192
+            || maximum_input_tokens != self.max_position_embeddings
+            || self.layer_norm_eps != 1e-5
+            || self.global_attn_every_n_layers != 3
+            || self.global_rope_theta != 160_000.
+            || self.local_rope_theta != 160_000.
+            || self.local_attention != 128
+            || self.hidden_activation != "gelu"
+            || self.pad_token_id != 0
+            || self.attention_bias
+            || self.mlp_bias
+            || self.norm_bias
+        {
             return Err(Error::new(
                 ErrorCode::EmbeddingProfileMismatch,
-                "embedding configuration differs from the pinned encoder contract",
+                "embedding configuration is not the Bekko a8m architecture",
             ));
         }
         Ok(())
     }
-}
-
-pub(super) struct BidirectionalEncoder {
-    token_embedding: Embedding,
-    layers: Vec<EncoderLayer>,
-    final_norm: RmsNorm,
-    rotary: RotaryCache,
-}
-
-impl BidirectionalEncoder {
-    pub(super) fn load(
-        builder: VarBuilder<'static>,
-        config: &BidirectionalEncoderConfig,
-        maximum_input_tokens: usize,
-    ) -> CandleResult<Self> {
-        let token_embedding = embedding(
-            config.vocab_size,
-            config.hidden_size,
-            builder.pp("embed_tokens"),
-        )?;
-        let layers = (0..config.num_hidden_layers)
-            .map(|index| EncoderLayer::load(builder.pp(format!("layers.{index}")), config))
-            .collect::<CandleResult<Vec<_>>>()?;
-        let final_norm = rms_norm(config.hidden_size, config.rms_norm_eps, builder.pp("norm"))?;
-        let rotary = RotaryCache::new(
-            config,
-            maximum_input_tokens,
-            builder.dtype(),
-            builder.device(),
-        )?;
-        Ok(Self {
-            token_embedding,
-            layers,
-            final_norm,
-            rotary,
-        })
-    }
-
-    pub(super) fn forward(&self, token_ids: &Tensor) -> CandleResult<Tensor> {
-        let (_, sequence_length) = token_ids.dims2()?;
-        if sequence_length == 0 || sequence_length > self.rotary.maximum_sequence_length {
-            candle_core::bail!("embedding token sequence exceeds the encoder capacity")
-        }
-        let mut hidden = self.token_embedding.forward(token_ids)?;
-        for layer in &self.layers {
-            hidden = layer.forward(&hidden, &self.rotary)?;
-        }
-        self.final_norm.forward(&hidden)
-    }
-
-    /// Resident tensor bytes measured from the allocations actually constructed on the selected
-    /// device. This includes the immutable rotary tables because they share the same lifetime and
-    /// physical memory budget as the embedding weights.
-    pub(super) fn resident_bytes(&self) -> usize {
-        let layers = self.layers.iter().fold(0_usize, |total, layer| {
-            total.saturating_add(layer.resident_bytes())
-        });
-        tensor_bytes(self.token_embedding.embeddings())
-            .saturating_add(layers)
-            .saturating_add(tensor_bytes(self.final_norm.weight()))
-            .saturating_add(self.rotary.resident_bytes())
+    pub(super) fn vocabulary_size(&self) -> usize {
+        self.vocab_size
     }
 }
 
-struct EncoderLayer {
-    input_norm: RmsNorm,
-    attention: BidirectionalAttention,
-    post_attention_norm: RmsNorm,
-    mlp: GatedMlp,
+struct Layer {
+    qkv: Linear,
+    attention_out: Linear,
+    wi: Linear,
+    wo: Linear,
+    attention_norm: Option<LayerNorm>,
+    mlp_norm: LayerNorm,
 }
-
-impl EncoderLayer {
-    fn load(
-        builder: VarBuilder<'static>,
-        config: &BidirectionalEncoderConfig,
-    ) -> CandleResult<Self> {
-        Ok(Self {
-            input_norm: rms_norm(
-                config.hidden_size,
-                config.rms_norm_eps,
-                builder.pp("input_layernorm"),
-            )?,
-            attention: BidirectionalAttention::load(builder.pp("self_attn"), config)?,
-            post_attention_norm: rms_norm(
-                config.hidden_size,
-                config.rms_norm_eps,
-                builder.pp("post_attention_layernorm"),
-            )?,
-            mlp: GatedMlp::load(builder.pp("mlp"), config)?,
-        })
-    }
-
-    fn forward(&self, hidden: &Tensor, rotary: &RotaryCache) -> CandleResult<Tensor> {
-        let attention = self
-            .attention
-            .forward(&self.input_norm.forward(hidden)?, rotary)?;
-        let hidden = (hidden + attention)?;
-        let feed_forward = self
-            .mlp
-            .forward(&self.post_attention_norm.forward(&hidden)?)?;
-        hidden + feed_forward
-    }
-
-    fn resident_bytes(&self) -> usize {
-        tensor_bytes(self.input_norm.weight())
-            .saturating_add(self.attention.resident_bytes())
-            .saturating_add(tensor_bytes(self.post_attention_norm.weight()))
-            .saturating_add(self.mlp.resident_bytes())
-    }
+pub(super) struct Encoder {
+    embeddings: Embedding,
+    embedding_norm: LayerNorm,
+    final_norm: LayerNorm,
+    layers: Vec<Layer>,
+    rope_sin: Tensor,
+    rope_cos: Tensor,
+    heads: usize,
+    hidden: usize,
+    global_every: usize,
+    local_window: usize,
+    maximum_tokens: usize,
 }
-
-struct BidirectionalAttention {
-    query: Linear,
-    key: Linear,
-    value: Linear,
-    output: Linear,
-    query_heads: usize,
-    key_value_heads: usize,
-    head_dimension: usize,
-}
-
-impl BidirectionalAttention {
-    fn load(
-        builder: VarBuilder<'static>,
-        config: &BidirectionalEncoderConfig,
-    ) -> CandleResult<Self> {
-        let query_width = config.num_attention_heads * config.head_dim;
-        let key_value_width = config.num_key_value_heads * config.head_dim;
-        Ok(Self {
-            query: linear_no_bias(config.hidden_size, query_width, builder.pp("q_proj"))?,
-            key: linear_no_bias(config.hidden_size, key_value_width, builder.pp("k_proj"))?,
-            value: linear_no_bias(config.hidden_size, key_value_width, builder.pp("v_proj"))?,
-            output: linear_no_bias(query_width, config.hidden_size, builder.pp("o_proj"))?,
-            query_heads: config.num_attention_heads,
-            key_value_heads: config.num_key_value_heads,
-            head_dimension: config.head_dim,
-        })
-    }
-
-    fn forward(&self, hidden: &Tensor, rotary: &RotaryCache) -> CandleResult<Tensor> {
-        let (batch, sequence_length, _) = hidden.dims3()?;
-        let query = self
-            .query
-            .forward(hidden)?
-            .reshape((
-                batch,
-                sequence_length,
-                self.query_heads,
-                self.head_dimension,
-            ))?
-            .transpose(1, 2)?
-            .contiguous()?;
-        let key = self
-            .key
-            .forward(hidden)?
-            .reshape((
-                batch,
-                sequence_length,
-                self.key_value_heads,
-                self.head_dimension,
-            ))?
-            .transpose(1, 2)?
-            .contiguous()?;
-        let value = self
-            .value
-            .forward(hidden)?
-            .reshape((
-                batch,
-                sequence_length,
-                self.key_value_heads,
-                self.head_dimension,
-            ))?
-            .transpose(1, 2)?
-            .contiguous()?;
-        let query = rotary.apply(&query, sequence_length)?;
-        let key = rotary.apply(&key, sequence_length)?;
-        let scale = 1.0_f32 / (self.head_dimension as f32).sqrt();
-        let attended = bidirectional_attention(&query, &key, &value, scale)?;
-        let attended = attended.transpose(1, 2)?.reshape((
-            batch,
-            sequence_length,
-            self.query_heads * self.head_dimension,
-        ))?;
-        self.output.forward(&attended)
-    }
-
-    fn resident_bytes(&self) -> usize {
-        linear_bytes(&self.query)
-            .saturating_add(linear_bytes(&self.key))
-            .saturating_add(linear_bytes(&self.value))
-            .saturating_add(linear_bytes(&self.output))
-    }
-}
-
-fn bidirectional_attention(
-    query: &Tensor,
-    key: &Tensor,
-    value: &Tensor,
-    scale: f32,
-) -> CandleResult<Tensor> {
-    let device = query.device();
-    if device.is_cpu() {
-        let query = query.transpose(1, 2)?.contiguous()?;
-        let key = key.transpose(1, 2)?.contiguous()?;
-        let value = value.transpose(1, 2)?.contiguous()?;
-        return candle_nn::attention::flash_attn::<f32>(
-            &query,
-            &key,
-            &value,
-            scale,
-            candle_nn::attention::AttnMask::None,
-            None,
-            None,
-        );
-    }
-    if device.is_metal() {
-        return candle_nn::ops::sdpa(query, key, value, None, false, scale, 1.0);
-    }
-
-    // CUDA currently has no fused SDPA in the selected tensor backend. This exact fallback keeps
-    // semantics correct; the CUDA performance gate remains open until its native kernel lands.
-    let key = candle_transformers::utils::repeat_kv(key.clone(), query.dims()[1] / key.dims()[1])?;
-    let value =
-        candle_transformers::utils::repeat_kv(value.clone(), query.dims()[1] / value.dims()[1])?;
-    let input_dtype = query.dtype();
-    let scores = query
-        .to_dtype(DType::F32)?
-        .matmul(&key.to_dtype(DType::F32)?.t()?)?
-        .affine(f64::from(scale), 0.0)?;
-    candle_nn::ops::softmax_last_dim(&scores)?
-        .matmul(&value.to_dtype(DType::F32)?.contiguous()?)?
-        .to_dtype(input_dtype)
-}
-
-struct GatedMlp {
-    gate: Linear,
-    up: Linear,
-    down: Linear,
-}
-
-impl GatedMlp {
-    fn load(
-        builder: VarBuilder<'static>,
-        config: &BidirectionalEncoderConfig,
-    ) -> CandleResult<Self> {
-        Ok(Self {
-            gate: linear_no_bias(
-                config.hidden_size,
-                config.intermediate_size,
-                builder.pp("gate_proj"),
-            )?,
-            up: linear_no_bias(
-                config.hidden_size,
-                config.intermediate_size,
-                builder.pp("up_proj"),
-            )?,
-            down: linear_no_bias(
-                config.intermediate_size,
-                config.hidden_size,
-                builder.pp("down_proj"),
-            )?,
-        })
-    }
-
-    fn forward(&self, hidden: &Tensor) -> CandleResult<Tensor> {
-        let gated =
-            (candle_nn::ops::silu(&self.gate.forward(hidden)?)? * self.up.forward(hidden)?)?;
-        self.down.forward(&gated)
-    }
-
-    fn resident_bytes(&self) -> usize {
-        linear_bytes(&self.gate)
-            .saturating_add(linear_bytes(&self.up))
-            .saturating_add(linear_bytes(&self.down))
-    }
-}
-
-struct RotaryCache {
-    cosine: Tensor,
-    sine: Tensor,
-    maximum_sequence_length: usize,
-}
-
-impl RotaryCache {
-    fn new(
-        config: &BidirectionalEncoderConfig,
-        maximum_sequence_length: usize,
-        dtype: DType,
-        device: &Device,
-    ) -> CandleResult<Self> {
-        let low_frequency_wavelength = config.rope_scaling.original_max_position_embeddings as f32
-            / config.rope_scaling.low_freq_factor;
-        let high_frequency_wavelength = config.rope_scaling.original_max_position_embeddings as f32
-            / config.rope_scaling.high_freq_factor;
-        let inverse_frequencies = (0..config.head_dim)
-            .step_by(2)
-            .map(|index| {
-                1_f32
-                    / config
-                        .rope_theta
-                        .powf(index as f32 / config.head_dim as f32)
-            })
-            .map(|frequency| {
-                let wavelength = 2.0 * PI / frequency;
-                if wavelength < high_frequency_wavelength {
-                    frequency
-                } else if wavelength > low_frequency_wavelength {
-                    frequency / config.rope_scaling.factor
+impl Encoder {
+    pub(super) fn load(vb: VarBuilder<'static>, config: &EncoderConfig) -> CandleResult<Self> {
+        let hidden = config.hidden_size;
+        let prefix = &vb;
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for index in 0..config.num_hidden_layers {
+            let layer = prefix.pp(format!("layers.{index}"));
+            layers.push(Layer {
+                qkv: linear_no_bias(hidden, hidden * 3, layer.pp("attn.Wqkv"))?,
+                attention_out: linear_no_bias(hidden, hidden, layer.pp("attn.Wo"))?,
+                wi: linear_no_bias(hidden, config.intermediate_size * 2, layer.pp("mlp.Wi"))?,
+                wo: linear_no_bias(config.intermediate_size, hidden, layer.pp("mlp.Wo"))?,
+                attention_norm: if index == 0 {
+                    None
                 } else {
-                    let smooth = (config.rope_scaling.original_max_position_embeddings as f32
-                        / wavelength
-                        - config.rope_scaling.low_freq_factor)
-                        / (config.rope_scaling.high_freq_factor
-                            - config.rope_scaling.low_freq_factor);
-                    (1.0 - smooth) * frequency / config.rope_scaling.factor + smooth * frequency
-                }
-            })
-            .collect::<Vec<_>>();
-        let inverse_frequencies = Tensor::new(inverse_frequencies, device)?;
-        let positions = Tensor::arange(0, maximum_sequence_length as u32, device)?
-            .to_dtype(DType::F32)?
-            .reshape((maximum_sequence_length, 1))?;
-        let phase = positions
-            .matmul(&inverse_frequencies.reshape((1, inverse_frequencies.elem_count()))?)?;
+                    Some(layer_norm_no_bias(
+                        hidden,
+                        config.layer_norm_eps,
+                        layer.pp("attn_norm"),
+                    )?)
+                },
+                mlp_norm: layer_norm_no_bias(hidden, config.layer_norm_eps, layer.pp("mlp_norm"))?,
+            });
+        }
+        // Bekko uses the same rotary frequency for local and global attention.
+        let head_size = hidden / config.num_attention_heads;
+        let mut sin = Vec::with_capacity(config.max_position_embeddings * head_size / 2);
+        let mut cos = Vec::with_capacity(sin.capacity());
+        for position in 0..config.max_position_embeddings {
+            for channel in (0..head_size).step_by(2) {
+                let angle = position as f32
+                    / config
+                        .global_rope_theta
+                        .powf(channel as f64 / head_size as f64) as f32;
+                sin.push(angle.sin());
+                cos.push(angle.cos());
+            }
+        }
+        let shape = (config.max_position_embeddings, head_size / 2);
         Ok(Self {
-            cosine: phase.cos()?.to_dtype(dtype)?,
-            sine: phase.sin()?.to_dtype(dtype)?,
-            maximum_sequence_length,
+            embeddings: embedding(
+                config.vocab_size,
+                hidden,
+                prefix.pp("embeddings.tok_embeddings"),
+            )?,
+            embedding_norm: layer_norm_no_bias(
+                hidden,
+                config.layer_norm_eps,
+                prefix.pp("embeddings.norm"),
+            )?,
+            final_norm: layer_norm_no_bias(hidden, config.layer_norm_eps, prefix.pp("final_norm"))?,
+            rope_sin: Tensor::from_vec(sin, shape, vb.device())?.to_dtype(vb.dtype())?,
+            rope_cos: Tensor::from_vec(cos, shape, vb.device())?.to_dtype(vb.dtype())?,
+            layers,
+            heads: config.num_attention_heads,
+            hidden,
+            global_every: config.global_attn_every_n_layers,
+            local_window: config.local_attention,
+            maximum_tokens: config.max_position_embeddings,
         })
     }
-
-    fn resident_bytes(&self) -> usize {
-        tensor_bytes(&self.cosine).saturating_add(tensor_bytes(&self.sine))
+    pub(super) fn forward(&self, ids: &Tensor, attention: &Tensor) -> CandleResult<Tensor> {
+        let (batch, sequence) = ids.dims2()?;
+        if batch == 0
+            || sequence == 0
+            || sequence > self.maximum_tokens
+            || attention.dims() != ids.dims()
+        {
+            candle_core::bail!("embedding input and attention mask have invalid dimensions");
+        }
+        let global = ((1. - attention.to_dtype(DType::F32)?)? * f32::MIN as f64)?
+            .unsqueeze(1)?
+            .unsqueeze(1)?;
+        let local: Vec<f32> = (0..sequence)
+            .flat_map(|i| {
+                (0..sequence).map(move |j| {
+                    if i.abs_diff(j) > self.local_window / 2 {
+                        f32::NEG_INFINITY
+                    } else {
+                        0.
+                    }
+                })
+            })
+            .collect();
+        let local =
+            Tensor::from_vec(local, (sequence, sequence), ids.device())?.broadcast_add(&global)?;
+        let cos = self.rope_cos.narrow(0, 0, sequence)?.contiguous()?;
+        let sin = self.rope_sin.narrow(0, 0, sequence)?.contiguous()?;
+        let mut hidden = ids.apply(&self.embeddings)?.apply(&self.embedding_norm)?;
+        for (index, layer) in self.layers.iter().enumerate() {
+            let residual = hidden.clone();
+            let normalized = if let Some(norm) = &layer.attention_norm {
+                hidden.apply(norm)?
+            } else {
+                hidden.clone()
+            };
+            let qkv = normalized
+                .apply(&layer.qkv)?
+                .reshape((batch, sequence, 3, self.heads, self.hidden / self.heads))?
+                .permute((2, 0, 3, 1, 4))?;
+            let q = candle_nn::rotary_emb::rope(&qkv.i(0)?.contiguous()?, &cos, &sin)?;
+            let k = candle_nn::rotary_emb::rope(&qkv.i(1)?.contiguous()?, &cos, &sin)?;
+            let v = qkv.i(2)?.contiguous()?;
+            let scores = (q.matmul(&k.t()?)? / (self.hidden as f64 / self.heads as f64).sqrt())?
+                .to_dtype(DType::F32)?
+                .broadcast_add(if index % self.global_every == 0 {
+                    &global
+                } else {
+                    &local
+                })?;
+            // Masking and softmax stay FP32, including on FP16 devices.
+            let attended = candle_nn::ops::softmax_last_dim(&scores)?
+                .to_dtype(v.dtype())?
+                .matmul(&v)?
+                .transpose(1, 2)?
+                .reshape((batch, sequence, self.hidden))?
+                .apply(&layer.attention_out)?;
+            hidden = (residual + attended)?;
+            let halves = hidden
+                .apply(&layer.mlp_norm)?
+                .apply(&layer.wi)?
+                .chunk(2, D::Minus1)?;
+            let feed_forward = (halves[0].gelu_erf()? * &halves[1])?.apply(&layer.wo)?;
+            hidden = (&hidden + feed_forward)?;
+        }
+        hidden.apply(&self.final_norm)
     }
 
-    fn apply(&self, tensor: &Tensor, sequence_length: usize) -> CandleResult<Tensor> {
-        let cosine = self.cosine.narrow(0, 0, sequence_length)?;
-        let sine = self.sine.narrow(0, 0, sequence_length)?;
-        candle_nn::rotary_emb::rope(tensor, &cosine, &sine)
+    pub(super) fn resident_bytes(&self) -> usize {
+        let tensor_bytes = |t: &Tensor| t.elem_count().saturating_mul(t.dtype().size_in_bytes());
+        let linear_bytes = |l: &Linear| tensor_bytes(l.weight());
+        let norm_bytes = |n: &LayerNorm| tensor_bytes(n.weight());
+        let mut bytes = tensor_bytes(self.embeddings.embeddings())
+            .saturating_add(norm_bytes(&self.embedding_norm))
+            .saturating_add(norm_bytes(&self.final_norm))
+            .saturating_add(tensor_bytes(&self.rope_sin))
+            .saturating_add(tensor_bytes(&self.rope_cos));
+        for layer in &self.layers {
+            for linear in [&layer.qkv, &layer.attention_out, &layer.wi, &layer.wo] {
+                bytes = bytes.saturating_add(linear_bytes(linear));
+            }
+            bytes = bytes.saturating_add(norm_bytes(&layer.mlp_norm));
+            if let Some(norm) = &layer.attention_norm {
+                bytes = bytes.saturating_add(norm_bytes(norm));
+            }
+        }
+        bytes
     }
-}
-
-fn tensor_bytes(tensor: &Tensor) -> usize {
-    tensor
-        .elem_count()
-        .saturating_mul(tensor.dtype().size_in_bytes())
-}
-
-fn linear_bytes(linear: &Linear) -> usize {
-    tensor_bytes(linear.weight()).saturating_add(linear.bias().map_or(0, tensor_bytes))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_core::Device;
 
-    #[test]
-    fn pinned_configuration_accepts_only_the_owned_bidirectional_shape() -> crate::Result<()> {
-        let config = BidirectionalEncoderConfig {
-            hidden_size: PINNED_HIDDEN_SIZE,
-            intermediate_size: 8_192,
-            vocab_size: 128_256,
-            num_hidden_layers: 16,
-            num_attention_heads: 32,
-            num_key_value_heads: 8,
-            head_dim: 64,
-            rms_norm_eps: 1e-5,
-            rope_theta: 500_000.0,
-            max_position_embeddings: 131_072,
-            hidden_act: "silu".to_owned(),
+    fn small_encoder() -> CandleResult<Encoder> {
+        let config = EncoderConfig {
+            hidden_size: 8,
+            intermediate_size: 12,
+            vocab_size: 32,
+            num_hidden_layers: 4,
+            num_attention_heads: 2,
+            max_position_embeddings: 256,
+            layer_norm_eps: 1e-5,
+            global_attn_every_n_layers: 3,
+            global_rope_theta: 160_000.,
+            local_attention: 128,
+            local_rope_theta: 160_000.,
+            hidden_activation: "gelu".into(),
+            pad_token_id: 0,
             attention_bias: false,
             mlp_bias: false,
-            pooling: "avg".to_owned(),
-            use_bidirectional_attention: true,
-            tie_word_embeddings: true,
-            rope_scaling: RopeScaling {
-                factor: 32.0,
-                high_freq_factor: 4.0,
-                low_freq_factor: 1.0,
-                original_max_position_embeddings: 8_192,
-                rope_type: "llama3".to_owned(),
-            },
+            norm_bias: false,
         };
-        config.validate_pinned(PINNED_MAXIMUM_INPUT_TOKENS)?;
+        let mut weights = std::collections::HashMap::new();
+        let mut put = |name: String, shape: Vec<usize>, ones: bool| -> CandleResult<()> {
+            let size = shape.iter().product();
+            let values = (0..size)
+                .map(|i| {
+                    if ones {
+                        1.
+                    } else {
+                        ((i * 17 + name.len()) % 101) as f32 / 100. - 0.5
+                    }
+                })
+                .collect::<Vec<_>>();
+            weights.insert(name, Tensor::from_vec(values, shape, &Device::Cpu)?);
+            Ok(())
+        };
+        put(
+            "embeddings.tok_embeddings.weight".into(),
+            vec![32, 8],
+            false,
+        )?;
+        for name in ["embeddings.norm", "final_norm"] {
+            put(format!("{name}.weight"), vec![8], true)?;
+        }
+        for i in 0..4 {
+            for (name, shape) in [
+                ("attn.Wqkv", vec![24, 8]),
+                ("attn.Wo", vec![8, 8]),
+                ("mlp.Wi", vec![24, 8]),
+                ("mlp.Wo", vec![8, 12]),
+            ] {
+                put(format!("layers.{i}.{name}.weight"), shape, false)?;
+            }
+            put(format!("layers.{i}.mlp_norm.weight"), vec![8], true)?;
+            if i > 0 {
+                put(format!("layers.{i}.attn_norm.weight"), vec![8], true)?;
+            }
+        }
+        Encoder::load(
+            VarBuilder::from_tensors(weights, DType::F32, &Device::Cpu),
+            &config,
+        )
+    }
+
+    #[test]
+    fn padding_cannot_change_visible_outputs_in_global_or_local_layers() -> CandleResult<()> {
+        let encoder = small_encoder()?;
+        let tokens = (0..137).map(|i| (i % 31 + 1) as u32).collect::<Vec<_>>();
+        let ids = Tensor::from_slice(&tokens, (1, 137), &Device::Cpu)?;
+        let visible = encoder.forward(&ids, &ids.ones_like()?)?;
+        // A second full row makes the first row heavily padded past the local window.
+        let mut batch = tokens.clone();
+        batch.resize(192, 0);
+        batch.extend((0..192).map(|i| (i % 31 + 1) as u32));
+        let mut mask = vec![1u32; 137];
+        mask.resize(192, 0);
+        mask.extend(vec![1; 192]);
+        let result = encoder.forward(
+            &Tensor::from_vec(batch, (2, 192), &Device::Cpu)?,
+            &Tensor::from_vec(mask, (2, 192), &Device::Cpu)?,
+        )?;
+        let actual = result
+            .narrow(0, 0, 1)?
+            .narrow(1, 0, 137)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let expected = visible.flatten_all()?.to_vec1::<f32>()?;
         assert!(
-            config
-                .validate_pinned(PINNED_MAXIMUM_INPUT_TOKENS - 1)
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(a, b)| a.is_finite() && (a - b).abs() < 1e-5)
+        );
+        assert!(encoder.resident_bytes() > 0);
+        Ok(())
+    }
+    #[test]
+    fn invalid_shapes_return_errors_instead_of_panics() -> CandleResult<()> {
+        let encoder = small_encoder()?;
+        let ids = Tensor::zeros((1, 257), DType::U32, &Device::Cpu)?;
+        assert!(encoder.forward(&ids, &ids.ones_like()?).is_err());
+        let ids = Tensor::zeros((1, 2), DType::U32, &Device::Cpu)?;
+        assert!(
+            encoder
+                .forward(&ids, &Tensor::zeros((1, 1), DType::U32, &Device::Cpu)?)
                 .is_err()
         );
         Ok(())

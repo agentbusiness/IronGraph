@@ -75,7 +75,7 @@ export declare class Client {
 }
 
 export declare class EmbeddedDatabase {
-  static open(dataDir: string, device?: 'auto' | 'cpu' | null, deviceOrdinal?: number | null, loadModels?: boolean | null, budgets?: ResourceBudgets | null, embeddingDevice?: 'auto' | 'cpu' | 'metal' | 'cuda' | null, embeddingDeviceOrdinal?: number | null): Promise<EmbeddedDatabase>
+  static open(dataDir: string, device?: 'auto' | 'cpu' | null, deviceOrdinal?: number | null, loadModels?: boolean | null, budgets?: ResourceBudgets | null, embeddingDevice?: 'auto' | 'cpu' | 'metal' | 'cuda' | null, embeddingDeviceOrdinal?: number | null, modelDir?: string | null, embeddingCacheDir?: string | null): Promise<EmbeddedDatabase>
   query(cypher: string, projectId?: string | null, parameters?: Record<string, unknown> | null, options?: QueryOptions | null, operation?: OperationOptions | null): Promise<QueryResult>
   streamAppend(request: StreamAppend, options?: OperationOptions | null): Promise<StreamAcknowledgement>
   streamFetch(request: StreamFetch, options?: OperationOptions | null): Promise<StreamPage>

@@ -4,7 +4,7 @@ use std::{
 };
 
 #[cfg(feature = "accelerator")]
-use std::{borrow::Cow, io::Read as _};
+use std::borrow::Cow;
 
 #[cfg(feature = "accelerator")]
 use parking_lot::{Mutex, RwLock};
@@ -13,7 +13,7 @@ use crate::{
     Error, ErrorCode, Result,
     execution::TextEmbedding,
     gpu::{BackendKind, DeviceMemoryGovernor, ResolvedComputeDevice},
-    graph::{EmbeddingDType, EmbeddingProfile, Similarity},
+    graph::EmbeddingProfile,
 };
 
 #[cfg(feature = "accelerator")]
@@ -23,42 +23,28 @@ use super::EmbeddingDevice;
 #[cfg(feature = "accelerator")]
 use super::{
     device,
-    encoder::{BidirectionalEncoder, BidirectionalEncoderConfig},
+    encoder::{Encoder, EncoderConfig},
 };
 
-const MAX_EMBEDDING_TEXT_BYTES: usize = 4 * 1024 * 1024;
 #[cfg(feature = "accelerator")]
-pub(super) const PINNED_HIDDEN_SIZE: usize = 2_048;
+pub(super) const EMBEDDING_HIDDEN_SIZE: usize = 384;
 /// Texts per forward pass while indexing. Large enough to amortise the call, small enough that
 /// the padded rectangle stays modest when one text in the batch is long.
 #[cfg(feature = "accelerator")]
 const EMBEDDING_BATCH: usize = 16;
 
-/// Padded tokens a single batch may carry.
-///
-/// The rectangle is what the device actually processes, so this — not the row count — is what keeps
-/// one long document from dragging its whole batch with it. It also decides how much of the long
-/// tail gets batched, and bigger is not better. At 8,192 tokens a representative 200-document
-/// rebuild held roughly 20 GiB of transient encoder state and spent 228 seconds waiting on one
-/// Metal command buffer. A 4,096-token rectangle was still able to peak above 7 GiB and leave the
-/// real 645-message cold rebuild waiting indefinitely in Metal. Keep each submission to 1,024
-/// padded tokens and at most sixteen rows. This is also small enough for an interactive query to
-/// get the encoder lock between background batches without a multi-second head-of-line stall.
+/// Maximum padded token rectangle per submission; queries can interleave between batches.
 #[cfg(feature = "accelerator")]
 const EMBEDDING_BATCH_TOKENS: usize = 1_024;
 
-// Shared rolling windows use the same bound on every embedding execution backend.
+// Rolling windows use the same bound on every embedding execution backend.
 #[cfg(feature = "accelerator")]
-const COREML_INPUT_TOKENS: usize = 512;
+const EMBEDDING_WINDOW_TOKENS: usize = 512;
 
-pub(super) const PINNED_OUTPUT_SIZE: usize = 384;
-pub(super) const PINNED_MAXIMUM_INPUT_TOKENS: usize = 8_192;
+pub(super) const EMBEDDING_OUTPUT_SIZE: usize = 384;
+pub(super) const EMBEDDING_MAXIMUM_INPUT_TOKENS: usize = 8_192;
 #[cfg(feature = "accelerator")]
-const QUERY_PREFIX: &str = "query: ";
-#[cfg(feature = "accelerator")]
-const PASSAGE_PREFIX: &str = "passage: ";
-#[cfg(feature = "accelerator")]
-const PRESERVED_INPUT_HEAD_TOKENS: usize = 16;
+const PRESERVED_INPUT_HEAD_TOKENS: usize = 1;
 
 #[cfg(feature = "accelerator")]
 fn embedding_error(error: candle_core::Error) -> Error {
@@ -68,23 +54,17 @@ fn embedding_error(error: candle_core::Error) -> Error {
     )
 }
 
-/// Immutable exact files for the project-compatible local text encoder.
+/// Locally cached files for the one supported text encoder.
 #[derive(Clone, Debug)]
 pub struct EmbeddingModelArtifacts {
     pub model_safetensors: PathBuf,
     pub tokenizer_json: PathBuf,
     pub model_config_json: PathBuf,
-    pub model_sha256: [u8; 32],
-    pub model_exact_bytes: u64,
-    pub tokenizer_sha256: [u8; 32],
-    pub tokenizer_exact_bytes: u64,
-    pub config_sha256: [u8; 32],
-    pub config_exact_bytes: u64,
     pub profile: EmbeddingProfile,
     pub maximum_input_tokens: usize,
 }
 
-/// Hash-verified local encoder used only by the sequencer to resolve canonical vectors.
+/// Local text encoder shared by interactive retrieval and background embedding jobs.
 pub struct LocalEmbeddingModel {
     artifacts: EmbeddingModelArtifacts,
     resolved_device: ResolvedComputeDevice,
@@ -102,7 +82,7 @@ pub struct LocalEmbeddingModel {
     /// Separate from `cache` on purpose: that one is the durable passage store keyed for indexing,
     /// while this exists because one question is embedded repeatedly — the repeated semantic query encodes
     /// the current question every turn, and a re-asked or retried question encodes it again. A
-    /// query embed measured 26-53 ms, all of it on the request path.
+    /// cache hit avoids inference on the request path.
     #[cfg(feature = "accelerator")]
     query_cache: Mutex<QueryEmbeddingCache>,
 }
@@ -145,43 +125,10 @@ impl QueryEmbeddingCache {
 
 #[cfg(feature = "accelerator")]
 struct LoadedEmbeddingModel {
-    model: BidirectionalEncoder,
+    model: Encoder,
     tokenizer: tokenizers::Tokenizer,
     device: candle_core::Device,
     maximum_input_tokens: usize,
-    #[cfg(target_vendor = "apple")]
-    coreml_buckets: Vec<CoreMlEmbeddingProgram>,
-}
-
-#[cfg(all(feature = "accelerator", target_vendor = "apple"))]
-struct CoreMlEmbeddingProgram {
-    model: coreml_native::Model,
-    resident_bytes: usize,
-    fixed_batch: usize,
-    fixed_tokens: usize,
-    /// The compiled artifact backing `model`. Retained so it can be released when it
-    /// is still Core ML's temporary output rather than a cached copy.
-    compiled_path: PathBuf,
-    /// True when `compiled_path` is in `$TMPDIR` and this process must delete it.
-    owns_temp: bool,
-}
-
-#[cfg(all(feature = "accelerator", target_vendor = "apple"))]
-impl Drop for CoreMlEmbeddingProgram {
-    fn drop(&mut self) {
-        // Core ML hands the caller ownership of its compile output. When we could not
-        // move it into the cache, releasing it here is what stops `$TMPDIR` growing by
-        // ~2.3GB per program on every process start.
-        if self.owns_temp
-            && self.compiled_path.starts_with(std::env::temp_dir())
-            && std::fs::remove_dir_all(&self.compiled_path).is_ok()
-        {
-            tracing::debug!(
-                path = %self.compiled_path.display(),
-                "released temporary Core ML compile artifact"
-            );
-        }
-    }
 }
 
 #[cfg(feature = "accelerator")]
@@ -196,87 +143,86 @@ enum EmbeddingPurpose {
     Passage,
 }
 
-impl EmbeddingPurpose {
-    #[cfg(feature = "accelerator")]
-    const fn prefix(self) -> &'static str {
-        match self {
-            Self::Query => QUERY_PREFIX,
-            Self::Passage => PASSAGE_PREFIX,
-        }
-    }
-}
-
 impl LocalEmbeddingModel {
     pub fn load(artifacts: EmbeddingModelArtifacts, device: EmbeddingDevice) -> Result<Self> {
+        Self::load_with_storage(artifacts, device, &crate::EmbeddingStorage::default())
+    }
+
+    pub fn load_with_storage(
+        artifacts: EmbeddingModelArtifacts,
+        device: EmbeddingDevice,
+        storage: &crate::EmbeddingStorage,
+    ) -> Result<Self> {
         validate_artifact_contract(&artifacts)?;
+        let cache_directory = storage.cache_directory()?;
 
         #[cfg(feature = "accelerator")]
         {
-            let selected = device::select_device(device)?;
-            let device = selected.device;
-            let dtype = selected.dtype;
-            let resolved_device = selected.identity;
-            let config_bytes = read_verified_sha256_exact(
-                &artifacts.model_config_json,
-                artifacts.config_exact_bytes,
-                artifacts.config_sha256,
-            )?;
-            let config: BidirectionalEncoderConfig = serde_json::from_slice(&config_bytes)
-                .map_err(|error| {
-                    Error::new(
-                        ErrorCode::EmbeddingUnavailable,
-                        format!("embedding model config is invalid: {error}"),
-                    )
-                })?;
-            config.validate_pinned(artifacts.maximum_input_tokens)?;
-            let tokenizer_bytes = read_verified_sha256_exact(
-                &artifacts.tokenizer_json,
-                artifacts.tokenizer_exact_bytes,
-                artifacts.tokenizer_sha256,
-            )?;
-            let tokenizer =
+            let config_bytes = std::fs::read(&artifacts.model_config_json).map_err(|error| {
+                Error::new(
+                    ErrorCode::EmbeddingUnavailable,
+                    format!("reading embedding configuration failed: {error}"),
+                )
+            })?;
+            let config: EncoderConfig = serde_json::from_slice(&config_bytes).map_err(|error| {
+                Error::new(
+                    ErrorCode::EmbeddingUnavailable,
+                    format!("embedding model config is invalid: {error}"),
+                )
+            })?;
+            config.validate(artifacts.maximum_input_tokens)?;
+            let tokenizer_bytes = std::fs::read(&artifacts.tokenizer_json).map_err(|error| {
+                Error::new(
+                    ErrorCode::EmbeddingUnavailable,
+                    format!("reading embedding tokenizer failed: {error}"),
+                )
+            })?;
+            let mut tokenizer =
                 tokenizers::Tokenizer::from_bytes(&tokenizer_bytes).map_err(|error| {
                     Error::new(
                         ErrorCode::EmbeddingUnavailable,
                         format!("embedding tokenizer is invalid: {error}"),
                     )
                 })?;
-            if tokenizer.get_vocab_size(true) != 128_256 {
+            if tokenizer.get_vocab_size(true) != config.vocabulary_size() {
                 return Err(Error::new(
                     ErrorCode::EmbeddingProfileMismatch,
-                    "embedding tokenizer vocabulary differs from the pinned encoder",
+                    "embedding tokenizer vocabulary does not match Bekko a8m",
                 ));
             }
-            let builder = irongraph_artifact_loader::mmap_verified_safetensors_sha256_exact(
-                &artifacts.model_safetensors,
-                artifacts.model_exact_bytes,
-                artifacts.model_sha256,
-                dtype,
-                &device,
-            )
-            .map_err(embedding_error)?;
-            let embedding_model =
-                BidirectionalEncoder::load(builder, &config, artifacts.maximum_input_tokens)
-                    .map_err(embedding_error)?;
-            #[cfg(target_vendor = "apple")]
-            let coreml_buckets = if resolved_device.backend == BackendKind::Metal {
-                // Reclaim artifacts stranded by runs that were killed before Drop could
-                // fire. An hour is comfortably longer than a cold compile, so a
-                // concurrently starting process cannot lose its in-flight output.
-                sweep_stale_coreml_artifacts(std::time::Duration::from_secs(60 * 60));
-                [
-                    ("model-64.mlpackage", 64),
-                    ("model-512.mlpackage", COREML_INPUT_TOKENS),
-                ]
-                .into_iter()
-                .filter_map(|(name, tokens)| {
-                    load_coreml_fixed(&artifacts.model_safetensors, name, 1, tokens)
-                })
-                .collect()
-            } else {
-                Vec::new()
+            tokenizer.with_padding(None);
+            tokenizer.with_truncation(None).map_err(|error| {
+                Error::new(
+                    ErrorCode::EmbeddingUnavailable,
+                    format!("configuring embedding tokenizer failed: {error}"),
+                )
+            })?;
+            let selected = device::select_device(device)?;
+            let selected_gpu = selected.identity.backend != BackendKind::Cpu;
+            let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                load_on_device(&artifacts, &config, tokenizer.clone(), selected)
+            }))
+            .unwrap_or_else(|_| {
+                Err(Error::new(
+                    ErrorCode::EmbeddingUnavailable,
+                    "embedding device initialization panicked",
+                ))
+            });
+            let (loaded, resolved_device) = match loaded {
+                Ok(loaded) => loaded,
+                Err(error) if device == EmbeddingDevice::Auto && selected_gpu => {
+                    tracing::warn!(%error, "GPU embedding initialization failed; using CPU");
+                    load_on_device(
+                        &artifacts,
+                        &config,
+                        tokenizer,
+                        device::select_device(EmbeddingDevice::Cpu)?,
+                    )?
+                }
+                Err(error) => return Err(error),
             };
-            let maximum_input_tokens = artifacts.maximum_input_tokens;
+            tracing::info!(model = super::install::DEFAULT_EMBEDDING_MODEL_ID, backend = ?resolved_device.backend,
+                ordinal = resolved_device.ordinal, "local embedding encoder selected");
             // Hex so it can name a file, and part of the path so a different encoder can never be
             // served vectors produced by this one.
             let artifacts_profile_hash = artifacts
@@ -289,25 +235,19 @@ impl LocalEmbeddingModel {
                 artifacts,
                 resolved_device,
                 warmed: AtomicBool::new(false),
-                inner: Mutex::new(LoadedEmbeddingModel {
-                    model: embedding_model,
-                    tokenizer,
-                    device,
-                    maximum_input_tokens,
-                    #[cfg(target_vendor = "apple")]
-                    coreml_buckets,
-                }),
+                inner: Mutex::new(loaded),
                 governor: RwLock::new(None),
-                cache: super::embedding_cache::EmbeddingCache::open(
+                cache: super::embedding_cache::EmbeddingCache::open_in(
+                    &cache_directory,
                     &artifacts_profile_hash,
-                    PINNED_OUTPUT_SIZE,
+                    EMBEDDING_OUTPUT_SIZE,
                 ),
                 query_cache: Mutex::new(QueryEmbeddingCache::default()),
             })
         }
         #[cfg(not(feature = "accelerator"))]
         {
-            let _ = device;
+            let _ = (device, cache_directory);
             Err(Error::new(
                 ErrorCode::EmbeddingUnavailable,
                 "binary was built without the local embedding encoder",
@@ -320,12 +260,12 @@ impl LocalEmbeddingModel {
         &self.artifacts.profile
     }
 
-    /// Encodes native SEARCH/retrieval text with the pinned query prefix.
+    /// Encodes raw query text for semantic retrieval.
     pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
         self.embed_for(EmbeddingPurpose::Query, text)
     }
 
-    /// Encodes indexed graph/document values with the pinned passage prefix.
+    /// Encodes raw graph/document text for indexing.
     pub fn embed_passage(&self, text: &str) -> Result<Vec<f32>> {
         self.embed_for(EmbeddingPurpose::Passage, text)
     }
@@ -350,10 +290,10 @@ impl LocalEmbeddingModel {
         #[cfg(not(feature = "accelerator"))]
         let _ = is_cancelled;
         for text in texts {
-            if text.is_empty() || text.len() > MAX_EMBEDDING_TEXT_BYTES {
+            if text.is_empty() {
                 return Err(Error::new(
                     ErrorCode::ResultBudgetExceeded,
-                    "embedding text is empty or exceeds its byte budget",
+                    "embedding text is empty",
                 ));
             }
         }
@@ -378,7 +318,7 @@ impl LocalEmbeddingModel {
                 let cached = self.cache.as_ref().and_then(|cache| {
                     cache.get(&super::embedding_cache::EmbeddingCache::key(
                         text,
-                        PINNED_OUTPUT_SIZE,
+                        EMBEDDING_OUTPUT_SIZE,
                     ))
                 });
                 if cached.is_none() {
@@ -444,10 +384,7 @@ impl LocalEmbeddingModel {
                 let mut rows = Vec::with_capacity(work_texts.len());
                 for (index, text) in work_texts.iter().enumerate() {
                     ensure_embedding_not_cancelled(is_cancelled)?;
-                    rows.push((
-                        index,
-                        tokenize_for(&loaded, EmbeddingPurpose::Passage, text)?,
-                    ));
+                    rows.push((index, tokenize_for(&loaded, text)?));
                 }
                 rows
             };
@@ -540,31 +477,11 @@ impl LocalEmbeddingModel {
         }
         let started = std::time::Instant::now();
         let vector = self.embed_query("warmup")?;
-        if vector.len() != PINNED_OUTPUT_SIZE {
+        if vector.len() != EMBEDDING_OUTPUT_SIZE {
             return Err(Error::new(
                 ErrorCode::EmbeddingUnavailable,
                 "embedding warmup returned an invalid vector width",
             ));
-        }
-        #[cfg(all(feature = "accelerator", target_vendor = "apple"))]
-        {
-            let loaded = self.inner.lock();
-            if let Some(coreml) = loaded
-                .coreml_buckets
-                .iter()
-                .find(|program| program.fixed_tokens == COREML_INPUT_TOKENS)
-            {
-                let warm_text = "retrieval encoder fused execution warmup ".repeat(32);
-                let row = tokenize_for(&loaded, EmbeddingPurpose::Passage, &warm_text)?;
-                let rows = [row];
-                let vectors = embed_coreml_fixed(coreml, &rows)?;
-                if vectors.len() != 1 || vectors[0].len() != PINNED_OUTPUT_SIZE {
-                    return Err(Error::new(
-                        ErrorCode::EmbeddingUnavailable,
-                        "Core ML embedding warmup returned an invalid vector shape",
-                    ));
-                }
-            }
         }
         self.warmed.store(true, Ordering::Release);
         tracing::info!(
@@ -580,10 +497,10 @@ impl LocalEmbeddingModel {
     }
 
     fn embed_for(&self, purpose: EmbeddingPurpose, text: &str) -> Result<Vec<f32>> {
-        if text.is_empty() || text.len() > MAX_EMBEDDING_TEXT_BYTES {
+        if text.is_empty() {
             return Err(Error::new(
                 ErrorCode::ResultBudgetExceeded,
-                "embedding text is empty or exceeds its byte budget",
+                "embedding text is empty",
             ));
         }
         #[cfg(feature = "accelerator")]
@@ -596,7 +513,7 @@ impl LocalEmbeddingModel {
                 return Ok(hit);
             }
             let governor = self.governor.read().clone();
-            let vector = embed_loaded(&self.inner.lock(), purpose, text, governor.as_ref())?;
+            let vector = embed_loaded(&self.inner.lock(), text, governor.as_ref())?;
             if purpose == EmbeddingPurpose::Query {
                 self.query_cache.lock().insert(text, &vector);
             }
@@ -633,22 +550,7 @@ impl LocalEmbeddingModel {
     pub fn resident_weight_bytes(&self) -> usize {
         #[cfg(feature = "accelerator")]
         {
-            let loaded = self.inner.lock();
-            let candle = loaded.model.resident_bytes();
-            #[cfg(target_vendor = "apple")]
-            {
-                candle.saturating_add(
-                    loaded
-                        .coreml_buckets
-                        .iter()
-                        .map(|program| program.resident_bytes)
-                        .fold(0usize, usize::saturating_add),
-                )
-            }
-            #[cfg(not(target_vendor = "apple"))]
-            {
-                candle
-            }
+            self.inner.lock().model.resident_bytes()
         }
         #[cfg(not(feature = "accelerator"))]
         {
@@ -721,7 +623,10 @@ fn cache_completed_embedding_rows(
         .iter()
         .filter_map(|index| {
             Some((
-                super::embedding_cache::EmbeddingCache::key(texts.get(*index)?, PINNED_OUTPUT_SIZE),
+                super::embedding_cache::EmbeddingCache::key(
+                    texts.get(*index)?,
+                    EMBEDDING_OUTPUT_SIZE,
+                ),
                 vectors.get(*index)?.as_ref()?.clone(),
             ))
         })
@@ -742,7 +647,7 @@ impl TextEmbedding for LocalEmbeddingModel {
         #[cfg(feature = "accelerator")]
         {
             let loaded = self.inner.lock();
-            rolling_embedding_windows(&loaded, EmbeddingPurpose::Passage, text)
+            rolling_embedding_windows(&loaded, text)
         }
         #[cfg(not(feature = "accelerator"))]
         {
@@ -754,7 +659,7 @@ impl TextEmbedding for LocalEmbeddingModel {
         #[cfg(feature = "accelerator")]
         {
             let loaded = self.inner.lock();
-            rolling_embedding_windows(&loaded, EmbeddingPurpose::Query, text)
+            rolling_embedding_windows(&loaded, text)
         }
         #[cfg(not(feature = "accelerator"))]
         {
@@ -783,34 +688,24 @@ impl TextEmbedding for LocalEmbeddingModel {
 /// encoder inputs only: the semantic row key retains the original graph owner and its window
 /// number, and model-visible memory is materialised from that complete owner.
 #[cfg(feature = "accelerator")]
-fn rolling_embedding_windows(
-    loaded: &LoadedEmbeddingModel,
-    purpose: EmbeddingPurpose,
-    text: &str,
-) -> Result<Vec<String>> {
+fn rolling_embedding_windows(loaded: &LoadedEmbeddingModel, text: &str) -> Result<Vec<String>> {
     const WINDOW_CONTENT_TOKENS: usize = 400;
     const WINDOW_OVERLAP_TOKENS: usize = 64;
 
     if text.is_empty() {
         return Ok(Vec::new());
     }
-    let prefix = purpose.prefix();
-    let mut prefixed = String::with_capacity(prefix.len().saturating_add(text.len()));
-    prefixed.push_str(prefix);
-    prefixed.push_str(text);
-    let complete = loaded.tokenizer.encode(prefixed, true).map_err(|error| {
+    let complete = loaded.tokenizer.encode(text, true).map_err(|error| {
         Error::new(
             ErrorCode::EmbeddingUnavailable,
             format!("embedding tokenization failed: {error}"),
         )
     })?;
-    if complete.len() <= COREML_INPUT_TOKENS {
+    if complete.len() <= EMBEDDING_WINDOW_TOKENS {
         return Ok(vec![text.to_owned()]);
     }
 
-    // Offsets let the derived windows retain byte-exact substrings of the canonical value rather
-    // than tokenizer-decoded approximations. The final fit check includes the required `passage: `
-    // prefix and special tokens, so every returned row is guaranteed to use the 512-token path.
+    // Byte offsets preserve source text exactly. The final fit check includes special tokens.
     let encoding = loaded.tokenizer.encode(text, false).map_err(|error| {
         Error::new(
             ErrorCode::EmbeddingUnavailable,
@@ -842,16 +737,13 @@ fn rolling_embedding_windows(
                 && text.is_char_boundary(end_byte)
             {
                 let candidate = &text[start_byte..end_byte];
-                let mut input = String::with_capacity(prefix.len().saturating_add(candidate.len()));
-                input.push_str(prefix);
-                input.push_str(candidate);
-                let tokens = loaded.tokenizer.encode(input, true).map_err(|error| {
+                let tokens = loaded.tokenizer.encode(candidate, true).map_err(|error| {
                     Error::new(
                         ErrorCode::EmbeddingUnavailable,
                         format!("embedding tokenization failed: {error}"),
                     )
                 })?;
-                if tokens.len() <= COREML_INPUT_TOKENS {
+                if tokens.len() <= EMBEDDING_WINDOW_TOKENS {
                     accepted = Some((end_token, candidate.to_owned()));
                     break;
                 }
@@ -876,310 +768,59 @@ fn rolling_embedding_windows(
 
 fn validate_artifact_contract(artifacts: &EmbeddingModelArtifacts) -> Result<()> {
     artifacts.profile.validate()?;
-    if artifacts.model_exact_bytes == 0
-        || artifacts.tokenizer_exact_bytes == 0
-        || artifacts.config_exact_bytes == 0
-        || artifacts.maximum_input_tokens != PINNED_MAXIMUM_INPUT_TOKENS
-        || artifacts.profile.model_hash != artifacts.model_sha256
-        || encoder_hash(artifacts.tokenizer_sha256, artifacts.config_sha256)
-            != artifacts.profile.tokenizer_hash
-        || artifacts.profile.dimension as usize != PINNED_OUTPUT_SIZE
-        || artifacts.profile.dtype != EmbeddingDType::F16
-        || !artifacts.profile.normalized
-        || artifacts.profile.similarity != Similarity::Cosine
+    if artifacts.maximum_input_tokens != EMBEDDING_MAXIMUM_INPUT_TOKENS
+        || artifacts.profile != super::install::default_profile()?
     {
         return Err(Error::new(
             ErrorCode::EmbeddingProfileMismatch,
-            "embedding artifacts differ from the pinned 384-coordinate FP16 cosine profile",
-        ));
-    }
-    #[cfg(feature = "accelerator")]
-    if artifacts.model_sha256 != super::install::DEFAULT_EMBEDDING_MODEL_SHA256
-        || artifacts.model_exact_bytes != super::install::DEFAULT_EMBEDDING_MODEL_BYTES
-        || artifacts.tokenizer_sha256 != super::install::DEFAULT_EMBEDDING_TOKENIZER_SHA256
-        || artifacts.tokenizer_exact_bytes != super::install::DEFAULT_EMBEDDING_TOKENIZER_BYTES
-        || artifacts.config_sha256 != super::install::DEFAULT_EMBEDDING_CONFIG_SHA256
-        || artifacts.config_exact_bytes != super::install::DEFAULT_EMBEDDING_CONFIG_BYTES
-    {
-        return Err(Error::new(
-            ErrorCode::EmbeddingProfileMismatch,
-            "embedding files differ from the pinned encoder revision",
+            "embedding profile is not the Bekko a8m 384-coordinate cosine profile",
         ));
     }
     Ok(())
 }
 
 #[cfg(feature = "accelerator")]
-fn read_verified_sha256_exact(
-    path: &std::path::Path,
-    bytes: u64,
-    sha256: [u8; 32],
-) -> Result<Vec<u8>> {
-    let mut file = irongraph_artifact_loader::open_verified_once(path, bytes, sha256)
-        .map_err(embedding_error)?;
-    let capacity = usize::try_from(bytes).map_err(|_| {
-        Error::new(
-            ErrorCode::EmbeddingUnavailable,
-            "embedding artifact exceeds this platform's address space",
-        )
-    })?;
-    let mut output = Vec::with_capacity(capacity);
-    file.read_to_end(&mut output)
+fn load_on_device(
+    artifacts: &EmbeddingModelArtifacts,
+    config: &EncoderConfig,
+    tokenizer: tokenizers::Tokenizer,
+    selected: crate::gpu::ResolvedCandleDevice,
+) -> Result<(LoadedEmbeddingModel, ResolvedComputeDevice)> {
+    let _gate = irongraph_gpu::lock_metal_device(&selected.device);
+    let builder = irongraph_artifact_loader::mmap_safetensors(
+        &artifacts.model_safetensors,
+        selected.dtype,
+        &selected.device,
+    )
+    .map_err(embedding_error)?;
+    let model = Encoder::load(builder, config).map_err(embedding_error)?;
+    // Resolve kernel/dtype availability before advertising a usable GPU. Read back to synchronize.
+    let input = tokenizer
+        .encode("embedding device warmup", true)
         .map_err(|error| Error::new(ErrorCode::EmbeddingUnavailable, error.to_string()))?;
-    if output.len() != capacity {
-        return Err(Error::new(
-            ErrorCode::EmbeddingUnavailable,
-            "embedding artifact changed while it was read",
-        ));
-    }
-    Ok(output)
-}
-
-/// Load a locally derived fixed 512-token Core ML program when present. The verified
-/// safetensors remain the authority and Candle remains the complete 8,192-token fallback; failure
-/// to compile this acceleration artifact therefore costs speed, never availability or semantics.
-#[cfg(all(feature = "accelerator", target_vendor = "apple"))]
-fn load_coreml_fixed(
-    safetensors: &std::path::Path,
-    package_name: &str,
-    fixed_batch: usize,
-    fixed_tokens: usize,
-) -> Option<CoreMlEmbeddingProgram> {
-    let package = safetensors.parent()?.join(package_name);
-    if !package.is_dir() {
-        return None;
-    }
-    let started = std::time::Instant::now();
-
-    // Compile once, then reuse. `MLModel.compileModelAtURL:` writes into `$TMPDIR` and
-    // transfers ownership to the caller; the upstream crate documents that it must be
-    // copied somewhere permanent. Discarding that path leaked ~2.3GB per program per
-    // process start, and because each compile produced a *fresh* path the Neural Engine
-    // saw a new bundle identity every time and could never reuse its own cache, so
-    // `com.apple.e5rt.e5bundlecache` grew unbounded alongside it.
-    //
-    // Both buckets contain `Data/com.apple.CoreML/model.mlmodel`, so both compile to
-    // `model.mlmodelc` — the destination must be keyed per bucket or they collide.
-    // That collision is precisely why Core ML was appending `_<UUID>` disambiguators.
-    let cached = coreml_cache_destination(&package);
-    let (compiled_path, owns_temp) = match cached {
-        Some(destination) if destination.is_dir() => {
-            tracing::debug!(path = %destination.display(), "reusing cached Core ML program");
-            (destination, false)
-        }
-        destination => match coreml_native::compile_model(&package) {
-            Ok(compiled) => destination
-                .and_then(|destination| persist_compiled_model(&compiled, &destination))
-                .map_or((compiled, true), |persisted| (persisted, false)),
-            Err(error) => {
-                tracing::warn!(%error, "fused Core ML retrieval encoder unavailable; using Candle");
-                return None;
-            }
+    let ids = candle_core::Tensor::from_slice(input.get_ids(), (1, input.len()), &selected.device)
+        .map_err(embedding_error)?;
+    let attention = ids.ones_like().map_err(embedding_error)?;
+    let hidden = model.forward(&ids, &attention).map_err(embedding_error)?;
+    pool_truncate_normalize(&hidden, input.get_attention_mask(), EMBEDDING_OUTPUT_SIZE)?;
+    Ok((
+        LoadedEmbeddingModel {
+            model,
+            tokenizer,
+            device: selected.device,
+            maximum_input_tokens: artifacts.maximum_input_tokens,
         },
-    };
-
-    match coreml_native::Model::load(&compiled_path, coreml_native::ComputeUnits::All) {
-        Ok(model) => {
-            tracing::info!(
-                fixed_batch,
-                fixed_tokens,
-                elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
-                "fused Core ML retrieval encoder loaded"
-            );
-            Some(CoreMlEmbeddingProgram {
-                model,
-                // Measure what is actually resident: the compiled program, not the
-                // source package it was built from.
-                resident_bytes: directory_file_bytes(&compiled_path),
-                fixed_batch,
-                fixed_tokens,
-                compiled_path,
-                owns_temp,
-            })
-        }
-        Err(error) => {
-            // The load failed, so nothing else will free this. Do it here rather than
-            // stranding it — this path is why the leak survived even failed startups.
-            if owns_temp && compiled_path.starts_with(std::env::temp_dir()) {
-                let _ = std::fs::remove_dir_all(&compiled_path);
-            }
-            tracing::warn!(%error, "fused Core ML retrieval encoder unavailable; using Candle");
-            None
-        }
-    }
-}
-
-/// Where the compiled form of `package` is cached, keyed by the package name so the
-/// two fixed-shape buckets cannot overwrite one another.
-#[cfg(all(feature = "accelerator", target_vendor = "apple"))]
-fn coreml_cache_destination(package: &std::path::Path) -> Option<PathBuf> {
-    let parent = package.parent()?;
-    let stem = package.file_stem()?.to_str()?;
-    if !is_writable_dir(parent) {
-        return None;
-    }
-    Some(parent.join("compiled").join(format!("{stem}.mlmodelc")))
-}
-
-#[cfg(all(feature = "accelerator", target_vendor = "apple"))]
-fn is_writable_dir(dir: &std::path::Path) -> bool {
-    if !dir.is_dir() {
-        return false;
-    }
-    let probe = dir.join(format!(".ig-write-probe-{}", std::process::id()));
-    match std::fs::File::create(&probe) {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            true
-        }
-        Err(_) => false,
-    }
-}
-
-/// Move `compiled` to `destination`, returning the final path on success.
-///
-/// Staged through a unique sibling and renamed into place, so two processes racing to
-/// warm the cache can never observe a half-written program.
-#[cfg(all(feature = "accelerator", target_vendor = "apple"))]
-fn persist_compiled_model(
-    compiled: &std::path::Path,
-    destination: &std::path::Path,
-) -> Option<PathBuf> {
-    let parent = destination.parent()?;
-    std::fs::create_dir_all(parent).ok()?;
-
-    let staging = parent.join(format!(".staging-{}.mlmodelc", std::process::id()));
-    let _ = std::fs::remove_dir_all(&staging);
-
-    if std::fs::rename(compiled, &staging).is_err() {
-        // Different volume, or otherwise unrenameable: fall back to copying.
-        if copy_dir_recursive(compiled, &staging).is_err() {
-            let _ = std::fs::remove_dir_all(&staging);
-            return None;
-        }
-        let _ = std::fs::remove_dir_all(compiled);
-    }
-
-    match std::fs::rename(&staging, destination) {
-        Ok(()) => {
-            tracing::info!(path = %destination.display(), "cached compiled Core ML program");
-            Some(destination.to_path_buf())
-        }
-        Err(_) if destination.is_dir() => {
-            // Another process won the race; adopt theirs and discard ours.
-            let _ = std::fs::remove_dir_all(&staging);
-            Some(destination.to_path_buf())
-        }
-        Err(_) => {
-            let _ = std::fs::remove_dir_all(&staging);
-            None
-        }
-    }
-}
-
-#[cfg(all(feature = "accelerator", target_vendor = "apple"))]
-fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(to)?;
-    for entry in std::fs::read_dir(from)? {
-        let entry = entry?;
-        let target = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_dir_recursive(&entry.path(), &target)?;
-        } else {
-            std::fs::copy(entry.path(), &target)?;
-        }
-    }
-    Ok(())
-}
-
-/// Remove Core ML compile artifacts stranded in `$TMPDIR` by earlier runs.
-///
-/// `CoreMlEmbeddingProgram::drop` releases the artifact it owns, but a process killed
-/// with `SIGKILL` never runs `Drop`. This is the guarantee behind that mechanism — the
-/// the same pairing used for other atomic artifact cleanup. Without
-/// it, every crash strands multiple gigabytes permanently.
-///
-/// Only directories that are genuinely Core ML output and older than `max_age` are
-/// removed, so a concurrently starting process cannot lose its in-flight compile.
-#[cfg(all(feature = "accelerator", target_vendor = "apple"))]
-pub fn sweep_stale_coreml_artifacts(max_age: std::time::Duration) {
-    let temp_dir = std::env::temp_dir();
-    let Ok(entries) = std::fs::read_dir(&temp_dir) else {
-        return;
-    };
-    let now = std::time::SystemTime::now();
-    let mut removed = 0usize;
-    let mut reclaimed = 0usize;
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let is_candidate = path.is_dir()
-            && path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("model") && name.ends_with(".mlmodelc"));
-        if !is_candidate {
-            continue;
-        }
-        // Confirm it is really a compiled Core ML bundle before removing anything.
-        if !path.join("coremldata.bin").exists() && !path.join("model.mil").exists() {
-            continue;
-        }
-        let old_enough = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age >= max_age);
-        if !old_enough {
-            continue;
-        }
-        let bytes = directory_file_bytes(&path);
-        if std::fs::remove_dir_all(&path).is_ok() {
-            removed += 1;
-            reclaimed = reclaimed.saturating_add(bytes);
-        }
-    }
-
-    if removed > 0 {
-        tracing::info!(
-            removed,
-            reclaimed_mb = reclaimed / (1024 * 1024),
-            "swept stale Core ML compile artifacts"
-        );
-    }
-}
-
-#[cfg(all(feature = "accelerator", target_vendor = "apple"))]
-fn directory_file_bytes(path: &std::path::Path) -> usize {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return 0;
-    };
-    entries
-        .filter_map(std::result::Result::ok)
-        .map(|entry| {
-            entry.metadata().map_or(0, |metadata| {
-                if metadata.is_dir() {
-                    directory_file_bytes(&entry.path())
-                } else {
-                    usize::try_from(metadata.len()).unwrap_or(usize::MAX)
-                }
-            })
-        })
-        .fold(0usize, usize::saturating_add)
+        selected.identity,
+    ))
 }
 
 #[cfg(feature = "accelerator")]
 fn embed_loaded(
     loaded: &LoadedEmbeddingModel,
-    purpose: EmbeddingPurpose,
     text: &str,
     governor: Option<&DeviceMemoryGovernor>,
 ) -> Result<Vec<f32>> {
-    let mut input = String::with_capacity(purpose.prefix().len().saturating_add(text.len()));
-    input.push_str(purpose.prefix());
-    input.push_str(text);
-    let encoding = loaded.tokenizer.encode(input, true).map_err(|error| {
+    let encoding = loaded.tokenizer.encode(text, true).map_err(|error| {
         Error::new(
             ErrorCode::EmbeddingUnavailable,
             format!("embedding tokenization failed: {error}"),
@@ -1198,25 +839,9 @@ fn embed_loaded(
             "embedding token sequence has an empty attention mask",
         ));
     }
-    #[cfg(target_vendor = "apple")]
-    if let Some(coreml) = loaded
-        .coreml_buckets
-        .iter()
-        .find(|program| ids.len() <= program.fixed_tokens)
-    {
-        let rows = [(ids.to_vec(), attention.to_vec())];
-        return embed_coreml_fixed(coreml, &rows).and_then(|mut vectors| {
-            vectors.pop().ok_or_else(|| {
-                Error::new(
-                    ErrorCode::EmbeddingUnavailable,
-                    "Core ML embedding returned no query vector",
-                )
-            })
-        });
-    }
     let _activation = governor
         .map(|governor| {
-            embedding_activation_bytes(ids.len(), &loaded.device)
+            embedding_activation_bytes(1, ids.len(), &loaded.device)
                 .and_then(|bytes| governor.reserve_shared(SharedMemoryClass::EncoderState, bytes))
         })
         .transpose()?;
@@ -1229,21 +854,19 @@ fn embed_loaded(
     let _gate = irongraph_gpu::lock_metal_device(&loaded.device);
     let input = candle_core::Tensor::from_slice(ids, (1, ids.len()), &loaded.device)
         .map_err(embedding_error)?;
-    let hidden = loaded.model.forward(&input).map_err(embedding_error)?;
-    pool_truncate_normalize(&hidden, attention, PINNED_OUTPUT_SIZE)
+    let mask = candle_core::Tensor::from_slice(attention, (1, ids.len()), &loaded.device)
+        .map_err(embedding_error)?;
+    let hidden = loaded
+        .model
+        .forward(&input, &mask)
+        .map_err(embedding_error)?;
+    pool_truncate_normalize(&hidden, attention, EMBEDDING_OUTPUT_SIZE)
 }
 
 /// Tokenise one text for the encoder, bounded to its input limit.
 #[cfg(feature = "accelerator")]
-fn tokenize_for(
-    loaded: &LoadedEmbeddingModel,
-    purpose: EmbeddingPurpose,
-    text: &str,
-) -> Result<(Vec<u32>, Vec<u32>)> {
-    let mut input = String::with_capacity(purpose.prefix().len().saturating_add(text.len()));
-    input.push_str(purpose.prefix());
-    input.push_str(text);
-    let encoding = loaded.tokenizer.encode(input, true).map_err(|error| {
+fn tokenize_for(loaded: &LoadedEmbeddingModel, text: &str) -> Result<(Vec<u32>, Vec<u32>)> {
+    let encoding = loaded.tokenizer.encode(text, true).map_err(|error| {
         Error::new(
             ErrorCode::EmbeddingUnavailable,
             format!("embedding tokenization failed: {error}"),
@@ -1320,18 +943,6 @@ fn embed_batch_loaded(
     if rows.is_empty() {
         return Ok(Vec::new());
     }
-    #[cfg(target_vendor = "apple")]
-    if let Some(widest) = rows.iter().map(|(ids, _)| ids.len()).max()
-        && let Some(coreml) = loaded
-            .coreml_buckets
-            .iter()
-            .find(|program| widest <= program.fixed_tokens)
-        && rows
-            .iter()
-            .all(|(ids, attention)| ids.len() == attention.len() && !ids.is_empty())
-    {
-        return embed_coreml_fixed(coreml, rows);
-    }
     let width = rows
         .iter()
         .map(|(ids, _)| ids.len())
@@ -1341,13 +952,16 @@ fn embed_batch_loaded(
     // Reserved for the padded rectangle, which is what the device actually holds.
     let _activation = governor
         .map(|governor| {
-            embedding_activation_bytes(width.saturating_mul(batch), &loaded.device)
+            embedding_activation_bytes(batch, width, &loaded.device)
                 .and_then(|bytes| governor.reserve_shared(SharedMemoryClass::EncoderState, bytes))
         })
         .transpose()?;
 
     let mut flat_ids = Vec::with_capacity(batch * width);
-    for (ids, _) in rows {
+    let mut flat_attention = Vec::with_capacity(batch * width);
+    for (ids, attention) in rows {
+        flat_attention.extend_from_slice(attention);
+        flat_attention.resize(flat_attention.len() + width - attention.len(), 0);
         flat_ids.extend_from_slice(ids);
         // Padding is masked out below, so the value only has to be a token the model can embed.
         flat_ids.resize(flat_ids.len() + (width - ids.len()), 0);
@@ -1361,90 +975,14 @@ fn embed_batch_loaded(
     let _gate = irongraph_gpu::lock_metal_device(&loaded.device);
     let input = candle_core::Tensor::from_slice(&flat_ids, (batch, width), &loaded.device)
         .map_err(embedding_error)?;
-    let hidden = loaded.model.forward(&input).map_err(embedding_error)?;
+    let mask = candle_core::Tensor::from_slice(&flat_attention, (batch, width), &loaded.device)
+        .map_err(embedding_error)?;
+    let hidden = loaded
+        .model
+        .forward(&input, &mask)
+        .map_err(embedding_error)?;
 
-    pool_batch_truncate_normalize(&hidden, rows, PINNED_OUTPUT_SIZE)
-}
-
-/// Execute a fused fixed-shape program in its native batch size. A partial final batch repeats its
-/// last real input in the unused slots; those outputs are discarded. Repetition keeps every model
-/// row valid without inventing an empty attention mask or changing a real row's vector.
-#[cfg(all(feature = "accelerator", target_vendor = "apple"))]
-fn embed_coreml_fixed(
-    program: &CoreMlEmbeddingProgram,
-    rows: &[(Vec<u32>, Vec<u32>)],
-) -> Result<Vec<Vec<f32>>> {
-    use coreml_native::{AsMultiArray, BorrowedTensor};
-
-    let mut output = Vec::with_capacity(rows.len());
-    if program.fixed_batch == 0 {
-        return Err(Error::new(
-            ErrorCode::EmbeddingUnavailable,
-            "Core ML embedding program has an empty batch",
-        ));
-    }
-    for chunk in rows.chunks(program.fixed_batch) {
-        let mut padded_ids = vec![0_i32; program.fixed_batch * program.fixed_tokens];
-        let mut padded_attention = vec![0_i32; program.fixed_batch * program.fixed_tokens];
-        for slot in 0..program.fixed_batch {
-            let (ids, attention) = &chunk[slot.min(chunk.len() - 1)];
-            if ids.len() != attention.len() || ids.is_empty() || ids.len() > program.fixed_tokens {
-                return Err(Error::new(
-                    ErrorCode::EmbeddingUnavailable,
-                    "embedding row does not fit the fixed Core ML input",
-                ));
-            }
-            let start = slot * program.fixed_tokens;
-            for (target, value) in padded_ids[start..].iter_mut().zip(ids) {
-                *target = i32::try_from(*value).map_err(|_| {
-                    Error::new(
-                        ErrorCode::EmbeddingUnavailable,
-                        "embedding token exceeds Core ML i32",
-                    )
-                })?;
-            }
-            for (target, value) in padded_attention[start..].iter_mut().zip(attention) {
-                *target = i32::try_from(*value).map_err(|_| {
-                    Error::new(
-                        ErrorCode::EmbeddingUnavailable,
-                        "embedding attention value exceeds Core ML i32",
-                    )
-                })?;
-            }
-        }
-        let shape = [program.fixed_batch, program.fixed_tokens];
-        let input_ids = BorrowedTensor::from_i32(&padded_ids, &shape)
-            .map_err(|error| Error::new(ErrorCode::EmbeddingUnavailable, error.to_string()))?;
-        let attention_mask = BorrowedTensor::from_i32(&padded_attention, &shape)
-            .map_err(|error| Error::new(ErrorCode::EmbeddingUnavailable, error.to_string()))?;
-        let inputs: [(&str, &dyn AsMultiArray); 2] = [
-            ("input_ids", &input_ids),
-            ("attention_mask", &attention_mask),
-        ];
-        let prediction = program
-            .model
-            .predict(&inputs)
-            .map_err(|error| Error::new(ErrorCode::EmbeddingUnavailable, error.to_string()))?;
-        let (vectors, output_shape) = prediction
-            .get_f32("embeddings")
-            .map_err(|error| Error::new(ErrorCode::EmbeddingUnavailable, error.to_string()))?;
-        let expected = program.fixed_batch.saturating_mul(PINNED_OUTPUT_SIZE);
-        if vectors.len() != expected
-            || (output_shape.as_slice() != [program.fixed_batch, PINNED_OUTPUT_SIZE]
-                && !(program.fixed_batch == 1 && output_shape.as_slice() == [PINNED_OUTPUT_SIZE]))
-        {
-            return Err(Error::new(
-                ErrorCode::EmbeddingUnavailable,
-                format!("Core ML embedding returned unexpected shape {output_shape:?}"),
-            ));
-        }
-        for vector in vectors.chunks_exact(PINNED_OUTPUT_SIZE).take(chunk.len()) {
-            let mut vector = vector.to_vec();
-            normalize(&mut vector)?;
-            output.push(vector);
-        }
-    }
-    Ok(output)
+    pool_batch_truncate_normalize(&hidden, rows, EMBEDDING_OUTPUT_SIZE)
 }
 
 /// Pool a padded encoder batch with one device reduction and one device-to-host transfer.
@@ -1463,10 +1001,7 @@ fn pool_batch_truncate_normalize(
     use candle_core::{DType, Tensor};
 
     let (batch, sequence_length, hidden_width) = hidden.dims3().map_err(embedding_error)?;
-    if batch != rows.len()
-        || hidden_width != PINNED_HIDDEN_SIZE
-        || output_width == 0
-        || output_width > hidden_width
+    if batch != rows.len() || hidden_width != EMBEDDING_HIDDEN_SIZE || output_width != hidden_width
     {
         return Err(Error::new(
             ErrorCode::EmbeddingUnavailable,
@@ -1514,8 +1049,6 @@ fn pool_batch_truncate_normalize(
     let mut vectors = pooled.to_vec2::<f32>().map_err(embedding_error)?;
     for vector in &mut vectors {
         normalize(vector)?;
-        vector.truncate(output_width);
-        normalize(vector)?;
         if vector.len() != output_width || vector.iter().any(|coordinate| !coordinate.is_finite()) {
             return Err(Error::new(
                 ErrorCode::EmbeddingUnavailable,
@@ -1545,8 +1078,8 @@ fn bound_embedding_input<'a>(
         });
     }
 
-    // The pinned tokenizer places special tokens and the exact query/passage prefix at the head.
-    // Keep that small header and spend the remaining budget on the newest semantic content.
+    // Preserve the leading special token and the newest semantic content for direct calls.
+    // Automatic indexing uses overlapping windows and retains the complete source.
     let head_tokens = PRESERVED_INPUT_HEAD_TOKENS.min(maximum_input_tokens.saturating_sub(1));
     let tail_tokens = maximum_input_tokens - head_tokens;
     let tail_start = ids.len() - tail_tokens;
@@ -1564,57 +1097,44 @@ fn bound_embedding_input<'a>(
 }
 
 #[cfg(feature = "accelerator")]
-fn embedding_activation_bytes(tokens: usize, device: &candle_core::Device) -> Result<usize> {
-    let hidden = tokens
-        .checked_mul(PINNED_HIDDEN_SIZE)
-        .and_then(|values| values.checked_mul(12))
-        .ok_or_else(|| {
-            Error::new(
-                ErrorCode::GpuAdmissionFailure,
-                "embedding hidden-state admission estimate overflowed",
-            )
-        })?;
-    let feed_forward = tokens
-        .checked_mul(8_192)
-        .and_then(|values| values.checked_mul(6))
-        .ok_or_else(|| {
-            Error::new(
-                ErrorCode::GpuAdmissionFailure,
-                "embedding feed-forward admission estimate overflowed",
-            )
-        })?;
-    let attention = if device.is_cpu() || device.is_metal() {
-        tokens
-            .checked_mul(PINNED_HIDDEN_SIZE + 1_024)
-            .and_then(|values| values.checked_mul(6))
-    } else {
-        32_usize
-            .checked_mul(tokens)
-            .and_then(|values| values.checked_mul(tokens))
-            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
-            .and_then(|scores| {
-                tokens
-                    .checked_mul(PINNED_HIDDEN_SIZE + 1_024)
-                    .and_then(|values| values.checked_mul(6))
-                    .and_then(|values| values.checked_add(scores))
-            })
-    }
-    .ok_or_else(|| {
+fn embedding_activation_bytes(
+    batch: usize,
+    sequence: usize,
+    device: &candle_core::Device,
+) -> Result<usize> {
+    let bytes_per_value = if device.is_cpu() { 4usize } else { 2 };
+    let estimate = || -> Option<usize> {
+        let tokens = batch.checked_mul(sequence)?;
+        let hidden = tokens
+            .checked_mul(EMBEDDING_HIDDEN_SIZE)?
+            .checked_mul(12)?
+            .checked_mul(bytes_per_value)?;
+        let mlp = tokens
+            .checked_mul(1152)?
+            .checked_mul(6)?
+            .checked_mul(bytes_per_value)?;
+        // QK scores and FP32 softmax coexist; local masks also scale with padded sequence area.
+        let scores = batch
+            .checked_mul(6)?
+            .checked_mul(sequence)?
+            .checked_mul(sequence)?
+            .checked_mul(12)?;
+        let masks = batch
+            .checked_mul(sequence)?
+            .checked_mul(sequence)?
+            .checked_mul(8)?;
+        hidden
+            .checked_add(mlp)?
+            .checked_add(scores)?
+            .checked_add(masks)?
+            .checked_add(8 * 1024 * 1024)
+    };
+    estimate().ok_or_else(|| {
         Error::new(
             ErrorCode::GpuAdmissionFailure,
-            "embedding attention admission estimate overflowed",
+            "embedding activation estimate overflowed",
         )
-    })?;
-    hidden
-        .checked_add(feed_forward)
-        .and_then(|bytes| bytes.checked_add(attention))
-        .and_then(|bytes| bytes.checked_add(8 * 1024 * 1024))
-        .ok_or_else(|| {
-            Error::new(
-                ErrorCode::GpuAdmissionFailure,
-                "embedding activation admission estimate overflowed",
-            )
-        })
+    })
 }
 
 #[cfg(feature = "accelerator")]
@@ -1628,9 +1148,8 @@ fn pool_truncate_normalize(
     let (batch, sequence_length, hidden_width) = hidden.dims3().map_err(embedding_error)?;
     if batch != 1
         || sequence_length != attention.len()
-        || hidden_width != PINNED_HIDDEN_SIZE
-        || output_width == 0
-        || output_width > hidden_width
+        || hidden_width != EMBEDDING_HIDDEN_SIZE
+        || output_width != hidden_width
     {
         return Err(Error::new(
             ErrorCode::EmbeddingUnavailable,
@@ -1668,8 +1187,6 @@ fn pool_truncate_normalize(
         )
     })?;
     normalize(&mut vector)?;
-    vector.truncate(output_width);
-    normalize(&mut vector)?;
     if vector.len() != output_width || vector.iter().any(|coordinate| !coordinate.is_finite()) {
         return Err(Error::new(
             ErrorCode::EmbeddingUnavailable,
@@ -1700,35 +1217,96 @@ fn normalize(vector: &mut [f32]) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn encoder_hash(tokenizer_hash: [u8; 32], config_hash: [u8; 32]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"irongraph-embedding-encoder-v1");
-    hasher.update(&tokenizer_hash);
-    hasher.update(&config_hash);
-    *hasher.finalize().as_bytes()
-}
-
 #[cfg(all(test, feature = "accelerator"))]
 mod tests {
     use super::*;
 
     #[test]
-    fn pooling_uses_only_visible_tokens_then_applies_matryoshka_normalization() -> crate::Result<()>
-    {
-        let mut values = vec![0.0_f32; 3 * PINNED_HIDDEN_SIZE];
+    #[ignore = "copies and loads the installed real encoder in two application directories"]
+    fn application_paths_real_encoder_uses_selected_model_and_cache() -> crate::Result<()> {
+        let root = tempfile::tempdir()?;
+        let source = crate::EmbeddingStorage::default()
+            .model_directory()?
+            .join("hotchpotch-bekko-embedding-v1-a8m")
+            .join(crate::DEFAULT_EMBEDDING_REVISION);
+        let mut first = None;
+        for app in ["app-a", "app-b"] {
+            let storage = crate::EmbeddingStorage {
+                model_dir: Some(root.path().join(app).join("models")),
+                cache_dir: Some(root.path().join(app).join("cache")),
+            };
+            let model_directory = storage
+                .model_directory()?
+                .join("hotchpotch-bekko-embedding-v1-a8m")
+                .join(crate::DEFAULT_EMBEDDING_REVISION);
+            std::fs::create_dir_all(&model_directory)?;
+            for file in [
+                crate::DEFAULT_EMBEDDING_MODEL_FILE,
+                crate::DEFAULT_EMBEDDING_CONFIG_FILE,
+                crate::DEFAULT_EMBEDDING_TOKENIZER_FILE,
+            ] {
+                std::fs::copy(source.join(file), model_directory.join(file))?;
+            }
+            let artifacts = crate::ensure_default_embedding_model_with_storage(
+                &storage,
+                &crate::ModelInstallProgress::default(),
+            )?;
+            assert!(
+                artifacts
+                    .model_safetensors
+                    .starts_with(storage.model_directory()?)
+            );
+            let encoder = LocalEmbeddingModel::load_with_storage(
+                artifacts.clone(),
+                EmbeddingDevice::Cpu,
+                &storage,
+            )?;
+            encoder.warm_up()?;
+            let texts = vec!["Application-owned embedding storage preserves complete searchable document content.".to_owned()];
+            let vector = encoder.embed_passages(&texts)?.remove(0);
+            assert_eq!(vector.len(), EMBEDDING_OUTPUT_SIZE);
+            assert!(vector.iter().all(|value| value.is_finite()));
+            assert!(encoder.cache.is_some(), "selected cache opens");
+            let cached = std::fs::read_dir(storage.cache_directory()?)?
+                .collect::<std::io::Result<Vec<_>>>()?;
+            assert_eq!(cached.len(), 1);
+            assert_eq!(
+                cached[0]
+                    .path()
+                    .extension()
+                    .and_then(|value| value.to_str()),
+                Some("vectors")
+            );
+            assert!(cached[0].metadata()?.len() > 0);
+            if let Some(first) = &first {
+                assert_eq!(&vector, first);
+            } else {
+                first = Some(vector.clone());
+            }
+            drop(encoder);
+            let reopened =
+                LocalEmbeddingModel::load_with_storage(artifacts, EmbeddingDevice::Cpu, &storage)?;
+            assert_eq!(reopened.embed_passages(&texts)?.remove(0), vector);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pooling_uses_only_visible_tokens_then_normalizes() -> crate::Result<()> {
+        let mut values = vec![0.0_f32; 3 * EMBEDDING_HIDDEN_SIZE];
         values[0] = 3.0;
         values[1] = 4.0;
-        values[PINNED_HIDDEN_SIZE] = 3.0;
-        values[PINNED_HIDDEN_SIZE + 1] = 4.0;
-        values[2 * PINNED_HIDDEN_SIZE] = 1_000.0;
+        values[EMBEDDING_HIDDEN_SIZE] = 3.0;
+        values[EMBEDDING_HIDDEN_SIZE + 1] = 4.0;
+        values[2 * EMBEDDING_HIDDEN_SIZE] = 1_000.0;
         let hidden = candle_core::Tensor::from_vec(
             values,
-            (1, 3, PINNED_HIDDEN_SIZE),
+            (1, 3, EMBEDDING_HIDDEN_SIZE),
             &candle_core::Device::Cpu,
         )
         .map_err(embedding_error)?;
-        let vector = pool_truncate_normalize(&hidden, &[1, 1, 0], PINNED_OUTPUT_SIZE)?;
-        assert_eq!(vector.len(), PINNED_OUTPUT_SIZE);
+        let vector = pool_truncate_normalize(&hidden, &[1, 1, 0], EMBEDDING_OUTPUT_SIZE)?;
+        assert_eq!(vector.len(), EMBEDDING_OUTPUT_SIZE);
         assert!((vector[0] - 0.6).abs() < 1e-6);
         assert!((vector[1] - 0.8).abs() < 1e-6);
         let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
@@ -1739,23 +1317,23 @@ mod tests {
     #[test]
     fn batched_pooling_matches_independent_rows_with_padding() -> crate::Result<()> {
         let sequence = 3;
-        let mut values = vec![0.0_f32; 2 * sequence * PINNED_HIDDEN_SIZE];
+        let mut values = vec![0.0_f32; 2 * sequence * EMBEDDING_HIDDEN_SIZE];
         for row in 0..2 {
             for token in 0..sequence {
-                for coordinate in 0..PINNED_OUTPUT_SIZE {
-                    values[(row * sequence + token) * PINNED_HIDDEN_SIZE + coordinate] =
+                for coordinate in 0..EMBEDDING_OUTPUT_SIZE {
+                    values[(row * sequence + token) * EMBEDDING_HIDDEN_SIZE + coordinate] =
                         (row * 17 + token * 5 + coordinate + 1) as f32;
                 }
             }
         }
         let hidden = candle_core::Tensor::from_vec(
             values,
-            (2, sequence, PINNED_HIDDEN_SIZE),
+            (2, sequence, EMBEDDING_HIDDEN_SIZE),
             &candle_core::Device::Cpu,
         )
         .map_err(embedding_error)?;
         let rows = vec![(vec![1, 2], vec![1, 1]), (vec![3, 4, 5], vec![1, 0, 1])];
-        let batched = pool_batch_truncate_normalize(&hidden, &rows, PINNED_OUTPUT_SIZE)?;
+        let batched = pool_batch_truncate_normalize(&hidden, &rows, EMBEDDING_OUTPUT_SIZE)?;
         for (row, (_, attention)) in rows.iter().enumerate() {
             let independent = pool_truncate_normalize(
                 &hidden
@@ -1763,7 +1341,7 @@ mod tests {
                     .and_then(|value| value.narrow(1, 0, attention.len()))
                     .map_err(embedding_error)?,
                 attention,
-                PINNED_OUTPUT_SIZE,
+                EMBEDDING_OUTPUT_SIZE,
             )?;
             assert_eq!(batched[row].len(), independent.len());
             assert!(
@@ -1774,12 +1352,6 @@ mod tests {
             );
         }
         Ok(())
-    }
-
-    #[test]
-    fn query_and_passage_prefixes_are_exact_and_distinct() {
-        assert_eq!(EmbeddingPurpose::Query.prefix(), "query: ");
-        assert_eq!(EmbeddingPurpose::Passage.prefix(), "passage: ");
     }
 
     #[test]
@@ -1838,9 +1410,121 @@ mod tests {
         let model = LocalEmbeddingModel::load(artifacts, device)?;
         let query = model.embed_query("durable graph memory")?;
         let passage = model.embed_passage("durable graph memory")?;
-        assert_eq!(query.len(), PINNED_OUTPUT_SIZE);
-        assert_eq!(passage.len(), PINNED_OUTPUT_SIZE);
-        assert_ne!(query, passage);
+        assert_eq!(query.len(), EMBEDDING_OUTPUT_SIZE);
+        assert_eq!(passage.len(), EMBEDDING_OUTPUT_SIZE);
+        assert_eq!(query, passage);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "downloads and executes Bekko on the selected real device"]
+    fn bekko_reference_vectors_and_batch_padding_match() -> crate::Result<()> {
+        let artifacts = super::super::install::ensure_default_embedding_model()?;
+        let requested = match std::env::var("IRONGRAPH_REAL_EMBEDDING_DEVICE").as_deref() {
+            Ok("cpu") => EmbeddingDevice::Cpu,
+            Ok("metal") => EmbeddingDevice::Metal(0),
+            Ok("cuda") => EmbeddingDevice::Cuda(0),
+            _ => EmbeddingDevice::Auto,
+        };
+        let mut model = LocalEmbeddingModel::load(artifacts, requested)?;
+        // Every device must execute inference; a persistent CPU cache must not mask GPU defects.
+        model.cache = None;
+        model.warm_up()?;
+        assert!(model.is_warm());
+        match requested {
+            EmbeddingDevice::Cpu => assert_eq!(model.backend_kind(), BackendKind::Cpu),
+            EmbeddingDevice::Metal(_) => assert_eq!(model.backend_kind(), BackendKind::Metal),
+            EmbeddingDevice::Cuda(_) => assert_eq!(model.backend_kind(), BackendKind::Cuda),
+            EmbeddingDevice::Auto => {
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                assert_eq!(model.backend_kind(), BackendKind::Metal);
+            }
+        }
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/bekko_reference.json"))
+                .map_err(|error| Error::new(ErrorCode::Internal, error.to_string()))?;
+        assert_eq!(
+            fixture["model"],
+            super::super::install::DEFAULT_EMBEDDING_MODEL_ID
+        );
+        assert_eq!(
+            fixture["revision"],
+            super::super::install::DEFAULT_EMBEDDING_REVISION
+        );
+        let texts: Vec<String> = serde_json::from_value(fixture["texts"].clone())
+            .map_err(|error| Error::new(ErrorCode::Internal, error.to_string()))?;
+        let expected: Vec<Vec<f32>> = serde_json::from_value(fixture["vectors"].clone())
+            .map_err(|error| Error::new(ErrorCode::Internal, error.to_string()))?;
+        let actual = model.embed_passages(&texts)?;
+        assert_eq!(actual.len(), texts.len());
+        for ((text, vector), reference) in texts.iter().zip(&actual).zip(&expected) {
+            assert_eq!(vector.len(), EMBEDDING_OUTPUT_SIZE);
+            assert!(vector.iter().all(|coordinate| coordinate.is_finite()));
+            let norm = vector
+                .iter()
+                .map(|coordinate| coordinate * coordinate)
+                .sum::<f32>();
+            assert!((norm - 1.).abs() < 1e-5);
+            let cosine = vector
+                .iter()
+                .zip(reference)
+                .map(|(left, right)| left * right)
+                .sum::<f32>();
+            assert!(cosine > 0.999, "reference cosine {cosine}: {text}");
+            let single = model.embed_passage(text)?;
+            let cosine = vector
+                .iter()
+                .zip(&single)
+                .map(|(left, right)| left * right)
+                .sum::<f32>();
+            assert!(cosine > 0.9999, "single/batch cosine {cosine}: {text}");
+            assert_eq!(single, model.embed_query(text)?);
+        }
+        let repeated = vec![texts[0].clone(), texts[1].clone(), texts[0].clone()];
+        let deduplicated = model.embed_passages(&repeated)?;
+        assert_eq!(deduplicated[0], deduplicated[2]);
+        let uneven = model.embed_passages(&[texts[0].clone(), texts[4].clone()])?;
+        for (vector, reference) in uneven.iter().zip([&expected[0], &expected[4]]) {
+            let cosine = vector
+                .iter()
+                .zip(reference)
+                .map(|(left, right)| left * right)
+                .sum::<f32>();
+            assert!(cosine > 0.999, "heavily padded batch cosine {cosine}");
+        }
+        assert_eq!(
+            model
+                .embed_passages_cancellable(&repeated, &|| true)
+                .unwrap_err()
+                .code,
+            ErrorCode::Cancelled
+        );
+        let source = "Árvíztűrő tükörfúrógép: complete graph document context. ".repeat(2000);
+        let windows = model.index_windows(&source)?;
+        assert!(windows.len() > 1);
+        let loaded = model.inner.lock();
+        for window in &windows {
+            assert!(source.contains(window));
+            assert!(
+                loaded
+                    .tokenizer
+                    .encode(window.as_str(), true)
+                    .unwrap()
+                    .len()
+                    <= EMBEDDING_WINDOW_TOKENS
+            );
+        }
+        assert!(source.starts_with(&windows[0]));
+        assert!(source.ends_with(windows.last().unwrap()));
+        drop(loaded);
+        assert_eq!(model.embed_passages(&windows[..2])?.len(), 2);
+        eprintln!(
+            "BEKKO_REAL_DEVICE_PASSED backend={:?} vectors={} dimension={} resident_bytes={}",
+            model.backend_kind(),
+            actual.len(),
+            EMBEDDING_OUTPUT_SIZE,
+            model.resident_weight_bytes()
+        );
         Ok(())
     }
 }
@@ -1856,7 +1540,7 @@ mod throughput {
     #[test]
     #[ignore = "loads the real encoder"]
     fn encoder_throughput() {
-        use super::{LocalEmbeddingModel, PINNED_OUTPUT_SIZE};
+        use super::{EMBEDDING_OUTPUT_SIZE, LocalEmbeddingModel};
 
         let Ok(artifacts) = crate::ensure_default_embedding_model() else {
             eprintln!("encoder is not installed; nothing to measure");
@@ -1907,7 +1591,7 @@ mod throughput {
 
         assert_eq!(one_at_a_time.len(), rows.min(4));
         assert_eq!(batched.len(), texts.len());
-        assert!(batched.iter().all(|row| row.len() == PINNED_OUTPUT_SIZE));
+        assert!(batched.iter().all(|row| row.len() == EMBEDDING_OUTPUT_SIZE));
 
         let per_single = single.as_secs_f64() / one_at_a_time.len().max(1) as f64;
         let per_batched = batch.as_secs_f64() / texts.len() as f64;
@@ -1917,116 +1601,5 @@ mod throughput {
             model.execution_device(),
             per_single / per_batched.max(f64::EPSILON)
         );
-
-        #[cfg(target_vendor = "apple")]
-        if std::env::var_os("IRONGRAPH_EMBED_COMPARE_CANDLE").is_some() {
-            let candle_texts = texts
-                .iter()
-                .enumerate()
-                .map(|(index, text)| format!("Candle comparison {nonce}-{index}: {text}"))
-                .collect::<Vec<_>>();
-            let coreml_buckets = {
-                let mut loaded = model.inner.lock();
-                std::mem::take(&mut loaded.coreml_buckets)
-            };
-            let started = std::time::Instant::now();
-            let candle = model
-                .embed_passages(&candle_texts)
-                .expect("Candle batched embed");
-            let candle_elapsed = started.elapsed();
-            {
-                let mut loaded = model.inner.lock();
-                loaded.coreml_buckets = coreml_buckets;
-            }
-            assert_eq!(candle.len(), candle_texts.len());
-            eprintln!(
-                "Candle comparison: {:.4}s/text total={:.3}s",
-                candle_elapsed.as_secs_f64() / candle_texts.len().max(1) as f64,
-                candle_elapsed.as_secs_f64()
-            );
-        }
-
-        #[cfg(target_vendor = "apple")]
-        if std::env::var_os("IRONGRAPH_EMBED_COMPARE_B8").is_some() {
-            let b8_texts = texts
-                .iter()
-                .enumerate()
-                .map(|(index, text)| format!("Core ML batch-eight {nonce}-{index}: {text}"))
-                .collect::<Vec<_>>();
-            let defaults = {
-                let mut loaded = model.inner.lock();
-                std::mem::take(&mut loaded.coreml_buckets)
-            };
-            let b8 = super::load_coreml_fixed(
-                &model.artifacts.model_safetensors,
-                "model-512-b8.mlpackage",
-                8,
-                512,
-            );
-            model.inner.lock().coreml_buckets = b8.into_iter().collect();
-            let started = std::time::Instant::now();
-            let vectors = model.embed_passages(&b8_texts).expect("Core ML b8 embed");
-            let elapsed = started.elapsed();
-            model.inner.lock().coreml_buckets = defaults;
-            assert_eq!(vectors.len(), b8_texts.len());
-            eprintln!(
-                "Core ML b8 comparison: {:.4}s/text total={:.3}s",
-                elapsed.as_secs_f64() / b8_texts.len().max(1) as f64,
-                elapsed.as_secs_f64()
-            );
-        }
-
-        #[cfg(target_vendor = "apple")]
-        if std::env::var_os("IRONGRAPH_EMBED_COMPARE_64").is_some() {
-            let (token_rows, baseline) = {
-                let loaded = model.inner.lock();
-                let token_rows = texts
-                    .iter()
-                    .map(|text| {
-                        super::tokenize_for(&loaded, super::EmbeddingPurpose::Passage, text)
-                            .expect("tokenize comparison row")
-                    })
-                    .collect::<Vec<_>>();
-                assert!(token_rows.iter().all(|(ids, _)| ids.len() <= 64));
-                let baseline = super::embed_coreml_fixed(
-                    loaded
-                        .coreml_buckets
-                        .iter()
-                        .find(|program| program.fixed_tokens == 512)
-                        .expect("512-token program"),
-                    &token_rows,
-                )
-                .expect("512-token baseline");
-                (token_rows, baseline)
-            };
-            let started = std::time::Instant::now();
-            let vectors = {
-                let loaded = model.inner.lock();
-                super::embed_coreml_fixed(
-                    loaded
-                        .coreml_buckets
-                        .iter()
-                        .find(|program| program.fixed_tokens == 64)
-                        .expect("64-token program"),
-                    &token_rows,
-                )
-                .expect("64-token bucket")
-            };
-            let elapsed = started.elapsed();
-            assert_eq!(vectors.len(), texts.len());
-            for (expected, actual) in baseline.iter().zip(&vectors) {
-                let cosine = expected
-                    .iter()
-                    .zip(actual)
-                    .map(|(left, right)| left * right)
-                    .sum::<f32>();
-                assert!(cosine > 0.999, "bucket changed embedding: {cosine}");
-            }
-            eprintln!(
-                "Core ML 64-token comparison: {:.4}s/text total={:.3}s",
-                elapsed.as_secs_f64() / texts.len().max(1) as f64,
-                elapsed.as_secs_f64()
-            );
-        }
     }
 }

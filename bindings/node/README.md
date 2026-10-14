@@ -60,7 +60,7 @@ Installation does not require a Rust compiler.
 ## Store and read a text document
 
 Choose a writable directory exclusively owned by your application process. Default startup
-downloads and verifies the local embedding model if absent, then loads and warms it. Allow
+downloads the local embedding model if absent, then loads and warms it. Allow
 network access and sufficient disk space on first use.
 
 ```javascript

@@ -25,6 +25,7 @@ function help() {
   npx irongraph start [--background] [--data-dir PATH]
                      [--http-addr LOOPBACK:PORT] [--execution-backend auto|cpu]
                      [--embedding-backend auto|cpu|metal|cuda]
+                     [--model-dir PATH] [--embedding-cache-dir PATH]
   npx irongraph status [--data-dir PATH]
   npx irongraph logs [--data-dir PATH]
   npx irongraph stop [--data-dir PATH]
@@ -53,7 +54,7 @@ function options(argv) {
     if (seen.has(flag)) throw new Error(`Repeated option: ${flag}`);
     seen.add(flag);
     if (flag === '--background' && command === 'start') result.background = true;
-    else if (flag === '--data-dir' || (command === 'start' && ['--http-addr', '--execution-backend', '--embedding-backend'].includes(flag))) {
+    else if (flag === '--data-dir' || (command === 'start' && ['--http-addr', '--execution-backend', '--embedding-backend', '--model-dir', '--embedding-cache-dir'].includes(flag))) {
       const value = argv.shift();
       if (!value || value.startsWith('--')) throw new Error(`${flag} requires a value.`);
       result[flag.slice(2)] = value;
@@ -300,6 +301,8 @@ async function start(opts, ctx) {
     if (previousStatus === 'unverified') throw new Error(`A live PID does not match the recorded IronGraph process. No process was signaled. Inspect ${ctx.state} before starting another instance.`);
     const native = nativePackage();
     const env = { ...process.env, IRONGRAPH_DATA_DIR: ctx.data, IRONGRAPH_EXECUTION_BACKEND: opts.backend, IRONGRAPH_EMBEDDING_BACKEND: opts.embeddingBackend };
+    if (opts['model-dir'] || env.IRONGRAPH_MODEL_DIR) env.IRONGRAPH_MODEL_DIR = path.resolve(opts['model-dir'] || env.IRONGRAPH_MODEL_DIR);
+    if (opts['embedding-cache-dir'] || env.IRONGRAPH_EMBEDDING_CACHE_DIR) env.IRONGRAPH_EMBEDDING_CACHE_DIR = path.resolve(opts['embedding-cache-dir'] || env.IRONGRAPH_EMBEDDING_CACHE_DIR);
     for (const [key, value] of Object.entries(DEFAULT_ADDRESSES)) env[key] ||= value;
     if (opts['http-addr']) env.IRONGRAPH_HTTP_ADDR = opts['http-addr'];
     await checkPorts(env);

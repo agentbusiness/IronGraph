@@ -1212,6 +1212,8 @@ pub enum IndexKind {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IndexDefinition {
     pub name: String,
+    #[serde(default)]
+    pub if_not_exists: bool,
     pub kind: IndexKind,
     pub variable: String,
     pub label: String,
@@ -1260,6 +1262,8 @@ pub struct RollupDefinition {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EmbeddingDefinition {
     pub name: String,
+    #[serde(default)]
+    pub if_not_exists: bool,
     pub variable: String,
     pub label: String,
     pub source_property: String,

@@ -1194,6 +1194,11 @@ impl<'source> Parser<'source> {
             return self.error("invalid CREATE INDEX form");
         };
         let name = self.identifier()?;
+        let if_not_exists = self.eat_word("IF");
+        if if_not_exists {
+            self.expect_word("NOT")?;
+            self.expect_word("EXISTS")?;
+        }
         self.expect_word("FOR")?;
         self.expect_symbol(Symbol::LeftParen)?;
         let variable = self.identifier()?;
@@ -1217,6 +1222,7 @@ impl<'source> Parser<'source> {
         self.expect_symbol(Symbol::RightParen)?;
         Ok(IndexDefinition {
             name,
+            if_not_exists,
             kind,
             variable,
             label,
@@ -1317,6 +1323,11 @@ impl<'source> Parser<'source> {
 
     fn create_embedding(&mut self) -> Result<EmbeddingDefinition> {
         let name = self.identifier()?;
+        let if_not_exists = self.eat_word("IF");
+        if if_not_exists {
+            self.expect_word("NOT")?;
+            self.expect_word("EXISTS")?;
+        }
         self.expect_word("FOR")?;
         self.expect_symbol(Symbol::LeftParen)?;
         let variable = self.identifier()?;
@@ -1342,6 +1353,7 @@ impl<'source> Parser<'source> {
         let similarity = self.identifier()?;
         Ok(EmbeddingDefinition {
             name,
+            if_not_exists,
             variable,
             label,
             source_property,

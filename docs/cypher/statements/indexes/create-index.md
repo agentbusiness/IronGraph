@@ -5,7 +5,7 @@
 | | |
 | --- | --- |
 | Kind | Statement |
-| Signature | `CREATE [RANGE\|TEXT\|VECTOR] INDEX <name> FOR (<var>:<Label>) ON (<var>.<property> [, <var>.<property> …])` |
+| Signature | `CREATE [RANGE\|TEXT\|VECTOR] INDEX <name> [IF NOT EXISTS] FOR (<var>:<Label>) ON (<var>.<property> [, <var>.<property> …])` |
 | Relationship to standard Cypher | IronGraph extension |
 | Reference dataset | [`flights`](../../datasets.md#flights) — OpenFlights airports, airlines and routes |
 
@@ -25,6 +25,17 @@ Several properties may be named, which builds one composite index rather than se
 The label and every property must already exist in the project's schema. A property that has never been written is not in the catalogue and the statement is rejected with `index property is not declared` — so an index is declared after the first write, not before it.
 
 Index names are unique within a project; re-declaring a name is rejected rather than replacing the index.
+
+Add `IF NOT EXISTS` after the name for repeatable application setup:
+
+```cypher
+USE catalog CREATE INDEX product_by_sku IF NOT EXISTS FOR (p:Product) ON (p.sku)
+```
+
+If that name already exists, the statement succeeds with zero updates and leaves the existing
+definition and index contents unchanged, even if you supply a different definition. It does not
+rebuild the index or verify that the existing definition matches. Without the guard, duplicate
+creation returns an error.
 
 An index changes cost, never answers. Every query returns the same rows with or without one. That also means an index can be dropped to test whether it was earning its keep.
 
@@ -91,7 +102,7 @@ book_title_text        | TEXT     | ONLINE | null
 ## Limitations and trade-offs
 
 - The label and properties must already exist; declare after the first write.
-- Index names are unique per project and re-declaring is rejected.
+- Index names are unique per project; use `IF NOT EXISTS` to leave an existing index unchanged.
 - An index is maintained on every write to the property it covers, so an unused one is pure cost.
 - Indexes are per project. A second project needs its own.
 

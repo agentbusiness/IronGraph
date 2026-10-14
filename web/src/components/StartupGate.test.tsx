@@ -29,10 +29,26 @@ describe('startup progress', () => {
   });
 
   it('keeps a startup failure visible with the actual cause', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(status('failed', 20, 'Model checksum verification failed')));
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(status('failed', 20, 'Model download was interrupted')));
     await act(async () => { render(<StartupGate><p>Console</p></StartupGate>); await Promise.resolve(); });
-    expect(screen.getByRole('alert')).toHaveTextContent('Model checksum verification failed');
+    expect(screen.getByRole('alert')).toHaveTextContent('Model download was interrupted');
     expect(screen.queryByText('Console')).not.toBeInTheDocument();
+  });
+
+  it('shows indeterminate progress until a download size is available', async () => {
+    vi.useFakeTimers();
+    const fetch = vi.fn().mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ phase: 'downloading', downloaded_bytes: 16, total_bytes: 0 }) })
+      .mockResolvedValueOnce(status('downloading', 50)).mockResolvedValue({ ok: true, json: () => Promise.resolve({ phase: 'ready', downloaded_bytes: 0, total_bytes: 0 }) });
+    vi.stubGlobal('fetch', fetch);
+    await act(async () => { render(<StartupGate><p>Console</p></StartupGate>); await Promise.resolve(); });
+    expect(screen.getByRole('progressbar')).not.toHaveAttribute('value');
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.queryByText(/NaN|Infinity|verifying/)).not.toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(screen.getByRole('progressbar')).toHaveAttribute('value', '50');
+    expect(screen.getByText(/50%/)).toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(screen.getByText('Console')).toBeInTheDocument();
   });
 
   it('stops polling and cancels in-flight status requests while hidden', async () => {

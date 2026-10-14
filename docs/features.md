@@ -117,7 +117,7 @@ CREATE (:Document {
 The document follows the normal transaction, WAL, and snapshot path. There is no document-specific
 REST endpoint or second document store. Source text remains complete on its owning node.
 
-The verified local text encoder installs, loads, binds to the selected device, and warms at startup
+The local Bekko a8m text encoder installs, loads, binds to the selected device, and warms at startup
 when embedding support is enabled. Encoder memory must be included in device-capacity planning.
 
 ## Transactions, recovery, and snapshots

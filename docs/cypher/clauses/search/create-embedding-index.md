@@ -6,7 +6,7 @@ Applications using automatic graph-wide semantic search do not need this stateme
 | | |
 | --- | --- |
 | Kind | Statement |
-| Signature | `CREATE EMBEDDING INDEX <name> FOR (<var>:<Label>) FROM <var>.<source> INTO <var>.<target> USING MODEL default SIMILARITY COSINE\|DOT\|EUCLIDEAN` |
+| Signature | `CREATE EMBEDDING INDEX <name> [IF NOT EXISTS] FOR (<var>:<Label>) FROM <var>.<source> INTO <var>.<target> USING MODEL default SIMILARITY COSINE\|DOT\|EUCLIDEAN` |
 | Relationship to standard Cypher | IronGraph extension |
 
 ## Prerequisites
@@ -14,6 +14,11 @@ Applications using automatic graph-wide semantic search do not need this stateme
 Select an existing project with `USE` and enable the local embedding model. The node label and source
 text property must exist. `INTO` names the index's vector field; IronGraph declares that field when
 needed. You do not need to write placeholder vectors to graph nodes.
+
+Use `IF NOT EXISTS` after the index name for repeatable setup. If the name already exists,
+the statement succeeds with zero updates, preserving the existing definition and vectors without
+generating embeddings or rebuilding the index. It does not check that the existing definition
+matches. Without this guard, duplicate creation returns an error.
 
 ## Create and search a field index
 
@@ -56,7 +61,7 @@ and maintains the vectors as text changes or nodes are deleted. Creation can fin
 embedding completes. The complete text stays on its original node. Generated vectors are
 derived index data; reading `document.embedding` does not return the generated vector.
 
-`MODEL` accepts `default`, the verified local model loaded by the database. The similarity must match
+`MODEL` accepts `default`, the local model loaded by the database. The similarity must match
 the active embedding profile. Vector search runs on the CPU. Text inference uses its independently
 selected CPU, Metal, or CUDA device.
 

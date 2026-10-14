@@ -205,10 +205,12 @@ pub enum EmbeddingPolicy {
     Disabled,
 }
 
-/// Options for one database process. Automatic embeddings install and warm the verified model.
+/// Options for one database process. Automatic embeddings install and warm the local model.
 #[derive(Clone, Debug)]
 pub struct EmbeddedOptions {
     pub data_dir: PathBuf,
+    pub model_dir: Option<PathBuf>,
+    pub embedding_cache_dir: Option<PathBuf>,
     pub execution_device: ExecutionDevice,
     pub embedding_device: EmbeddingDevice,
     pub embedding_policy: EmbeddingPolicy,
@@ -219,6 +221,8 @@ impl EmbeddedOptions {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: data_dir.into(),
+            model_dir: None,
+            embedding_cache_dir: None,
             execution_device: ExecutionDevice::Auto,
             embedding_device: EmbeddingDevice::Auto,
             embedding_policy: EmbeddingPolicy::Automatic,
@@ -238,6 +242,14 @@ impl EmbeddedOptions {
         self.embedding_device = device;
         self
     }
+    pub fn with_model_dir(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.model_dir = Some(directory.into());
+        self
+    }
+    pub fn with_embedding_cache_dir(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.embedding_cache_dir = Some(directory.into());
+        self
+    }
     fn json(self) -> Value {
         let (device, ordinal) = match self.execution_device {
             ExecutionDevice::Auto => ("auto", 0),
@@ -251,13 +263,32 @@ impl EmbeddedOptions {
             EmbeddingDevice::Metal(ordinal) => ("metal", ordinal),
             EmbeddingDevice::Cuda(ordinal) => ("cuda", ordinal),
         };
-        json!({"data_dir":self.data_dir,"execution_device":device,"device_ordinal":ordinal,"embedding_policy":self.embedding_policy,
+        json!({"data_dir":self.data_dir,"model_dir":self.model_dir,"embedding_cache_dir":self.embedding_cache_dir,"execution_device":device,"device_ordinal":ordinal,"embedding_policy":self.embedding_policy,
             "embedding_device":embedding_device,"embedding_device_ordinal":embedding_ordinal,
             "snapshot_interval_ms":self.snapshot_interval_ms,"worker_threads":self.worker_threads})
     }
 }
 
 struct Handle(Option<u64>, Option<tokio::sync::OwnedSemaphorePermit>);
+
+#[cfg(test)]
+mod application_paths_tests {
+    use super::*;
+
+    #[test]
+    fn application_paths_serialize_independent_storage_options() {
+        let options = EmbeddedOptions::new("app/data")
+            .with_model_dir("app/models")
+            .with_embedding_cache_dir("app/cache")
+            .json();
+        assert_eq!(options["data_dir"], "app/data");
+        assert_eq!(options["model_dir"], "app/models");
+        assert_eq!(options["embedding_cache_dir"], "app/cache");
+        let defaults = EmbeddedOptions::new("app/data").json();
+        assert!(defaults["model_dir"].is_null());
+        assert!(defaults["embedding_cache_dir"].is_null());
+    }
+}
 
 struct HandleTeardown {
     handle: u64,

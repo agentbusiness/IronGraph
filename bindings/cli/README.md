@@ -46,10 +46,9 @@ npx irongraph logs
 npx irongraph status
 ```
 
-Graph execution uses the CPU. Text inference selects its device independently; on a supported
-Mac, use `--embedding-backend metal`. On CPU-only hosts, including the published Linux packages,
-start with `npx irongraph start --background --embedding-backend cpu`. Automatic inference selection
-requires a supported accelerator. To run in the
+Graph execution uses the CPU. Text inference selects its device independently: automatic selection
+prefers a supported GPU and falls back to the CPU when no usable GPU is available. You can select
+CPU inference explicitly with `--embedding-backend cpu`. To run in the
 foreground with live terminal output, use `npx irongraph start` without `--background`.
 
 ### 3. Open the web console
@@ -178,7 +177,7 @@ your release. CUDA requires a package built with CUDA support.
 ## Start with a text document in Python
 
 You need Python 3.9 or later, a matching official wheel, and a writable directory owned by one
-application process. Default startup installs, verifies, loads, and warms the local embedding
+application process. Default startup downloads, loads, and warms the local Bekko a8m embedding
 model; allow network access and space for the model on first use.
 
 After configuring your official package source, install the binary package:

@@ -31,13 +31,9 @@ use crate::{Error, ErrorCode, Result};
 const KEY_BYTES: usize = 32;
 
 /// Bump only when the semantic embedding recipe changes without changing the public profile.
-/// Execution backends do not belong in this key: the Core ML program and Candle path implement the
-/// same pinned bidirectional/masked-average/Matryoshka recipe, and are numerically cross-validated.
-/// Keying on the backend would discard correct persisted vectors whenever execution is accelerated.
-/// Earlier caches did need invalidating after fixes to bidirectional attention and batched pooling,
-/// because those changed the actual recipe rather than merely how it was executed.
-const ENCODING_RECIPE_REVISION: &[u8] =
-    b"llama-nemotron-bidirectional-masked-average-matryoshka384-v2";
+/// CPU and GPU implement the same raw-text, masked-mean, normalized recipe. Device selection
+/// does not change the cache namespace; the model profile identifies the encoder revision.
+const ENCODING_RECIPE_REVISION: &[u8] = b"bekko-a8m-raw-text-masked-mean-normalized384-v1";
 
 /// Vectors the file may hold before the oldest are dropped.
 ///
@@ -79,17 +75,9 @@ impl EmbeddingCache {
     /// A cache that cannot be opened or parsed is not an error: the encoder still works, it is
     /// merely slower, and refusing to start because a cache file is unreadable would trade a
     /// performance feature for availability.
-    pub(super) fn open(profile_hash: &str, width: usize) -> Option<Self> {
-        let home = std::env::var("HOME").ok()?;
-        let directory = PathBuf::from(home).join(".irongraph").join("embeddings");
-        Self::open_in(&directory, profile_hash, width)
-    }
-
     /// Open a cache in a named directory.
     ///
-    /// Separate from [`Self::open`] so the location is an argument rather than an environment
-    /// variable — which is what lets a test exercise the real mapped read path without mutating the
-    /// process environment out from under every other test in the binary.
+    /// The location is an argument so each application can select its own storage.
     pub(super) fn open_in(directory: &Path, profile_hash: &str, width: usize) -> Option<Self> {
         std::fs::create_dir_all(directory).ok()?;
         let path = directory.join(format!("{profile_hash}.vectors"));
@@ -277,6 +265,39 @@ impl EmbeddingCache {
 #[cfg(test)]
 mod tests {
     use super::EmbeddingCache;
+
+    #[test]
+    fn application_paths_keep_vector_caches_separate_and_durable() {
+        let root = tempfile::tempdir().expect("temporary application roots");
+        let app_a = crate::EmbeddingStorage {
+            model_dir: Some(root.path().join("app-a/models")),
+            cache_dir: Some(root.path().join("app-a/cache")),
+        };
+        let app_b = crate::EmbeddingStorage {
+            model_dir: Some(root.path().join("app-b/models")),
+            cache_dir: Some(root.path().join("app-b/cache")),
+        };
+        let key = EmbeddingCache::key("same passage", 4);
+        let a_dir = app_a
+            .cache_directory()
+            .expect("application A cache directory");
+        let b_dir = app_b
+            .cache_directory()
+            .expect("application B cache directory");
+        let a = EmbeddingCache::open_in(&a_dir, "same-profile", 4).expect("A opens");
+        let b = EmbeddingCache::open_in(&b_dir, "same-profile", 4).expect("B opens");
+        a.put(&[(key, vec![0.5, -0.25, 0.125, 1.0])])
+            .expect("A writes");
+        assert_eq!(b.get(&key), None);
+        b.put(&[(key, vec![1.0, 0.0, 0.0, 0.0])]).expect("B writes");
+        drop((a, b));
+        let a = EmbeddingCache::open_in(&a_dir, "same-profile", 4).expect("A reopens");
+        let b = EmbeddingCache::open_in(&b_dir, "same-profile", 4).expect("B reopens");
+        assert_eq!(a.get(&key), Some(vec![0.5, -0.25, 0.125, 1.0]));
+        assert_eq!(b.get(&key), Some(vec![1.0, 0.0, 0.0, 0.0]));
+        assert!(!app_a.model_directory().expect("model directory").exists());
+        assert!(!app_b.model_directory().expect("model directory").exists());
+    }
 
     /// The key must change with the text and with the width, and not otherwise.
     #[test]

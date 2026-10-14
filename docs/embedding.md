@@ -8,7 +8,7 @@ embedding, and execution-device semantics as the standalone instance.
 
 Native queries and stream append/fetch execute inside your process. Opening an embedded database
 does not launch a database executable or open an HTTP, Bolt, Kafka, or AMQP listener. Automatic
-text-model installation requires network access when the verified model is not already installed.
+text-model installation requires network access when the model is not already installed.
 For graph and stream applications that do not use text embeddings, explicitly disable model loading.
 
 ## Decide whether embedding fits
@@ -83,6 +83,33 @@ boundary, and releases directory ownership. Independent query and stream calls a
 transaction. Always observe errors from explicit close.
 
 Runtime options include `worker_threads` and `snapshot_interval_ms`.
+
+## Keep embedding files with your application
+
+Automatic embedding uses `~/.irongraph/models` for downloaded models and
+`~/.irongraph/embeddings` for the rebuildable vector cache by default. Choose each directory
+independently when applications need separate storage:
+
+```python
+from irongraph import EmbeddedDatabase
+
+with EmbeddedDatabase("./app/data", model_dir="./app/models",
+                      embedding_cache_dir="./app/embedding-cache") as db:
+    db.query("CREATE PROJECT IF NOT EXISTS app")
+    assert db.query("USE app RETURN 1 AS ready")["rows"][0][0] == {"type": "integer", "value": "1"}
+```
+
+These directory options require SDKs built from the current source. The example requires the
+native Python package with embedding support and access to the model artifact
+source on first use. Startup installs and warms the model in the selected directory; the query
+returns `1`. Next, write your application records in project `app`.
+
+Rust accepts `EmbeddedOptions::with_model_dir` and `with_embedding_cache_dir`. Node.js accepts
+`modelDir` and `embeddingCacheDir` as the final two arguments of `EmbeddedDatabase.open`.
+For process-wide defaults, set `IRONGRAPH_MODEL_DIR` and `IRONGRAPH_EMBEDDING_CACHE_DIR` before
+startup. Explicit SDK paths take precedence. Relative paths resolve against the application's
+working directory. Selecting a new path does not move or delete existing files; an empty model
+directory triggers an installation. Database vectors remain in the database's normal durable data.
 Database operations have no configurable data, memory, concurrency, or duration quota.
 `status` reports readiness, the resolved data directory, and active operations. One handle can
 serve concurrent projects; asynchronous work waits for a worker without rejecting requests.
@@ -231,9 +258,10 @@ directory.
 
 Graph execution uses the CPU. Its `device` option accepts `auto` or `cpu`. Text inference is selected
 independently: `embedding_device` in Python accepts `auto`, `cpu`, `metal`, or `cuda`, with
-`embedding_device_ordinal` selecting an accelerator. Automatic selection uses the supported inference
-accelerator for the packaged build and platform.
-On CPU-only hosts, select CPU inference explicitly: use `embedding_device="cpu"` in Python,
+`embedding_device_ordinal` selecting an accelerator. Automatic selection prefers a supported GPU
+and falls back to the CPU when no usable GPU is available. The local encoder is Bekko a8m and
+produces normalized 384-dimensional vectors.
+To select CPU inference explicitly, use `embedding_device="cpu"` in Python,
 `with_embedding_device(ExecutionDevice::Cpu)` in Rust, or the `"cpu"` embedding-device argument
 in Node.js. Setting the graph execution device alone does not select the inference device.
 

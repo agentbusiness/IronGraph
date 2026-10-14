@@ -105,6 +105,61 @@ async fn concurrent_create_then_set_keeps_canonical_apply_healthy() -> Result<()
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_index_requests_terminate_and_guards_preserve_existing_schema() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let encoder = Arc::new(ContentEncoder::new()?);
+    encoder.paused.store(true, Ordering::Release);
+    let boot = open(directory.path(), encoder).await?;
+    let database = boot.backend().as_ref().clone();
+    let result = async {
+        query_async(&database, "CREATE PROJECT duplicate_indexes").await?;
+        query_async(&database, "USE duplicate_indexes CREATE (:Document {body:'contract', value:1})").await?;
+        for (kind, definition) in [
+            ("", "FOR (n:Document) ON (n.value)"),
+            ("RANGE ", "FOR (n:Document) ON (n.value)"),
+            ("TEXT ", "FOR (n:Document) ON (n.body)"),
+            ("EMBEDDING ", "FOR (n:Document) FROM n.body INTO n.vector USING MODEL default SIMILARITY COSINE"),
+        ] {
+            let name = format!("test_{}", kind.trim().to_lowercase());
+            let create = format!("USE duplicate_indexes CREATE {kind}INDEX {name} {definition}");
+            query_async(&database, &create).await?;
+            let id = database.resolve_project_name("duplicate_indexes")?;
+            let before = database.capture_canonical_project(id)?.0.indexes.optimizer_generation();
+            let mut request: QueryRequest = serde_json::from_value(serde_json::json!({
+                "request_id": Uuid::new_v4(), "query": create
+            })).map_err(|error| Error::internal(error.to_string()))?;
+            request.deadline = Some(Instant::now() + Duration::from_secs(1));
+            let db = database.clone();
+            let started = Instant::now();
+            let error = tokio::task::spawn_blocking(move || db.execute(request, &mut |_| Ok(())))
+                .await.map_err(|error| Error::internal(error.to_string()))?
+                .expect_err("unguarded duplicate must fail");
+            assert_eq!(error.code, ErrorCode::QueryType);
+            assert_eq!(error.message, "index already exists");
+            assert!(started.elapsed() < Duration::from_secs(1));
+            // Existing-name semantics ignore a different declaration, including absent schema.
+            let guarded = format!("USE duplicate_indexes CREATE {kind}INDEX {name} IF NOT EXISTS {definition}");
+            query_async(&database, &guarded).await?;
+            assert_eq!(database.capture_canonical_project(id)?.0.indexes.optimizer_generation(), before);
+        }
+        let guarded = "USE duplicate_indexes CREATE INDEX concurrent IF NOT EXISTS FOR (n:Document) ON (n.value)";
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let db = database.clone();
+            tasks.push(tokio::spawn(async move { query_async(&db, guarded).await }));
+        }
+        for task in tasks {
+            task.await.map_err(|error| Error::internal(error.to_string()))??;
+        }
+        query_async(&database, "USE duplicate_indexes CREATE INDEX concurrent IF NOT EXISTS FOR (n:Absent) ON (n.absent)").await?;
+        Ok::<_, Error>(())
+    }.await;
+    database.shutdown_embedding_jobs().await?;
+    boot.runtime().shutdown().await?;
+    result
+}
+
 struct ContentEncoder {
     profile: EmbeddingProfile,
     inputs: parking_lot::Mutex<Vec<String>>,

@@ -42,6 +42,10 @@ int main(int argc, char **argv) {
   fclose(state);
   printf("fixture ready: %s\n", address);
   printf("fixture embedding backend: %s\n", getenv("IRONGRAPH_EMBEDDING_BACKEND"));
+  const char *model_dir = getenv("IRONGRAPH_MODEL_DIR");
+  const char *cache_dir = getenv("IRONGRAPH_EMBEDDING_CACHE_DIR");
+  printf("fixture model directory: %s\n", model_dir ? model_dir : "default");
+  printf("fixture embedding cache directory: %s\n", cache_dir ? cache_dir : "default");
   printf("fixture MCP: %s %s\n", getenv("IRONGRAPH_MCP_BINARY"), getenv("IRONGRAPH_MCP_URL"));
   while (running) {
     int client = accept(listener, NULL, NULL);

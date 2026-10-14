@@ -25,6 +25,14 @@ pub struct Config {
     )]
     pub data_dir: PathBuf,
 
+    /// Directory containing downloaded embedding model versions.
+    #[arg(long, env = "IRONGRAPH_MODEL_DIR")]
+    pub model_dir: Option<PathBuf>,
+
+    /// Directory containing rebuildable passage-vector caches.
+    #[arg(long, env = "IRONGRAPH_EMBEDDING_CACHE_DIR")]
+    pub embedding_cache_dir: Option<PathBuf>,
+
     #[arg(long, env = "IRONGRAPH_HTTP_ADDR", default_value = "127.0.0.1:18484")]
     pub http_addr: SocketAddr,
 
@@ -124,6 +132,13 @@ fn default_data_dir() -> PathBuf {
 }
 
 impl Config {
+    #[must_use]
+    pub fn embedding_storage(&self) -> crate::embeddings::EmbeddingStorage {
+        crate::embeddings::EmbeddingStorage {
+            model_dir: self.model_dir.clone(),
+            cache_dir: self.embedding_cache_dir.clone(),
+        }
+    }
     #[must_use]
     pub const fn request_timeout(&self) -> Duration {
         Duration::ZERO
@@ -249,6 +264,28 @@ fn socket_addresses_conflict(left: SocketAddr, right: SocketAddr) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn application_paths_accept_independent_cli_directories() -> crate::Result<()> {
+        use clap::Parser;
+        let config = super::Config::try_parse_from([
+            "irongraph",
+            "--model-dir",
+            "app/models",
+            "--embedding-cache-dir",
+            "app/cache",
+        ])
+        .map_err(|error| crate::Error::invalid_data(error.to_string()))?;
+        let storage = config.embedding_storage();
+        assert_eq!(
+            storage.model_directory()?,
+            std::env::current_dir()?.join("app/models")
+        );
+        assert_eq!(
+            storage.cache_directory()?,
+            std::env::current_dir()?.join("app/cache")
+        );
+        Ok(())
+    }
     use std::path::PathBuf;
 
     use clap::Parser as _;

@@ -88,12 +88,15 @@ fn initialize_embedding(
     progress: Arc<StartupProgress>,
     database: Database,
     device: crate::embeddings::EmbeddingDevice,
+    storage: crate::embeddings::EmbeddingStorage,
 ) -> Result<()> {
-    let artifacts =
-        irongraph_embedding::ensure_default_embedding_model_with_progress(&progress.install)?;
+    let artifacts = irongraph_embedding::ensure_default_embedding_model_with_storage(
+        &storage,
+        &progress.install,
+    )?;
     *progress.phase.lock() = "loading";
-    let embedding = Arc::new(crate::embeddings::LocalEmbeddingModel::load(
-        artifacts, device,
+    let embedding = Arc::new(crate::embeddings::LocalEmbeddingModel::load_with_storage(
+        artifacts, device, &storage,
     )?);
     *progress.phase.lock() = "warming";
     embedding.warm_up()?;
@@ -109,6 +112,7 @@ async fn run_with_startup(
         Arc<StartupProgress>,
         Database,
         crate::embeddings::EmbeddingDevice,
+        crate::embeddings::EmbeddingStorage,
     ) -> Result<()>
     + Send
     + 'static,
@@ -270,12 +274,18 @@ async fn run_with_startup(
             .map_err(Error::from)
     }));
     let embedding_device = config.embedding_device();
+    let embedding_storage = config.embedding_storage();
     let embedding_database = database.clone();
     let embedding_shutdown = shutdown.clone();
     components.spawn(async move {
         let progress = Arc::clone(&startup);
         let mut initializer = tokio::task::spawn_blocking(move || {
-            initialize(progress, embedding_database, embedding_device)
+            initialize(
+                progress,
+                embedding_database,
+                embedding_device,
+                embedding_storage,
+            )
         });
         let initialized = tokio::select! {
             result = &mut initializer => result,
@@ -996,7 +1006,7 @@ mod tests {
         let server = tokio::spawn(run_with_startup(
             config,
             shutdown.clone(),
-            move |_progress, _database, _device| {
+            move |_progress, _database, _device, _storage| {
                 while !release.is_cancelled() {
                     std::thread::sleep(Duration::from_millis(5));
                 }

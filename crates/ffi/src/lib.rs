@@ -161,6 +161,8 @@ enum Request {
 #[serde(deny_unknown_fields)]
 struct OpenOptions {
     data_dir: PathBuf,
+    model_dir: Option<PathBuf>,
+    embedding_cache_dir: Option<PathBuf>,
     #[serde(default = "default_device")]
     execution_device: String,
     #[serde(default)]
@@ -225,6 +227,8 @@ impl OpenOptions {
             .with_execution_device(device)
             .with_embedding_device(embedding_device)
             .with_embedding_policy(embedding);
+        options.model_dir = self.model_dir;
+        options.embedding_cache_dir = self.embedding_cache_dir;
         if let Some(value) = self.snapshot_interval_ms {
             options.snapshot_interval = Duration::from_millis(value);
         }
@@ -513,6 +517,22 @@ pub unsafe extern "C" fn irongraph_buffer_free_v1(buffer: Buffer) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn application_paths_survive_native_option_decoding() {
+        let options: super::OpenOptions = serde_json::from_value(serde_json::json!({
+            "data_dir":"app/data", "model_dir":"app/models", "embedding_cache_dir":"app/cache"
+        }))
+        .unwrap();
+        let options = options.into_options().unwrap();
+        assert_eq!(
+            options.model_dir,
+            Some(std::path::PathBuf::from("app/models"))
+        );
+        assert_eq!(
+            options.embedding_cache_dir,
+            Some(std::path::PathBuf::from("app/cache"))
+        );
+    }
     #[test]
     fn direct_response_preserves_dirty_nested_values_and_float_precision() {
         use irongraph_client::QueryResult;

@@ -311,6 +311,8 @@ pub struct EmbeddedDatabase {
 #[napi]
 impl EmbeddedDatabase {
     #[napi(factory)]
+    // Optional trailing arguments preserve the existing JavaScript positional API.
+    #[allow(clippy::too_many_arguments)]
     pub async fn open(
         data_dir: String,
         device: Option<String>,
@@ -319,6 +321,8 @@ impl EmbeddedDatabase {
         budgets: Option<serde_json::Value>,
         embedding_device: Option<String>,
         embedding_device_ordinal: Option<u32>,
+        model_dir: Option<String>,
+        embedding_cache_dir: Option<String>,
     ) -> Result<Self> {
         let ordinal = device_ordinal.unwrap_or(0);
         let execution_device = match device.as_deref().unwrap_or("auto") {
@@ -361,6 +365,8 @@ impl EmbeddedDatabase {
         if let Some(budgets) = budgets {
             irongraph_embedded::configure_budgets(&mut options, budgets).map_err(node_error)?;
         }
+        options.model_dir = model_dir.map(Into::into);
+        options.embedding_cache_dir = embedding_cache_dir.map(Into::into);
         let admission = AdapterOwnerAdmission::reserve().map_err(node_error)?;
         let workers = Arc::new(napi::tokio::sync::Semaphore::new(
             options.worker_threads.saturating_mul(4),

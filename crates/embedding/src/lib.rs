@@ -1,4 +1,4 @@
-//! Automatic local text embedding and verified encoder artifacts.
+//! Automatic local text embedding with GPU-first inference and CPU fallback.
 
 #![allow(
     clippy::collapsible_if,
@@ -20,6 +20,7 @@ mod embedding_cache;
 #[cfg(feature = "accelerator")]
 mod encoder;
 mod install;
+mod paths;
 
 pub mod execution {
     pub use irongraph_execution::*;
@@ -56,10 +57,10 @@ pub mod graph {
 pub use device::EmbeddingDevice;
 pub use embedding::{EmbeddingModelArtifacts, LocalEmbeddingModel};
 pub use install::{
-    DEFAULT_EMBEDDING_CONFIG_BYTES, DEFAULT_EMBEDDING_CONFIG_FILE, DEFAULT_EMBEDDING_CONFIG_SHA256,
-    DEFAULT_EMBEDDING_MODEL_BYTES, DEFAULT_EMBEDDING_MODEL_FILE, DEFAULT_EMBEDDING_MODEL_SHA256,
-    DEFAULT_EMBEDDING_REVISION, DEFAULT_EMBEDDING_TOKENIZER_BYTES,
-    DEFAULT_EMBEDDING_TOKENIZER_FILE, DEFAULT_EMBEDDING_TOKENIZER_SHA256, ModelInstallProgress,
+    DEFAULT_EMBEDDING_CONFIG_FILE, DEFAULT_EMBEDDING_MODEL_FILE, DEFAULT_EMBEDDING_MODEL_ID,
+    DEFAULT_EMBEDDING_REVISION, DEFAULT_EMBEDDING_TOKENIZER_FILE, ModelInstallProgress,
     ensure_default_embedding_model, ensure_default_embedding_model_with_progress,
+    ensure_default_embedding_model_with_storage,
 };
 pub use irongraph_types::{EdgeId, Error, ErrorCode, NodeId, ProjectId, Result};
+pub use paths::EmbeddingStorage;

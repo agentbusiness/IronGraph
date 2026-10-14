@@ -66,7 +66,7 @@ startup additionally requires the embedding model to be installed before disconn
 ## Store and read a text document
 
 Use a writable directory exclusively owned by your application process. Default startup
-downloads and verifies the local embedding model if absent, then loads and warms it. Allow
+downloads the local embedding model if absent, then loads and warms it. Allow
 network access and sufficient disk space on first use.
 
 ```rust

@@ -56,7 +56,7 @@ npx irongraph status
 ```
 
 Open [http://127.0.0.1:18484/web/](http://127.0.0.1:18484/web/) after status reports that the
-instance is ready. The first embedding-enabled start can take longer while the verified local text
+instance is ready. The first embedding-enabled start can take longer while the local text
 encoder is installed, loaded, bound to the selected device, and warmed.
 
 The address is served by your local database;
@@ -87,6 +87,22 @@ Pass the same `--data-dir` to `status`, `logs`, and `stop` when managing this in
 Launcher state, logs, and runtime binaries live outside npm's package cache. Set
 `IRONGRAPH_CLI_HOME` to change their parent directory; this does not move your database or the
 embedding model cache. Use the same setting for every launcher command managing that instance.
+
+From a source checkout with Rust 1.94 or later installed, select model and rebuildable
+vector-cache directories separately for each application:
+
+```sh
+cargo run --release -- --data-dir ./app/data \
+  --model-dir ./app/models --embedding-cache-dir ./app/embedding-cache
+```
+
+The directories default to `~/.irongraph/models` and `~/.irongraph/embeddings`. The equivalent
+environment variables are `IRONGRAPH_MODEL_DIR` and `IRONGRAPH_EMBEDDING_CACHE_DIR`; explicit flags
+take precedence. Relative flag paths resolve against the launch directory. Existing files are
+not moved or deleted. An empty model directory requires access to the model artifact source and
+downloads its own copy. Open `http://127.0.0.1:18484/web/` to check readiness, then follow
+[Verify the installation](#verify-the-installation). This source command runs in the foreground;
+Ctrl-C stops it. The source launcher's `start` command accepts the same directory flags.
 
 ## Configure local listener addresses
 

@@ -101,6 +101,22 @@ test('embedding selection reaches the native process independently and flags ove
   assert.match((await c.run('logs')).stdout, /fixture embedding backend: metal/);
 });
 
+test('application embedding paths reach the native process and flags override environment', async (t) => {
+  const c = await setup(t, { IRONGRAPH_MODEL_DIR: 'environment models', IRONGRAPH_EMBEDDING_CACHE_DIR: 'environment cache' });
+  const model = 'app models';
+  const cache = 'app cache';
+  const started = await c.run('start', '--background', '--model-dir', model, '--embedding-cache-dir', cache);
+  assert.equal(started.code, 0, started.stderr);
+  const logs = (await c.run('logs')).stdout;
+  assert.ok(logs.includes(`fixture model directory: ${path.resolve(model)}`), logs);
+  assert.ok(logs.includes(`fixture embedding cache directory: ${path.resolve(cache)}`), logs);
+  assert.equal((await c.run('stop')).code, 0);
+  assert.equal((await c.run('start', '--background')).code, 0);
+  const inherited = (await c.run('logs')).stdout;
+  assert.ok(inherited.includes(`fixture model directory: ${path.resolve('environment models')}`), inherited);
+  assert.ok(inherited.includes(`fixture embedding cache directory: ${path.resolve('environment cache')}`), inherited);
+});
+
 test('background lifecycle persists data and executable outside npm cache', async (t) => {
   const c = await setup(t);
   assert.match((await c.run('status')).stdout, /stopped/);

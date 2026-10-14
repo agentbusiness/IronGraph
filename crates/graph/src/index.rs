@@ -2582,10 +2582,7 @@ impl IndexCatalog {
         }
         validate_definition(graph, definition)?;
         if self.contains(&definition.name) {
-            return Err(Error::new(
-                ErrorCode::TransactionConflict,
-                "index already exists",
-            ));
+            return Err(Error::new(ErrorCode::QueryType, "index already exists"));
         }
         if definition.kind == GraphIndexKind::Vector {
             let profile = self.profile.get().ok_or_else(|| {
@@ -2701,10 +2698,7 @@ impl IndexCatalog {
         }
         validate_definition(graph, &ordinary)?;
         if self.contains(&definition.name) {
-            return Err(Error::new(
-                ErrorCode::TransactionConflict,
-                "index already exists",
-            ));
+            return Err(Error::new(ErrorCode::QueryType, "index already exists"));
         }
         if definition.model.to_ascii_lowercase() != "default"
             || graph
@@ -2809,10 +2803,7 @@ impl IndexCatalog {
             ));
         }
         if self.contains(&definition.name) {
-            return Err(Error::new(
-                ErrorCode::TransactionConflict,
-                "index already exists",
-            ));
+            return Err(Error::new(ErrorCode::QueryType, "index already exists"));
         }
         if !definition.model.eq_ignore_ascii_case("default") {
             return Err(Error::new(
@@ -3072,10 +3063,7 @@ impl IndexCatalog {
         validate_definition(graph, &definition)?;
         let is_vector = definition.kind == GraphIndexKind::Vector;
         if self.entries.contains_key(&definition.name) {
-            return Err(Error::new(
-                ErrorCode::TransactionConflict,
-                "index already exists",
-            ));
+            return Err(Error::new(ErrorCode::QueryType, "index already exists"));
         }
         self.invalidate_optimizer_generation();
         if is_vector {
@@ -3186,10 +3174,7 @@ impl IndexCatalog {
         }
         self.activate_profile(profile.clone())?;
         if self.entries.contains_key(&definition.name) {
-            return Err(Error::new(
-                ErrorCode::TransactionConflict,
-                "index already exists",
-            ));
+            return Err(Error::new(ErrorCode::QueryType, "index already exists"));
         }
         self.invalidate_optimizer_generation();
         if definition.model.to_ascii_lowercase() != "default" {

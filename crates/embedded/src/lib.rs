@@ -11,7 +11,10 @@ use std::{
 
 use irongraph_client::{ClientError, Query, QueryResult};
 use irongraph_server::{
-    embeddings::{LocalEmbeddingModel, ensure_default_embedding_model},
+    embeddings::{
+        EmbeddingStorage, LocalEmbeddingModel, ModelInstallProgress,
+        ensure_default_embedding_model_with_storage,
+    },
     engine::{
         ExecutionClass, SingleNodeBootstrapConfig, WriteRuntime, WriteStorageLimits,
         open_standalone,
@@ -116,6 +119,19 @@ mod embedding_configuration_tests {
     use super::*;
 
     #[test]
+    fn application_paths_are_carried_independently_of_database_storage() {
+        let options = EmbeddedOptions::new("app/data")
+            .with_model_dir("app/models")
+            .with_embedding_cache_dir("app/cache");
+        assert_eq!(options.data_dir(), Path::new("app/data"));
+        assert_eq!(options.model_dir.as_deref(), Some(Path::new("app/models")));
+        assert_eq!(
+            options.embedding_cache_dir.as_deref(),
+            Some(Path::new("app/cache"))
+        );
+    }
+
+    #[test]
     fn cpu_graph_keeps_independent_embedding_selection() {
         let options = EmbeddedOptions::new("test-data").with_execution_device(ExecutionDevice::Cpu);
         assert_eq!(options.embedding_device, EmbeddingDevice::Auto);
@@ -159,6 +175,8 @@ pub struct EmbeddedOptions {
     pub execution_device: ExecutionDevice,
     pub embedding_device: EmbeddingDevice,
     pub embedding_policy: EmbeddingPolicy,
+    pub model_dir: Option<PathBuf>,
+    pub embedding_cache_dir: Option<PathBuf>,
     pub snapshot_interval: Duration,
     pub worker_threads: usize,
 }
@@ -171,6 +189,8 @@ impl EmbeddedOptions {
             execution_device: ExecutionDevice::Auto,
             embedding_device: EmbeddingDevice::Auto,
             embedding_policy: EmbeddingPolicy::Automatic,
+            model_dir: None,
+            embedding_cache_dir: None,
             snapshot_interval: DEFAULT_SNAPSHOT_INTERVAL,
             worker_threads: 2,
         }
@@ -196,6 +216,18 @@ impl EmbeddedOptions {
     #[must_use]
     pub fn with_embedding_device(mut self, embedding_device: EmbeddingDevice) -> Self {
         self.embedding_device = embedding_device;
+        self
+    }
+
+    #[must_use]
+    pub fn with_model_dir(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.model_dir = Some(directory.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_embedding_cache_dir(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.embedding_cache_dir = Some(directory.into());
         self
     }
 
@@ -339,13 +371,21 @@ impl EmbeddedCore {
 
         let embedding = if options.embedding_policy == EmbeddingPolicy::Automatic {
             let embedding_device = options.embedding_device;
+            let storage = EmbeddingStorage {
+                model_dir: options.model_dir.clone(),
+                cache_dir: options.embedding_cache_dir.clone(),
+            };
             let embedding_database = database.clone();
             Some(
                 tokio::task::spawn_blocking(move || {
-                    let artifacts = ensure_default_embedding_model()?;
-                    let embedding = std::sync::Arc::new(LocalEmbeddingModel::load(
+                    let artifacts = ensure_default_embedding_model_with_storage(
+                        &storage,
+                        &ModelInstallProgress::default(),
+                    )?;
+                    let embedding = std::sync::Arc::new(LocalEmbeddingModel::load_with_storage(
                         artifacts,
                         embedding_device,
+                        &storage,
                     )?);
                     embedding.warm_up()?;
                     embedding_database.bind_text_embedding(embedding.clone())?;

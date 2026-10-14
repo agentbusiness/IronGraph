@@ -2557,9 +2557,6 @@ impl Database {
             _ => {}
         }
         let project = self.resolve_project(request.project_id, &request.query)?;
-        if matches!(&parsed.statement, Statement::CreateEmbedding(_)) {
-            self.ensure_embedding_profile_activated(project)?;
-        }
         let (snapshot, captured_bookmark) = self.capture_canonical_project(project)?;
         let text_embedding = self.0.text_embedding.read().clone();
         let capabilities = full_capabilities();
@@ -2602,6 +2599,35 @@ impl Database {
             loop {
                 let (snapshot, planning_bookmark) = self.capture_canonical_project(project)?;
                 self.remaining_query_write_time(&request)?;
+                if index_creation_already_exists(&parsed.statement, &snapshot.indexes)? {
+                    self.ensure_apply_healthy()?;
+                    self.wait_for_captured_all(
+                        request.consistency,
+                        barrier_bookmark,
+                        planning_bookmark,
+                    )?;
+                    emit_catalog(
+                        Some(project),
+                        planning_bookmark,
+                        snapshot.graph.catalog(),
+                        &snapshot.indexes,
+                        emit,
+                    )?;
+                    emit(QueryStreamEvent::Schema {
+                        request_id: request.request_id,
+                        columns: Vec::new(),
+                    })?;
+                    return emit(QueryStreamEvent::Summary {
+                        request_id: request.request_id,
+                        bookmark: planning_bookmark,
+                        statistics: QueryStatistics::default(),
+                        truncated: false,
+                        truncation_reason: None,
+                    });
+                }
+                if matches!(&parsed.statement, Statement::CreateEmbedding(_)) {
+                    self.ensure_embedding_profile_activated(project)?;
+                }
                 let next_index = planning_bookmark
                     .index
                     .checked_add(1)
@@ -2663,6 +2689,18 @@ impl Database {
                 );
                 let (bookmark, _) = match committed {
                     Ok(committed) => committed,
+                    // A concurrent creator can win after the precheck. Recheck the guard
+                    // against canonical schema; validation rejected this request before WAL.
+                    Err(error)
+                        if error.code == ErrorCode::QueryType
+                            && error.message == "index already exists" =>
+                    {
+                        let (current, _) = self.capture_canonical_project(project)?;
+                        if index_creation_already_exists(&parsed.statement, &current.indexes)? {
+                            continue;
+                        }
+                        return Err(error);
+                    }
                     Err(error) if error.code == ErrorCode::TransactionConflict => {
                         self.ensure_apply_healthy()?;
                         continue;
@@ -6110,6 +6148,23 @@ fn validate_request_results(state: &DatabaseState) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Existing names are terminal errors unless the caller explicitly requested idempotence.
+fn index_creation_already_exists(statement: &Statement, indexes: &IndexCatalog) -> Result<bool> {
+    let (name, guarded) = match statement {
+        Statement::CreateIndex(definition) => (&definition.name, definition.if_not_exists),
+        Statement::CreateEmbedding(definition) => (&definition.name, definition.if_not_exists),
+        _ => return Ok(false),
+    };
+    if !indexes.contains(name) {
+        return Ok(false);
+    }
+    if guarded {
+        Ok(true)
+    } else {
+        Err(Error::new(ErrorCode::QueryType, "index already exists"))
+    }
 }
 
 fn refresh_optimizer_statistics(project: &ProjectState) {

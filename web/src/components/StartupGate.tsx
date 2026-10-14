@@ -23,8 +23,8 @@ function parseProgress(value: unknown): Progress {
   const data = value as Record<string, unknown>;
   if (typeof data.phase !== 'string' || !Object.hasOwn(LABEL, data.phase)
     || typeof data.downloaded_bytes !== 'number' || !Number.isSafeInteger(data.downloaded_bytes) || data.downloaded_bytes < 0
-    || typeof data.total_bytes !== 'number' || !Number.isSafeInteger(data.total_bytes) || data.total_bytes <= 0
-    || data.downloaded_bytes > data.total_bytes
+    || typeof data.total_bytes !== 'number' || !Number.isSafeInteger(data.total_bytes) || data.total_bytes < 0
+    || (data.total_bytes > 0 && data.downloaded_bytes > data.total_bytes)
     || (data.error != null && typeof data.error !== 'string')) throw new Error('Startup status is invalid.');
   return { phase: data.phase as Phase, downloaded_bytes: data.downloaded_bytes, total_bytes: data.total_bytes, error: data.error as string | undefined };
 }
@@ -69,7 +69,7 @@ export function StartupGate({ children }: { children: ReactNode }) {
 
   if (progress?.phase === 'ready') return children;
   const failed = progress?.phase === 'failed';
-  const percentage = progress ? Math.floor(progress.downloaded_bytes / progress.total_bytes * 100) : undefined;
+  const percentage = progress && progress.total_bytes > 0 ? Math.floor(progress.downloaded_bytes / progress.total_bytes * 100) : undefined;
   const bytes = (value: number) => `${(value / 1024 ** 3).toFixed(2)} GiB`;
   return (
     <main id="ig" data-view={theme === 'dark' ? 'plate' : theme === 'light' ? 'page' : 'auto'} className="drawn">
@@ -81,12 +81,12 @@ export function StartupGate({ children }: { children: ReactNode }) {
           <span className="ap faint">Preparing the console</span>
           <h1>{progress ? LABEL[progress.phase] : 'Connecting to the database'}</h1>
           <p className="empty-line" role="status">{progress?.phase === 'downloading'
-            ? 'Downloading and verifying the model files. This page updates automatically.'
+            ? 'Downloading the model files. This page updates automatically.'
             : failed ? 'Resolve the reported problem, then restart IronGraph.'
               : 'The console opens automatically when the embedding model is ready.'}</p>
           {progress && !failed && <>
-            <progress className="startup-progress" aria-label="Model download" max={progress.total_bytes} value={progress.downloaded_bytes} />
-            <p className="ap">{percentage}% · {bytes(progress.downloaded_bytes)} of {bytes(progress.total_bytes)}</p>
+            <progress className="startup-progress" aria-label="Model download" max={progress.total_bytes || undefined} value={percentage === undefined ? undefined : progress.downloaded_bytes} />
+            <p className="ap">{percentage === undefined ? `${bytes(progress.downloaded_bytes)} downloaded` : `${percentage}% · ${bytes(progress.downloaded_bytes)} of ${bytes(progress.total_bytes)}`}</p>
           </>}
           {(error || progress?.error) && <div className="notice contradiction" role="alert"><p>{error ?? progress?.error}</p></div>}
         </div>
