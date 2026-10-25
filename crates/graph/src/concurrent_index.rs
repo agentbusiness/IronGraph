@@ -239,9 +239,130 @@ impl<'de> Deserialize<'de> for ProfileCell {
 pub(super) struct Postings<K: Hash + Eq + Clone>(ConcurrentMap<K, Arc<PostingRows>>);
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct PostingRows {
-    values: ConcurrentMap<u32, ()>,
+    values: PostingValues,
     #[serde(skip)]
     writers: std::sync::atomic::AtomicUsize,
+}
+// Most equality keys (sids, paths, identifiers) own one row. A hash table per such key costs
+// several KiB before storing a single posting. Keep that row inline and allocate a shared
+// table only for genuinely multi-row keys. Readers never acquire the mutation mutex.
+#[derive(Debug, Default)]
+struct PostingValues {
+    inline: std::sync::atomic::AtomicU64,
+    spill: std::sync::OnceLock<ConcurrentMap<u32, ()>>,
+    writer: std::sync::Mutex<()>,
+}
+const SPILLED: u64 = u64::MAX;
+impl PostingValues {
+    fn insert(&self, row: u32, (): ()) {
+        use std::sync::atomic::Ordering;
+        let current = self.inline.load(Ordering::Acquire);
+        let value = u64::from(row) + 1;
+        match current {
+            0 => self.inline.store(value, Ordering::Release),
+            SPILLED => self
+                .spill
+                .get_or_init(ConcurrentMap::default)
+                .insert(row, ()),
+            current if current == value => {}
+            current => {
+                let spill = self.spill.get_or_init(ConcurrentMap::default);
+                spill.insert((current - 1) as u32, ());
+                spill.insert(row, ());
+                self.inline.store(SPILLED, Ordering::Release);
+            }
+        }
+    }
+    fn remove(&self, row: &u32) {
+        use std::sync::atomic::Ordering;
+        match self.inline.load(Ordering::Acquire) {
+            SPILLED => {
+                if let Some(spill) = self.spill.get() {
+                    spill.remove(row);
+                }
+            }
+            value if value == u64::from(*row) + 1 => self.inline.store(0, Ordering::Release),
+            _ => {}
+        }
+    }
+    fn len(&self) -> usize {
+        match self.inline.load(std::sync::atomic::Ordering::Acquire) {
+            0 => 0,
+            SPILLED => self.spill.get().map_or(0, ConcurrentMap::len),
+            _ => 1,
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn bounded(&self, limit: usize) -> Vec<u32> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        match self.inline.load(std::sync::atomic::Ordering::Acquire) {
+            0 => Vec::new(),
+            SPILLED => self.spill.get().map_or_else(Vec::new, |spill| {
+                spill.0.pin().keys().take(limit).copied().collect()
+            }),
+            value => vec![(value - 1) as u32],
+        }
+    }
+    fn rows(&self) -> roaring::RoaringBitmap {
+        match self.inline.load(std::sync::atomic::Ordering::Acquire) {
+            0 => roaring::RoaringBitmap::new(),
+            SPILLED => self
+                .spill
+                .get()
+                .map_or_else(roaring::RoaringBitmap::new, |spill| {
+                    spill.0.pin().keys().copied().collect()
+                }),
+            value => std::iter::once((value - 1) as u32).collect(),
+        }
+    }
+}
+impl Serialize for PostingValues {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        // Preserve the original map wire shape, including old checkpoints and postcard data.
+        match self.inline.load(std::sync::atomic::Ordering::Acquire) {
+            SPILLED => {
+                if let Some(spill) = self.spill.get() {
+                    spill.serialize(serializer)
+                } else {
+                    serializer.serialize_map(Some(0))?.end()
+                }
+            }
+            value => {
+                let mut map = serializer.serialize_map(Some(usize::from(value != 0)))?;
+                if value != 0 {
+                    map.serialize_entry(&((value - 1) as u32), &())?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+impl<'de> Deserialize<'de> for PostingValues {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = PostingValues;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a posting row map")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let result = PostingValues::default();
+                while let Some((row, value)) = map.next_entry::<u32, ()>()? {
+                    result.insert(row, value);
+                }
+                Ok(result)
+            }
+        }
+        deserializer.deserialize_map(Visitor)
+    }
 }
 const CLOSED: usize = usize::MAX / 2 + 1;
 impl<K: Hash + Eq + Clone> Default for Postings<K> {
@@ -269,6 +390,11 @@ impl<K: Hash + Eq + Clone> Postings<K> {
             {
                 continue;
             }
+            let _writer = rows
+                .values
+                .writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if insert {
                 rows.values.insert(row, ());
             } else {
@@ -294,14 +420,14 @@ impl<K: Hash + Eq + Clone> Postings<K> {
         self.edit(key.clone(), row, false);
     }
     pub fn rows(&self, key: &K) -> Option<roaring::RoaringBitmap> {
-        let rows: roaring::RoaringBitmap = self.0.get(key)?.values.keys().collect();
+        let rows = self.0.get(key)?.values.rows();
         (!rows.is_empty()).then_some(rows)
     }
     pub fn bounded(&self, key: &K, limit: usize) -> Vec<u32> {
         let Some(rows) = self.0.get(key) else {
             return Vec::new();
         };
-        let mut result: Vec<_> = rows.values.0.pin().keys().take(limit).copied().collect();
+        let mut result = rows.values.bounded(limit);
         result.sort_unstable();
         result
     }
@@ -316,5 +442,78 @@ impl<K: Hash + Eq + Clone> Postings<K> {
             .keys()
             .filter_map(|key| self.rows(&key).map(|rows| (key, rows)))
             .collect()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod posting_tests {
+    use super::*;
+
+    #[test]
+    fn unique_dirty_keys_do_not_allocate_posting_tables() {
+        let postings = Postings::default();
+        for row in 0..20_000_u32 {
+            postings.insert(format!("code:{row}:{}", "x".repeat(700)), row);
+        }
+        assert_eq!(postings.0.len(), 20_000);
+        for (_, rows) in &postings.0 {
+            assert_eq!(rows.values.len(), 1);
+            assert!(rows.values.spill.get().is_none());
+        }
+        let key = format!("code:0:{}", "x".repeat(700));
+        postings.insert(key.clone(), u32::MAX);
+        assert_eq!(postings.rows(&key).unwrap().len(), 2);
+        assert_eq!(postings.bounded(&key, 0), Vec::<u32>::new());
+        postings.remove(&key, 0);
+        assert_eq!(postings.bounded(&key, 1), vec![u32::MAX]);
+        postings.remove(&key, u32::MAX);
+        assert_eq!(postings.count(&key), 0);
+        assert!(!postings.0.contains_key(&key));
+    }
+
+    #[test]
+    fn posting_wire_shape_reads_old_maps_and_roundtrips_promoted_rows() -> crate::Result<()> {
+        #[derive(Serialize)]
+        struct OldRows {
+            values: std::collections::BTreeMap<u32, ()>,
+        }
+        for values in [vec![], vec![0], vec![u32::MAX], vec![0, 7, u32::MAX]] {
+            let old = OldRows {
+                values: values.iter().map(|row| (*row, ())).collect(),
+            };
+            let mut encoded = Vec::new();
+            ciborium::ser::into_writer(&old, &mut encoded)
+                .map_err(|e| crate::Error::internal(e.to_string()))?;
+            let rows: PostingRows = ciborium::de::from_reader(encoded.as_slice())
+                .map_err(|e| crate::Error::internal(e.to_string()))?;
+            assert_eq!(rows.values.rows().iter().collect::<Vec<_>>(), values);
+            let encoded =
+                postcard::to_stdvec(&rows).map_err(|e| crate::Error::internal(e.to_string()))?;
+            let recovered: PostingRows = postcard::from_bytes(&encoded)
+                .map_err(|e| crate::Error::internal(e.to_string()))?;
+            assert_eq!(recovered.values.rows(), rows.values.rows());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_posting_insert_remove_keeps_completed_rows() {
+        let postings = Postings::default();
+        std::thread::scope(|scope| {
+            for worker in 0..8_u32 {
+                let postings = &postings;
+                scope.spawn(move || {
+                    for iteration in 0..1000_u32 {
+                        let row = worker * 1000 + iteration;
+                        postings.insert(1, row);
+                        assert!(postings.rows(&1).is_some_and(|rows| rows.contains(row)));
+                        postings.remove(&1, row);
+                    }
+                    postings.insert(1, 10_000 + worker);
+                });
+            }
+        });
+        assert_eq!(postings.rows(&1).unwrap(), (10_000..10_008).collect());
     }
 }

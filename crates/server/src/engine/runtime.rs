@@ -844,6 +844,47 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn drop_completes_after_tokio_cooperative_budget_is_exhausted() -> Result<()> {
+        let executor = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+        let directory = tempfile::tempdir()?;
+        let identity = NodeIdentity::generate_genesis().public();
+        let backend = Arc::new(BatchedBackend {
+            applied: AtomicU64::new(0),
+            reservations: AtomicUsize::new(0),
+            first_apply_reservations: AtomicUsize::new(0),
+        });
+        let runtime = executor.block_on(WriteRuntime::start(
+            directory.path(),
+            StandaloneNode {
+                identity,
+                execution_class: ExecutionClass::Cpu,
+            },
+            backend,
+            WriteStorageLimits {
+                max_log_record_bytes: 1024 * 1024,
+                max_log_entries_per_read: 1024,
+                max_snapshot_bytes: 1024 * 1024,
+            },
+        ))?;
+        let (finished, completed) = mpsc::sync_channel(1);
+        executor.spawn(async move {
+            while tokio::task::coop::has_budget_remaining() {
+                tokio::task::consume_budget().await;
+            }
+            drop(runtime);
+            let _ = finished.send(());
+        });
+        let result = completed.recv_timeout(Duration::from_secs(3));
+        // A failed regression must report rather than hang while joining the stuck Tokio task.
+        executor.shutdown_background();
+        result.map_err(|error| Error::internal(format!("runtime drop did not finish: {error}")))?;
+        Ok(())
+    }
 }
 
 /// Exact term/index reserved by the local sequencer for a generated control write.
@@ -1204,8 +1245,11 @@ impl Drop for WriteRuntime {
     fn drop(&mut self) {
         if let Some(workers) = self.workers.get_mut().take() {
             let (reply, _response) = tokio::sync::oneshot::channel();
-            let _ =
-                futures::executor::block_on(self.writer_tx.send(WriterMessage::Shutdown(reply)));
+            // Drop cannot yield back to Tokio to renew an exhausted cooperative budget. Polling
+            // this bounded shutdown send on the synchronous executor must bypass that budget.
+            let _ = futures::executor::block_on(tokio::task::unconstrained(
+                self.writer_tx.send(WriterMessage::Shutdown(reply)),
+            ));
             let _ = join_workers(workers, &self.persistence_tx);
         }
     }

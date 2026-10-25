@@ -3713,10 +3713,25 @@ impl IndexCatalog {
     /// Collects bounded planner statistics without exposing or persisting derived pages.
     #[must_use]
     pub fn optimizer_statistics(&self) -> Vec<OptimizerIndexStatistics> {
+        self.optimizer_statistics_filtered(None)
+    }
+
+    /// Vector costing must not collect scalar/text posting statistics for unrelated indexes.
+    #[must_use]
+    pub fn vector_optimizer_statistics(&self) -> Vec<OptimizerIndexStatistics> {
+        self.optimizer_statistics_filtered(Some(GraphIndexKind::Vector))
+    }
+
+    fn optimizer_statistics_filtered(
+        &self,
+        kind: Option<GraphIndexKind>,
+    ) -> Vec<OptimizerIndexStatistics> {
         self.entries
             .iter()
             .filter_map(|(name, entry)| {
-                if entry.state != DerivedIndexState::Online {
+                if entry.state != DerivedIndexState::Online
+                    || kind.is_some_and(|kind| entry.definition.kind != kind)
+                {
                     return None;
                 }
                 let runtime = entry.runtime.as_deref()?;

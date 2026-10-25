@@ -5,6 +5,10 @@ const root = resolve(import.meta.dirname, '..');
 const read = (path) => readFileSync(resolve(root, path), 'utf8');
 const workspaceVersion = /^version = "([^"]+)"/m.exec(read('Cargo.toml'))?.[1];
 if (!workspaceVersion) throw new Error('workspace package version is missing');
+const pluginVersion = JSON.parse(read('integrations/agent-plugins/irongraph/plugin.json')).version;
+if (typeof pluginVersion !== 'string' || !/^\d+\.\d+\.\d+(?:-[\w.-]+)?(?:\+[\w.-]+)?$/.test(pluginVersion)) {
+  throw new Error('agent plugin version is missing or invalid');
+}
 
 for (const path of [
   'integrations/agent-plugins/irongraph/plugin.json',
@@ -13,14 +17,14 @@ for (const path of [
   'integrations/agent-plugins/irongraph/gemini-extension.json',
 ]) {
   const version = JSON.parse(read(path)).version;
-  if (version !== workspaceVersion) throw new Error(`${path} is ${version}; expected ${workspaceVersion}`);
+  if (version !== pluginVersion) throw new Error(`${path} is ${version}; expected ${pluginVersion}`);
 }
 
 const skill = read('integrations/agent-plugins/irongraph/skills/irongraph/SKILL.md');
 for (const capability of ['irongraph_run_cypher', 'irongraph_search', 'irongraph_save_document', 'irongraph_get_schema', 'irongraph_search_cypher_docs']) {
   if (!skill.includes(capability)) throw new Error(`skill does not route ${capability}`);
 }
-for (const phrase of ['any indexed node label', 'relationships and neighboring nodes', 'durable second brain']) {
+for (const phrase of ['across nodes and relationships', 'relationships and neighboring nodes', 'durable second brain']) {
   if (!skill.includes(phrase)) throw new Error(`skill is missing: ${phrase}`);
 }
 
@@ -41,4 +45,4 @@ for (const action of ["'install'", "'update'", "'repair'"]) {
 if (!app.includes("settings: '/web/settings'")) throw new Error('top-level Settings route is missing');
 if (!server.includes('"/system/local-ai-integrations"')) throw new Error('local Settings status endpoint is missing');
 
-console.log(`agent integration package verification passed (${workspaceVersion})`);
+console.log(`agent integration package verification passed (plugin ${pluginVersion}, database ${workspaceVersion})`);

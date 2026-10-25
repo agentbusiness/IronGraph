@@ -15434,6 +15434,67 @@ fn apply_operator_sequence_step(
     {
         let demand =
             downstream_unwind_row_demand(operators, operator_index, rows.first(), state, context)?;
+        if let Expression::Parameter(name) = expression
+            && let Some(ResultValue::List(values)) = context.parameters.get(name)
+        {
+            // Only fuse node lookup stages; writes, filters, projections, ordering and aggregation
+            // remain barriers. Endpoint reads all finish before any following mutation runs.
+            let suffix = &operators[operator_index + 1..];
+            let lookup_count = suffix
+                .iter()
+                .take_while(|operator| {
+                    matches!(operator,
+                        PhysicalOperator::ScanPattern { optional: false, pattern, .. }
+                            if pattern.steps.is_empty() && pattern.selector == PathSelector::All
+                                && (pattern.start.properties.len() != 1
+                                    || pattern_has_online_scalar_index(&pattern.start, state, context))
+                                && pattern.start.properties.iter().all(|(_, expression)| match expression {
+                                    Expression::Literal(_) | Expression::Parameter(_) | Expression::Variable(_) => true,
+                                    Expression::Property(source, _) => matches!(source.as_ref(), Expression::Variable(_) | Expression::Parameter(_)),
+                                    _ => false,
+                                })
+                    )
+                })
+                .count();
+            state.scope_columns.insert(variable.clone());
+            let mut output = Vec::new();
+            let mut expanded = 0usize;
+            for row in rows {
+                for value in values {
+                    if demand.is_some_and(|limit| expanded >= limit) {
+                        break;
+                    }
+                    check_execution(context)?;
+                    if expanded >= context.max_result_rows {
+                        return Err(Error::new(
+                            ErrorCode::ResultBudgetExceeded,
+                            "query row budget exceeded",
+                        ));
+                    }
+                    expanded += 1;
+                    let mut next = row.clone();
+                    next.insert(
+                        variable.clone(),
+                        checked_result_binding(value.clone(), context)?,
+                    );
+                    if lookup_count == 0 {
+                        output.push(next);
+                        continue;
+                    }
+                    let mut selected = vec![next];
+                    for lookup in &suffix[..lookup_count] {
+                        selected = apply_operator(lookup, selected, state, context, procedures)?;
+                    }
+                    output.extend(selected);
+                }
+            }
+            for lookup in &suffix[..lookup_count] {
+                if let PhysicalOperator::ScanPattern { pattern, .. } = lookup {
+                    extend_pattern_scope(&mut state.scope_columns, pattern);
+                }
+            }
+            return Ok((output, 1 + lookup_count));
+        }
         let rows = unwind_rows(rows, expression, variable, demand, state, context)?;
         state.scope_columns.insert(variable.clone());
         return Ok((rows, 1));
@@ -16928,6 +16989,9 @@ fn match_pattern_seed_filtered(
     state: &mut ExecutionState<'_>,
     context: &ExecutionContext<'_>,
 ) -> Result<Vec<Row>> {
+    if pattern.steps.is_empty() && pattern.selector == PathSelector::All && predicates.is_empty() {
+        return match_node_rows(input, pattern, access, optional, state, context);
+    }
     let mut output = Vec::new();
     for row in input {
         check_execution(context)?;
@@ -17008,6 +17072,198 @@ fn match_pattern_seed_filtered(
                 }
                 output.push(row);
             }
+        }
+    }
+    Ok(output)
+}
+
+/// Keep indexed lookups fused; leave unindexed single-property lookups together for batch seeding.
+fn pattern_has_online_scalar_index(
+    pattern: &NodePattern,
+    state: &ExecutionState<'_>,
+    context: &ExecutionContext<'_>,
+) -> bool {
+    context.scalar_indexes.is_some_and(|indexes| {
+        indexes.definitions().any(|definition| {
+            matches!(
+                definition.kind,
+                crate::graph::GraphIndexKind::Equality | crate::graph::GraphIndexKind::Range
+            ) && pattern
+                .labels
+                .iter()
+                .any(|label| state.graph.label(label) == Some(definition.label))
+                && definition.properties.iter().all(|property| {
+                    pattern
+                        .properties
+                        .iter()
+                        .any(|(name, _)| state.graph.property(name) == Some(*property))
+                })
+                && indexes.statuses().any(|status| {
+                    status.name == definition.name
+                        && status.state == crate::graph::DerivedIndexState::Online
+                })
+        })
+    })
+}
+
+/// A correlated string equality without an index scans once for the requested keys, rather than
+/// rescanning every unrelated node for each input row. Only requested keys and matching ordinals
+/// are scratch; source text and graph records stay canonical. The ordinary matcher rechecks rows.
+fn batch_string_node_seeds(
+    input: &[Row],
+    pattern: &NodePattern,
+    access: &super::ScanAccessPath,
+    state: &mut ExecutionState<'_>,
+    context: &ExecutionContext<'_>,
+) -> Result<Option<Vec<Vec<u32>>>> {
+    if input.len() < 2
+        || pattern.properties.len() != 1
+        || state.initial_scan_cap.is_some()
+        || current_backend(state, context).is_some()
+        || pattern
+            .variable
+            .as_ref()
+            .is_some_and(|name| input.iter().any(|row| row.contains_key(name)))
+    {
+        return Ok(None);
+    }
+    let (name, expression) = &pattern.properties[0];
+    let total = match expression {
+        Expression::Literal(ScalarValue::String(_)) | Expression::Parameter(_) => true,
+        Expression::Property(owner, _) => match owner.as_ref() {
+            Expression::Variable(name) => input
+                .iter()
+                .all(|row| matches!(row.get(name), Some(BindingValue::Map(_)))),
+            _ => false,
+        },
+        _ => false,
+    };
+    if !total {
+        return Ok(None);
+    }
+    let Some(labels) = pattern
+        .labels
+        .iter()
+        .map(|name| state.graph.label(name))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    let Some(property) = state.graph.property(name) else {
+        return Ok(None);
+    };
+    if host_index_candidates(&input[0], pattern, &labels, access, state, context)?.is_some() {
+        return Ok(None);
+    }
+    let mut keys = Vec::with_capacity(input.len());
+    let mut wanted = BTreeMap::<Arc<str>, Vec<u32>>::new();
+    for row in input {
+        check_execution(context)?;
+        let Ok(ResultValue::Scalar(ScalarValue::String(value))) =
+            evaluate_state(expression, row, state, context)
+        else {
+            return Ok(None);
+        };
+        wanted.entry(Arc::clone(&value)).or_default();
+        keys.push(value);
+    }
+    for dense in state
+        .graph
+        .scan_node_denses(labels.first().copied(), state.read_layers)
+    {
+        check_execution(context)?;
+        let Some(node) = state.graph.node_dense(dense) else {
+            continue;
+        };
+        if !labels.iter().all(|label| node.labels().contains(label)) {
+            continue;
+        }
+        if let Some(ScalarValue::String(value)) = node.property(property)
+            && let Some(rows) = wanted.get_mut(&value)
+        {
+            rows.push(dense);
+        }
+    }
+    Ok(Some(
+        keys.into_iter()
+            .map(|key| wanted.get(&key).cloned().unwrap_or_default())
+            .collect(),
+    ))
+}
+
+/// A node-only MATCH adds an ordinal to the existing row. Clone only when the match actually
+/// fans out; a single indexed endpoint must not recursively copy an UNWIND payload or build paths.
+fn match_node_rows(
+    input: Vec<Row>,
+    pattern: &Pattern,
+    access: &super::ScanAccessPath,
+    optional: bool,
+    state: &mut ExecutionState<'_>,
+    context: &ExecutionContext<'_>,
+) -> Result<Vec<Row>> {
+    let mut seeds = batch_string_node_seeds(&input, &pattern.start, access, state, context)?
+        .map(Vec::into_iter);
+    let mut output = Vec::new();
+    for mut row in input {
+        check_execution(context)?;
+        let mut selected = Vec::new();
+        let candidates = if let Some(seeds) = &mut seeds {
+            seeds
+                .next()
+                .ok_or_else(|| Error::internal("correlated scan omitted an input row"))?
+        } else {
+            node_start_denses(&row, &pattern.start, access, &[], state, context)?
+        };
+        for dense in candidates {
+            check_execution(context)?;
+            if !node_matches(dense, &pattern.start, &row, state, context)? {
+                continue;
+            }
+            if selected.len() >= context.max_result_rows {
+                return Err(Error::new(
+                    ErrorCode::ResultBudgetExceeded,
+                    "path match exceeded the result row budget",
+                ));
+            }
+            if let Some(node) = state.graph.node_dense(dense)
+                && let Some(base) = context.graph.node(node.id())
+            {
+                state
+                    .dependencies
+                    .entities
+                    .insert(EntityDependency::Node(node.id()), base.revision());
+            }
+            selected.push(dense);
+        }
+        if selected.is_empty() {
+            if optional {
+                bind_pattern_nulls(pattern, &mut row);
+                output.push(row);
+            }
+            continue;
+        }
+        let last = selected
+            .pop()
+            .ok_or_else(|| Error::internal("selected endpoint disappeared"))?;
+        for dense in selected.into_iter().chain(std::iter::once(last)) {
+            let mut next = if dense == last {
+                std::mem::take(&mut row)
+            } else {
+                row.clone()
+            };
+            if let Some(variable) = &pattern.start.variable {
+                next.insert(variable.clone(), BindingValue::Node(dense));
+            }
+            if let Some(variable) = &pattern.variable {
+                next.insert(
+                    variable.clone(),
+                    BindingValue::Path {
+                        nodes: vec![dense],
+                        relationships: Vec::new(),
+                    },
+                );
+            }
+            output.push(next);
         }
     }
     Ok(output)
@@ -17446,24 +17702,18 @@ fn canonical_integer_seed_candidates(
     Ok(Some(selected))
 }
 
-fn start_candidates_filtered(
+fn node_start_denses(
     row: &Row,
     pattern: &NodePattern,
     access: &super::ScanAccessPath,
-    record_dependencies: bool,
     predicates: &[&Expression],
     state: &mut ExecutionState<'_>,
     context: &ExecutionContext<'_>,
-) -> Result<Vec<(u32, Row)>> {
+) -> Result<Vec<u32>> {
     if let Some(variable) = &pattern.variable {
         if let Some(value) = row.get(variable) {
             return match value {
-                BindingValue::Node(dense)
-                    if node_matches(*dense, pattern, row, state, context)? =>
-                {
-                    Ok(vec![(*dense, row.clone())])
-                }
-                BindingValue::Node(_) => Ok(Vec::new()),
+                BindingValue::Node(dense) => Ok(vec![*dense]),
                 binding if binding_is_null(binding) => Ok(Vec::new()),
                 _ => Err(Error::new(
                     ErrorCode::QueryType,
@@ -17574,6 +17824,19 @@ fn start_candidates_filtered(
             candidates.retain(|row| selected.contains(row));
         }
     }
+    Ok(candidates)
+}
+
+fn start_candidates_filtered(
+    row: &Row,
+    pattern: &NodePattern,
+    access: &super::ScanAccessPath,
+    record_dependencies: bool,
+    predicates: &[&Expression],
+    state: &mut ExecutionState<'_>,
+    context: &ExecutionContext<'_>,
+) -> Result<Vec<(u32, Row)>> {
+    let candidates = node_start_denses(row, pattern, access, predicates, state, context)?;
     let mut result = Vec::new();
     for dense in candidates {
         check_execution(context)?;
@@ -17618,17 +17881,9 @@ fn host_index_candidates(
     state: &ExecutionState<'_>,
     context: &ExecutionContext<'_>,
 ) -> Result<Option<Vec<u32>>> {
-    // Prior-transaction mutations are not reflected in this view's node overlay, so a full scan is
-    // still required when they are present. Same-statement node mutations ARE captured by the overlay
-    // (`self.nodes`) and are unioned into the candidates below, so they no longer force a full scan.
-    // The scan itself runs entirely on the host view (`state.graph`, `node_matches`, `node_dense`),
-    // so a Metal backend no longer precludes the host index — under Apple unified memory the host
-    // store is the same physical memory the device reads. This is the fix that lets a correlated
-    // index join (e.g. `UNWIND ... MATCH (n:L {k: rowvalue}) ...`, the bulk edge-load pattern) use
-    // the equality index per row instead of scanning every node for every row.
-    if !context.prior_graph_mutations.is_empty() || !context.prior_temporal_mutations.is_empty() {
-        return Ok(None);
-    }
+    // transaction_graph_view applies prior-statement mutations before execution. Its modified-node
+    // ordinals are unioned below along with same-statement changes, and node_matches rechecks every
+    // candidate. Earlier edge or temporal writes therefore do not invalidate scalar node indexes.
     let Some(indexes) = context.scalar_indexes else {
         return Ok(None);
     };
@@ -18697,6 +18952,12 @@ fn set_map_item(
         }
     }
     for (property, value) in updates {
+        let current = target.property(state, property)?;
+        if current.as_ref() == Some(&value)
+            || (matches!(&value, ScalarValue::Null) && current.is_none())
+        {
+            continue;
+        }
         apply_mutation(state, target.mutation(property, value, state.revision))?;
         state.stats.properties_set = state.stats.properties_set.saturating_add(1);
     }
@@ -19889,6 +20150,10 @@ mod range_scheduling_tests;
 #[path = "traversal_seed_tests.rs"]
 mod traversal_seed_tests;
 
+#[cfg(test)]
+#[path = "unwind_write_tests.rs"]
+mod unwind_write_tests;
+
 #[path = "canonical_trail_count.rs"]
 mod canonical_trail_count;
 
@@ -19940,6 +20205,133 @@ mod materialized_value_order_tests {
                 BindingValue::Value(ResultValue::Scalar(ScalarValue::Integer(payload))),
             ),
         ])
+    }
+
+    fn correlated_string_fixture() -> Result<GraphStore> {
+        let graph = GraphStore::default();
+        let code = graph.catalog().intern_label("Code")?;
+        let file = graph.catalog().intern_label("File")?;
+        let sid = graph.catalog().intern_property("sid")?;
+        let body = graph.catalog().intern_property("body")?;
+        let dirty: Arc<str> = "unrelated complete source text ".repeat(4096).into();
+        for id in 1..=10_000 {
+            graph.insert_node(NodeInput {
+                id: NodeId(id),
+                layer: Layer::Observed,
+                revision: 1,
+                labels: vec![code],
+                properties: vec![(body, ScalarValue::String(Arc::clone(&dirty)))],
+            })?;
+        }
+        for (id, labels, layer, value) in [
+            (10_001, vec![code, file], Layer::Observed, "dup"),
+            (10_002, vec![code, file], Layer::Observed, "dup"),
+            (10_003, vec![code, file], Layer::Observed, "one"),
+            (10_004, vec![file], Layer::Observed, "dup"),
+            (10_005, vec![code, file], Layer::Workspace, "dup"),
+        ] {
+            graph.insert_node(NodeInput {
+                id: NodeId(id),
+                layer,
+                revision: 1,
+                labels,
+                properties: vec![(sid, ScalarValue::String(value.into()))],
+            })?;
+        }
+        Ok(graph)
+    }
+
+    #[test]
+    fn batched_unindexed_string_match_preserves_duplicates_labels_and_optional_rows() -> Result<()>
+    {
+        let graph = correlated_string_fixture()?;
+        let before = graph.resident_bytes();
+        for (matching, expected) in [
+            ("MATCH (n:Code:File {sid:r.sid})", 5),
+            ("OPTIONAL MATCH (n:Code:File {sid:r.sid})", 6),
+            ("MATCH (n:File {sid:r.sid})", 7),
+        ] {
+            let mut ctx = context(&graph);
+            ctx.next_node_id = 20_000;
+            ctx.max_result_rows = usize::MAX;
+            ctx.parameters.insert(
+                "rows".into(),
+                ResultValue::List(
+                    ["dup", "missing", "dup", "one"]
+                        .into_iter()
+                        .map(|value| {
+                            ResultValue::Map(BTreeMap::from([(
+                                "sid".into(),
+                                ResultValue::Scalar(ScalarValue::String(value.into())),
+                            )]))
+                        })
+                        .collect(),
+                ),
+            );
+            let output = QueryEngine.execute(
+                &format!("UNWIND $rows AS r {matching} RETURN n.sid"),
+                &mut ctx,
+            )?;
+            let rows = output
+                .result
+                .batches
+                .iter()
+                .map(|batch| batch.columns[0].values.len())
+                .sum::<usize>();
+            assert_eq!(rows, expected, "{matching}");
+            assert!(output.graph_mutations.is_empty());
+        }
+        assert_eq!(graph.resident_bytes(), before);
+        Ok(())
+    }
+
+    #[test]
+    fn batched_unindexed_string_match_observes_prior_writes_and_cancellation() -> Result<()> {
+        let graph = correlated_string_fixture()?;
+        let sid = graph
+            .catalog()
+            .property("sid")
+            .ok_or_else(|| Error::internal("missing test sid"))?;
+        let mutations = [GraphMutation::SetNodeProperty {
+            node: NodeId(10_003),
+            property: sid,
+            value: ScalarValue::String("dup".into()),
+            revision: 2,
+        }];
+        let mut ctx = context(&graph);
+        ctx.next_node_id = 20_000;
+        ctx.prior_graph_mutations = &mutations;
+        ctx.parameters.insert(
+            "rows".into(),
+            ResultValue::List(
+                ["dup", "one", "dup"]
+                    .into_iter()
+                    .map(|value| {
+                        ResultValue::Map(BTreeMap::from([(
+                            "sid".into(),
+                            ResultValue::Scalar(ScalarValue::String(value.into())),
+                        )]))
+                    })
+                    .collect(),
+            ),
+        );
+        let output = QueryEngine.execute(
+            "UNWIND $rows AS r MATCH (n:Code:File {sid:r.sid}) RETURN n.sid",
+            &mut ctx,
+        )?;
+        assert_eq!(output.result.batches[0].columns[0].values.len(), 6);
+        ctx.cancellation.cancel();
+        assert_eq!(
+            QueryEngine
+                .execute(
+                    "UNWIND $rows AS r MATCH (n:Code:File {sid:r.sid}) RETURN n.sid",
+                    &mut ctx
+                )
+                .err()
+                .map(|error| error.code),
+            Some(ErrorCode::Cancelled)
+        );
+        Ok(())
     }
 
     #[test]
@@ -24024,6 +24416,19 @@ fn evaluate_with_temporal(
                             _ => ScalarValue::Null,
                         };
                         return ResultValue::from_property(value);
+                    }
+                    Some(BindingValue::Map(values)) => {
+                        return values
+                            .get(property)
+                            .map(|value| binding_to_result(value, graph))
+                            .transpose()
+                            .map(|value| value.unwrap_or(ResultValue::Scalar(ScalarValue::Null)));
+                    }
+                    Some(BindingValue::Value(ResultValue::Map(values))) => {
+                        return Ok(values
+                            .get(property)
+                            .cloned()
+                            .unwrap_or(ResultValue::Scalar(ScalarValue::Null)));
                     }
                     _ => {}
                 }

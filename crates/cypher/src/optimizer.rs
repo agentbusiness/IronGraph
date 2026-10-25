@@ -1411,9 +1411,15 @@ fn select_vector_access_paths(
     layers: LayerMask,
     input: OptimizerInput<'_>,
 ) -> Vec<PhysicalOperator> {
+    if !operators
+        .iter()
+        .any(|operator| matches!(operator, PhysicalOperator::VectorSearch { .. }))
+    {
+        return operators;
+    }
     let index_statistics = input
         .indexes
-        .map(IndexCatalog::optimizer_statistics)
+        .map(IndexCatalog::vector_optimizer_statistics)
         .unwrap_or_default();
     let dimension = input
         .indexes

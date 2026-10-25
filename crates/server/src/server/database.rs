@@ -843,6 +843,10 @@ pub(super) struct DatabaseInner {
     reader_security: ArcSwap<SecurityState>,
     // Serializes local sequencer writes while the mutation is applied.
     pub(super) apply: Mutex<()>,
+    // Checkpoint packaging can continue after releasing apply. Serialize only checkpoint builds.
+    snapshot_build: Mutex<()>,
+    // Publication/pruning share one checkpoint directory, including its temporary attachments.
+    snapshot_publication: tokio::sync::Mutex<()>,
     pub(super) admission: AdmissionController,
     transactions: TransactionAdmissionRegistry,
     pub(super) request_timeout: Duration,
@@ -907,6 +911,8 @@ impl Database {
             reader_broker,
             reader_security,
             apply: Mutex::new(()),
+            snapshot_build: Mutex::new(()),
+            snapshot_publication: tokio::sync::Mutex::new(()),
             admission,
             transactions,
             request_timeout,
@@ -1213,6 +1219,7 @@ impl Database {
     /// bookmark. Broker/streaming payload segments are published beside the state file in a stable,
     /// content-addressed attachment directory before `LATEST` makes the snapshot visible.
     pub async fn standalone_snapshot(&self, dir: &Path) -> Result<Bookmark> {
+        let _publication = self.0.snapshot_publication.lock().await;
         let snapshot_dir = dir.to_owned();
         tokio::task::spawn_blocking(move || std::fs::create_dir_all(snapshot_dir))
             .await
@@ -2654,6 +2661,25 @@ impl Database {
                     text_embedding.as_deref(),
                     next_index,
                 )?;
+                if output.graph_mutations.is_empty()
+                    && output.temporal_mutations.is_empty()
+                    && administrative.is_none()
+                {
+                    self.ensure_apply_healthy()?;
+                    self.wait_for_captured_all(
+                        request.consistency,
+                        barrier_bookmark,
+                        planning_bookmark,
+                    )?;
+                    output.result.bookmark = planning_bookmark;
+                    return emit_result(
+                        request.request_id,
+                        output.result,
+                        snapshot.graph.catalog(),
+                        &snapshot.indexes,
+                        emit,
+                    );
+                }
                 let vectors = Vec::new();
                 let mutation = DatabaseMutation::Graph {
                     project,
@@ -3907,8 +3933,14 @@ fn embedding_freshness_updates(
 ) -> Result<Vec<(super::embedding_jobs::EmbeddingOwner, String, u64)>> {
     use super::embedding_jobs::EmbeddingOwner;
     use crate::types::EntityKind;
+    // With no encoder/index there are no vector freshness stamps to maintain. In particular,
+    // ordinary metadata writes must not walk adjacency just to discover an empty index set.
+    if project.indexes.profile().is_none() {
+        return Ok(Vec::new());
+    }
     let (dirty_nodes, dirty_edges) = embedding_changed_owners(project, mutations)?;
     let mut candidates = BTreeSet::new();
+    let mut changed_nodes = BTreeSet::new();
     for mutation in mutations {
         match mutation {
             GraphMutation::SetNodeProperty { node, .. } => {
@@ -3917,17 +3949,7 @@ fn embedding_freshness_updates(
                     kind: EntityKind::Node,
                     entity_id: node.0,
                 });
-                // Newly created owners have no prior embedding or canonical adjacency.
-                // Their inserted relationships are already covered by dirty_edges.
-                if project.graph.node(*node).is_some() {
-                    for edge in project.graph.incident_edge_ids(*node)? {
-                        candidates.insert(EmbeddingOwner {
-                            project: project.id,
-                            kind: EntityKind::Relationship,
-                            entity_id: edge.0,
-                        });
-                    }
-                }
+                changed_nodes.insert(*node);
             }
             GraphMutation::SetEdgeProperty { edge, .. } => {
                 candidates.insert(EmbeddingOwner {
@@ -3937,6 +3959,19 @@ fn embedding_freshness_updates(
                 });
             }
             _ => {}
+        }
+    }
+    // A map update can change many fields on the same owner. Visit its incident relationships
+    // once, rather than once per field. New owners have no canonical adjacency yet.
+    for node in changed_nodes {
+        if project.graph.node(node).is_some() {
+            for edge in project.graph.incident_edge_ids(node)? {
+                candidates.insert(EmbeddingOwner {
+                    project: project.id,
+                    kind: EntityKind::Relationship,
+                    entity_id: edge.0,
+                });
+            }
         }
     }
     let mut updates = Vec::new();
@@ -5433,6 +5468,7 @@ fn build_database_snapshot_file(
     bookmark: Bookmark,
     destination: &Path,
 ) -> Result<BackendSnapshot> {
+    let _snapshot = database.0.snapshot_build.lock();
     // Checkpoints represent an exact committed WAL prefix. Pause mutation application while
     // streaming the canonical state; do not create an in-memory graph generation for encoding.
     // Canonical concurrent graph readers do not acquire this writer ordering gate.
@@ -5477,9 +5513,7 @@ fn build_database_snapshot_file(
         })?;
         output.flush()?;
         drop(output);
-        crate::storage::sync_durable(&state_file)?;
         let state_bytes = state_file.metadata()?.len();
-        drop(state_file);
         let mut manifest = DatabaseCheckpointManifest {
             format_version: DATABASE_SNAPSHOT_FORMAT,
             store_id: database.0.store_id,
@@ -5488,6 +5522,12 @@ fn build_database_snapshot_file(
             state_checksum: None,
             broker_segments: state.broker.payload_segments(),
         };
+        // The encoded file now owns the exact committed prefix. Keep only immutable segment
+        // pins during packaging; neither filesystem durability nor checksum/copy passes need
+        // to stop graph writers. The intermediate file is never a recovery authority.
+        drop(state);
+        drop(_apply);
+        drop(state_file);
         let mut state_hash = checkpoint_state_hasher(&manifest)?;
         state_hash.update_reader(File::open(&state_path)?)?;
         manifest.state_checksum = Some(*state_hash.finalize().as_bytes());
@@ -9260,6 +9300,79 @@ mod project_lifecycle_tests {
             authority_revision: (revision).into(),
             optimizer_statistics: OnceLock::new().into(),
         }))
+    }
+
+    #[test]
+    fn metadata_map_updates_preserve_each_current_embedding_once() -> Result<()> {
+        let project = ordered_graph_project(ProjectId::random(), 1)?;
+        let property = project.graph.catalog().intern_property("body_hash")?;
+        let relationship_type = project.graph.catalog().intern_relationship_type("CALLS")?;
+        for id in 2..=129 {
+            project.graph.insert_node(NodeInput {
+                id: NodeId(id),
+                layer: crate::Layer::Observed,
+                revision: 1,
+                labels: vec![],
+                properties: vec![],
+            })?;
+            project.graph.insert_edge(crate::graph::EdgeInput {
+                id: crate::EdgeId(id),
+                source: NodeId(1),
+                target: NodeId(id),
+                relationship_type,
+                layer: crate::Layer::Observed,
+                revision: 1,
+                properties: vec![],
+            })?;
+        }
+        let mutations = (0..50)
+            .map(|_| GraphMutation::SetNodeProperty {
+                node: NodeId(1),
+                property,
+                value: ScalarValue::String(Arc::from("operational metadata ".repeat(4096))),
+                revision: 2,
+            })
+            .collect::<Vec<_>>();
+        assert!(embedding_freshness_updates(&project, &mutations)?.is_empty());
+        let profile = crate::graph::EmbeddingProfile::new(
+            [1; 32],
+            [2; 32],
+            2,
+            crate::graph::EmbeddingDType::F16,
+            true,
+            crate::graph::Similarity::Cosine,
+        )?;
+        project.indexes.initialize_semantic(profile.clone())?;
+        for (property, ids) in [
+            (crate::graph::SEMANTIC_NODE_PROPERTY, vec![1]),
+            (
+                crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY,
+                (2..=129).collect(),
+            ),
+        ] {
+            for entity_id in ids {
+                project
+                    .indexes
+                    .apply_vector_mutation(&ResolvedVectorMutation::Upsert {
+                        property,
+                        entity_id,
+                        coordinates: profile.quantize(&[1.0, 0.0])?,
+                        revision: 1,
+                    })?;
+            }
+        }
+        let updates = embedding_freshness_updates(&project, &mutations)?;
+        assert_eq!(updates.len(), 129);
+        assert_eq!(
+            updates
+                .iter()
+                .map(|(owner, _, _)| *owner)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            129
+        );
+        assert!(updates.iter().all(|(_, _, revision)| *revision == 1));
+        Ok(())
     }
 
     #[test]

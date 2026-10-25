@@ -436,6 +436,8 @@ fn meaningful_field(name: &str) -> bool {
         matches!(
             *word,
             "id" | "ids"
+                | "sid"
+                | "sids"
                 | "uuid"
                 | "guid"
                 | "metadata"
@@ -727,6 +729,7 @@ mod tests {
                 ("content", ScalarValue::Map(payload)),
                 ("api_key", string("hidden-credential")),
                 ("createdAt", string("hidden-timestamp")),
+                ("sid", string("hidden-stable-id")),
                 ("source_url", string("https://hidden.example")),
                 ("source", string("hidden-source-file.pdf")),
                 ("provenance", string("hidden-import-system")),
@@ -949,12 +952,21 @@ mod tests {
         let mut graph = GraphStore::default();
         insert_node(&mut graph, 1, "Person", vec![("name", string("Alice"))])?;
         let metadata = graph.catalog_mut().intern_property("syncRevision")?;
-        let mutations = [GraphMutation::SetNodeProperty {
-            node: NodeId(1),
-            property: metadata,
-            value: ScalarValue::Integer(19),
-            revision: 2,
-        }];
+        let sid = graph.catalog_mut().intern_property("sid")?;
+        let mutations = [
+            GraphMutation::SetNodeProperty {
+                node: NodeId(1),
+                property: metadata,
+                value: ScalarValue::Integer(19),
+                revision: 2,
+            },
+            GraphMutation::SetNodeProperty {
+                node: NodeId(1),
+                property: sid,
+                value: string("external:stable:id"),
+                revision: 2,
+            },
+        ];
         assert_eq!(
             semantic_text_delta(&graph, &[], &mutations)?,
             SemanticTextBatch::default()
