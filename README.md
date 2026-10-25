@@ -1,15 +1,22 @@
-# IronGraph
+<p align="center">
+  <img src="web/public/irongraph.svg" alt="IronGraph" width="96" height="96" />
+</p>
 
-**Embeddable Cypher graph database with sub-µs point reads, built-in streams, queues, and local text embeddings. Written in Rust.**
+<h1 align="center">IronGraph</h1>
 
-Embed IronGraph in **Python, Node.js, or Rust**, or run it as a standalone process. Query graphs,
-search vectors, inspect property history, and administer topics and queues with Cypher.
-Kafka and AMQP clients connect to the same database process. Local text embeddings run
-asynchronously on CPU, Metal, or CUDA; graph execution runs on the CPU.
+<p align="center">
+  <strong>Embeddable Cypher graph database with sub-µs point reads, built-in streams, queues, and local text embeddings. Written in Rust.</strong><br/>
+  Embed in Python, Node.js, or Rust, or run as a standalone database.<br/>
+  CPU graph execution. Asynchronous local embeddings on CPU, Metal, or CUDA.
+</p>
 
-**[Quickstart](docs/getting-started.md) · [Documentation](docs/README.md) ·
-[Cypher reference](docs/cypher/README.md) ·
-[Releases](https://github.com/agentbusiness/IronGraph/releases)**
+<p align="center">
+  <a href="docs/getting-started.md">Quickstart</a> ·
+  <a href="docs/README.md">Documentation</a> ·
+  <a href="docs/cypher/README.md">Cypher reference</a> ·
+  <a href="https://github.com/agentbusiness/IronGraph/releases">Releases</a> ·
+  <a href="LICENSE.txt">Apache-2.0</a>
+</p>
 
 ![IronGraph web console showing a Cypher query and the flights graph with relationships colored by community](docs/assets/irongraph-console.png)
 

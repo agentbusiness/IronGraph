@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>IronGraph connected cells</title>
+  <rect width="64" height="64" fill="#14171A"/>
+  <path d="M12 12H32V32H12Z M32 32H52V52H32Z M12 12 32 32 52 52" fill="none" stroke="#6E9BB5" stroke-width="1.6"/>
+  <g fill="#E9EBEC">
+    <rect x="8" y="8" width="8" height="8"/>
+    <rect x="28" y="8" width="8" height="8"/>
+    <rect x="8" y="28" width="8" height="8"/>
+    <rect x="48" y="28" width="8" height="8"/>
+    <rect x="28" y="48" width="8" height="8"/>
+    <rect x="48" y="48" width="8" height="8"/>
+  </g>
+  <rect x="27" y="27" width="10" height="10" fill="#E2603F"/>
+</svg>

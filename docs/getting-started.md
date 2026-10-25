@@ -1,4 +1,4 @@
-# Query your first graph
+# Start here
 
 In this guide, you will create a project, add a small graph, and find a path with Cypher. The example
 uses the built-in Query view and takes about five minutes after IronGraph is running.

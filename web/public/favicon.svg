@@ -1,9 +1,14 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect width="64" height="64" rx="15" fill="#171a22"/>
-  <path d="M19 20 32 13l13 7v15L32 51 19 43V20Z" fill="none" stroke="#8b96ff" stroke-width="4" stroke-linejoin="round"/>
-  <circle cx="19" cy="20" r="5" fill="#eef0ff"/>
-  <circle cx="45" cy="20" r="5" fill="#eef0ff"/>
-  <circle cx="32" cy="51" r="5" fill="#eef0ff"/>
-  <circle cx="32" cy="32" r="6" fill="#8b96ff"/>
-  <path d="m22 22 6 6m14-6-6 6m-2 10-2 8" stroke="#eef0ff" stroke-width="3" stroke-linecap="round"/>
+  <title>IronGraph connected cells favicon</title>
+  <rect width="64" height="64" fill="#14171A"/>
+  <path d="M12 12H32V32H12Z M32 32H52V52H32Z" fill="none" stroke="#6E9BB5" stroke-width="1.6"/>
+  <g fill="#E9EBEC">
+    <rect x="6" y="6" width="12" height="12"/>
+    <rect x="26" y="6" width="12" height="12"/>
+    <rect x="6" y="26" width="12" height="12"/>
+    <rect x="46" y="26" width="12" height="12"/>
+    <rect x="26" y="46" width="12" height="12"/>
+    <rect x="46" y="46" width="12" height="12"/>
+  </g>
+  <rect x="26" y="26" width="12" height="12" fill="#E2603F"/>
 </svg>
