@@ -11,6 +11,8 @@ asynchronously on CPU, Metal, or CUDA; graph execution runs on the CPU.
 [Cypher reference](docs/cypher/README.md) ·
 [Releases](https://github.com/agentbusiness/IronGraph/releases)**
 
+![IronGraph web console showing a Cypher query and the flights graph with relationships colored by community](docs/assets/irongraph-console.png)
+
 | Capability | Interface |
 | --- | --- |
 | Property graph and analytics | Cypher patterns, variable-length paths, PageRank, shortest paths, components, and communities |
