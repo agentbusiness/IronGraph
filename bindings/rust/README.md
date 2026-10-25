@@ -1,45 +1,11 @@
 # IronGraph for Rust
 
-**Rust access to a CPU graph database with built-in streaming and queues.**
+**Embeddable Cypher graph database with sub-µs point reads, built-in streams, queues, and local text embeddings. Rust SDK.**
 
 Use Cypher to query graph structure, search text and vectors, inspect property history, and
 administer the database. Built-in Kafka-compatible Streams and AMQP-compatible Queues handle event
 and message workloads. `irongraph-sdk` provides native embedded access and remote Query API/Bolt
 clients for Rust. IronGraph is open-source software released under the Apache License 2.0.
-
-## Performance at a glance
-
-Graph queries execute on the CPU against one shared canonical graph. Local text inference can
-use Metal or CUDA independently. Measure complete queries separately from individual graph operations;
-latency depends on the workload, graph size, indexes, and host.
-
-## Database capabilities
-
-| Capability | What you can do |
-| --- | --- |
-| **Graph queries and analytics** | Match relationships and paths with Cypher; run shortest paths, PageRank, connected components, and community detection. |
-| **Temporal properties and analysis** | Retain property history, read values with `AT TIME`, inspect samples with `HISTORY`, and aggregate with time windows and maintained rollups. |
-| **Text documents and search** | Store the full text of articles, notes, manuals, and other written content on graph nodes; search that text with text and vector indexes and automatic local embeddings. |
-| **Built-in Kafka-compatible Streams** | Produce and consume events through supported Kafka clients; manage topics, partitions, retention, and consumer-lag monitoring. |
-| **Built-in AMQP-compatible Queues** | Use classic and stream queues, direct/fanout/topic exchanges, bindings, and retention with supported AMQP clients. |
-
-Cypher handles graph operations, temporal analysis, search, and stream/queue administration.
-Message producers and consumers use the supported Kafka or AMQP protocols through the instance's
-configured listeners. The SDK query interface does not replace those protocol clients.
-
-Explicit projects and the `OBSERVED`, `KNOWLEDGE`, and `WORKSPACE` layers organize data.
-Indexes and unique constraints, transactions, asynchronous write-ahead logging, recovery, and
-periodic snapshots are part of the database.
-
-The standalone instance serves its web console at
-[http://127.0.0.1:18484/web/](http://127.0.0.1:18484/web/) by default and also supports local MCP
-access. Start the official standalone distribution before opening that address. Opening an
-embedded database through Python, Node.js, or Rust does not start a web server or expose the
-console. For a configured remote instance, use its HTTPS address followed by `/web/`, with
-the required browser-managed client certificate.
-
-Temporal reads apply to declared properties within their retention window. Graph topology and
-ordinary properties are read in their current state.
 
 ## Install
 
@@ -143,6 +109,34 @@ embeds text locally and does not run generative language models.
 Use `RemoteClient::api_mtls` or `RemoteClient::bolt_mtls` with `MutualTls` for remote access.
 Remote connections require mutual TLS and project authorization. Plain connections are
 loopback-only.
+
+## Database capabilities
+
+| Capability | What you can do |
+| --- | --- |
+| **Graph queries and analytics** | Match relationships and paths with Cypher; run shortest paths, PageRank, connected components, and community detection. |
+| **Temporal properties and analysis** | Retain property history, read values with `AT TIME`, inspect samples with `HISTORY`, and aggregate with time windows and maintained rollups. |
+| **Text documents and search** | Store the full text of articles, notes, manuals, and other written content on graph nodes; search that text with text and vector indexes and automatic local embeddings. |
+| **Built-in Kafka-compatible Streams** | Produce and consume events through supported Kafka clients; manage topics, partitions, retention, and consumer-lag monitoring. |
+| **Built-in AMQP-compatible Queues** | Use classic and stream queues, direct/fanout/topic exchanges, bindings, and retention with supported AMQP clients. |
+
+Cypher handles graph operations, temporal analysis, search, and stream/queue administration.
+Message producers and consumers use the supported Kafka or AMQP protocols through the instance's
+configured listeners. The SDK query interface does not replace those protocol clients.
+
+Explicit projects and the `OBSERVED`, `KNOWLEDGE`, and `WORKSPACE` layers organize data.
+Indexes and unique constraints, transactions, asynchronous write-ahead logging, recovery, and
+periodic snapshots are part of the database.
+
+The standalone instance serves its web console at
+[http://127.0.0.1:18484/web/](http://127.0.0.1:18484/web/) by default and also supports local MCP
+access. Start the official standalone distribution before opening that address. Opening an
+embedded database through Python, Node.js, or Rust does not start a web server or expose the
+console. For a configured remote instance, use its HTTPS address followed by `/web/`, with
+the required browser-managed client certificate.
+
+Temporal reads apply to declared properties within their retention window. Graph topology and
+ordinary properties are read in their current state.
 
 ## License
 

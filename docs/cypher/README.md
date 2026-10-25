@@ -30,7 +30,7 @@ them once and every example on every page becomes runnable.
 | [`epinions`](./datasets.md#epinions) | 75,879 | 508,837 | Centrality and component structure: PageRank, WCC, SCC, k-core, degree. |
 | [`dblp`](./datasets.md#dblp) | 322,080 | 1,162,094 | Community detection at scale, compared against published communities. |
 | [`citations`](./datasets.md#citations) | 58,572 | 352,807 | Text and document work: text indexes, string functions, dates, documents. |
-| [`library`](./datasets.md#library) | 8 | 0 | Vector and text search: the largest corpus for which the vector index publishes. |
+| [`library`](./datasets.md#library) | 8 | 0 | A compact paper collection for text and semantic-search examples. |
 | [`social`](./datasets.md#social) | 4,039 | 88,234 | Dense undirected neighbourhoods: triangle counting and clustering coefficient. |
 | [`email`](./datasets.md#email) | 1,005 | 24,929 | Small labelled graph with 42 known departments for checking community output. |
 | [`overflow`](./datasets.md#overflow) | 24,818 | 506,550 | Large timestamped interaction stream for windowed time analysis. |

@@ -1,177 +1,141 @@
 # IronGraph
 
-**An embeddable, CPU graph database with automatic local embeddings, streaming,
-and queues.**
+**Embeddable Cypher graph database with sub-µs point reads, built-in streams, queues, and local text embeddings. Written in Rust.**
 
-Run IronGraph inside a Python, Node.js, or Rust application, or connect to it as a standalone
-single-node database. Store relationships and complete text documents in the same graph. Declare
-text and vector indexes, and IronGraph automatically installs, verifies, loads, and warms its local
-embedding model on its independently selected inference device.
+Embed IronGraph in **Python, Node.js, or Rust**, or run it as a standalone process. Query graphs,
+search vectors, inspect property history, and administer topics and queues with Cypher.
+Kafka and AMQP clients connect to the same database process. Local text embeddings run
+asynchronously on CPU, Metal, or CUDA; graph execution runs on the CPU.
 
-Use Cypher to query graph structure, search text and vectors, inspect property history, and
-administer the database. Built-in Kafka-compatible Streams and AMQP-compatible Queues handle event
-and message workloads. The browser package provides a typed client and React hooks. IronGraph is
-open-source software released under the Apache License 2.0.
+**[Quickstart](docs/getting-started.md) · [Documentation](docs/README.md) ·
+[Cypher reference](docs/cypher/README.md) ·
+[Releases](https://github.com/agentbusiness/IronGraph/releases)**
 
-## Performance at a glance
+| Capability | Interface |
+| --- | --- |
+| Property graph and analytics | Cypher patterns, variable-length paths, PageRank, shortest paths, components, and communities |
+| Text and vector retrieval | Automatic embeddings for nodes and relationships; semantic search composed with graph queries |
+| Temporal properties | `AT TIME`, `HISTORY`, time windows, and maintained rollups |
+| Streams | Kafka-compatible producers and consumers; topic, retention, and consumer-lag administration in Cypher |
+| Queues | AMQP-compatible queues, exchanges, and bindings; classic and stream queues |
 
-Performance depends on the query, graph size, indexes, and host. Graph queries execute on the CPU;
-local text inference can use Metal or CUDA independently. Measure complete queries separately from
-individual graph operations.
+Projects isolate graphs and indexes. `OBSERVED`, `KNOWLEDGE`, and `WORKSPACE` distinguish source,
+curated, and provisional data. Embedded and standalone deployments share transactions,
+write-ahead logging, recovery, and snapshots. The standalone distribution includes a web console,
+Bolt, an HTTP Query API, and local MCP over stdio or Streamable HTTP.
 
-## Start the database and open the web console
+## Performance
 
-Use this path to run IronGraph as a standalone database with its built-in web console.
-Python, Node.js, and Rust embedding are separate options described below.
+**Submicrosecond node and relationship counts.** Recorded CPU benchmarks on an Apple M5 Pro
+measured median counts of **0.792 µs** and **0.791 µs**, respectively, on a graph with
+**100,000 nodes and 400,000 relationships**. These measure in-process query execution;
+SDK decoding and network transport add latency.
 
-### 1. Check the prerequisites
+## Install and run
 
-You need Node.js 20.17 or later with npm, and an official `irongraph` release available on npm
-for your platform: macOS 15+ ARM64, or Linux ARM64/AMD64 with glibc 2.28+. Before the first
-official publication, these npm commands are not an available installation channel.
-
-Use a writable local data directory owned exclusively by this database process. First startup
-also needs network access and several gigabytes of free storage for the automatically installed
-local text embedding model. The launcher selects a compiled database binary with the web console
-included. You do not need Python, a Rust compiler, or a separate frontend server.
-
-### 2. Start IronGraph
-
-Run this command to install the matching package as needed and start in the background:
+The standalone npm launcher requires Node.js 20.17 or later and a matching published platform
+package. Native release targets are macOS 15+ ARM64 and Linux ARM64/AMD64 with glibc 2.28+.
 
 ```sh
-npx irongraph start --background
+npx irongraph start --background --embedding-backend cpu
 ```
 
-Your data lives in `~/.irongraph/data`. The database keeps running after you close the terminal.
-Wait for startup and the embedding model's installation, loading, and warm-up to finish. Check
-progress and readiness with:
+Check readiness with `npx irongraph status`, then open the local console at
+[127.0.0.1:18484/web/](http://127.0.0.1:18484/web/). First startup downloads and prepares the
+embedding model; allow network access and several gigabytes of free storage. Data persists
+in `~/.irongraph/data`. Use `--embedding-backend metal` for Metal inference on a supported Mac.
 
-```sh
-npx irongraph logs
-npx irongraph status
-```
+Stop with `npx irongraph stop`. See [installation](docs/installation.md) for native archives,
+source builds, directories, and listener configuration.
 
-Graph execution uses the CPU. Text inference selects its device independently: automatic selection
-prefers a supported GPU and falls back to the CPU when no usable GPU is available. You can select
-CPU inference explicitly with `--embedding-backend cpu`. To run in the
-foreground with live terminal output, use `npx irongraph start` without `--background`.
+## Query a graph with Cypher
 
-### 3. Open the web console
-
-When status reports **ready**, open **[http://127.0.0.1:18484/web/](http://127.0.0.1:18484/web/)**
-in a browser on the same computer.
-This address belongs to your running local instance, not a public project page.
-
-The console provides Query, Streams, Documents (for text documents), Training, Docs, and
-Settings. The graph visualization is the Plot result view inside Query.
-
-### 4. Create your first project
-
-Click **New** in the top bar, enter `notes`, and click **Create project**. The console selects
-your new project. In **Query**, replace the editor contents with:
+Create a project, then run each statement separately in Query:
 
 ```cypher
-USE notes
-RETURN 'IronGraph is ready' AS status
+CREATE PROJECT recommendations
 ```
 
-Click **Run**, then select the **Table** result view. Expected result: a `status` column
-containing `IronGraph is ready`. Every graph operation needs
-an explicit project; IronGraph has no implicit default project. Next, open **Documents** to work
-with text documents in your project, or continue in Query to create nodes and relationships.
-
-### 5. Stop and restart
-
-For a background instance, run:
-
-```sh
-npx irongraph stop
+```cypher
+USE recommendations
+CREATE
+  (ada:Developer {name: 'Ada', language: 'Rust'}),
+  (lin:Developer {name: 'Lin', language: 'Python'}),
+  (mira:Developer {name: 'Mira', language: 'TypeScript'}),
+  (graph:Technology {name: 'Graph databases'}),
+  (ada)-[:RECOMMENDS]->(graph),
+  (lin)-[:FOLLOWS]->(ada),
+  (mira)-[:FOLLOWS]->(lin)
 ```
 
-For a foreground instance, press `Ctrl+C` and wait for the process to exit. Start again with
-`npx irongraph start --background` to reopen the same data directory. Your data persists between
-runs. Background mode does not install a system service or restart the database after a reboot.
+Find recommendations through one or more `FOLLOWS` relationships:
 
-### Configuration and direct binary use
+```cypher
+USE recommendations
+MATCH (developer:Developer)-[:FOLLOWS*1..]->(:Developer)-[:RECOMMENDS]->(topic:Technology)
+RETURN developer.name AS developer, topic.name AS recommendation
+ORDER BY developer
+```
 
-Choose another directory with `--data-dir /absolute/path`. Pass the same directory to `status`,
-`logs`, and `stop`. A second start cannot open a second managed instance on that directory.
-
-Local listener defaults are consistent across development and releases:
-
-| Surface | Loopback port |
+| developer | recommendation |
 | --- | --- |
-| Web console and Query API | `18484` |
-| Bolt | `18485` |
-| Kafka-compatible Streams | `18486` |
-| AMQP-compatible Queues | `18487` |
-| Local MCP HTTP | `18488` |
+| Lin | Graph databases |
+| Mira | Graph databases |
 
-The frontend development server uses `18489`; the standalone console is always served by the
-database's HTTP listener. Embedded libraries do not start these listeners.
+The [quickstart](docs/getting-started.md) includes graph visualization and a Python example.
+Every data query selects a project explicitly; there is no implicit default project.
 
-If the console does not open, check that the process is still running and startup completed.
-If port `18484` is already occupied, start with `--http-addr 127.0.0.1:19484` and open
-`http://127.0.0.1:19484/web/` instead. Keep plain listeners on loopback; access from another
-computer requires a configured remote listener with mutual TLS.
+## Streams and queues use Cypher too
 
-You can also extract the matching official standalone archive and run its executable directly,
-without Node.js or npm:
+In an existing project, create a Kafka-compatible topic:
 
-```sh
-./bin/irongraph --data-dir "$HOME/.irongraph/data" --http-addr 127.0.0.1:18484
+```cypher
+USE recommendations
+CREATE TOPIC activity PARTITIONS 12 RETENTION 30 DAYS
 ```
 
-Direct execution runs in the foreground. Stop it with `Ctrl+C`; launcher commands manage only
-instances started through the launcher. The archive also includes `bin/irongraph-mcp` for local
-stdio MCP hosts.
+Create an AMQP-compatible exchange and stream queue, then bind them. Run each statement separately:
 
-## Database capabilities
+```cypher
+USE recommendations CREATE EXCHANGE routing TYPE TOPIC
+```
 
-| Capability | What you can do |
-| --- | --- |
-| **Graph queries and analytics** | Match relationships and paths with Cypher; run shortest paths, PageRank, connected components, and community detection. |
-| **Temporal properties and analysis** | Retain property history, read values with `AT TIME`, inspect samples with `HISTORY`, and aggregate with time windows and maintained rollups. |
-| **Text documents and search** | Store the full text of articles, notes, manuals, and other written content on graph nodes; search that text with text and vector indexes and automatic local embeddings. |
-| **Built-in Kafka-compatible Streams** | Produce and consume events through supported Kafka clients; manage topics, partitions, retention, and consumer-lag monitoring. |
-| **Built-in AMQP-compatible Queues** | Use classic and stream queues, direct/fanout/topic exchanges, bindings, and retention with supported AMQP clients. |
+```cypher
+USE recommendations CREATE QUEUE updates STREAM RETENTION 14 DAYS
+```
 
-Cypher handles graph operations, temporal analysis, search, and stream/queue administration.
-Message producers and consumers use the supported Kafka or AMQP protocols through the instance's
-configured listeners. The SDK query interface does not replace those protocol clients.
+```cypher
+USE recommendations BIND QUEUE updates TO EXCHANGE routing KEY updates
+```
 
-Explicit projects and the `OBSERVED`, `KNOWLEDGE`, and `WORKSPACE` layers organize data.
-Indexes and unique constraints, transactions, asynchronous write-ahead logging, recovery, and
-periodic snapshots are part of the database.
+Producers and consumers use supported Kafka or AMQP clients. Cypher manages topics, queues,
+exchanges, bindings, retention, and consumer lag. See [streams and queues](docs/features.md#kafka-compatible-streams).
 
-The standalone instance serves its web console at
-[http://127.0.0.1:18484/web/](http://127.0.0.1:18484/web/) by default and also supports local MCP
-access. Start the official standalone distribution before opening that address. Opening an
-embedded database through Python, Node.js, or Rust does not start a web server or expose the
-console. For a configured remote instance, use its HTTPS address followed by `/web/`, with
-the required browser-managed client certificate.
+## Search nodes and relationships by meaning
 
-Temporal reads apply to declared properties within their retention window. Graph topology and
-ordinary properties are read in their current state.
+With local embeddings enabled and the automatic indexes `ONLINE`, search the same project:
 
-A project is an isolated graph with its own schema and indexes. `OBSERVED` holds source facts,
-`KNOWLEDGE` holds curated facts, and `WORKSPACE` holds provisional working data. There is no
-implicit default project.
+```cypher
+USE recommendations
+SEARCH entity IN (EMBEDDING INDEX graph_semantic
+                  FOR TEXT 'developers interested in graph databases' LIMIT 5)
+  SCORE AS score
+RETURN entity, score
+```
 
-Graph storage, queries, algorithms, and vector retrieval use one shared CPU graph. Parallel reads
-do not wait for a write and can observe changes from different points within a multi-record write.
-Text embeddings are generated asynchronously on the independently selected inference device.
+Results include ranked nodes and relationships. Embeddings are maintained asynchronously as
+content changes. Use [field-specific embedding indexes](docs/cypher/clauses/search/create-embedding-index.md)
+to select a particular text property, or supply your own vectors.
 
 ## Choose your package
 
 | Application | Package | Access |
 | --- | --- | --- |
 | Standalone database and web console | `irongraph` on npm, or native archive | Local process and remote listeners |
-| Python | `irongraph` | Embedded and remote |
-| Node.js | `@irongraph/node` | Embedded and remote |
-| Rust / Cargo | `irongraph-sdk` | Embedded and remote |
-| Browser / React | `@irongraph/client`, with `/react` exports | Remote Query API |
+| [Python](bindings/python/README.md) | `irongraph` | Embedded and remote |
+| [Node.js](bindings/node/README.md) | `@irongraph/node` | Embedded and remote |
+| [Rust / Cargo](bindings/rust/README.md) | `irongraph-sdk` | Embedded and remote |
+| [Browser / React](bindings/javascript/README.md) | `@irongraph/client`, with `/react` exports | Remote Query API |
 
 Install from the official package source or artifact bundle supplied with your release. An
 installation command requires the matching release to be available in that source. Native

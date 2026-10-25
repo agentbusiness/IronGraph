@@ -1,7 +1,7 @@
 # Features
 
-IronGraph brings graph storage, Cypher, analytics, vector search, and compatible event protocols
-into one CPU, single-node database. This page highlights the supported capabilities and the
+IronGraph is an embeddable Cypher graph database with sub-µs point reads, analytics, vector search, local text embeddings,
+Kafka-compatible streams, and AMQP-compatible queues. This page highlights the supported capabilities and the
 operating boundaries that accompany them.
 
 ## Cypher-native graph development

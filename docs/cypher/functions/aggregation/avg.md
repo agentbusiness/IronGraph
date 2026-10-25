@@ -98,5 +98,5 @@ window_start        | ratings | mean  | median | skew
 
 ## See also
 
-- [`percentilecont`](../aggregation/percentilecont.md) for the median
-- [`stdev`](./stdev.md) for how spread the values are
+- [`percentilecont`](./percentiles/percentilecont.md) for the median
+- [`stdev`](./dispersion/stdev.md) for how spread the values are

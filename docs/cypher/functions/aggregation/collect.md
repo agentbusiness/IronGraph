@@ -120,4 +120,4 @@ account | strongly_endorsed | endorsed_back_by | reciprocity_percent | mean_rati
 ## See also
 
 - [`count`](./count.md) when only the size matters
-- [`size`](../collection/size.md) to measure the resulting list
+- `size` to measure the resulting list

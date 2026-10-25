@@ -1,6 +1,6 @@
 # Architecture
 
-IronGraph is a standalone, CPU, single-node graph database. It combines a property graph,
+IronGraph is an embeddable Cypher graph database with sub-µs point reads, standalone deployment, and CPU execution on one host. It combines a property graph,
 Cypher, transactions, durable storage, graph analytics, vector search, and compatible streaming
 protocols in one database process.
 

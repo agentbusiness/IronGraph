@@ -7,7 +7,7 @@ application process.
 ## Choose a distribution
 
 IronGraph is open-source software released under the Apache License 2.0. Build it from source or use
-a published package that matches your platform. Do not assume an unpublished package is available.
+a published package that matches your platform. Choose a published package or archive for your platform.
 
 For the npm launcher, install Node.js 20.17 or later with npm. The official `irongraph` package and
 its matching platform package must be published on npm before using the commands below. Supported
@@ -35,7 +35,7 @@ later. Available operating-system and processor builds depend on the current dis
 Start a database that keeps running after you close the terminal:
 
 ```sh
-npx irongraph start --background
+npx irongraph start --background --embedding-backend cpu
 ```
 
 The local defaults are:
@@ -68,8 +68,7 @@ Use `npx irongraph start` without `--background` for foreground execution. Keep 
 open, and press `Ctrl+C` to stop cleanly. Graph execution uses the CPU. Add
 `--embedding-backend metal` to select Metal text inference on a supported Mac.
 On CPU-only hosts, including the published Linux packages, start with
-`npx irongraph start --background --embedding-backend cpu`. Automatic inference selection requires
-a supported accelerator.
+`npx irongraph start --background --embedding-backend cpu`. Use `--embedding-backend metal` on a supported Mac for GPU text inference.
 
 ## Choose the local data directory
 

@@ -1,4 +1,4 @@
-# Start here
+# Query your first graph
 
 In this guide, you will create a project, add a small graph, and find a path with Cypher. The example
 uses the built-in Query view and takes about five minutes after IronGraph is running.
@@ -94,9 +94,16 @@ RETURN source, relationship, target
 In the result panel, select **Plot**. The graph visualization contains four nodes and three
 relationships. This view visualizes the same data returned by Cypher; it is not a separate store.
 
-## Use the same example from Python
+## Query from Python
 
-Embedded applications run the same Cypher and use a directory chosen by the caller:
+With Python 3.9 or later and a matching native wheel, install the SDK:
+
+```sh
+python -m pip install --only-binary=:all: irongraph
+```
+
+Save this as `example.py` and run `python example.py`. It opens a separate embedded database;
+it does not connect to the standalone project above.
 
 ```python
 from irongraph import EmbeddedDatabase
@@ -134,6 +141,6 @@ avoids constructing queries through string interpolation.
 
 ## Where to go next
 
-- Read [Architecture](architecture.md) to understand projects, layers, residency, and durability.
+- Read [Architecture](architecture.md) to understand projects, layers, memory, and durability.
 - Read [Embed IronGraph](embedding.md) for lifecycle and deployment guidance.
 - Read [Features](features.md) for indexes, temporal data, vectors, algorithms, and streams.
