@@ -42,7 +42,18 @@ pub fn semantic_owner_text(
     kind: crate::types::EntityKind,
     entity_id: u64,
 ) -> Result<Option<String>> {
-    let overlay = Overlay::new(graph, &[], &[]);
+    semantic_owner_text_with_mutations(graph, &[], &[], kind, entity_id)
+}
+
+/// Render an owner against the current transaction journal without materializing a graph copy.
+pub fn semantic_owner_text_with_mutations(
+    graph: &GraphStore,
+    prior: &[GraphMutation],
+    current: &[GraphMutation],
+    kind: crate::types::EntityKind,
+    entity_id: u64,
+) -> Result<Option<String>> {
+    let overlay = Overlay::new(graph, prior, current);
     match kind {
         crate::types::EntityKind::Node => overlay.node_text(NodeId(entity_id)),
         crate::types::EntityKind::Relationship => overlay.edge_text(EdgeId(entity_id)),

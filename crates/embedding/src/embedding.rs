@@ -639,6 +639,13 @@ impl TextEmbedding for LocalEmbeddingModel {
         self.profile()
     }
 
+    fn supports_prefix_dimensions(&self, dimensions: usize) -> bool {
+        self.artifacts.profile.dimension == EMBEDDING_OUTPUT_SIZE as u32
+            && super::install::default_profile()
+                .is_ok_and(|profile| profile.profile_hash == self.artifacts.profile.profile_hash)
+            && matches!(dimensions, 64 | 128 | 256)
+    }
+
     fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         self.embed_passages(texts)
     }

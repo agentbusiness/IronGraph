@@ -6,7 +6,7 @@ This page is for applications that need ranked graph results from text or vector
 | | |
 | --- | --- |
 | Kind | Clause |
-| Signature | `SEARCH <variable> IN (EMBEDDING INDEX <name> FOR TEXT\|VECTOR <input> LIMIT <n>) SCORE AS <alias>` |
+| Signature | `SEARCH <variable> IN (EMBEDDING INDEX <name> FOR TEXT\|VECTOR\|HYBRID TEXT <input> [USING <method>] LIMIT <n>) SCORE AS <alias> [EVIDENCE AS <path>]` |
 | Relationship to standard Cypher | IronGraph extension |
 
 ## Search the whole project
@@ -71,6 +71,73 @@ can leave fewer rows, while later traversals can produce multiple rows per match
 `LIMIT` when you also need to bound expanded results.
 
 ## Scores and execution
+
+### Choose a retrieval method
+
+You can select a method explicitly. Existing queries without `USING` retain their normal index
+selection. Use `EXACT` when you need full-dimensional scoring of every eligible owner:
+
+```cypher
+USE knowledge
+SEARCH entity IN (EMBEDDING INDEX graph_semantic
+                  FOR TEXT 'configure the local device' USING EXACT LIMIT 10)
+  SCORE AS score
+RETURN entity, score
+```
+
+| Method | Behavior |
+| --- | --- |
+| `EXACT` | Score every eligible owner using complete vectors. |
+| `PREFIX` | Select candidates using a trained shorter prefix, then rank them using complete vectors. Requires text input and a compatible local encoder. |
+| `QUANTIZED` | Select candidates using compressed binary comparisons, then rank them using complete vectors. |
+| `ADAPTIVE` | Choose precise scoring for small eligible sets and compressed candidate selection for larger sets. |
+
+Methods that select candidates can miss matches compared with `EXACT`. Compare relevance and
+latency on your own data before choosing one. Complete final scores do not make an approximate
+candidate search exact. `PREFIX` uses the existing embedding; it does not run a second model or
+store a second full vector. These methods execute on the CPU.
+
+### Combine terminology and meaning
+
+`FOR HYBRID TEXT` combines lexical and semantic rankings. It is useful for queries containing exact
+names, codes, or phrases alongside a natural-language description:
+
+```cypher
+USE knowledge
+SEARCH entity IN (EMBEDDING INDEX graph_semantic
+                  FOR HYBRID TEXT 'device error E104' USING EXACT LIMIT 10)
+  SCORE AS score
+RETURN entity, score
+```
+
+Hybrid scores describe rank fusion and are not directly comparable with ordinary vector scores.
+The lexical branch reads meaningful owner content and can cost more than semantic search alone.
+Filtering and graph layer visibility still apply. A declared text-field embedding index uses only
+that selected field for lexical matching. A supplied-vector index has no declared text source and
+does not support `FOR HYBRID TEXT`.
+
+### Return relationship evidence
+
+Search relationships directly and request their existing graph path:
+
+```cypher
+USE knowledge
+SEARCH relationship IN (EMBEDDING INDEX semantic_relationships
+                        FOR HYBRID TEXT 'responsible for the delayed shipment'
+                        USING EXACT LIMIT 10)
+  SCORE AS score EVIDENCE AS evidence
+RETURN relationship, evidence, score
+```
+
+For a relationship, `evidence` contains its source node, relationship, and target node. For a node
+result, it contains that node as a zero-length path. This exposes graph context; it does not prove
+that the relationship is true or generate an explanation. Continue with ordinary Cypher to explore
+the supporting records.
+
+Long text remains complete on its owner. Retrieval can match a relevant part of a long value and
+return the owning record without creating passage nodes.
+
+### Interpret scores
 
 `FOR TEXT` embeds the query using the same model as the stored text. `FOR VECTOR` accepts a supplied
 vector of the required dimensions. Larger scores rank first; the interpretation depends on the

@@ -308,6 +308,7 @@ impl HostFootprint {
         for vector in delta.vectors.iter().filter(|_| retain_history) {
             let property = match vector {
                 crate::graph::ResolvedVectorMutation::Upsert { property, .. }
+                | crate::graph::ResolvedVectorMutation::UpsertSpans { property, .. }
                 | crate::graph::ResolvedVectorMutation::Remove { property, .. } => *property,
             };
             changed.push((
@@ -423,6 +424,19 @@ impl HostFootprint {
                     coordinates,
                     ..
                 } => (*property, *entity_id, coordinates.len() * 2),
+                crate::graph::ResolvedVectorMutation::UpsertSpans {
+                    property,
+                    entity_id,
+                    coordinates,
+                    ..
+                } => (
+                    *property,
+                    *entity_id,
+                    coordinates
+                        .iter()
+                        .map(|span| span.len().saturating_mul(2))
+                        .fold(0_usize, usize::saturating_add),
+                ),
                 crate::graph::ResolvedVectorMutation::Remove {
                     property,
                     entity_id,
@@ -548,6 +562,11 @@ fn identity_path_changes(
     for mutation in &delta.vectors {
         let (property, entity) = match mutation {
             crate::graph::ResolvedVectorMutation::Upsert {
+                property,
+                entity_id,
+                ..
+            }
+            | crate::graph::ResolvedVectorMutation::UpsertSpans {
                 property,
                 entity_id,
                 ..

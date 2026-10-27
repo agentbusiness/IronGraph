@@ -101,6 +101,7 @@ pub(super) fn staging_bytes(
     for mutation in &delta.vectors {
         let property = match mutation {
             ResolvedVectorMutation::Upsert { property, .. }
+            | ResolvedVectorMutation::UpsertSpans { property, .. }
             | ResolvedVectorMutation::Remove { property, .. } => property,
         };
         let column = resident.vectors.get(property).ok_or_else(|| {
@@ -815,6 +816,11 @@ pub(super) fn vectors(
     for mutation in &delta.vectors {
         let (property, entity) = match mutation {
             ResolvedVectorMutation::Upsert {
+                property,
+                entity_id,
+                ..
+            }
+            | ResolvedVectorMutation::UpsertSpans {
                 property,
                 entity_id,
                 ..

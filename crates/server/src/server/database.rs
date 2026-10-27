@@ -1039,7 +1039,12 @@ impl Database {
                         project
                             .indexes
                             .vector_search_source(name)
-                            .and_then(|(column, _)| column.row_revision(job.owner.entity_id))
+                            .and_then(|(column, _)| {
+                                column
+                                    .has_owner_spans(job.owner.entity_id)
+                                    .then(|| column.row_revision(job.owner.entity_id))
+                                    .flatten()
+                            })
                             .is_some_and(|revision| revision >= job.revision)
                     };
                     if project.indexes.contains(semantic_index) && !current_vector(semantic_index) {
@@ -1115,7 +1120,11 @@ impl Database {
                     }
                     if revision.is_none()
                         && vectors.iter().any(|mutation| {
-                            matches!(mutation, ResolvedVectorMutation::Upsert { .. })
+                            matches!(
+                                mutation,
+                                ResolvedVectorMutation::Upsert { .. }
+                                    | ResolvedVectorMutation::UpsertSpans { .. }
+                            )
                         })
                     {
                         return Ok(false);
@@ -7474,6 +7483,17 @@ fn retag_vector_mutation(
             coordinates,
             revision,
         },
+        ResolvedVectorMutation::UpsertSpans {
+            property,
+            entity_id,
+            coordinates,
+            ..
+        } => ResolvedVectorMutation::UpsertSpans {
+            property,
+            entity_id,
+            coordinates,
+            revision,
+        },
         ResolvedVectorMutation::Remove {
             property,
             entity_id,
@@ -11569,7 +11589,13 @@ mod project_lifecycle_tests {
             .vector_for(2000)
             .ok_or_else(|| Error::internal("document vector absent"))?;
         assert_eq!(coordinates.len(), 2);
-        assert!(coordinates.iter().all(|v| *v > 0.0));
+        assert_eq!(coordinates, vec![1.0, 0.0]);
+        assert!(exact.has_owner_spans(2000));
+        for query in [[1.0, 0.0], [0.0, 1.0]] {
+            let hits = exact.exact_search(&query, 1)?;
+            assert_eq!(hits[0].entity_id, 2000);
+            assert_eq!(hits[0].score, 1.0, "both source windows remain searchable");
+        }
         assert_eq!(exact.len(), 1);
         for id in 1000..1400 {
             let Some(ScalarValue::String(retained)) = project

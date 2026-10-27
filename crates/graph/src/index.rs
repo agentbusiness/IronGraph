@@ -253,6 +253,10 @@ pub struct VectorIndex {
     dtype: EmbeddingDType,
     store: Arc<VectorStore>,
 }
+#[path = "retrieval.rs"]
+mod retrieval;
+pub use retrieval::RetrievalStrategy;
+
 #[derive(Default)]
 struct VectorStore {
     slots: crate::concurrent::Segments<VectorSlot>,
@@ -262,6 +266,9 @@ struct VectorStore {
     dirty: ConcurrentMap<usize, u64>,
     graph: arc_swap::ArcSwapOption<GraphStore>,
     live: std::sync::atomic::AtomicUsize,
+    retrieval: retrieval::RetrievalIndex,
+    payload_bytes: std::sync::atomic::AtomicUsize,
+    multi_span_owners: std::sync::atomic::AtomicUsize,
 }
 #[derive(Default)]
 struct VectorSlot {
@@ -276,6 +283,25 @@ struct VectorPayload {
     #[serde(with = "atomic_vector_revision")]
     revision: std::sync::atomic::AtomicU64,
     coordinates: VectorCoordinates,
+}
+impl VectorPayload {
+    fn is_multi_span(&self) -> bool {
+        matches!(&self.coordinates, VectorCoordinates::Spans(spans) if spans.len() > 1)
+    }
+    fn resident_bytes(&self) -> usize {
+        size_of::<Self>()
+            + match &self.coordinates {
+                VectorCoordinates::Quantized(values) => values.len() * size_of::<u16>(),
+                VectorCoordinates::Spans(spans) => {
+                    spans.capacity() * size_of::<Box<[u16]>>()
+                        + spans
+                            .iter()
+                            .map(|span| span.len() * size_of::<u16>())
+                            .sum::<usize>()
+                }
+                VectorCoordinates::PropertyOwner { .. } => 0,
+            }
+    }
 }
 mod atomic_vector_revision {
     use serde::{Deserialize, Deserializer, Serializer};
@@ -294,6 +320,7 @@ enum VectorCoordinates {
         property: PropertyId,
         kind: crate::types::EntityKind,
     },
+    Spans(Vec<Box<[u16]>>),
 }
 struct CoordinateView<'a> {
     quantized: Option<&'a [u16]>,
@@ -371,13 +398,27 @@ impl<'de> Deserialize<'de> for VectorIndex {
                 return Err(serde::de::Error::custom("duplicate canonical vector owner"));
             }
             if let Some(payload) = &payload {
-                if let VectorCoordinates::Quantized(coordinates) = &payload.coordinates {
-                    result
+                result.store.multi_span_owners.fetch_add(
+                    usize::from(payload.is_multi_span()),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                match &payload.coordinates {
+                    VectorCoordinates::Quantized(coordinates) => result
                         .validate_coordinates(coordinates)
-                        .map_err(serde::de::Error::custom)?;
+                        .map_err(serde::de::Error::custom)?,
+                    VectorCoordinates::Spans(spans) => result
+                        .validate_spans(spans.iter().map(AsRef::as_ref))
+                        .map_err(serde::de::Error::custom)?,
+                    VectorCoordinates::PropertyOwner { .. } => {}
                 }
             }
             let active = payload.is_some();
+            if let Some(payload) = &payload {
+                result.store.payload_bytes.fetch_add(
+                    payload.resident_bytes(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
             let row = result
                 .store
                 .slots
@@ -414,6 +455,9 @@ impl<'de> Deserialize<'de> for VectorIndex {
             }
             result.store.dirty.insert(row, revision);
         }
+        result
+            .rebuild_retrieval()
+            .map_err(serde::de::Error::custom)?;
         Ok(result)
     }
 }
@@ -656,6 +700,39 @@ impl VectorIndex {
             revision,
         )
     }
+    /// Publish derived windows for one owner, without creating passage graph records.
+    pub fn upsert_spans(
+        &self,
+        entity_id: u64,
+        coordinates: &[Vec<u16>],
+        revision: u64,
+    ) -> Result<()> {
+        self.validate_spans(coordinates.iter().map(Vec::as_slice))?;
+        self.publish_payload(
+            entity_id,
+            VectorCoordinates::Spans(
+                coordinates
+                    .iter()
+                    .map(|v| v.clone().into_boxed_slice())
+                    .collect(),
+            ),
+            revision,
+        )
+    }
+    fn validate_spans<'a>(&self, spans: impl Iterator<Item = &'a [u16]>) -> Result<()> {
+        let mut count = 0;
+        for span in spans {
+            self.validate_coordinates(span)?;
+            count += 1;
+        }
+        if count == 0 {
+            return Err(Error::new(
+                ErrorCode::EmbeddingProfileMismatch,
+                "owner spans are empty",
+            ));
+        }
+        Ok(())
+    }
     fn publish_payload(
         &self,
         entity_id: u64,
@@ -673,13 +750,32 @@ impl VectorIndex {
             coordinates,
         });
         let stamp = payload.stamp;
+        let payload_bytes = payload.resident_bytes();
+        let multi_span = usize::from(payload.is_multi_span());
         if let Some(row) = self.store.rows.get(&entity_id) {
             let slot = self
                 .store
                 .slots
                 .get(row)
                 .ok_or_else(|| Error::internal("vector owner slot is missing"))?;
-            if slot.payload.swap(Some(payload)).is_none() {
+            let previous = slot.payload.swap(Some(Arc::clone(&payload)));
+            self.store
+                .multi_span_owners
+                .fetch_add(multi_span, std::sync::atomic::Ordering::Relaxed);
+            self.store
+                .payload_bytes
+                .fetch_add(payload_bytes, std::sync::atomic::Ordering::Relaxed);
+            if let Some(previous) = previous.as_ref() {
+                self.store.multi_span_owners.fetch_sub(
+                    usize::from(previous.is_multi_span()),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                self.store.payload_bytes.fetch_sub(
+                    previous.resident_bytes(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            if previous.is_none() {
                 self.store
                     .live
                     .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -710,11 +806,18 @@ impl VectorIndex {
                 row
             };
             self.store.rows.insert(entity_id, row);
+            self.store
+                .multi_span_owners
+                .fetch_add(multi_span, std::sync::atomic::Ordering::Relaxed);
+            self.store
+                .payload_bytes
+                .fetch_add(payload_bytes, std::sync::atomic::Ordering::Relaxed);
             self.store.dirty.insert(row, stamp);
             self.store
                 .live
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
         }
+        self.refresh_retrieval(entity_id)?;
         Ok(())
     }
     /// Binds the same canonical graph allocation; no graph or vector payload is copied.
@@ -819,6 +922,12 @@ impl VectorIndex {
                     numeric: Some((list, norm, self.dtype)),
                 }))
             }
+            VectorCoordinates::Spans(spans) => {
+                Ok(spans.first().map(|coordinates| CoordinateView {
+                    quantized: Some(coordinates),
+                    numeric: None,
+                }))
+            }
         }
     }
     pub fn remove(&self, entity_id: u64, _revision: u64) {
@@ -831,13 +940,22 @@ impl VectorIndex {
                     + 1;
                 slot.deleted_revision
                     .store(stamp, std::sync::atomic::Ordering::Release);
-                if slot.payload.swap(None).is_some() {
+                if let Some(previous) = slot.payload.swap(None) {
+                    self.store.multi_span_owners.fetch_sub(
+                        usize::from(previous.is_multi_span()),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    self.store.payload_bytes.fetch_sub(
+                        previous.resident_bytes(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     self.store
                         .live
                         .fetch_sub(1, std::sync::atomic::Ordering::Release);
                 }
                 self.store.dirty.insert(row, stamp);
                 self.store.free.release(row as u32);
+                self.remove_retrieval(entity_id);
             }
         }
     }
@@ -884,24 +1002,8 @@ impl VectorIndex {
             if !visible(payload.entity_id) {
                 continue;
             }
-            let Some(coordinates) = self.payload_coordinates(payload.entity_id, payload)? else {
+            let Some(score) = self.score_payload(&query, payload)? else {
                 continue;
-            };
-            let score = match self.similarity {
-                Similarity::Euclidean => query
-                    .iter()
-                    .zip(coordinates.iter())
-                    .map(|(left, bits)| {
-                        let delta = left - decode_coordinate(self.dtype, bits);
-                        delta * delta
-                    })
-                    .sum::<f32>()
-                    .sqrt(),
-                Similarity::Dot | Similarity::Cosine => query
-                    .iter()
-                    .zip(coordinates.iter())
-                    .map(|(left, bits)| left * decode_coordinate(self.dtype, bits))
-                    .sum(),
             };
             let hit = VectorHit {
                 entity_id: payload.entity_id,
@@ -1007,25 +1109,31 @@ impl VectorIndex {
         }
         let mut result = vector.to_vec();
         if self.similarity == Similarity::Cosine {
-            let norm = result.iter().map(|v| v * v).sum::<f32>().sqrt();
-            if norm <= f32::EPSILON {
+            let norm = result
+                .iter()
+                .map(|v| f64::from(*v).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            if norm <= f64::from(f32::EPSILON) {
                 return Err(Error::new(
                     ErrorCode::EmbeddingProfileMismatch,
                     "cosine vector has zero norm",
                 ));
             }
             for value in &mut result {
-                *value /= norm;
+                *value = (f64::from(*value) / norm) as f32;
             }
         }
         Ok(result)
     }
     pub fn quantize(&self, vector: &[f32]) -> Result<Vec<u16>> {
-        Ok(self
+        let coordinates = self
             .prepare(vector)?
             .into_iter()
             .map(|v| encode_coordinate(self.dtype, v))
-            .collect())
+            .collect::<Vec<_>>();
+        self.validate_coordinates(&coordinates)?;
+        Ok(coordinates)
     }
     fn vector(&self, row: usize) -> Option<Vec<f32>> {
         let slot = self.store.slots.get(row)?;
@@ -1083,6 +1191,26 @@ impl VectorIndex {
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+    /// A single-vector ANN base cannot cover every passage of these owners.
+    pub fn has_multi_span_owners(&self) -> bool {
+        self.store
+            .multi_span_owners
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+    }
+    /// Whether this generated owner was encoded with the span-preserving representation.
+    pub fn has_owner_spans(&self, entity_id: u64) -> bool {
+        self.store
+            .rows
+            .get(&entity_id)
+            .and_then(|row| self.store.slots.get(row))
+            .is_some_and(|slot| {
+                slot.payload.load().as_ref().is_some_and(|payload| {
+                    payload.entity_id == entity_id
+                        && matches!(payload.coordinates, VectorCoordinates::Spans(_))
+                })
+            })
     }
     fn device_image(&self, property: PropertyId) -> Result<VectorDeviceImage> {
         let mut entity_ids = Vec::new();
@@ -1764,14 +1892,13 @@ impl IvfPqIndex {
             if !source.row_active(row) {
                 continue;
             }
-            let (Some(entity_id), Some(vector)) = (source.row_entity(row), source.vector(row))
-            else {
+            let Some(entity_id) = source.row_entity(row) else {
                 continue;
             };
-            hits.push(VectorHit {
-                entity_id,
-                score: public_score(self.similarity, &query, &vector),
-            });
+            let Some(score) = source.score_owner(&query, entity_id)? else {
+                continue;
+            };
+            hits.push(VectorHit { entity_id, score });
         }
         sort_hits(&mut hits, self.similarity);
         hits.truncate(limit);
@@ -2336,6 +2463,12 @@ pub enum ResolvedVectorMutation {
         entity_id: u64,
         revision: u64,
     },
+    UpsertSpans {
+        property: PropertyId,
+        entity_id: u64,
+        coordinates: Vec<Vec<u16>>,
+        revision: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2749,11 +2882,15 @@ impl IndexCatalog {
         for mutation in mutations {
             let property = match mutation {
                 ResolvedVectorMutation::Upsert { property, .. }
+                | ResolvedVectorMutation::UpsertSpans { property, .. }
                 | ResolvedVectorMutation::Remove { property, .. } => property,
             };
             if let Some(column) = self.vector_columns.get(property) {
                 if let ResolvedVectorMutation::Upsert { coordinates, .. } = mutation {
                     column.validate_coordinates(coordinates)?;
+                }
+                if let ResolvedVectorMutation::UpsertSpans { coordinates, .. } = mutation {
+                    column.validate_spans(coordinates.iter().map(Vec::as_slice))?;
                 }
             } else {
                 let profile = planned_profile
@@ -2775,6 +2912,14 @@ impl IndexCatalog {
                             "planned vector is incompatible with the embedding profile",
                         ));
                     }
+                }
+                if let ResolvedVectorMutation::UpsertSpans { coordinates, .. } = mutation {
+                    let validator = VectorIndex::new_with_dtype(
+                        profile.dimension as usize,
+                        profile.similarity,
+                        profile.dtype,
+                    )?;
+                    validator.validate_spans(coordinates.iter().map(Vec::as_slice))?;
                 }
             }
         }
@@ -3766,16 +3911,10 @@ impl IndexCatalog {
                         let candidate_budget = approximate
                             .as_ref()
                             .map_or(0_u64, |ann| ann.config.candidate_budget as u64);
-                        let dimension = self
-                            .profile
-                            .get()
-                            .map_or(0_u64, |profile| u64::from(profile.dimension));
-                        let bytes = rows.saturating_mul(
-                            8_u64
-                                .saturating_add(8)
-                                .saturating_add(1)
-                                .saturating_add(dimension.saturating_mul(2)),
-                        );
+                        let bytes = self
+                            .vector_columns
+                            .get(property)
+                            .map_or(0, |vectors| vectors.resident_bytes() as u64);
                         (0, 0, 0, rows, candidate_budget, bytes)
                     }
                 };
@@ -4235,6 +4374,12 @@ impl IndexCatalog {
                 revision,
                 ..
             }
+            | ResolvedVectorMutation::UpsertSpans {
+                property,
+                entity_id,
+                revision,
+                ..
+            }
             | ResolvedVectorMutation::Remove {
                 property,
                 entity_id,
@@ -4251,6 +4396,9 @@ impl IndexCatalog {
         match mutation {
             ResolvedVectorMutation::Upsert { coordinates, .. } => {
                 matrix.upsert_quantized(entity_id, coordinates, revision)?;
+            }
+            ResolvedVectorMutation::UpsertSpans { coordinates, .. } => {
+                matrix.upsert_spans(entity_id, coordinates, revision)?;
             }
             ResolvedVectorMutation::Remove { .. } => matrix.remove(entity_id, revision),
         }
@@ -4793,17 +4941,6 @@ fn l2_squared(left: &[f32], right: &[f32]) -> f32 {
             delta * delta
         })
         .sum()
-}
-
-fn public_score(similarity: Similarity, left: &[f32], right: &[f32]) -> f32 {
-    match similarity {
-        Similarity::Euclidean => l2_squared(left, right).sqrt(),
-        Similarity::Dot | Similarity::Cosine => left
-            .iter()
-            .zip(right)
-            .map(|(left, right)| left * right)
-            .sum(),
-    }
 }
 
 fn sort_hits(hits: &mut [VectorHit], similarity: Similarity) {

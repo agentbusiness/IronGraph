@@ -38,6 +38,17 @@ impl<K: Hash + Eq + Clone, V: Clone> ConcurrentMap<K, V> {
     pub fn insert(&self, key: K, value: V) {
         self.0.pin().insert(key, value);
     }
+    pub fn swap_value(&self, key: K, value: V) -> Option<V> {
+        self.0.pin().insert(key, value).cloned()
+    }
+    pub fn remove_if_value(&self, key: &K, predicate: impl Fn(&V) -> bool) -> Option<V> {
+        self.0
+            .pin()
+            .remove_if(key, |_, value| predicate(value))
+            .ok()
+            .flatten()
+            .map(|(_, value)| value.clone())
+    }
     pub fn remove<Q: Hash + Eq + ?Sized>(&self, key: &Q) -> Option<V>
     where
         K: Borrow<Q>,

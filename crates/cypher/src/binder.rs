@@ -635,16 +635,32 @@ impl Binder<'_> {
                         self.scope.insert(search.variable.clone(), kind);
                     }
                     match &search.input {
-                        SearchInput::Text(value) | SearchInput::Vector(value) => {
-                            self.bind_expression(value)?
-                        }
+                        SearchInput::Text(value)
+                        | SearchInput::HybridText(value)
+                        | SearchInput::Vector(value) => self.bind_expression(value)?,
                     }
                     self.bind_expression(&search.limit)?;
                     self.dependency(DependencyKind::Index, &search.index);
+                    if matches!(search.input, SearchInput::HybridText(_)) {
+                        // Lexical matches can change even before an owner's vector is available.
+                        self.dependency(DependencyKind::FullNodeScan, "*");
+                        self.dependency(DependencyKind::FullRelationshipScan, "*");
+                    }
                     self.scope
                         .insert(search.score_variable.clone(), BindingKind::Value);
                     self.static_sources.remove(&search.score_variable);
                     self.static_lists.remove(&search.score_variable);
+                    if let Some(evidence) = &search.evidence_variable {
+                        if self.scope.contains_key(evidence) {
+                            return Err(Error::new(
+                                ErrorCode::QuerySyntax,
+                                "SEARCH EVIDENCE variable is already bound",
+                            ));
+                        }
+                        self.scope.insert(evidence.clone(), BindingKind::Path);
+                        self.static_sources.remove(evidence);
+                        self.static_lists.remove(evidence);
+                    }
                 }
                 Clause::Call(call) => {
                     let resolved = validate_call(call, self.procedures, self.parameters)?;

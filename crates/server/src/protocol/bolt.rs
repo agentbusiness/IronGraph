@@ -162,10 +162,12 @@ struct InterruptRegistry {
 
 impl InterruptRegistry {
     fn activate(&self, cancellation: CancellationToken) {
+        // Publish before checking the jump-ahead flag. Otherwise RESET can observe no active
+        // token between our flag check and registration, leaving the new worker uncancelled.
+        *self.active.lock() = Some(cancellation.clone());
         if self.reset_pending.load(Ordering::Acquire) {
             cancellation.cancel();
         }
-        *self.active.lock() = Some(cancellation);
     }
 
     fn clear(&self) {
@@ -3176,6 +3178,32 @@ mod tests {
             .await
             .map_err(|error| Error::internal(format!("Bolt server task failed: {error}")))??;
         Ok(())
+    }
+
+    #[test]
+    fn reset_racing_with_activation_never_loses_cancellation() {
+        for _ in 0..1024 {
+            let interrupt = super::InterruptRegistry::default();
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let start = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    start.wait();
+                    interrupt.signal_reset();
+                });
+                start.wait();
+                interrupt.activate(cancellation.clone());
+            });
+            assert!(cancellation.is_cancelled());
+            interrupt.clear();
+            interrupt.acknowledge_reset();
+            let next = tokio_util::sync::CancellationToken::new();
+            interrupt.activate(next.clone());
+            assert!(
+                !next.is_cancelled(),
+                "acknowledged RESET cannot cancel the next query"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

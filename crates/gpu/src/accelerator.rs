@@ -2226,6 +2226,7 @@ impl CandleResident {
             for mutation in &delta.vectors {
                 let property = match mutation {
                     ResolvedVectorMutation::Upsert { property, .. }
+                    | ResolvedVectorMutation::UpsertSpans { property, .. }
                     | ResolvedVectorMutation::Remove { property, .. } => *property,
                 };
                 let column = self.vectors.get_mut(&property).ok_or_else(|| {
@@ -73625,8 +73626,20 @@ fn apply_shared_vector_mutation(
     rows: &mut PersistentMap<u32>,
     mutation: &ResolvedVectorMutation,
 ) -> Result<()> {
+    if matches!(mutation, ResolvedVectorMutation::UpsertSpans { .. }) {
+        return Err(Error::new(
+            ErrorCode::IndexUnavailable,
+            "owner span vectors require canonical CPU retrieval",
+        ));
+    }
     let (property, entity, revision) = match mutation {
         ResolvedVectorMutation::Upsert {
+            property,
+            entity_id,
+            revision,
+            ..
+        }
+        | ResolvedVectorMutation::UpsertSpans {
             property,
             entity_id,
             revision,
@@ -73648,7 +73661,10 @@ fn apply_shared_vector_mutation(
     let row = match (mutation, existing) {
         (ResolvedVectorMutation::Remove { .. }, None) => return Ok(()),
         (_, Some(row)) => row as usize,
-        (ResolvedVectorMutation::Upsert { .. }, None) => {
+        (
+            ResolvedVectorMutation::Upsert { .. } | ResolvedVectorMutation::UpsertSpans { .. },
+            None,
+        ) => {
             let row = backing.entity_ids.len();
             let encoded = u32::try_from(row).map_err(|_| {
                 Error::new(ErrorCode::ResultBudgetExceeded, "vector row exceeds u32")
@@ -73668,6 +73684,12 @@ fn apply_shared_vector_mutation(
         .get_mut(row)
         .ok_or_else(|| Error::internal("shared vector revision row disappeared"))? = revision;
     match mutation {
+        ResolvedVectorMutation::UpsertSpans { .. } => {
+            return Err(Error::new(
+                ErrorCode::IndexUnavailable,
+                "owner spans are CPU-only",
+            ));
+        }
         ResolvedVectorMutation::Remove { .. } => {
             *backing
                 .active
@@ -73728,8 +73750,20 @@ fn apply_vector_delta(
     mutation: &ResolvedVectorMutation,
     device: &Device,
 ) -> Result<()> {
+    if matches!(mutation, ResolvedVectorMutation::UpsertSpans { .. }) {
+        return Err(Error::new(
+            ErrorCode::IndexUnavailable,
+            "owner span vectors require canonical CPU retrieval",
+        ));
+    }
     let (property, entity, revision) = match mutation {
         ResolvedVectorMutation::Upsert {
+            property,
+            entity_id,
+            revision,
+            ..
+        }
+        | ResolvedVectorMutation::UpsertSpans {
             property,
             entity_id,
             revision,
@@ -73751,7 +73785,10 @@ fn apply_vector_delta(
     let row = match (mutation, existing) {
         (ResolvedVectorMutation::Remove { .. }, None) => return Ok(()),
         (_, Some(row)) => row,
-        (ResolvedVectorMutation::Upsert { .. }, None) => {
+        (
+            ResolvedVectorMutation::Upsert { .. } | ResolvedVectorMutation::UpsertSpans { .. },
+            None,
+        ) => {
             let row = u32::try_from(column.rows).map_err(|_| {
                 Error::new(ErrorCode::ResultBudgetExceeded, "vector row exceeds u32")
             })?;

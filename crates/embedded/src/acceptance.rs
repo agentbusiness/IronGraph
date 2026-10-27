@@ -91,21 +91,23 @@ fn async_large_parameters_and_results_keep_current_thread_responsive()
         .enable_all()
         .build()?;
     runtime.block_on(async {
-        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let observed = ticks.clone();
-        let heartbeat = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-                observed.fetch_add(1, Ordering::Relaxed);
-            }
-        });
-        let result = database.query_async(query).await?;
-        heartbeat.abort();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        *QUERY_EXECUTION_GATE.lock().unwrap() = Some((entered, released));
+        let execution = database.query_async(query);
+        let observer = async move {
+            // Wait until the real result-collection worker is blocked, then require a timer on
+            // the caller's current-thread runtime to release it. This also catches moving
+            // result assembly back onto the caller, without assuming a query lasts >1 ms.
+            started.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            release.send(()).unwrap();
+        };
+        let (result, ()) = tokio::join!(execution, observer);
+        let result = result?;
         assert_eq!(result.rows.len(), 32);
-        assert!(
-            ticks.load(Ordering::Relaxed) > 0,
-            "current-thread timer did not run during large query"
-        );
+        assert!(result.rows.iter().all(|row| matches!(row.as_slice(),
+            [irongraph_server::protocol::TypedValue::String(body)] if body.len() == 1024 * 1024)));
         Ok::<_, EmbeddedError>(())
     })?;
     database.close()?;

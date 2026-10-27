@@ -365,7 +365,9 @@ fn validate_operator_existential_subqueries(
             }
             PhysicalOperator::VectorSearch { search, .. } => {
                 let input = match &search.input {
-                    SearchInput::Text(expression) | SearchInput::Vector(expression) => expression,
+                    SearchInput::Text(expression)
+                    | SearchInput::HybridText(expression)
+                    | SearchInput::Vector(expression) => expression,
                 };
                 validate_expression_existential_subqueries(input, depth)?;
                 validate_expression_existential_subqueries(&search.limit, depth)?;

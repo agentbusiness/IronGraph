@@ -219,9 +219,17 @@ fn encode(
     batch_size: usize,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<Vec<ResolvedVectorMutation>> {
-    work.encoder.profile().validate()?;
-    let dimension = usize::try_from(work.encoder.profile().dimension)
+    if batch_size == 0 {
+        return Err(Error::internal(
+            "embedding inference batch must be nonempty",
+        ));
+    }
+    let profile = work.encoder.profile();
+    profile.validate()?;
+    let dimension = usize::try_from(profile.dimension)
         .map_err(|_| Error::internal("embedding dimension exceeds process range"))?;
+    let quantizer =
+        crate::graph::VectorIndex::new_with_dtype(dimension, profile.similarity, profile.dtype)?;
     let mut mutations = Vec::with_capacity(work.chunks.len());
     for chunk in &work.chunks {
         if is_cancelled() {
@@ -239,8 +247,10 @@ fn encode(
         if windows.is_empty() {
             windows.push(text.to_string());
         }
-        let count = windows.len();
-        let mut aggregate = vec![0_f64; dimension];
+        // Keep each window's meaning. These vectors belong to the original owner/property;
+        // they neither create graph records nor require a second summary inference pass.
+        // Only one owner's derived output is retained until its revision-fenced publication.
+        let mut coordinates = Vec::with_capacity(windows.len());
         for batch in windows.chunks(batch_size) {
             if is_cancelled() {
                 return Err(cancelled());
@@ -254,32 +264,42 @@ fn encode(
                     "embedding output shape differs from active profile",
                 ));
             }
-            for vector in encoded {
-                for (sum, value) in aggregate.iter_mut().zip(vector) {
-                    *sum += f64::from(value);
+            for mut vector in encoded {
+                if is_cancelled() {
+                    return Err(cancelled());
                 }
+                if vector.iter().any(|value| !value.is_finite()) {
+                    return Err(Error::new(
+                        ErrorCode::EmbeddingProfileMismatch,
+                        "embedding output contains a non-finite coordinate",
+                    ));
+                }
+                if profile.normalized {
+                    let norm = vector
+                        .iter()
+                        .map(|value| f64::from(*value).powi(2))
+                        .sum::<f64>()
+                        .sqrt();
+                    if norm == 0.0 {
+                        return Err(Error::new(
+                            ErrorCode::EmbeddingProfileMismatch,
+                            "normalized embedding output has zero norm",
+                        ));
+                    }
+                    for value in &mut vector {
+                        *value = (f64::from(*value) / norm) as f32;
+                    }
+                }
+                coordinates.push(quantizer.quantize(&vector)?);
             }
         }
-        let mut vector = aggregate
-            .into_iter()
-            .map(|sum| (sum / count as f64) as f32)
-            .collect::<Vec<_>>();
-        if work.encoder.profile().normalized {
-            let norm = vector
-                .iter()
-                .map(|value| f64::from(*value).powi(2))
-                .sum::<f64>()
-                .sqrt();
-            if norm > 0.0 {
-                for value in &mut vector {
-                    *value = (f64::from(*value) / norm) as f32;
-                }
-            }
-        }
-        mutations.push(ResolvedVectorMutation::Upsert {
+        // A one-window owner also uses the span format. Besides retaining its exact vector,
+        // this marks generated data as using span semantics, so recovery can distinguish it
+        // from older averaged vectors without re-encoding current owners on every restart.
+        mutations.push(ResolvedVectorMutation::UpsertSpans {
             property: chunk.property,
             entity_id: job.owner.entity_id,
-            coordinates: work.encoder.profile().quantize(&vector)?,
+            coordinates,
             revision: job.revision,
         });
     }
@@ -393,10 +413,15 @@ mod tests {
         assert_eq!(
             output,
             vec![
-                ResolvedVectorMutation::Upsert {
+                ResolvedVectorMutation::UpsertSpans {
                     property: PropertyId(1),
                     entity_id: 7,
-                    coordinates: encoder.profile.quantize(&[0.25, 0.75])?,
+                    coordinates: vec![
+                        encoder.profile.quantize(&[1.0, 0.0])?,
+                        encoder.profile.quantize(&[0.0, 1.0])?,
+                        encoder.profile.quantize(&[0.0, 1.0])?,
+                        encoder.profile.quantize(&[0.0, 1.0])?,
+                    ],
                     revision: 11
                 },
                 ResolvedVectorMutation::Remove {
@@ -409,6 +434,314 @@ mod tests {
         assert_eq!(encoder.calls.load(Ordering::Relaxed), 2);
         assert_eq!(encoder.largest_batch.load(Ordering::Relaxed), 2);
         assert!(encode(&work, owner, 2, &|| true).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn retrieval_span_single_window_preserves_owner_revision_without_summary_inference()
+    -> Result<()> {
+        let encoder = Arc::new(Encoder::new(false)?);
+        let work = EmbeddingWork {
+            encoder: encoder.clone(),
+            chunks: vec![SemanticTextChunk {
+                property: PropertyId(9),
+                text: Some(Arc::from("head")),
+            }],
+            is_current: None,
+        };
+        let output = encode(&work, job(ProjectId::random(), 42, 77), 16, &|| false)?;
+        assert_eq!(
+            output,
+            vec![ResolvedVectorMutation::UpsertSpans {
+                property: PropertyId(9),
+                entity_id: 42,
+                coordinates: vec![encoder.profile.quantize(&[1.0, 0.0])?],
+                revision: 77,
+            }]
+        );
+        assert_eq!(encoder.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(encoder.largest_batch.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn retrieval_span_large_owner_keeps_distinct_topics_and_bounded_inference() -> Result<()> {
+        let encoder = Arc::new(Encoder::new(false)?);
+        let text = std::iter::once("head".to_owned())
+            .chain((0..1_000).map(|_| "tail".repeat(1_024)))
+            .collect::<Vec<_>>()
+            .join("|");
+        let source: Arc<str> = text.into();
+        let original = Arc::clone(&source);
+        let work = EmbeddingWork {
+            encoder: encoder.clone(),
+            chunks: vec![SemanticTextChunk {
+                property: PropertyId(1),
+                text: Some(source),
+            }],
+            is_current: None,
+        };
+        let output = encode(&work, job(ProjectId::random(), 7, 11), 16, &|| false)?;
+        let [
+            ResolvedVectorMutation::UpsertSpans {
+                coordinates,
+                entity_id,
+                revision,
+                ..
+            },
+        ] = output.as_slice()
+        else {
+            return Err(Error::internal("long owner did not publish span vectors"));
+        };
+        assert_eq!((*entity_id, *revision), (7, 11));
+        assert_eq!(coordinates.len(), 1_001);
+        assert_eq!(coordinates[0], encoder.profile.quantize(&[1.0, 0.0])?);
+        assert!(
+            coordinates[1..]
+                .iter()
+                .all(|vector| *vector == coordinates[1])
+        );
+        assert_eq!(
+            encoder.calls.load(Ordering::Relaxed),
+            1_001_usize.div_ceil(16)
+        );
+        assert_eq!(encoder.largest_batch.load(Ordering::Relaxed), 16);
+        assert_eq!(work.chunks[0].text.as_deref(), Some(original.as_ref()));
+        Ok(())
+    }
+
+    #[test]
+    fn retrieval_span_cancellation_between_batches_discards_partial_owner() -> Result<()> {
+        let encoder = Arc::new(Encoder::new(false)?);
+        let work = EmbeddingWork {
+            encoder: encoder.clone(),
+            chunks: vec![SemanticTextChunk {
+                property: PropertyId(1),
+                text: Some(Arc::from("head|tail|tail|tail")),
+            }],
+            is_current: None,
+        };
+        let error = encode(&work, job(ProjectId::random(), 7, 11), 2, &|| {
+            encoder.calls.load(Ordering::Relaxed) >= 1
+        })
+        .err()
+        .ok_or_else(|| Error::internal("cancelled owner returned partial vectors"))?;
+        assert_eq!(error.code, ErrorCode::Cancelled);
+        assert_eq!(encoder.calls.load(Ordering::Relaxed), 1);
+        let error = encode(&work, job(ProjectId::random(), 7, 11), 0, &|| false)
+            .err()
+            .ok_or_else(|| Error::internal("zero inference batch was accepted"))?;
+        assert!(error.message.contains("batch must be nonempty"));
+        Ok(())
+    }
+
+    struct InvalidEncoder {
+        profile: EmbeddingProfile,
+        vector: Vec<f32>,
+    }
+
+    impl TextEmbedding for InvalidEncoder {
+        fn profile(&self) -> &EmbeddingProfile {
+            &self.profile
+        }
+
+        fn embed(&self, _text: &str) -> Result<Vec<f32>> {
+            Ok(self.vector.clone())
+        }
+    }
+
+    struct MissingBatchEncoder(EmbeddingProfile);
+
+    impl TextEmbedding for MissingBatchEncoder {
+        fn profile(&self) -> &EmbeddingProfile {
+            &self.0
+        }
+
+        fn embed(&self, _text: &str) -> Result<Vec<f32>> {
+            Ok(vec![1.0, 0.0])
+        }
+
+        fn index_windows(&self, _text: &str) -> Result<Vec<String>> {
+            Ok(vec!["head".to_owned(), "tail".to_owned()])
+        }
+
+        fn embed_batch(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(vec![vec![1.0, 0.0]])
+        }
+    }
+
+    #[test]
+    fn retrieval_span_rejects_an_encoder_that_drops_a_window() -> Result<()> {
+        let work = EmbeddingWork {
+            encoder: Arc::new(MissingBatchEncoder(Encoder::new(false)?.profile)),
+            chunks: vec![SemanticTextChunk {
+                property: PropertyId(1),
+                text: Some(Arc::from("head|tail")),
+            }],
+            is_current: None,
+        };
+        let error = encode(&work, job(ProjectId::random(), 7, 11), 16, &|| false)
+            .err()
+            .ok_or_else(|| Error::internal("encoder dropped a window without an error"))?;
+        assert_eq!(error.code, ErrorCode::EmbeddingProfileMismatch);
+        Ok(())
+    }
+
+    #[test]
+    fn retrieval_span_rejects_malformed_vectors_and_normalizes_each_window() -> Result<()> {
+        let profile = EmbeddingProfile::new(
+            [1; 32],
+            [2; 32],
+            2,
+            EmbeddingDType::F16,
+            true,
+            Similarity::Dot,
+        )?;
+        for vector in [
+            vec![1.0],
+            vec![f32::NAN, 0.0],
+            vec![f32::INFINITY, 1.0],
+            vec![0.0, 0.0],
+        ] {
+            let work = EmbeddingWork {
+                encoder: Arc::new(InvalidEncoder {
+                    profile: profile.clone(),
+                    vector,
+                }),
+                chunks: vec![SemanticTextChunk {
+                    property: PropertyId(1),
+                    text: Some(Arc::from("text")),
+                }],
+                is_current: None,
+            };
+            let error = encode(&work, job(ProjectId::random(), 7, 11), 16, &|| false)
+                .err()
+                .ok_or_else(|| Error::internal("malformed encoder output was accepted"))?;
+            assert_eq!(error.code, ErrorCode::EmbeddingProfileMismatch);
+        }
+        let work = EmbeddingWork {
+            encoder: Arc::new(InvalidEncoder {
+                profile: profile.clone(),
+                vector: vec![3.0, 4.0],
+            }),
+            chunks: vec![SemanticTextChunk {
+                property: PropertyId(1),
+                text: Some(Arc::from("text")),
+            }],
+            is_current: None,
+        };
+        let output = encode(&work, job(ProjectId::random(), 7, 11), 16, &|| false)?;
+        assert_eq!(
+            output,
+            vec![ResolvedVectorMutation::UpsertSpans {
+                property: PropertyId(1),
+                entity_id: 7,
+                coordinates: vec![profile.quantize(&[0.6, 0.8])?],
+                revision: 11,
+            }]
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retrieval_span_stale_owner_never_publishes_partial_windows() -> Result<()> {
+        let encoder = Arc::new(Encoder::new(true)?);
+        let current = Arc::new(AtomicBool::new(true));
+        let loaded_encoder = Arc::clone(&encoder);
+        let loaded_current = Arc::clone(&current);
+        let published = Arc::new(AtomicUsize::new(0));
+        let publish_count = Arc::clone(&published);
+        let failures = Arc::new(AtomicUsize::new(0));
+        let failure_count = Arc::clone(&failures);
+        let callbacks = Arc::new(EmbeddingCallbacks {
+            load: Arc::new(move |_, _| {
+                let current = Arc::clone(&loaded_current);
+                Ok(Some(EmbeddingWork {
+                    encoder: loaded_encoder.clone(),
+                    chunks: vec![SemanticTextChunk {
+                        property: PropertyId(1),
+                        text: Some(Arc::from("head|tail")),
+                    }],
+                    is_current: Some(Arc::new(move || current.load(Ordering::Acquire))),
+                }))
+            }),
+            publish: Arc::new(move |_, _, _| {
+                publish_count.fetch_add(1, Ordering::Relaxed);
+                Ok(true)
+            }),
+            failed: Arc::new(move |_, _| {
+                failure_count.fetch_add(1, Ordering::Relaxed);
+            }),
+        });
+        let task = tokio::spawn(process_job(
+            job(ProjectId::random(), 7, 11),
+            callbacks,
+            1,
+            CancellationToken::new(),
+        ));
+        wait_until(|| encoder.entered.load(Ordering::Acquire)).await?;
+        current.store(false, Ordering::Release);
+        encoder.release.store(true, Ordering::Release);
+        assert!(
+            task.await
+                .map_err(|error| Error::internal(format!("test worker failed: {error}")))?
+        );
+        assert_eq!(published.load(Ordering::Relaxed), 0);
+        assert_eq!(failures.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retrieval_span_failed_publication_reloads_and_retries_whole_owner() -> Result<()> {
+        let encoder = Arc::new(Encoder::new(false)?);
+        let loaded_encoder = Arc::clone(&encoder);
+        let loads = Arc::new(AtomicUsize::new(0));
+        let load_count = Arc::clone(&loads);
+        let published = Arc::new(AtomicUsize::new(0));
+        let publish_count = Arc::clone(&published);
+        let failures = Arc::new(AtomicUsize::new(0));
+        let failure_count = Arc::clone(&failures);
+        let callbacks = Arc::new(EmbeddingCallbacks {
+            load: Arc::new(move |_, _| {
+                load_count.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(EmbeddingWork {
+                    encoder: loaded_encoder.clone(),
+                    chunks: vec![SemanticTextChunk {
+                        property: PropertyId(1),
+                        text: Some(Arc::from("head|tail")),
+                    }],
+                    is_current: None,
+                }))
+            }),
+            publish: Arc::new(move |_, output, _| {
+                let [ResolvedVectorMutation::UpsertSpans { coordinates, .. }] = output.as_slice()
+                else {
+                    return Err(Error::internal("retry did not publish all owner spans"));
+                };
+                assert_eq!(coordinates.len(), 2);
+                if publish_count.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Err(Error::internal("transient publish failure"))
+                } else {
+                    Ok(true)
+                }
+            }),
+            failed: Arc::new(move |_, _| {
+                failure_count.fetch_add(1, Ordering::Relaxed);
+            }),
+        });
+        assert!(
+            process_job(
+                job(ProjectId::random(), 7, 11),
+                callbacks,
+                1,
+                CancellationToken::new(),
+            )
+            .await
+        );
+        assert_eq!(loads.load(Ordering::Relaxed), 2);
+        assert_eq!(published.load(Ordering::Relaxed), 2);
+        assert_eq!(failures.load(Ordering::Relaxed), 1);
+        assert_eq!(encoder.calls.load(Ordering::Relaxed), 4);
         Ok(())
     }
 

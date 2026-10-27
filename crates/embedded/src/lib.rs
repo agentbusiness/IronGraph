@@ -34,7 +34,25 @@ pub use irongraph_server::embeddings::EmbeddingDevice;
 pub use owner::{AdapterDatabaseOwner, AdapterOwnerAdmission};
 pub use streams::{StreamAcknowledgement, StreamAppend, StreamFetch, StreamPage, StreamRecord};
 
+#[cfg(test)]
+type QueryExecutionGate = (
+    tokio::sync::oneshot::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+#[cfg(test)]
+static QUERY_EXECUTION_GATE: Mutex<Option<QueryExecutionGate>> = Mutex::new(None);
+
 fn collect_query_result(database: &Database, request: QueryRequest) -> Result<QueryResult> {
+    #[cfg(test)]
+    {
+        let gate = QUERY_EXECUTION_GATE.lock().unwrap().take();
+        if let Some((entered, release)) = gate {
+            let _ = entered.send(());
+            release.recv().map_err(|error| {
+                irongraph_types::Error::internal(format!("query test gate closed: {error}"))
+            })?;
+        }
+    }
     let mut result = QueryResult::default();
     let mut assembly_error = None;
     let execution = database.execute(request, &mut |event| {

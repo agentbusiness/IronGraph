@@ -139,7 +139,7 @@ pub struct VectorSearchSource<'a> {
     pub profile_hash: [u8; 32],
 }
 
-/// Actual exact-reranked vector evidence emitted by one physical SEARCH execution.
+/// Scored owner evidence emitted by one physical SEARCH execution.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VectorSearchTrace {
     pub index_name: String,
@@ -149,6 +149,12 @@ pub struct VectorSearchTrace {
     pub build_generation: [u8; 32],
     pub bookmark: Bookmark,
     pub hits: Vec<crate::graph::VectorHit>,
+    /// Explicit candidate strategy; `access` records the final canonical scoring boundary.
+    #[serde(default)]
+    pub retrieval_method: super::SearchMethod,
+    /// Hybrid scores are reciprocal rank fusion values, not raw vector similarities.
+    #[serde(default)]
+    pub hybrid: bool,
 }
 
 /// Execution inputs resolved by the protocol/transaction layer.
@@ -5881,7 +5887,11 @@ fn execute_resident_plan_unrendered(
         context.project_id,
         context.binding_catalog,
         &context.parameters,
-    )? {
+    )? && context
+        .vector_indexes
+        .get(&compiled.search.index)
+        .is_none_or(|source| !source.exact.has_multi_span_owners())
+    {
         return execute_resident_vector_plan(plan, &compiled, context, stream).map(Some);
     }
     let Some(mut compiled) = compile_resident(
@@ -15762,6 +15772,9 @@ fn apply_operator(
             let output = vector_search(rows, search, *access, state, context)?;
             state.scope_columns.insert(search.variable.clone());
             state.scope_columns.insert(search.score_variable.clone());
+            if let Some(evidence) = &search.evidence_variable {
+                state.scope_columns.insert(evidence.clone());
+            }
             Ok(output)
         }
         PhysicalOperator::BuiltinProcedure(call) => {
@@ -20143,6 +20156,10 @@ fn materialized_value_rows_are_ordered(
 mod procedure_streaming_tests;
 
 #[cfg(test)]
+#[path = "retrieval_tests.rs"]
+mod retrieval_tests;
+
+#[cfg(test)]
 #[path = "range_scheduling_tests.rs"]
 mod range_scheduling_tests;
 
@@ -21780,7 +21797,9 @@ fn vector_search(
         return Ok(Vec::new());
     }
     let input = match &search.input {
-        SearchInput::Text(value) | SearchInput::Vector(value) => value,
+        SearchInput::Text(value) | SearchInput::HybridText(value) | SearchInput::Vector(value) => {
+            value
+        }
     };
     if rows.iter().all(|row| {
         matches!(
@@ -21849,6 +21868,11 @@ fn vector_search(
                     if let Some(score) = hit.get(&search.score_variable) {
                         next.insert(search.score_variable.clone(), score.clone());
                     }
+                    if let Some(evidence) = &search.evidence_variable
+                        && let Some(path) = hit.get(evidence)
+                    {
+                        next.insert(evidence.clone(), path.clone());
+                    }
                     output.push(next);
                 }
             }
@@ -21905,7 +21929,8 @@ fn vector_search_with_selection(
     );
     let access = if automatic {
         let ann = source.approximate.filter(|ann| {
-            source.exact.row_count() > ann.config().candidate_budget.saturating_mul(4)
+            !source.exact.has_multi_span_owners()
+                && source.exact.row_count() > ann.config().candidate_budget.saturating_mul(4)
                 && limit <= ann.config().candidate_budget
                 && allowed_entities.is_none()
         });
@@ -21923,6 +21948,12 @@ fn vector_search_with_selection(
         access
     };
     let requested_access = match access {
+        _ if search.method != super::SearchMethod::Default
+            || matches!(search.input, SearchInput::HybridText(_))
+            || source.exact.has_multi_span_owners() =>
+        {
+            ResidentVectorAccess::Exact
+        }
         VectorAccessPath::IvfPq { .. } => ResidentVectorAccess::IvfPq,
         VectorAccessPath::Exact { .. } => ResidentVectorAccess::Exact,
         // The unoptimized/reference plan is always exact. IVF-PQ is legal only after the
@@ -21952,9 +21983,11 @@ fn vector_search_with_selection(
             .as_ref()
             .map(|ids| ids.as_slice())
             .or(allowed_entities);
+        let hybrid = matches!(&search.input, SearchInput::HybridText(_));
+        let mut lexical_query = None;
         let input = match &search.input {
             SearchInput::Vector(value) => evaluate_state(value, &row, state, context)?,
-            SearchInput::Text(value) => {
+            SearchInput::Text(value) | SearchInput::HybridText(value) => {
                 let value = evaluate_state(value, &row, state, context)?;
                 let ResultValue::Scalar(ScalarValue::String(text)) = value else {
                     return Err(Error::new(
@@ -21968,6 +22001,9 @@ fn vector_search_with_selection(
                         "local embedding artifact is not active",
                     )
                 })?;
+                if hybrid {
+                    lexical_query = Some(text.to_string());
+                }
                 ResultValue::Vector(embedding.embed_query(&text)?)
             }
         };
@@ -21977,64 +22013,141 @@ fn vector_search_with_selection(
                 "SEARCH FOR VECTOR requires a vector",
             ));
         };
-        let (hits, candidate_budget, build_generation, evidence_bookmark) =
-            if let Some(backend) = current_backend(state, context) {
-                let result = backend.search_vectors(
-                    &ResidentVectorQuery {
-                        project: context.project_id,
-                        property: source.property,
-                        layers: state.read_layers,
-                        selection: selection.cloned(),
-                        allowed_entities: allowed_entities.map(<[u64]>::to_vec),
-                        queries: vector,
-                        query_count: 1,
-                        limit,
-                        access: requested_access,
-                    },
-                    &context.cancellation,
-                )?;
-                let expected_project = context.project_id;
-                if result.project != expected_project
-                    || result.bookmark != context.bookmark
-                    || result.profile.profile_hash != source.profile_hash
-                    || result.access != requested_access
-                    || result.hits.len() != 1
-                {
-                    return Err(Error::new(
-                        ErrorCode::CorruptStorage,
-                        "resident vector evidence differs from its physical query contract",
-                    ));
+        let candidates = if hybrid {
+            limit.saturating_mul(8)
+        } else {
+            limit
+        };
+        let explicit = search.method != super::SearchMethod::Default;
+        let (mut hits, candidate_budget, build_generation, evidence_bookmark) = if explicit
+            || hybrid
+            || source.exact.has_multi_span_owners()
+        {
+            // A very narrow beam magnifies codec/navigation error as the corpus grows.
+            // This is minimum internal candidate work, never a result or ingestion quota.
+            // VectorIndex clamps scratch allocation to the live owner count.
+            let retrieval_candidates = candidates.saturating_mul(8).max(512);
+            let strategy = match search.method {
+                super::SearchMethod::Default | super::SearchMethod::Exact => {
+                    crate::graph::RetrievalStrategy::Exact
                 }
-                (
-                    result.hits.into_iter().next().unwrap_or_default(),
-                    result.candidate_budget,
-                    result.build_generation,
-                    result.bookmark,
-                )
-            } else if requested_access == ResidentVectorAccess::IvfPq {
-                let approximate = source.approximate.ok_or_else(|| {
-                    Error::new(
-                        ErrorCode::IndexUnavailable,
-                        "physical IVF-PQ access path is unavailable",
-                    )
-                })?;
-                (
-                    approximate.search(source.exact, &vector, limit)?,
-                    u32::try_from(approximate.config().candidate_budget).unwrap_or(u32::MAX),
-                    approximate.build_generation(),
-                    context.bookmark,
-                )
-            } else {
-                (
-                    source.exact.exact_search_where(&vector, limit, |id| {
-                        allowed_entities.is_none_or(|allowed| allowed.binary_search(&id).is_ok())
-                            && semantic_owner_visible(state, source.property, id)
-                    })?,
-                    0,
-                    [0_u8; 32],
-                    context.bookmark,
-                )
+                super::SearchMethod::Prefix => {
+                    let generated = automatic
+                        || context.scalar_indexes.is_some_and(|indexes| {
+                            indexes
+                                .embedding_definitions()
+                                .any(|definition| definition.target_property == source.property)
+                        });
+                    if !generated
+                        || !matches!(
+                            search.input,
+                            SearchInput::Text(_) | SearchInput::HybridText(_)
+                        )
+                        || !context.text_embedding.is_some_and(|encoder| {
+                            encoder.supports_prefix_dimensions(128)
+                                && encoder.profile().profile_hash == source.profile_hash
+                        })
+                    {
+                        return Err(Error::new(
+                            ErrorCode::EmbeddingProfileMismatch,
+                            "PREFIX requires text search with a compatible trained embedding profile",
+                        ));
+                    }
+                    crate::graph::RetrievalStrategy::Prefix {
+                        dimensions: 128,
+                        candidates: retrieval_candidates,
+                    }
+                }
+                super::SearchMethod::Adaptive => crate::graph::RetrievalStrategy::Adaptive {
+                    candidates: retrieval_candidates,
+                },
+                super::SearchMethod::Quantized => crate::graph::RetrievalStrategy::Quantized {
+                    candidates: retrieval_candidates,
+                },
             };
+            let hits = source.exact.search_retrieval_cancellable(
+                &vector,
+                candidates,
+                strategy,
+                |id| {
+                    allowed_entities.is_none_or(|allowed| allowed.binary_search(&id).is_ok())
+                        && semantic_owner_visible(state, source.property, id)
+                },
+                &context.cancellation,
+            )?;
+            let candidate_budget = match search.method {
+                super::SearchMethod::Default | super::SearchMethod::Exact => 0,
+                _ => u32::try_from(retrieval_candidates).unwrap_or(u32::MAX),
+            };
+            (hits, candidate_budget, [0_u8; 32], context.bookmark)
+        } else if let Some(backend) = current_backend(state, context) {
+            let result = backend.search_vectors(
+                &ResidentVectorQuery {
+                    project: context.project_id,
+                    property: source.property,
+                    layers: state.read_layers,
+                    selection: selection.cloned(),
+                    allowed_entities: allowed_entities.map(<[u64]>::to_vec),
+                    queries: vector,
+                    query_count: 1,
+                    limit,
+                    access: requested_access,
+                },
+                &context.cancellation,
+            )?;
+            let expected_project = context.project_id;
+            if result.project != expected_project
+                || result.bookmark != context.bookmark
+                || result.profile.profile_hash != source.profile_hash
+                || result.access != requested_access
+                || result.hits.len() != 1
+            {
+                return Err(Error::new(
+                    ErrorCode::CorruptStorage,
+                    "resident vector evidence differs from its physical query contract",
+                ));
+            }
+            (
+                result.hits.into_iter().next().unwrap_or_default(),
+                result.candidate_budget,
+                result.build_generation,
+                result.bookmark,
+            )
+        } else if requested_access == ResidentVectorAccess::IvfPq {
+            let approximate = source.approximate.ok_or_else(|| {
+                Error::new(
+                    ErrorCode::IndexUnavailable,
+                    "physical IVF-PQ access path is unavailable",
+                )
+            })?;
+            (
+                approximate.search(source.exact, &vector, limit)?,
+                u32::try_from(approximate.config().candidate_budget).unwrap_or(u32::MAX),
+                approximate.build_generation(),
+                context.bookmark,
+            )
+        } else {
+            (
+                source.exact.exact_search_where(&vector, limit, |id| {
+                    allowed_entities.is_none_or(|allowed| allowed.binary_search(&id).is_ok())
+                        && semantic_owner_visible(state, source.property, id)
+                })?,
+                0,
+                [0_u8; 32],
+                context.bookmark,
+            )
+        };
+        if let Some(query) = lexical_query {
+            hits = hybrid_retrieval_hits(
+                hits,
+                &query,
+                source,
+                allowed_entities,
+                limit,
+                state,
+                context,
+            )?;
+        }
         if hits.iter().any(|hit| !hit.score.is_finite()) {
             return Err(Error::new(
                 ErrorCode::CorruptStorage,
@@ -22075,6 +22188,40 @@ fn vector_search_with_selection(
             visible_hits.push(hit);
             let mut next = row.clone();
             next.insert(search.variable.clone(), binding);
+            if let Some(evidence) = &search.evidence_variable {
+                let path = if source.property == crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY {
+                    let Some(edge) = state.graph.edge(crate::EdgeId(hit.entity_id)) else {
+                        continue;
+                    };
+                    let Some(start) = state.graph.node(edge.source()) else {
+                        continue;
+                    };
+                    let Some(end) = state.graph.node(edge.target()) else {
+                        continue;
+                    };
+                    state
+                        .dependencies
+                        .entities
+                        .insert(EntityDependency::Node(start.id()), start.revision());
+                    state
+                        .dependencies
+                        .entities
+                        .insert(EntityDependency::Node(end.id()), end.revision());
+                    BindingValue::Path {
+                        nodes: vec![start.dense(), end.dense()],
+                        relationships: vec![edge.dense()],
+                    }
+                } else {
+                    let Some(node) = state.graph.node(NodeId(hit.entity_id)) else {
+                        continue;
+                    };
+                    BindingValue::Path {
+                        nodes: vec![node.dense()],
+                        relationships: Vec::new(),
+                    }
+                };
+                next.insert(evidence.clone(), path);
+            }
             next.insert(
                 search.score_variable.clone(),
                 BindingValue::Value(ResultValue::Scalar(ScalarValue::Float(OrderedFloat(
@@ -22083,40 +22230,250 @@ fn vector_search_with_selection(
             );
             output.push(next);
         }
-        if state.vector_searches.len() >= 128 || visible_hits.len() > 4_096 {
-            return Err(Error::new(
-                ErrorCode::ResultBudgetExceeded,
-                "vector evidence trace exceeds its bounded execution budget",
-            ));
+        // Diagnostics are bounded independently of query semantics: large LIMITs and correlated
+        // searches must not fail because their diagnostic trace is larger than this sample.
+        if state.vector_searches.len() < 128 {
+            visible_hits.truncate(4_096);
+            state.vector_searches.push(VectorSearchTrace {
+                index_name: search.index.clone(),
+                profile_hash: source.profile_hash,
+                access: requested_access,
+                candidate_budget,
+                build_generation,
+                bookmark: evidence_bookmark,
+                hits: visible_hits,
+                retrieval_method: search.method,
+                hybrid,
+            });
         }
-        state.vector_searches.push(VectorSearchTrace {
-            index_name: search.index.clone(),
-            profile_hash: source.profile_hash,
-            access: requested_access,
-            candidate_budget,
-            build_generation,
-            bookmark: evidence_bookmark,
-            hits: visible_hits,
-        });
     }
     Ok(output)
 }
 
+/// Lexical BM25 over meaningful canonical owner text, fused with semantic ranks. Only counts,
+/// lengths and IDs survive each owner visit: source text is never retained as a second corpus.
+fn hybrid_retrieval_hits(
+    semantic: Vec<crate::graph::VectorHit>,
+    query: &str,
+    source: &VectorSearchSource<'_>,
+    allowed_entities: Option<&[u64]>,
+    limit: usize,
+    state: &ExecutionState<'_>,
+    context: &ExecutionContext<'_>,
+) -> Result<Vec<crate::graph::VectorHit>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let terms = query
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(str::to_lowercase)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let kind = if source.property == crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY {
+        crate::types::EntityKind::Relationship
+    } else {
+        crate::types::EntityKind::Node
+    };
+    let automatic = matches!(
+        source.property,
+        crate::graph::SEMANTIC_NODE_PROPERTY | crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY
+    );
+    let declared = if automatic {
+        None
+    } else {
+        Some(context.scalar_indexes.and_then(|indexes| {
+            indexes.embedding_definitions()
+                .find(|definition| definition.target_property == source.property)
+        }).ok_or_else(|| Error::new(
+            ErrorCode::QueryType,
+            "HYBRID TEXT requires an automatic semantic index or a declared text embedding index",
+        ))?)
+    };
+    let mut document_frequency = vec![0_usize; terms.len()];
+    let mut matched = Vec::<(u64, usize, Vec<usize>)>::new();
+    let mut total_length = 0_usize;
+    let mut documents = 0_usize;
+    let mut visit = |id: u64| -> Result<()> {
+        check_execution(context)?;
+        if !allowed_entities.is_none_or(|allowed| allowed.binary_search(&id).is_ok())
+            || !semantic_owner_visible(state, source.property, id)
+        {
+            return Ok(());
+        }
+        // A declared field index must not gain lexical matches from unrelated properties.
+        // The borrowed statement view includes prior and current uncommitted changes.
+        let text = if let Some(definition) = &declared {
+            state
+                .graph
+                .node(NodeId(id))
+                .filter(|node| node.labels().contains(&definition.label))
+                .and_then(|node| node.property(definition.source_property))
+                .and_then(|value| match value {
+                    ScalarValue::String(text) => Some(text.to_string()),
+                    _ => None,
+                })
+        } else {
+            crate::graph::semantic_owner_text_with_mutations(
+                context.graph,
+                context.prior_graph_mutations,
+                &state.mutations,
+                kind,
+                id,
+            )?
+        };
+        let Some(text) = text else {
+            return Ok(());
+        };
+        let mut frequencies = vec![0_usize; terms.len()];
+        let mut length = 0_usize;
+        for (token_index, token) in text
+            .split(|character: char| !character.is_alphanumeric())
+            .enumerate()
+        {
+            if token_index & 1023 == 0 {
+                check_execution(context)?;
+            }
+            if token.is_empty() {
+                continue;
+            }
+            length = length.saturating_add(1);
+            if let Ok(at) = terms.binary_search(&token.to_lowercase()) {
+                frequencies[at] = frequencies[at].saturating_add(1);
+            }
+        }
+        total_length = total_length.saturating_add(length);
+        documents = documents.saturating_add(1);
+        if frequencies.iter().any(|frequency| *frequency > 0) {
+            for (at, frequency) in frequencies.iter().enumerate() {
+                if *frequency > 0 {
+                    document_frequency[at] = document_frequency[at].saturating_add(1);
+                }
+            }
+            matched.push((id, length, frequencies));
+        }
+        Ok(())
+    };
+    if !terms.is_empty() {
+        match kind {
+            crate::types::EntityKind::Node => {
+                for owner in context.graph.nodes() {
+                    visit(owner.id().0)?;
+                }
+            }
+            crate::types::EntityKind::Relationship => {
+                for owner in context.graph.edges() {
+                    visit(owner.id().0)?;
+                }
+            }
+        }
+        // The canonical iterator does not contain transaction-local insertions. Visit only
+        // those extra identities, retaining no graph/text copy and avoiding duplicate scoring.
+        let inserted = context
+            .prior_graph_mutations
+            .iter()
+            .chain(&state.mutations)
+            .filter_map(|mutation| match (kind, mutation) {
+                (crate::types::EntityKind::Node, GraphMutation::InsertNode(node))
+                    if context.graph.node(node.id).is_none() =>
+                {
+                    Some(node.id.0)
+                }
+                (crate::types::EntityKind::Relationship, GraphMutation::InsertEdge(edge))
+                    if context.graph.edge(edge.id).is_none() =>
+                {
+                    Some(edge.id.0)
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        for id in inserted {
+            visit(id)?;
+        }
+    }
+    let average_length = (total_length as f64 / documents.max(1) as f64).max(1.0);
+    let mut lexical = matched
+        .into_iter()
+        .map(|(id, length, frequencies)| {
+            let score = frequencies
+                .iter()
+                .enumerate()
+                .map(|(at, frequency)| {
+                    let tf = *frequency as f64;
+                    let df = document_frequency[at] as f64;
+                    let idf = (1.0 + (documents as f64 - df + 0.5) / (df + 0.5)).ln();
+                    idf * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * length as f64 / average_length))
+                })
+                .sum::<f64>();
+            (id, score)
+        })
+        .collect::<Vec<_>>();
+    lexical.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    lexical.truncate(limit.saturating_mul(8));
+    let mut fused = BTreeMap::<u64, f64>::new();
+    for (rank, hit) in semantic.iter().enumerate() {
+        *fused.entry(hit.entity_id).or_default() += 1.0 / (61.0 + rank as f64);
+    }
+    for (rank, (id, _)) in lexical.iter().enumerate() {
+        *fused.entry(*id).or_default() += 1.0 / (61.0 + rank as f64);
+    }
+    let mut hits = fused
+        .into_iter()
+        .map(|(entity_id, score)| crate::graph::VectorHit {
+            entity_id,
+            score: score as f32,
+        })
+        .collect::<Vec<_>>();
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.entity_id.cmp(&right.entity_id))
+    });
+    hits.truncate(limit);
+    Ok(hits)
+}
+
 fn sort_semantic_rows(rows: &mut [Row], search: &SearchClause, context: &ExecutionContext<'_>) {
-    let ascending = context
-        .vector_indexes
-        .get(crate::graph::SEMANTIC_NODE_INDEX)
-        .is_some_and(|source| source.exact.similarity() == crate::graph::Similarity::Euclidean);
+    let ascending = !matches!(search.input, SearchInput::HybridText(_))
+        && context
+            .vector_indexes
+            .get(crate::graph::SEMANTIC_NODE_INDEX)
+            .is_some_and(|source| source.exact.similarity() == crate::graph::Similarity::Euclidean);
     rows.sort_by(|left, right| {
         let score = |row: &Row| match row.get(&search.score_variable) {
             Some(BindingValue::Value(ResultValue::Scalar(ScalarValue::Float(score)))) => score.0,
             _ => f64::NEG_INFINITY,
         };
-        if ascending {
+        let order = if ascending {
             score(left).total_cmp(&score(right))
         } else {
             score(right).total_cmp(&score(left))
-        }
+        };
+        let owner = |row: &Row| match row.get(&search.variable) {
+            Some(BindingValue::Node(dense)) => (
+                0_u8,
+                context
+                    .graph
+                    .node_dense(*dense)
+                    .map_or(u64::MAX, |node| node.id().0),
+            ),
+            Some(BindingValue::Relationship(dense)) => (
+                1_u8,
+                context
+                    .graph
+                    .edge_dense(*dense)
+                    .map_or(u64::MAX, |edge| edge.id().0),
+            ),
+            _ => (2_u8, u64::MAX),
+        };
+        order.then_with(|| owner(left).cmp(&owner(right)))
     });
 }
 

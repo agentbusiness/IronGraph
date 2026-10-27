@@ -5,6 +5,11 @@ use irongraph_types::Result;
 
 pub trait TextEmbedding: Send + Sync {
     fn profile(&self) -> &EmbeddingProfile;
+    /// Whether training preserves retrieval meaning in the requested vector prefix.
+    /// Models without an explicit capability retain full-dimensional retrieval.
+    fn supports_prefix_dimensions(&self, _dimensions: usize) -> bool {
+        false
+    }
     fn embed(&self, text: &str) -> Result<Vec<f32>>;
     fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
         self.embed(text)

@@ -112,6 +112,10 @@ impl ResidentProjectDelta {
                 ResolvedVectorMutation::Upsert { coordinates, .. } => {
                     coordinates.len().saturating_mul(size_of::<u16>()) + 32
                 }
+                ResolvedVectorMutation::UpsertSpans { coordinates, .. } => coordinates
+                    .iter()
+                    .map(|span| span.len().saturating_mul(size_of::<u16>()))
+                    .fold(32_usize, usize::saturating_add),
                 ResolvedVectorMutation::Remove { .. } => 32,
             })
             .fold(0_usize, usize::saturating_add);

@@ -359,12 +359,28 @@ pub struct SearchClause {
     pub input: SearchInput,
     pub limit: Expression,
     pub score_variable: String,
+    #[serde(default)]
+    pub method: SearchMethod,
+    #[serde(default)]
+    pub evidence_variable: Option<String>,
+}
+
+/// An explicitly requested CPU retrieval strategy. Default preserves normal planning.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SearchMethod {
+    #[default]
+    Default,
+    Exact,
+    Prefix,
+    Adaptive,
+    Quantized,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum SearchInput {
     Text(Expression),
     Vector(Expression),
+    HybridText(Expression),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

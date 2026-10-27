@@ -207,6 +207,9 @@ impl TextEmbedding for ContentEncoder {
         self.inputs.lock().extend_from_slice(texts);
         texts.iter().map(|text| self.embed(text)).collect()
     }
+    fn index_windows(&self, text: &str) -> Result<Vec<String>> {
+        Ok(text.split("|span|").map(str::to_owned).collect())
+    }
     fn embed_batch_cancellable(
         &self,
         texts: &[String],
@@ -356,7 +359,9 @@ async fn wait_embeddings(database: &Database, name: &str, encoder: &ContentEncod
                 let Some(vector) = vectors.vector_for(id) else {
                     return Ok(false);
                 };
-                let expected = encoder.embed(&text)?;
+                let windows = encoder.index_windows(&text)?;
+                let expected =
+                    encoder.embed(windows.first().map_or(text.as_str(), String::as_str))?;
                 if vector.len() != expected.len()
                     || vector
                         .iter()
@@ -407,6 +412,68 @@ async fn wait_embedding_idle(database: &Database) -> Result<()> {
             .is_some_and(|queue| queue.is_idle()))
     })
     .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retrieval_span_backfills_persisted_average_without_changing_source() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let encoder = Arc::new(ContentEncoder::new()?);
+    let boot = open(directory.path(), encoder.clone()).await?;
+    let database = boot.backend();
+    query(database, "CREATE PROJECT old_span")?;
+    query(
+        database,
+        "USE old_span CREATE (:Document {body:'contract |span| guitar'})",
+    )?;
+    wait_embeddings(database, "old_span", &encoder).await?;
+    wait_embedding_idle(database).await?;
+    let project = database.resolve_project_name("old_span")?;
+    let (live, _) = database.capture_canonical_project(project)?;
+    let owner_id = live
+        .graph
+        .nodes()
+        .next()
+        .ok_or_else(|| Error::internal("missing fixture owner"))?
+        .id()
+        .0;
+    let (vectors, _) = live
+        .indexes
+        .vector_search_source(crate::graph::SEMANTIC_NODE_INDEX)
+        .ok_or_else(|| Error::internal("missing semantic column"))?;
+    let revision = vectors
+        .row_revision(owner_id)
+        .ok_or_else(|| Error::internal("missing owner revision"))?;
+    // Reproduce the persisted pre-span payload format with its unchanged freshness stamp.
+    // The canonical source remains complete; recovery must not mistake an average for spans.
+    vectors.upsert(owner_id, &encoder.embed("contract guitar")?, revision)?;
+    assert!(!vectors.has_owner_spans(owner_id));
+    database
+        .standalone_snapshot(&directory.path().join("standalone-snapshots"))
+        .await?;
+    database.shutdown_embedding_jobs().await?;
+    boot.runtime().shutdown().await?;
+    drop(vectors);
+    drop(live);
+    drop(boot);
+    let restored = open(directory.path(), encoder.clone()).await?;
+    let database = restored.backend();
+    wait_until(|| {
+        let (live, _) = database.capture_canonical_project(project)?;
+        Ok(live
+            .indexes
+            .vector_search_source(crate::graph::SEMANTIC_NODE_INDEX)
+            .is_some_and(|(column, _)| column.has_owner_spans(owner_id)))
+    })
+    .await?;
+    let rows = query(
+        database,
+        "USE old_span SEARCH d IN (EMBEDDING INDEX semantic_nodes FOR TEXT 'guitar' USING EXACT LIMIT 1) SCORE AS score RETURN d.body, score",
+    )?;
+    assert_eq!(rows[0][0]["value"], "contract |span| guitar");
+    assert!(rows[0][1]["value"].as_f64().unwrap_or_default() > 0.99);
+    database.shutdown_embedding_jobs().await?;
+    restored.runtime().shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -648,6 +715,185 @@ async fn verify() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn automatic_semantic_cpu() -> Result<()> {
     verify().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retrieval_span_wal_snapshot_and_query_methods() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let encoder = Arc::new(ContentEncoder::new()?);
+    let boot = open(directory.path(), encoder.clone()).await?;
+    let database = boot.backend();
+    query(database, "CREATE PROJECT span_retrieval")?;
+    let body = format!(
+        "{}|span|{}",
+        "contract ".repeat(1024),
+        "guitar ".repeat(1024)
+    );
+    query(
+        database,
+        &format!(
+            "USE span_retrieval CREATE (d:Document {{name:'Mixed document', body:'{body}'}}), (p:Person {{name:'Ada'}}), (d)-[:ABOUT {{description:'guitar tuition'}}]->(p)"
+        ),
+    )?;
+    wait_embeddings(database, "span_retrieval", &encoder).await?;
+    wait_embedding_idle(database).await?;
+    let statement = "USE span_retrieval MATCH (entity:Document) SEARCH entity IN (EMBEDDING INDEX semantic_nodes FOR TEXT 'guitar' USING EXACT LIMIT 1) SCORE AS score RETURN entity.body, score";
+    let before = query(database, statement)?;
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0][0]["value"], body);
+    assert!(
+        before[0][1]["value"].as_f64().unwrap_or_default() > 0.99,
+        "the matching span must not be diluted by an unrelated window"
+    );
+    let encoded_windows = encoder.inputs.lock().len();
+    database.shutdown_embedding_jobs().await?;
+    boot.runtime().shutdown().await?;
+    drop(boot);
+
+    let restored = open(directory.path(), encoder.clone()).await?;
+    let database = restored.backend();
+    wait_embedding_idle(database).await?;
+    assert_eq!(
+        query(database, statement)?,
+        before,
+        "WAL restores owner spans"
+    );
+    assert_eq!(
+        encoder.inputs.lock().len(),
+        encoded_windows,
+        "durable span vectors must not require another inference pass"
+    );
+    for method in ["EXACT", "PREFIX", "ADAPTIVE", "QUANTIZED"] {
+        let search = format!(
+            "USE span_retrieval MATCH (entity:Document) SEARCH entity IN (EMBEDDING INDEX semantic_nodes FOR TEXT 'guitar' USING {method} LIMIT 1) SCORE AS score RETURN entity.body, score"
+        );
+        if method == "PREFIX" {
+            assert!(
+                query(database, &search).is_err(),
+                "an untrained fake encoder cannot opt into prefix search"
+            );
+        } else {
+            assert_eq!(query(database, &search)?, before, "method {method}");
+        }
+    }
+    let evidence = query(
+        database,
+        "USE span_retrieval SEARCH r IN (EMBEDDING INDEX semantic_relationships FOR HYBRID TEXT 'guitar' USING EXACT LIMIT 1) SCORE AS score EVIDENCE AS evidence RETURN r, evidence",
+    )?;
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0][0]["type"], "relationship");
+    assert_eq!(evidence[0][1]["type"], "path");
+    database
+        .standalone_snapshot(&directory.path().join("standalone-snapshots"))
+        .await?;
+    database.shutdown_embedding_jobs().await?;
+    restored.runtime().shutdown().await?;
+    drop(restored);
+
+    let snapshot = open(directory.path(), encoder.clone()).await?;
+    let database = snapshot.backend();
+    wait_embedding_idle(database).await?;
+    assert_eq!(
+        query(database, statement)?,
+        before,
+        "snapshot restores owner spans"
+    );
+    query(
+        database,
+        "USE span_retrieval MATCH (d:Document) SET d.body = 'table only'",
+    )?;
+    wait_embeddings(database, "span_retrieval", &encoder).await?;
+    wait_embedding_idle(database).await?;
+    let after = query(database, statement)?;
+    assert_eq!(after[0][0]["value"], "table only");
+    assert!(
+        after[0][1]["value"].as_f64().unwrap_or_default() < 0.1,
+        "old spans must disappear after replacement"
+    );
+    query(
+        database,
+        "USE span_retrieval MATCH (d:Document) DETACH DELETE d",
+    )?;
+    wait_embedding_idle(database).await?;
+    let rows = query(
+        database,
+        "USE span_retrieval SEARCH r IN (EMBEDDING INDEX semantic_relationships FOR TEXT 'guitar' USING EXACT LIMIT 10) SCORE AS score RETURN r",
+    )?;
+    assert!(
+        rows.is_empty(),
+        "deleted relationship owners cannot leak stale spans"
+    );
+    database.shutdown_embedding_jobs().await?;
+    snapshot.runtime().shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "imports every complete bundled dataset with concurrent reads and live embedding work"]
+async fn retrieval_bundled_imports_with_live_embeddings_and_reads() -> Result<()> {
+    for dataset in super::super::dataset_loader::DATASETS {
+        let directory = tempfile::tempdir()?;
+        let encoder = Arc::new(ContentEncoder::new()?);
+        let boot = open(directory.path(), encoder.clone()).await?;
+        let database = boot.backend().as_ref().clone();
+        let importing = database.clone();
+        let statement = format!("IMPORT DATASET {}", dataset.name);
+        let started = Instant::now();
+        let importer = tokio::spawn(async move { query_async(&importing, &statement).await });
+        let mut reads = 0_usize;
+        loop {
+            let pending = !importer.is_finished();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                query_async(&database, "SHOW PROJECTS"),
+            )
+            .await
+            .map_err(|_| Error::internal("catalog read stalled behind dataset import"))??;
+            if pending {
+                reads += 1;
+            }
+            if importer.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        importer
+            .await
+            .map_err(|error| Error::internal(error.to_string()))??;
+        assert!(
+            reads > 0,
+            "a read must finish while import work is scheduled"
+        );
+        let nodes = query_async(
+            &database,
+            &format!("USE {} MATCH (n) RETURN count(n)", dataset.name),
+        )
+        .await?;
+        let edges = query_async(
+            &database,
+            &format!("USE {} MATCH ()-[r]->() RETURN count(r)", dataset.name),
+        )
+        .await?;
+        assert_eq!(nodes[0][0]["value"], dataset.nodes.to_string());
+        assert_eq!(edges[0][0]["value"], dataset.relationships.to_string());
+        wait_until(|| Ok(!encoder.inputs.lock().is_empty())).await?;
+        println!(
+            "RETRIEVAL_IMPORT name={} nodes={} relationships={} concurrent_reads={} encoded_windows={} elapsed_ms={}",
+            dataset.name,
+            dataset.nodes,
+            dataset.relationships,
+            reads,
+            encoder.inputs.lock().len(),
+            started.elapsed().as_millis()
+        );
+        // Qualification concerns write acceptance and live reads with inference enabled. It does
+        // not assert that the entire derived backlog has drained before returning control.
+        database.shutdown_embedding_jobs().await?;
+        boot.runtime().shutdown().await?;
+        drop(database);
+        drop(boot);
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

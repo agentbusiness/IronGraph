@@ -17296,6 +17296,14 @@ pub fn compile_vector(
         }
     };
     let (search, vector_access) = search;
+    // Explicit canonical retrieval and evidence bindings are executed by the ordinary CPU
+    // operator; this resident candidate compiler does not implement their semantics.
+    if search.method != super::SearchMethod::Default
+        || matches!(search.input, super::SearchInput::HybridText(_))
+        || search.evidence_variable.is_some()
+    {
+        return Ok(None);
+    }
     let trailing = operators.cloned().collect::<Vec<_>>();
     if trailing.iter().any(|operator| {
         !matches!(

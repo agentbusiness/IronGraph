@@ -1090,27 +1090,54 @@ impl<'source> Parser<'source> {
         self.expect_word("INDEX")?;
         let index = self.identifier()?;
         let input = if self.eat_word("FOR") {
-            if self.eat_word("TEXT") {
+            if self.eat_word("HYBRID") {
+                self.expect_word("TEXT")?;
+                SearchInput::HybridText(self.expression(0)?)
+            } else if self.eat_word("TEXT") {
                 SearchInput::Text(self.expression(0)?)
             } else if self.eat_word("VECTOR") {
                 SearchInput::Vector(self.expression(0)?)
             } else {
-                return self.error("SEARCH FOR requires TEXT or VECTOR");
+                return self.error("SEARCH FOR requires TEXT, HYBRID TEXT or VECTOR");
             }
         } else {
-            return self.error("SEARCH requires FOR TEXT or FOR VECTOR");
+            return self.error("SEARCH requires FOR TEXT, FOR HYBRID TEXT or FOR VECTOR");
+        };
+        let method = if self.eat_word("USING") {
+            if self.eat_word("EXACT") {
+                SearchMethod::Exact
+            } else if self.eat_word("PREFIX") {
+                SearchMethod::Prefix
+            } else if self.eat_word("ADAPTIVE") {
+                SearchMethod::Adaptive
+            } else if self.eat_word("QUANTIZED") {
+                SearchMethod::Quantized
+            } else {
+                return self.error("unknown SEARCH retrieval method");
+            }
+        } else {
+            SearchMethod::Default
         };
         self.expect_word("LIMIT")?;
         let limit = self.expression(0)?;
         self.expect_symbol(Symbol::RightParen)?;
         self.expect_word("SCORE")?;
         self.expect_word("AS")?;
+        let score_variable = self.identifier()?;
+        let evidence_variable = if self.eat_word("EVIDENCE") {
+            self.expect_word("AS")?;
+            Some(self.identifier()?)
+        } else {
+            None
+        };
         Ok(SearchClause {
             variable,
             index,
             input,
             limit,
-            score_variable: self.identifier()?,
+            score_variable,
+            method,
+            evidence_variable,
         })
     }
 

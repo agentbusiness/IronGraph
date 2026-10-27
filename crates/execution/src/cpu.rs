@@ -13254,6 +13254,11 @@ impl ExecutionBackend for CpuBackend {
                         entity_id,
                         ..
                     }
+                    | crate::graph::ResolvedVectorMutation::UpsertSpans {
+                        property,
+                        entity_id,
+                        ..
+                    }
                     | crate::graph::ResolvedVectorMutation::Remove {
                         property,
                         entity_id,
@@ -28102,8 +28107,23 @@ fn apply_cpu_vector_delta(
     columns: &mut BTreeMap<crate::types::PropertyId, CpuVectorColumn>,
     mutation: crate::graph::ResolvedVectorMutation,
 ) -> Result<()> {
+    if matches!(
+        mutation,
+        crate::graph::ResolvedVectorMutation::UpsertSpans { .. }
+    ) {
+        return Err(Error::new(
+            ErrorCode::IndexUnavailable,
+            "owner span vectors require canonical CPU retrieval",
+        ));
+    }
     let (property, entity, revision) = match &mutation {
         crate::graph::ResolvedVectorMutation::Upsert {
+            property,
+            entity_id,
+            revision,
+            ..
+        }
+        | crate::graph::ResolvedVectorMutation::UpsertSpans {
             property,
             entity_id,
             revision,
@@ -28130,6 +28150,12 @@ fn apply_cpu_vector_delta(
         vector.changed_rows.insert_cow(stable_id_key(entity), ());
     }
     match mutation {
+        crate::graph::ResolvedVectorMutation::UpsertSpans { .. } => {
+            return Err(Error::new(
+                ErrorCode::IndexUnavailable,
+                "owner span vectors require canonical CPU retrieval",
+            ));
+        }
         crate::graph::ResolvedVectorMutation::Remove { .. } => {
             if let Some(row) = row {
                 vector.active[row] = 0;

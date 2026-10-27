@@ -1454,6 +1454,7 @@ fn select_vector_access_paths(
                 });
                 let query_expression = match &search.input {
                     super::SearchInput::Text(expression)
+                    | super::SearchInput::HybridText(expression)
                     | super::SearchInput::Vector(expression) => expression,
                 };
                 let query_batch = if expression_variables(query_expression).is_empty() {

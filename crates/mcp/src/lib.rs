@@ -1036,7 +1036,7 @@ mod tests {
             assert!(!doc.markdown.contains("90%"));
             assert!(!doc.markdown.contains("recall floor"));
         }
-        assert_eq!(examples, 6);
+        assert_eq!(examples, 9);
     }
 
     #[test]

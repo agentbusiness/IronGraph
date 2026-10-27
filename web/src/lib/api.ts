@@ -65,10 +65,20 @@ function unwrapTypedValue(value: unknown): unknown {
       return isRecord(payload)
         ? {
             __kind: 'path',
-            nodes: Array.isArray(payload.nodes) ? payload.nodes.map(unwrapTypedValue) : [],
+            nodes: Array.isArray(payload.nodes)
+              ? payload.nodes.map((node: unknown) => unwrapTypedValue(
+                isRecord(node) && node.type === 'node' && 'value' in node
+                  ? node : { type: 'node', value: node },
+              )) : [],
             relationships: Array.isArray(payload.relationships)
-              ? payload.relationships.map(unwrapTypedValue)
-              : Array.isArray(payload.edges) ? payload.edges.map(unwrapTypedValue) : [],
+              ? payload.relationships.map((relationship: unknown) => unwrapTypedValue(
+                isRecord(relationship) && relationship.type === 'relationship' && 'value' in relationship
+                  ? relationship : { type: 'relationship', value: relationship },
+              ))
+              : Array.isArray(payload.edges) ? payload.edges.map((relationship: unknown) => unwrapTypedValue(
+                isRecord(relationship) && relationship.type === 'relationship' && 'value' in relationship
+                  ? relationship : { type: 'relationship', value: relationship },
+              )) : [],
           }
         : payload;
     case 'bytes':
