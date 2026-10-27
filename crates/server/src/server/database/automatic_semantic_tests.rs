@@ -1,9 +1,6 @@
 use super::*;
 use crate::{
-    engine::{
-        BootstrappedNode, ExecutionClass, SingleNodeBootstrapConfig, WriteStorageLimits,
-        open_standalone,
-    },
+    engine::{BootstrappedNode, ExecutionClass, SingleNodeBootstrapConfig, open_standalone},
     graph::{EmbeddingDType, EmbeddingProfile, Similarity},
     protocol::{QueryExecutor, QueryStreamEvent},
 };
@@ -235,11 +232,6 @@ async fn open(path: &Path, encoder: Arc<ContentEncoder>) -> Result<BootstrappedN
         SingleNodeBootstrapConfig {
             execution_class: ExecutionClass::Cpu,
             startup_timeout: Duration::from_secs(30),
-            storage_limits: WriteStorageLimits {
-                max_log_record_bytes: usize::MAX,
-                max_log_entries_per_read: 4096,
-                max_snapshot_bytes: usize::MAX,
-            },
         },
         |path, identity| {
             Ok(Arc::new(Database::open_backend(
@@ -253,10 +245,6 @@ async fn open(path: &Path, encoder: Arc<ContentEncoder>) -> Result<BootstrappedN
     .await?;
     boot.backend()
         .bind_runtime(Arc::downgrade(boot.runtime()))?;
-    boot.backend()
-        .standalone_recover(&path.join("standalone-snapshots"))
-        .await?;
-    boot.runtime().replay_standalone_wal().await?;
     boot.backend().bind_text_embedding(encoder)?;
     Ok(boot)
 }
@@ -412,68 +400,6 @@ async fn wait_embedding_idle(database: &Database) -> Result<()> {
             .is_some_and(|queue| queue.is_idle()))
     })
     .await
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn retrieval_span_backfills_persisted_average_without_changing_source() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let encoder = Arc::new(ContentEncoder::new()?);
-    let boot = open(directory.path(), encoder.clone()).await?;
-    let database = boot.backend();
-    query(database, "CREATE PROJECT old_span")?;
-    query(
-        database,
-        "USE old_span CREATE (:Document {body:'contract |span| guitar'})",
-    )?;
-    wait_embeddings(database, "old_span", &encoder).await?;
-    wait_embedding_idle(database).await?;
-    let project = database.resolve_project_name("old_span")?;
-    let (live, _) = database.capture_canonical_project(project)?;
-    let owner_id = live
-        .graph
-        .nodes()
-        .next()
-        .ok_or_else(|| Error::internal("missing fixture owner"))?
-        .id()
-        .0;
-    let (vectors, _) = live
-        .indexes
-        .vector_search_source(crate::graph::SEMANTIC_NODE_INDEX)
-        .ok_or_else(|| Error::internal("missing semantic column"))?;
-    let revision = vectors
-        .row_revision(owner_id)
-        .ok_or_else(|| Error::internal("missing owner revision"))?;
-    // Reproduce the persisted pre-span payload format with its unchanged freshness stamp.
-    // The canonical source remains complete; recovery must not mistake an average for spans.
-    vectors.upsert(owner_id, &encoder.embed("contract guitar")?, revision)?;
-    assert!(!vectors.has_owner_spans(owner_id));
-    database
-        .standalone_snapshot(&directory.path().join("standalone-snapshots"))
-        .await?;
-    database.shutdown_embedding_jobs().await?;
-    boot.runtime().shutdown().await?;
-    drop(vectors);
-    drop(live);
-    drop(boot);
-    let restored = open(directory.path(), encoder.clone()).await?;
-    let database = restored.backend();
-    wait_until(|| {
-        let (live, _) = database.capture_canonical_project(project)?;
-        Ok(live
-            .indexes
-            .vector_search_source(crate::graph::SEMANTIC_NODE_INDEX)
-            .is_some_and(|(column, _)| column.has_owner_spans(owner_id)))
-    })
-    .await?;
-    let rows = query(
-        database,
-        "USE old_span SEARCH d IN (EMBEDDING INDEX semantic_nodes FOR TEXT 'guitar' USING EXACT LIMIT 1) SCORE AS score RETURN d.body, score",
-    )?;
-    assert_eq!(rows[0][0]["value"], "contract |span| guitar");
-    assert!(rows[0][1]["value"].as_f64().unwrap_or_default() > 0.99);
-    database.shutdown_embedding_jobs().await?;
-    restored.runtime().shutdown().await?;
-    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -660,13 +586,18 @@ async fn verify() -> Result<()> {
         10
     );
     database
-        .standalone_snapshot(&directory.path().join("standalone-snapshots"))
+        .write_binding()?
+        .runtime
+        .upgrade()
+        .ok_or_else(|| Error::internal("runtime closed"))?
+        .flush_persistence()
         .await?;
     query(
         database,
-        "USE automatic MATCH (n:Document) SET n.body = 'contract WAL content'",
+        "USE automatic MATCH (n:Document) SET n.body = 'contract durable content'",
     )?;
     wait_embeddings(database, "automatic", &encoder).await?;
+    database.shutdown_embedding_jobs().await?;
     boot.runtime().shutdown().await?;
     drop(boot);
     let before_reopen = encoder.inputs.lock().len();
@@ -676,7 +607,7 @@ async fn verify() -> Result<()> {
         restored.backend(),
         "USE automatic SEARCH entity IN (EMBEDDING INDEX graph_semantic FOR TEXT 'contract' LIMIT 1) SCORE AS score RETURN entity, score",
     )?;
-    assert!(found[0][0].to_string().contains("WAL content"));
+    assert!(found[0][0].to_string().contains("durable content"));
     assert_eq!(
         encoder.inputs.lock().len(),
         before_reopen,
@@ -707,7 +638,7 @@ async fn verify() -> Result<()> {
     );
     restored.runtime().shutdown().await?;
     println!(
-        "automatic semantic integration verified on canonical CPU: all owner kinds, ranked limits, edits, metadata, WAL/snapshot and detach deletion"
+        "automatic semantic integration verified on canonical CPU: all owner kinds, ranked limits, edits, metadata, record recovery and detach deletion"
     );
     Ok(())
 }
@@ -718,7 +649,35 @@ async fn automatic_semantic_cpu() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn retrieval_span_wal_snapshot_and_query_methods() -> Result<()> {
+async fn durable_pending_owner_commit_wakes_idle_embedding_worker() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let encoder = Arc::new(ContentEncoder::new()?);
+    let boot = open(directory.path(), encoder.clone()).await?;
+    let database = boot.backend();
+    // Complete the sole startup recovery scan before creating any owner.
+    wait_embedding_idle(database).await?;
+    query(database, "CREATE PROJECT durable_wakeup")?;
+    query(
+        database,
+        "USE durable_wakeup CREATE (:Document {body:'contract durable notification'})",
+    )?;
+    boot.runtime().flush_persistence().await?;
+    wait_embeddings(database, "durable_wakeup", &encoder).await?;
+    wait_embedding_idle(database).await?;
+    assert!(
+        encoder
+            .inputs
+            .lock()
+            .iter()
+            .any(|text| text.contains("contract durable notification"))
+    );
+    database.shutdown_embedding_jobs().await?;
+    boot.runtime().shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retrieval_span_record_recovery_and_query_methods() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let encoder = Arc::new(ContentEncoder::new()?);
     let boot = open(directory.path(), encoder.clone()).await?;
@@ -756,7 +715,7 @@ async fn retrieval_span_wal_snapshot_and_query_methods() -> Result<()> {
     assert_eq!(
         query(database, statement)?,
         before,
-        "WAL restores owner spans"
+        "durable records restore owner spans"
     );
     assert_eq!(
         encoder.inputs.lock().len(),
@@ -784,7 +743,11 @@ async fn retrieval_span_wal_snapshot_and_query_methods() -> Result<()> {
     assert_eq!(evidence[0][0]["type"], "relationship");
     assert_eq!(evidence[0][1]["type"], "path");
     database
-        .standalone_snapshot(&directory.path().join("standalone-snapshots"))
+        .write_binding()?
+        .runtime
+        .upgrade()
+        .ok_or_else(|| Error::internal("runtime closed"))?
+        .flush_persistence()
         .await?;
     database.shutdown_embedding_jobs().await?;
     restored.runtime().shutdown().await?;
@@ -796,7 +759,7 @@ async fn retrieval_span_wal_snapshot_and_query_methods() -> Result<()> {
     assert_eq!(
         query(database, statement)?,
         before,
-        "snapshot restores owner spans"
+        "durable records restore owner spans"
     );
     query(
         database,

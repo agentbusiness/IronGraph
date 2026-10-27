@@ -1,32 +1,27 @@
 use std::{
-    collections::VecDeque,
-    path::Path,
-    sync::mpsc::{self, RecvTimeoutError, SyncSender},
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicU64, Ordering},
-    },
+    collections::{BTreeMap, BTreeSet, LinkedList, VecDeque},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::storage::{
-    AdmissionClass, AdmissionController, AdmissionPermit, ConnectionId, DurableLog, MutationEntry,
+    AdmissionClass, AdmissionController, AdmissionPermit, ConnectionId, MutationEntry, RecordBatch,
+    RecordOp,
 };
 use crate::{Bookmark, Error, ErrorCode, Result};
 
 use super::{
     ApplicationWait, CommandReservation, CommandReservationOutcome, CommittedWrite,
     MutationStateBackend, ProcessId, StandaloneNode, WriteCommand, WriteRequest, WriteResponse,
-    WriteStorageLimits,
 };
 
 // Keep the no-delay single-write path, but do not impose an artificial throughput ceiling when
 // thousands of already-admitted independent writes arrive together. This bound remains finite,
 // every queued payload already owns an admission permit, and a graph backend may end a batch
-// earlier when its COW overlay reaches capacity.
+// earlier when its ordered mutation overlay reaches capacity.
 const MAX_WRITE_BATCH: usize = 8_192;
-const MAX_PENDING_WAL_BATCHES: usize = 8;
-const WAL_SYNC_INTERVAL: Duration = Duration::from_millis(10);
+const PERSISTENCE_GROUP_INTERVAL: Duration = Duration::from_secs(1);
+const PERSISTENCE_BATCH_TARGET_BYTES: usize = 4 * 1024 * 1024;
 
 struct QueuedWrite {
     command: Option<WriteCommand>,
@@ -42,17 +37,215 @@ enum WriterMessage {
     Shutdown(tokio::sync::oneshot::Sender<Result<()>>),
 }
 
-enum PersistenceMessage {
-    Append(Vec<MutationEntry>),
-    Flush(mpsc::SyncSender<Result<()>>),
-    Shutdown(mpsc::SyncSender<Result<()>>),
+type ApplicationFailure = Arc<parking_lot::Mutex<Option<Error>>>;
+
+#[derive(Default)]
+struct PersistenceRecords {
+    batches: Vec<RecordBatch>,
+}
+
+#[derive(Default)]
+struct DirtyRecords {
+    first_index: u64,
+    bookmark: Bookmark,
+    points: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    prefixes: BTreeSet<Vec<u8>>,
+}
+
+impl DirtyRecords {
+    fn absorb(&mut self, batch: RecordBatch) {
+        if self.first_index == 0 {
+            self.first_index = batch.first_index;
+        }
+        self.bookmark = batch.bookmark;
+        for operation in batch.operations {
+            match operation {
+                RecordOp::Put { key, value } => {
+                    self.points.insert(key, Some(value));
+                }
+                RecordOp::Delete { key } => {
+                    self.points.insert(key, None);
+                }
+                RecordOp::DeletePrefix { prefix } => {
+                    let removed = self
+                        .points
+                        .range(prefix.clone()..)
+                        .take_while(|(key, _)| key.starts_with(&prefix))
+                        .map(|(key, _)| key.clone())
+                        .collect::<Vec<_>>();
+                    for key in removed {
+                        self.points.remove(&key);
+                    }
+                    if !self
+                        .prefixes
+                        .range(..=prefix.clone())
+                        .next_back()
+                        .is_some_and(|previous| prefix.starts_with(previous))
+                    {
+                        let removed = self
+                            .prefixes
+                            .range(prefix.clone()..)
+                            .take_while(|previous| previous.starts_with(&prefix))
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for previous in removed {
+                            self.prefixes.remove(&previous);
+                        }
+                        self.prefixes.insert(prefix);
+                    }
+                }
+            }
+        }
+    }
+
+    fn into_batch(self) -> RecordBatch {
+        RecordBatch {
+            first_index: self.first_index,
+            bookmark: self.bookmark,
+            operations: self
+                .prefixes
+                .into_iter()
+                .map(|prefix| RecordOp::DeletePrefix { prefix })
+                .chain(self.points.into_iter().map(|(key, value)| match value {
+                    Some(value) => RecordOp::Put { key, value },
+                    None => RecordOp::Delete { key },
+                }))
+                .collect(),
+        }
+    }
+}
+
+type DurabilityReply = tokio::sync::oneshot::Sender<Result<()>>;
+struct PersistenceState {
+    pending: Option<DirtyRecords>,
+    deadline: Option<Instant>,
+    published: u64,
+    durable: u64,
+    waiters: LinkedList<(u64, DurabilityReply)>,
+    force: bool,
+    closing: bool,
+    error: Option<Error>,
+    publication_parked: bool,
+}
+
+struct PersistenceMailbox {
+    state: parking_lot::Mutex<PersistenceState>,
+    wake: parking_lot::Condvar,
+    #[cfg(test)]
+    publication_pause: parking_lot::Mutex<Option<Arc<PublicationPause>>>,
+    #[cfg(test)]
+    parked: tokio::sync::Notify,
 }
 
 #[cfg(test)]
 #[derive(Default)]
-struct EventualDurabilityTestHook {
-    block_append: std::sync::atomic::AtomicBool,
-    append_reached: std::sync::atomic::AtomicBool,
+struct PublicationPause {
+    entered: tokio::sync::Notify,
+    released: parking_lot::Mutex<bool>,
+    resume: parking_lot::Condvar,
+}
+
+#[cfg(test)]
+impl PublicationPause {
+    fn release(&self) {
+        *self.released.lock() = true;
+        self.resume.notify_all();
+    }
+}
+
+impl PersistenceMailbox {
+    fn new(bookmark: Bookmark) -> Self {
+        Self {
+            state: parking_lot::Mutex::new(PersistenceState {
+                pending: None,
+                deadline: None,
+                published: bookmark.index,
+                durable: bookmark.index,
+                waiters: LinkedList::new(),
+                force: false,
+                closing: false,
+                error: None,
+                publication_parked: false,
+            }),
+            wake: parking_lot::Condvar::new(),
+            #[cfg(test)]
+            publication_pause: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            parked: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn publish(&self, records: PersistenceRecords) -> Result<()> {
+        if records.batches.is_empty() {
+            return Ok(());
+        }
+        let published = self.state.lock().published;
+        let mut previous = published;
+        for batch in &records.batches {
+            if previous.checked_add(1) != Some(batch.first_index)
+                || batch.bookmark.index < batch.first_index
+            {
+                return Err(Error::internal(
+                    "noncontiguous current-record publication span",
+                ));
+            }
+            previous = batch.bookmark.index;
+        }
+        // Only the ordered RAM writer merges. Swap roots under the mailbox lock, then perform
+        // all key traversal, allocation and obsolete-value destruction outside the lock.
+        let mut dirty = self.state.lock().pending.take().unwrap_or_default();
+        #[cfg(test)]
+        if let Some(pause) = self.publication_pause.lock().take() {
+            pause.entered.notify_one();
+            let mut released = pause.released.lock();
+            while !*released {
+                pause.resume.wait(&mut released);
+            }
+        }
+        for batch in records.batches {
+            dirty.absorb(batch);
+        }
+        let published = dirty.bookmark.index;
+        let mut state = self.state.lock();
+        state.pending = Some(dirty);
+        state.published = published;
+        let notify = state.error.is_none()
+            && (state.deadline.is_none()
+                || state.publication_parked
+                || state.force
+                || state
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline));
+        if state.error.is_none() {
+            state
+                .deadline
+                .get_or_insert_with(|| Instant::now() + PERSISTENCE_GROUP_INTERVAL);
+        }
+        drop(state);
+        if notify {
+            self.wake.notify_one();
+        }
+        Ok(())
+    }
+
+    fn barrier(&self, reply: Option<DurabilityReply>, closing: bool) {
+        let mut state = self.state.lock();
+        let target = state.published;
+        if let Some(reply) = reply {
+            if target <= state.durable {
+                let _ = reply.send(Ok(()));
+            } else {
+                state.waiters.push_back((target, reply));
+            }
+        }
+        state.closing |= closing;
+        let wake = closing || target > state.durable;
+        state.force |= wake; // A barrier that needs durability explicitly retries IO failures.
+        drop(state);
+        if wake {
+            self.wake.notify_one();
+        }
+    }
 }
 
 struct PreparedWrite {
@@ -65,10 +258,11 @@ struct PreparedWrite {
 
 fn standalone_writer_loop(
     mut receiver: tokio::sync::mpsc::Receiver<WriterMessage>,
-    persistence: SyncSender<PersistenceMessage>,
+    persistence: Arc<PersistenceMailbox>,
     backend: Arc<dyn MutationStateBackend>,
     gate: Arc<parking_lot::Mutex<()>>,
     runtime: tokio::runtime::Handle,
+    failure: ApplicationFailure,
 ) {
     let mut pending = VecDeque::new();
     let mut deferred_control = None;
@@ -82,40 +276,20 @@ fn standalone_writer_loop(
             match received {
                 Some(WriterMessage::Write(write)) => pending.push_back(write),
                 Some(WriterMessage::Flush(reply)) => {
-                    let (flush, completed) = mpsc::sync_channel(1);
-                    let result = persistence
-                        .send(PersistenceMessage::Flush(flush))
-                        .map_err(|_| Error::internal("WAL persistence worker is unavailable"))
-                        .and_then(|()| {
-                            completed.recv().map_err(|_| {
-                                Error::internal("WAL persistence flush response was lost")
-                            })?
-                        });
-                    let _ = reply.send(result);
+                    persistence.barrier(Some(reply), false);
                     continue;
                 }
                 Some(WriterMessage::Shutdown(reply)) => {
-                    let (shutdown, completed) = mpsc::sync_channel(1);
-                    let result = persistence
-                        .send(PersistenceMessage::Shutdown(shutdown))
-                        .map_err(|_| Error::internal("WAL persistence worker is unavailable"))
-                        .and_then(|()| {
-                            completed.recv().map_err(|_| {
-                                Error::internal("WAL persistence shutdown response was lost")
-                            })?
-                        });
-                    let _ = reply.send(result);
+                    persistence.barrier(Some(reply), true);
                     return;
                 }
                 None => {
-                    let (shutdown, completed) = mpsc::sync_channel(1);
-                    let _ = persistence.send(PersistenceMessage::Shutdown(shutdown));
-                    let _ = completed.recv();
+                    persistence.barrier(None, true);
                     return;
                 }
             }
         }
-        while pending.len() < MAX_WRITE_BATCH {
+        while pending.len() < MAX_WRITE_BATCH && deferred_control.is_none() {
             match receiver.try_recv() {
                 Ok(WriterMessage::Write(item)) => pending.push_back(item),
                 Ok(control) => {
@@ -135,17 +309,11 @@ fn standalone_writer_loop(
             &backend,
             &gate,
             &runtime,
+            &failure,
         ) {
-            Ok(appended) if appended.is_empty() => {}
-            Ok(appended) => {
-                if persistence
-                    .send(PersistenceMessage::Append(appended))
-                    .is_err()
-                {
-                    tracing::error!(
-                        "standalone WAL persistence stopped; the writer thread is shutting down \
-                         and further writes will be rejected"
-                    );
+            Ok(records) => {
+                if let Err(error) = persistence.publish(records) {
+                    *failure.lock() = Some(error);
                     return;
                 }
             }
@@ -166,77 +334,100 @@ fn standalone_writer_loop(
 }
 
 fn standalone_persistence_loop(
-    receiver: mpsc::Receiver<PersistenceMessage>,
-    wal: Arc<parking_lot::Mutex<DurableLog>>,
-    #[cfg(test)] test_hook: Arc<EventualDurabilityTestHook>,
+    mailbox: Arc<PersistenceMailbox>,
+    backend: Arc<dyn MutationStateBackend>,
 ) {
-    let mut unsynced = false;
-    let mut last_sync = Instant::now();
+    let mut retained: Option<DirtyRecords> = None;
     loop {
-        let received = if unsynced {
-            receiver.recv_timeout(WAL_SYNC_INTERVAL.saturating_sub(last_sync.elapsed()))
-        } else {
-            receiver.recv().map_err(|_| RecvTimeoutError::Disconnected)
-        };
-        match received {
-            Ok(PersistenceMessage::Append(mut entries)) => {
-                #[cfg(test)]
+        let pending = {
+            let mut state = mailbox.state.lock();
+            loop {
+                if state.closing && state.pending.is_none() && retained.is_none() {
+                    return;
+                }
+                let retry_allowed = state.error.is_none() || state.force;
+                let due = state.force
+                    || state
+                        .deadline
+                        .is_some_and(|deadline| Instant::now() >= deadline);
+                if retry_allowed && due && (state.pending.is_some() || retained.is_some()) {
+                    state.force = false;
+                    state.deadline = None;
+                    break state.pending.take();
+                }
+                if state.error.is_none()
+                    && state.pending.is_some()
+                    && let Some(deadline) = state.deadline
                 {
-                    use std::sync::atomic::Ordering;
-
-                    test_hook.append_reached.store(true, Ordering::Release);
-                    while test_hook.block_append.load(Ordering::Acquire) {
-                        std::thread::yield_now();
+                    mailbox.wake.wait_for(
+                        &mut state,
+                        deadline.saturating_duration_since(Instant::now()),
+                    );
+                } else {
+                    // A producer may temporarily own the pending root while merging outside
+                    // this lock. Arm the wake handshake before atomically unlocking to park.
+                    state.publication_parked = state.error.is_none() && state.pending.is_none();
+                    #[cfg(test)]
+                    if state.publication_parked {
+                        mailbox.parked.notify_one();
+                    }
+                    mailbox.wake.wait(&mut state);
+                    state.publication_parked = false;
+                }
+            }
+        };
+        let mut dirty = retained.take().unwrap_or_default();
+        if let Some(pending) = pending {
+            dirty.absorb(pending.into_batch());
+        }
+        let batch = dirty.into_batch();
+        let bookmark = batch.bookmark;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            backend.persist(std::slice::from_ref(&batch))
+        }))
+        .unwrap_or_else(|_| Err(Error::internal("persistence backend panicked")));
+        if let Err(error) = &result {
+            tracing::error!(code = ?error.code, message = %error.message,
+                "background persistence failed; current records retained for explicit flush or close retry; RAM publication continues");
+        }
+        let mut state = mailbox.state.lock();
+        match result {
+            Ok(()) => {
+                state.durable = bookmark.index;
+                state.error = None;
+                let waiters = std::mem::take(&mut state.waiters);
+                let durable = state.durable;
+                drop(state);
+                let mut remaining = LinkedList::new();
+                for (target, reply) in waiters {
+                    if target <= durable {
+                        let _ = reply.send(Ok(()));
+                    } else {
+                        remaining.push_back((target, reply));
                     }
                 }
-                let result = if entries.len() == 1 {
-                    wal.lock()
-                        .append_buffered(entries.pop().expect("one buffered mutation"))
-                } else {
-                    wal.lock().append_batch_buffered(entries)
-                };
-                if let Err(error) = result {
-                    tracing::error!(
-                        code = ?error.code,
-                        message = %error.message,
-                        "standalone WAL append failed; the persistence thread is shutting down \
-                         and WAL flushes will be rejected"
-                    );
+                let mut state = mailbox.state.lock();
+                state.waiters.append(&mut remaining);
+                if state.closing || !state.waiters.is_empty() {
+                    state.force = true;
+                }
+            }
+            Err(error) => {
+                state.error = Some(copy_error(&error));
+                state.force = false;
+                state.deadline = None;
+                let waiters = std::mem::take(&mut state.waiters);
+                let closing = state.closing;
+                drop(state);
+                let mut dirty = DirtyRecords::default();
+                dirty.absorb(batch);
+                retained = Some(dirty);
+                for (_, reply) in waiters {
+                    let _ = reply.send(Err(copy_error(&error)));
+                }
+                if closing {
                     return;
                 }
-                unsynced = true;
-            }
-            Ok(PersistenceMessage::Flush(reply)) => {
-                let result = wal.lock().sync();
-                if result.is_ok() {
-                    unsynced = false;
-                    last_sync = Instant::now();
-                }
-                let _ = reply.send(result);
-            }
-            Ok(PersistenceMessage::Shutdown(reply)) => {
-                let result = wal.lock().sync();
-                let _ = reply.send(result);
-                return;
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                if let Err(error) = wal.lock().sync() {
-                    tracing::error!(
-                        code = ?error.code,
-                        message = %error.message,
-                        "standalone WAL sync failed; the persistence thread is shutting down \
-                         and WAL flushes will be rejected"
-                    );
-                    return;
-                }
-                unsynced = false;
-                last_sync = Instant::now();
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                if unsynced {
-                    let _ = wal.lock().sync();
-                }
-                return;
             }
         }
     }
@@ -249,9 +440,13 @@ fn process_writer_batch(
     backend: &Arc<dyn MutationStateBackend>,
     gate: &Arc<parking_lot::Mutex<()>>,
     runtime: &tokio::runtime::Handle,
-) -> Result<Vec<MutationEntry>> {
+    failure: &ApplicationFailure,
+) -> Result<PersistenceRecords> {
+    if let Some(error) = failure.lock().as_ref() {
+        return Err(copy_error(error));
+    }
     let Some(first_deadline) = pending.front().map(|item| item.deadline) else {
-        return Ok(Vec::new());
+        return Ok(PersistenceRecords::default());
     };
     let Ok(remaining) = first_deadline.remaining() else {
         if let Some(item) = pending.pop_front() {
@@ -259,7 +454,7 @@ fn process_writer_batch(
                 "standalone write expired in the writer queue",
             )));
         }
-        return Ok(Vec::new());
+        return Ok(PersistenceRecords::default());
     };
     let batch_gate = match remaining {
         Some(remaining) => gate.try_lock_for(remaining),
@@ -271,7 +466,7 @@ fn process_writer_batch(
                 "standalone write admission timed out",
             )));
         }
-        return Ok(Vec::new());
+        return Ok(PersistenceRecords::default());
     };
 
     let applied_at = runtime.block_on(backend.applied_bookmark());
@@ -284,10 +479,11 @@ fn process_writer_batch(
                     .reply
                     .send(Err(Error::internal("standalone mutation index exhausted")));
             }
-            return Ok(Vec::new());
+            return Ok(PersistenceRecords::default());
         }
     };
     let mut prepared = Vec::with_capacity(pending.len().min(MAX_WRITE_BATCH));
+    let mut prepared_bytes = 0_usize;
     while prepared.len() < MAX_WRITE_BATCH {
         let Some(mut item) = pending.pop_front() else {
             break;
@@ -366,7 +562,8 @@ fn process_writer_batch(
                 continue;
             }
         };
-        let pipelined = reservation.may_release_after_append();
+        let pipelined = reservation.may_pipeline();
+        prepared_bytes = prepared_bytes.saturating_add(mutation.payload().len());
         prepared.push(PreparedWrite {
             mutation,
             reservation,
@@ -378,13 +575,13 @@ fn process_writer_batch(
             Some(index) => index,
             None => break,
         };
-        if !pipelined {
+        if !pipelined || prepared_bytes >= PERSISTENCE_BATCH_TARGET_BYTES {
             break;
         }
         // Preparation/reservation is often long enough for concurrent callers to arrive. Pull
         // them into this group before deciding the batch is complete; no artificial timer is
         // added to the single-write latency path.
-        while pending.len() + prepared.len() < MAX_WRITE_BATCH {
+        while pending.len() + prepared.len() < MAX_WRITE_BATCH && deferred_control.is_none() {
             match receiver.try_recv() {
                 Ok(WriterMessage::Write(item)) => pending.push_back(item),
                 Ok(control) => {
@@ -399,14 +596,15 @@ fn process_writer_batch(
         }
     }
     if prepared.is_empty() {
-        return Ok(Vec::new());
+        return Ok(PersistenceRecords::default());
     }
 
     // Canonical publication is the commit boundary. Replies are delivered immediately afterward;
-    // WAL serialization, write, and fsync are deliberately outside the request's latency path.
-    // The delta path moves each already-encoded mutation exactly once into one buffered append and
-    // never rebuilds or rescans unrelated graph state.
-    let mut appended = Vec::with_capacity(prepared.len());
+    // Record commits and filesystem synchronization run only on the persistence thread. Capture
+    // each mutation's records at publication, never by rescanning a later live graph view.
+    let mut records = PersistenceRecords {
+        batches: Vec::with_capacity(prepared.len()),
+    };
     let mut fatal = None;
     for write in prepared {
         let PreparedWrite {
@@ -416,7 +614,8 @@ fn process_writer_batch(
             admission,
             reply,
         } = write;
-        let result = if let Some(error) = fatal.as_ref() {
+        let failed = failure.lock().as_ref().map(copy_error);
+        let result = if let Some(error) = fatal.as_ref().or(failed.as_ref()) {
             let _ = runtime.block_on(
                 backend
                     .complete_command_reservation(reservation, CommandReservationOutcome::Rejected),
@@ -426,7 +625,25 @@ fn process_writer_batch(
             match runtime.block_on(backend.apply_mutation(&mutation)) {
                 Ok(applied) => {
                     let bookmark = mutation.bookmark();
-                    appended.push(mutation);
+                    {
+                        let Some(batch) = applied.persistence.filter(|batch| {
+                            batch.bookmark == bookmark && batch.first_index == bookmark.index
+                        }) else {
+                            let error = Error::internal(
+                                "applied mutation omitted its current-record span or returned a mismatched span",
+                            );
+                            *failure.lock() = Some(copy_error(&error));
+                            let _ = runtime.block_on(backend.complete_command_reservation(
+                                reservation,
+                                CommandReservationOutcome::Applied,
+                            ));
+                            fatal = Some(copy_error(&error));
+                            drop(admission);
+                            let _ = reply.send(Err(error));
+                            continue;
+                        };
+                        records.batches.push(batch);
+                    }
                     runtime
                         .block_on(backend.complete_command_reservation(
                             reservation,
@@ -443,6 +660,7 @@ fn process_writer_batch(
                         })
                 }
                 Err(error) => {
+                    *failure.lock() = Some(copy_error(&error));
                     let _ = runtime.block_on(backend.complete_command_reservation(
                         reservation,
                         CommandReservationOutcome::Rejected,
@@ -456,10 +674,7 @@ fn process_writer_batch(
         let _ = reply.send(result);
     }
 
-    if appended.is_empty() {
-        return Ok(Vec::new());
-    }
-    Ok(appended)
+    Ok(records)
 }
 
 fn copy_error(error: &Error) -> Error {
@@ -471,422 +686,6 @@ fn copy_error(error: &Error) -> Error {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-
-    use async_trait::async_trait;
-
-    use crate::ProjectId;
-
-    use super::*;
-    use crate::engine::{
-        BackendSnapshot, ExecutionClass, MutationApplyResult, NodeIdentity, WriteStorageLimits,
-    };
-    use crate::storage::MutationKind;
-
-    struct BatchedBackend {
-        applied: AtomicU64,
-        reservations: AtomicUsize,
-        first_apply_reservations: AtomicUsize,
-    }
-
-    #[async_trait]
-    impl MutationStateBackend for BatchedBackend {
-        async fn prepare_command(
-            &self,
-            mut command: WriteCommand,
-            sequencer_time_millis: i64,
-        ) -> Result<WriteCommand> {
-            if self.reservations.load(Ordering::Acquire) == 0 {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            command.commit_time_millis = sequencer_time_millis;
-            Ok(command)
-        }
-
-        async fn reserve_command(
-            &self,
-            _command: &WriteCommand,
-            position: Bookmark,
-        ) -> Result<CommandReservation> {
-            self.reservations.fetch_add(1, Ordering::AcqRel);
-            CommandReservation::pipelined(position)
-        }
-
-        async fn apply_mutation(&self, mutation: &MutationEntry) -> Result<MutationApplyResult> {
-            let previous = self.applied.fetch_add(1, Ordering::AcqRel);
-            if mutation.index() != previous + 1 {
-                return Err(Error::internal("test backend observed an apply gap"));
-            }
-            if mutation.index() == 1 {
-                self.first_apply_reservations
-                    .store(self.reservations.load(Ordering::Acquire), Ordering::Release);
-            }
-            Ok(MutationApplyResult::default())
-        }
-
-        async fn applied_bookmark(&self) -> Bookmark {
-            Bookmark {
-                term: 1,
-                index: self.applied.load(Ordering::Acquire),
-            }
-        }
-
-        async fn build_snapshot(
-            &self,
-            _bookmark: Bookmark,
-            _destination: &Path,
-        ) -> Result<BackendSnapshot> {
-            Err(Error::internal("snapshot is outside this test"))
-        }
-
-        async fn install_snapshot(
-            &self,
-            _bookmark: Bookmark,
-            _snapshot: &BackendSnapshot,
-        ) -> Result<()> {
-            Err(Error::internal("snapshot is outside this test"))
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn non_blocking_durability_paths_batch_independent_writes() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let identity = NodeIdentity::generate_genesis().public();
-        let backend = Arc::new(BatchedBackend {
-            applied: AtomicU64::new(0),
-            reservations: AtomicUsize::new(0),
-            first_apply_reservations: AtomicUsize::new(0),
-        });
-        let runtime = WriteRuntime::start(
-            directory.path(),
-            StandaloneNode {
-                identity,
-                execution_class: ExecutionClass::Cpu,
-            },
-            backend.clone(),
-            WriteStorageLimits {
-                max_log_record_bytes: 1024 * 1024,
-                max_log_entries_per_read: 1024,
-                max_snapshot_bytes: 1024 * 1024,
-            },
-        )
-        .await?;
-        let project = ProjectId::random();
-        let request = |payload: u8| WriteRequest {
-            command: WriteCommand {
-                kind: MutationKind::Graph,
-                project_id: Some(project),
-                request_id: Some(uuid::Uuid::new_v4()),
-                commit_time_millis: 0,
-                payload: vec![payload],
-            },
-            timeout_millis: 5_000,
-            connection_id: ConnectionId::new(),
-            admission_class: AdmissionClass::Client,
-            transaction_fence: None,
-        };
-
-        let runtime_work_progressed = Arc::new(AtomicBool::new(false));
-        let progress = Arc::clone(&runtime_work_progressed);
-        let unrelated = tokio::spawn(async move {
-            tokio::task::yield_now().await;
-            progress.store(true, Ordering::Release);
-        });
-        let (first, second) = tokio::join!(runtime.write(request(1)), runtime.write(request(2)));
-        unrelated
-            .await
-            .map_err(|error| Error::internal(error.to_string()))?;
-        assert_eq!(first?.response.bookmark.index, 1);
-        assert_eq!(second?.response.bookmark.index, 2);
-        assert!(runtime_work_progressed.load(Ordering::Acquire));
-        assert_eq!(backend.first_apply_reservations.load(Ordering::Acquire), 2);
-        assert_eq!(backend.reservations.load(Ordering::Acquire), 2);
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn eventual_durability_ack_precedes_wal_and_shutdown_recovers_flushed_prefix()
-    -> Result<()> {
-        const WRITES: usize = 32;
-        let directory = tempfile::tempdir()?;
-        let identity = NodeIdentity::generate_genesis().public();
-        let backend = Arc::new(BatchedBackend {
-            applied: AtomicU64::new(0),
-            reservations: AtomicUsize::new(0),
-            first_apply_reservations: AtomicUsize::new(0),
-        });
-        let limits = WriteStorageLimits {
-            max_log_record_bytes: 1024 * 1024,
-            max_log_entries_per_read: 1024,
-            max_snapshot_bytes: 1024 * 1024,
-        };
-        let runtime = WriteRuntime::start(
-            directory.path(),
-            StandaloneNode {
-                identity,
-                execution_class: ExecutionClass::Cpu,
-            },
-            backend.clone(),
-            limits,
-        )
-        .await?;
-        let project = ProjectId::random();
-        let request = |payload: u8| WriteRequest {
-            command: WriteCommand {
-                kind: MutationKind::Graph,
-                project_id: Some(project),
-                request_id: Some(uuid::Uuid::new_v4()),
-                commit_time_millis: 0,
-                payload: vec![payload],
-            },
-            timeout_millis: 5_000,
-            connection_id: ConnectionId::new(),
-            admission_class: AdmissionClass::Client,
-            transaction_fence: None,
-        };
-
-        runtime
-            .eventual_durability_test_hook
-            .block_append
-            .store(true, Ordering::Release);
-        let first = runtime.write(request(0)).await?;
-        assert_eq!(first.response.bookmark.index, 1);
-        assert_eq!(backend.applied.load(Ordering::Acquire), 1);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !runtime
-                .eventual_durability_test_hook
-                .append_reached
-                .load(Ordering::Acquire)
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .map_err(|_| Error::internal("writer did not reach the deferred WAL append"))?;
-        assert_eq!(runtime.standalone_wal.lock().len(), 0);
-        let second = runtime.write(request(1)).await?;
-        assert_eq!(second.response.bookmark.index, 2);
-        assert_eq!(backend.applied.load(Ordering::Acquire), 2);
-        assert_eq!(runtime.standalone_wal.lock().len(), 0);
-
-        runtime
-            .eventual_durability_test_hook
-            .block_append
-            .store(false, Ordering::Release);
-        runtime.flush_wal().await?;
-        for offset in 2..WRITES {
-            let committed = runtime.write(request(offset as u8)).await?;
-            assert_eq!(committed.response.bookmark.index, offset as u64 + 1);
-        }
-        runtime.shutdown().await?;
-        drop(runtime);
-
-        let recovered_backend = Arc::new(BatchedBackend {
-            applied: AtomicU64::new(0),
-            reservations: AtomicUsize::new(0),
-            first_apply_reservations: AtomicUsize::new(0),
-        });
-        let recovered_runtime = WriteRuntime::start(
-            directory.path(),
-            StandaloneNode {
-                identity,
-                execution_class: ExecutionClass::Cpu,
-            },
-            recovered_backend.clone(),
-            limits,
-        )
-        .await?;
-        let recovered_runtime = Arc::new(recovered_runtime);
-        let recovered = recovered_runtime.replay_standalone_wal().await?;
-        assert_eq!(recovered.index, WRITES as u64);
-        assert_eq!(
-            recovered_backend.applied.load(Ordering::Acquire),
-            WRITES as u64
-        );
-        recovered_runtime.shutdown().await?;
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn replay_discards_a_wal_suffix_covered_by_a_newer_restored_snapshot() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let identity = NodeIdentity::generate_genesis().public();
-        let limits = WriteStorageLimits {
-            max_log_record_bytes: 1024 * 1024,
-            max_log_entries_per_read: 1024,
-            max_snapshot_bytes: 1024 * 1024,
-        };
-        let backend = Arc::new(BatchedBackend {
-            applied: AtomicU64::new(0),
-            reservations: AtomicUsize::new(0),
-            first_apply_reservations: AtomicUsize::new(0),
-        });
-        let runtime = WriteRuntime::start(
-            directory.path(),
-            StandaloneNode {
-                identity,
-                execution_class: ExecutionClass::Cpu,
-            },
-            backend.clone(),
-            limits,
-        )
-        .await?;
-        let project = ProjectId::random();
-        let request = |payload: u8| WriteRequest {
-            command: WriteCommand {
-                kind: MutationKind::Graph,
-                project_id: Some(project),
-                request_id: Some(uuid::Uuid::new_v4()),
-                commit_time_millis: 0,
-                payload: vec![payload],
-            },
-            timeout_millis: 5_000,
-            connection_id: ConnectionId::new(),
-            admission_class: AdmissionClass::Client,
-            transaction_fence: None,
-        };
-        for payload in 0..3 {
-            runtime.write(request(payload)).await?;
-        }
-        runtime.shutdown().await?;
-        drop(runtime);
-
-        // A restored snapshot is newer than the WAL tail when the previous process lost its WAL
-        // appender and kept snapshotting published writes. Replay must realign the log to the
-        // snapshot instead of refusing to start or leaving a colliding tail behind.
-        let recovered_backend = Arc::new(BatchedBackend {
-            applied: AtomicU64::new(5),
-            reservations: AtomicUsize::new(0),
-            first_apply_reservations: AtomicUsize::new(0),
-        });
-        let recovered_runtime = WriteRuntime::start(
-            directory.path(),
-            StandaloneNode {
-                identity,
-                execution_class: ExecutionClass::Cpu,
-            },
-            recovered_backend.clone(),
-            limits,
-        )
-        .await?;
-        let recovered_runtime = Arc::new(recovered_runtime);
-        let recovered = recovered_runtime.replay_standalone_wal().await?;
-        assert_eq!(recovered, Bookmark { term: 1, index: 5 });
-        assert_eq!(recovered_backend.applied.load(Ordering::Acquire), 5);
-
-        let committed = recovered_runtime.write(request(9)).await?;
-        assert_eq!(committed.response.bookmark.index, 6);
-        recovered_runtime.shutdown().await?;
-        drop(recovered_runtime);
-
-        let wal = DurableLog::open(
-            directory.path().join("standalone.wal"),
-            limits.max_log_record_bytes,
-            Bookmark::default(),
-        )?;
-        assert_eq!(wal.compacted_through(), Bookmark { term: 1, index: 5 });
-        assert_eq!(wal.last_bookmark(), Bookmark { term: 1, index: 6 });
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn non_blocking_durability_paths_batch_beyond_old_sixty_four_write_ceiling() -> Result<()>
-    {
-        const WRITES: usize = 128;
-        let directory = tempfile::tempdir()?;
-        let identity = NodeIdentity::generate_genesis().public();
-        let backend = Arc::new(BatchedBackend {
-            applied: AtomicU64::new(0),
-            reservations: AtomicUsize::new(0),
-            first_apply_reservations: AtomicUsize::new(0),
-        });
-        let runtime = WriteRuntime::start(
-            directory.path(),
-            StandaloneNode {
-                identity,
-                execution_class: ExecutionClass::Cpu,
-            },
-            backend.clone(),
-            WriteStorageLimits {
-                max_log_record_bytes: 1024 * 1024,
-                max_log_entries_per_read: 1024,
-                max_snapshot_bytes: 1024 * 1024,
-            },
-        )
-        .await?;
-        let project = ProjectId::random();
-        let requests = (0..WRITES).map(|offset| {
-            runtime.write(WriteRequest {
-                command: WriteCommand {
-                    kind: MutationKind::Graph,
-                    project_id: Some(project),
-                    request_id: Some(uuid::Uuid::new_v4()),
-                    commit_time_millis: 0,
-                    payload: vec![offset as u8],
-                },
-                timeout_millis: 5_000,
-                connection_id: ConnectionId::new(),
-                admission_class: AdmissionClass::Client,
-                transaction_fence: None,
-            })
-        });
-        let committed = futures::future::join_all(requests).await;
-        for (offset, result) in committed.into_iter().enumerate() {
-            assert_eq!(result?.response.bookmark.index, offset as u64 + 1);
-        }
-        assert_eq!(backend.reservations.load(Ordering::Acquire), WRITES);
-        assert_eq!(
-            backend.first_apply_reservations.load(Ordering::Acquire),
-            WRITES,
-            "the coordinator split at the obsolete 64-write ceiling"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn drop_completes_after_tokio_cooperative_budget_is_exhausted() -> Result<()> {
-        let executor = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()?;
-        let directory = tempfile::tempdir()?;
-        let identity = NodeIdentity::generate_genesis().public();
-        let backend = Arc::new(BatchedBackend {
-            applied: AtomicU64::new(0),
-            reservations: AtomicUsize::new(0),
-            first_apply_reservations: AtomicUsize::new(0),
-        });
-        let runtime = executor.block_on(WriteRuntime::start(
-            directory.path(),
-            StandaloneNode {
-                identity,
-                execution_class: ExecutionClass::Cpu,
-            },
-            backend,
-            WriteStorageLimits {
-                max_log_record_bytes: 1024 * 1024,
-                max_log_entries_per_read: 1024,
-                max_snapshot_bytes: 1024 * 1024,
-            },
-        ))?;
-        let (finished, completed) = mpsc::sync_channel(1);
-        executor.spawn(async move {
-            while tokio::task::coop::has_budget_remaining() {
-                tokio::task::consume_budget().await;
-            }
-            drop(runtime);
-            let _ = finished.send(());
-        });
-        let result = completed.recv_timeout(Duration::from_secs(3));
-        // A failed regression must report rather than hang while joining the stuck Tokio task.
-        executor.shutdown_background();
-        result.map_err(|error| Error::internal(format!("runtime drop did not finish: {error}")))?;
-        Ok(())
-    }
-}
-
 /// Exact term/index reserved by the local sequencer for a generated control write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SequencerPosition {
@@ -894,98 +693,66 @@ pub struct SequencerPosition {
     pub index: u64,
 }
 
-/// Running standalone durable write path.
+/// Running standalone ordered publication and asynchronous record persistence.
 pub struct WriteRuntime {
     node_id: ProcessId,
     node: StandaloneNode,
-    backend: Arc<dyn MutationStateBackend>,
     sequencer_admission: AdmissionController,
-    // One dedicated writer thread owns ordering, canonical publication, and background WAL work.
-    // This gate excludes snapshot recovery/compaction from an active publish/append boundary.
-    standalone_gate: Arc<parking_lot::Mutex<()>>,
-    standalone_wal: Arc<parking_lot::Mutex<DurableLog>>,
-    embedding_replay_floor: OnceLock<Arc<AtomicU64>>,
-    persistence_tx: SyncSender<PersistenceMessage>,
+    failure: ApplicationFailure,
+    persistence: Arc<PersistenceMailbox>,
     writer_tx: tokio::sync::mpsc::Sender<WriterMessage>,
     workers: parking_lot::Mutex<Option<(std::thread::JoinHandle<()>, std::thread::JoinHandle<()>)>>,
-    #[cfg(test)]
-    eventual_durability_test_hook: Arc<EventualDurabilityTestHook>,
 }
 
 impl WriteRuntime {
-    /// Standalone construction. Writes publish
-    /// directly to the backend; the dedicated writer persists their ordered WAL suffix afterward.
+    /// Start dedicated ordered application and persistence threads. The backend must already be
+    /// restored before this call, so the first allocated position follows its durable state.
     pub async fn start(
-        root: impl AsRef<Path>,
         node: StandaloneNode,
         backend: Arc<dyn MutationStateBackend>,
-        storage_limits: WriteStorageLimits,
     ) -> Result<Self> {
         let node_id = node.identity.node_id;
         node.validate_for(node_id)?;
-        let storage_root = root.as_ref().to_owned();
-        let maximum_log_record_bytes = storage_limits.max_log_record_bytes;
-        let standalone_wal = tokio::task::spawn_blocking(move || {
-            std::fs::create_dir_all(&storage_root)?;
-            DurableLog::open(
-                storage_root.join("standalone.wal"),
-                maximum_log_record_bytes,
-                Bookmark::default(),
-            )
-        })
-        .await
-        .map_err(|error| Error::internal(format!("WAL startup task failed: {error}")))??;
-        let standalone_gate = Arc::new(parking_lot::Mutex::new(()));
-        let standalone_wal = Arc::new(parking_lot::Mutex::new(standalone_wal));
+        let gate = Arc::new(parking_lot::Mutex::new(()));
+        let failure = Arc::new(parking_lot::Mutex::new(None));
         let (writer_tx, writer_rx) = tokio::sync::mpsc::channel(MAX_WRITE_BATCH);
-        let (persistence_tx, persistence_rx) = mpsc::sync_channel(MAX_PENDING_WAL_BATCHES);
-        let writer_backend = Arc::clone(&backend);
-        let writer_gate = Arc::clone(&standalone_gate);
-        let writer_wal = Arc::clone(&standalone_wal);
-        let runtime = tokio::runtime::Handle::current();
-        #[cfg(test)]
-        let eventual_durability_test_hook = Arc::new(EventualDurabilityTestHook::default());
-        #[cfg(test)]
-        let writer_test_hook = Arc::clone(&eventual_durability_test_hook);
+        let persistence = Arc::new(PersistenceMailbox::new(backend.applied_bookmark().await));
+        let persistence_backend = Arc::clone(&backend);
+        let persistence_mailbox = Arc::clone(&persistence);
         let persistence_worker = std::thread::Builder::new()
-            .name("irongraph-wal-persistence".to_owned())
-            .spawn(move || {
-                standalone_persistence_loop(
-                    persistence_rx,
-                    writer_wal,
-                    #[cfg(test)]
-                    writer_test_hook,
-                );
-            })
-            .map_err(|error| {
-                Error::internal(format!("failed to start WAL persistence: {error}"))
-            })?;
-        let writer_persistence = persistence_tx.clone();
-        let writer_worker = std::thread::Builder::new()
-            .name("irongraph-wal-writer".to_owned())
+            .name("irongraph-persistence".to_owned())
+            .spawn(move || standalone_persistence_loop(persistence_mailbox, persistence_backend))
+            .map_err(|error| Error::internal(format!("failed to start persistence: {error}")))?;
+        let writer_persistence = Arc::clone(&persistence);
+        let writer_failure = Arc::clone(&failure);
+        let runtime = tokio::runtime::Handle::current();
+        let writer_worker = match std::thread::Builder::new()
+            .name("irongraph-writer".to_owned())
             .spawn(move || {
                 standalone_writer_loop(
                     writer_rx,
                     writer_persistence,
-                    writer_backend,
-                    writer_gate,
+                    backend,
+                    gate,
                     runtime,
-                );
-            })
-            .map_err(|error| Error::internal(format!("failed to start WAL writer: {error}")))?;
+                    writer_failure,
+                )
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                persistence.barrier(None, true);
+                let _ = persistence_worker.join();
+                return Err(Error::internal(format!("failed to start writer: {error}")));
+            }
+        };
         Ok(Self {
             node_id,
             node,
-            backend,
             sequencer_admission: AdmissionController::unrestricted(),
-            standalone_gate,
-            standalone_wal,
-            embedding_replay_floor: OnceLock::new(),
-            persistence_tx,
+            failure,
+            persistence,
             writer_tx,
             workers: parking_lot::Mutex::new(Some((writer_worker, persistence_worker))),
-            #[cfg(test)]
-            eventual_durability_test_hook,
         })
     }
 
@@ -1001,10 +768,13 @@ impl WriteRuntime {
 
     /// Accepts a mutation and preserves the original client connection for admission fairness.
     pub async fn write(&self, request: WriteRequest) -> Result<CommittedWrite> {
+        if let Some(error) = self.failure.lock().as_ref() {
+            return Err(copy_error(error));
+        }
         validate_write_request(&request)?;
         let deadline = ClientDeadline::new(request.timeout_millis)?;
 
-        // The dedicated writer owns ordering, apply, and subsequent WAL batching/fsync. Submitting
+        // The dedicated writer owns ordering and apply; record commits run on its sibling thread. Submitting
         // here is non-blocking; acknowledgement follows canonical publication, not filesystem I/O.
         let admission = self.admit_at_sequencer(&request, deadline)?;
         let (reply, response) = tokio::sync::oneshot::channel();
@@ -1035,139 +805,6 @@ impl WriteRuntime {
             .map_err(|_| Error::internal("writer stopped after dispatch; write outcome is uncertain; do not retry automatically"))?
     }
 
-    /// Replays every WAL mutation above the backend's restored snapshot bookmark.
-    ///
-    /// This must run after snapshot installation and before listeners start accepting work.
-    pub async fn replay_standalone_wal(self: &Arc<Self>) -> Result<Bookmark> {
-        let runtime = Arc::clone(self);
-        tokio::task::spawn_blocking(move || runtime.replay_standalone_wal_on_worker())
-            .await
-            .map_err(|error| Error::internal(format!("WAL recovery worker failed: {error}")))?
-    }
-
-    fn replay_standalone_wal_on_worker(&self) -> Result<Bookmark> {
-        let _gate = self.standalone_gate.lock();
-        let applied = futures::executor::block_on(self.backend.applied_bookmark());
-        let (wal_base, wal_tail, wal_is_empty) = {
-            let wal = self.standalone_wal.lock();
-            (wal.compacted_through(), wal.last_bookmark(), wal.is_empty())
-        };
-        if wal_base.index > applied.index && wal_is_empty {
-            // A previous snapshot loop could report success while snapshotting was skipped for
-            // live broker segments, then compact this empty WAL beyond the actual snapshot. Those
-            // un-snapshotted records cannot be recovered; restore the honest snapshot boundary so
-            // the database can start and sources can idempotently refill their derived state.
-            tracing::warn!(
-                snapshot_index = applied.index,
-                invalid_wal_base = wal_base.index,
-                "repairing a standalone WAL base published without a snapshot"
-            );
-            self.standalone_wal
-                .lock()
-                .repair_empty_compacted_base(applied)?;
-            return Ok(applied);
-        }
-        if wal_tail.index < applied.index {
-            // A previous process that lost its WAL appender kept publishing writes and snapshots,
-            // so the restored snapshot is ahead of the durable log tail. Every retained WAL entry
-            // is included in that snapshot; realign by treating the log as compacted through it.
-            tracing::warn!(
-                snapshot_index = applied.index,
-                wal_tail = wal_tail.index,
-                "restored snapshot is newer than the standalone WAL; discarding the covered entries"
-            );
-            self.standalone_wal
-                .lock()
-                .discard_snapshot_covered_entries(applied)?;
-            return Ok(applied);
-        }
-        let first = applied
-            .index
-            .checked_add(1)
-            .ok_or_else(|| Error::new(ErrorCode::CorruptStorage, "applied bookmark overflow"))?;
-        let mut recovered = applied;
-        let mut next = first;
-        loop {
-            let entry = self.standalone_wal.lock().lookup(next)?;
-            let Some(entry) = entry else {
-                break;
-            };
-            if entry.index() != recovered.index.saturating_add(1) {
-                return Err(Error::new(
-                    ErrorCode::CorruptStorage,
-                    "standalone WAL does not continue the restored snapshot",
-                ));
-            }
-            if let Err(error) = futures::executor::block_on(self.backend.apply_mutation(&entry)) {
-                // Older standalone builds prepared concurrent graph writes outside the write gate
-                // and could fsync a transaction that the state-dependent preflight then rejected.
-                // Such an entry was never visible or acknowledged, and no later index could be
-                // appended because the backend bookmark did not advance. Remove that rejected
-                // suffix so startup can recover the last actually committed prefix.
-                if error.code == ErrorCode::TransactionConflict {
-                    tracing::warn!(
-                        index = entry.index(),
-                        "discarding an uncommitted standalone WAL tail rejected during recovery"
-                    );
-                    self.standalone_wal
-                        .lock()
-                        .truncate_uncommitted(recovered.index)?;
-                    return Ok(recovered);
-                }
-                return Err(error);
-            }
-            recovered = entry.bookmark();
-            next = entry.index().checked_add(1).ok_or_else(|| {
-                Error::new(ErrorCode::CorruptStorage, "WAL replay index overflow")
-            })?;
-        }
-        if recovered != wal_tail {
-            return Err(Error::new(
-                ErrorCode::CorruptStorage,
-                "standalone WAL tail was not fully replayed",
-            ));
-        }
-        Ok(recovered)
-    }
-
-    /// Drops WAL records included in an atomically published snapshot.
-    pub(crate) fn committed_embedding_entry(&self, index: u64) -> Result<Option<MutationEntry>> {
-        self.standalone_wal.lock().lookup(index)
-    }
-
-    pub(crate) fn register_embedding_replay_floor(&self, floor: Arc<AtomicU64>) -> Result<()> {
-        self.embedding_replay_floor
-            .set(floor)
-            .map_err(|_| Error::internal("embedding WAL cursor is already registered"))
-    }
-
-    /// Drops WAL records included in an atomically published snapshot.
-    pub fn compact_wal_through(&self, included: Bookmark) -> Result<()> {
-        let _gate = self.standalone_gate.lock();
-        let (flush, completed) = mpsc::sync_channel(1);
-        self.persistence_tx
-            .send(PersistenceMessage::Flush(flush))
-            .map_err(|_| Error::internal("WAL persistence worker is unavailable"))?;
-        completed
-            .recv()
-            .map_err(|_| Error::internal("WAL persistence flush response was lost"))??;
-        let mut wal = self.standalone_wal.lock();
-        let included = if let Some(floor) = self.embedding_replay_floor.get() {
-            let index = included.index.min(floor.load(Ordering::Acquire));
-            if index <= wal.compacted_through().index {
-                return Ok(());
-            }
-            wal.lookup(index)?
-                .map(|entry| entry.bookmark())
-                .ok_or_else(|| {
-                    Error::internal("embedding compaction boundary is absent from the WAL")
-                })?
-        } else {
-            included
-        };
-        wal.compact_prefix(included)
-    }
-
     fn admit_at_sequencer(
         &self,
         request: &WriteRequest,
@@ -1189,19 +826,22 @@ impl WriteRuntime {
         )
     }
 
-    /// Establish a durable WAL boundary for all earlier queued writes.
-    pub async fn flush_wal(&self) -> Result<()> {
+    /// Await durability of all earlier queued writes while later RAM publications continue.
+    /// After an IO failure this explicitly retries retained current records.
+    pub async fn flush_persistence(&self) -> Result<()> {
         let (reply, response) = tokio::sync::oneshot::channel();
         self.writer_tx
             .send(WriterMessage::Flush(reply))
             .await
-            .map_err(|error| Error::internal(format!("failed to request WAL flush: {error}")))?;
-        response
-            .await
-            .map_err(|_| Error::internal("standalone writer stopped before WAL flush completed"))?
+            .map_err(|error| {
+                Error::internal(format!("failed to request persistence flush: {error}"))
+            })?;
+        response.await.map_err(|_| {
+            Error::internal("standalone writer stopped before persistence flush completed")
+        })?
     }
 
-    /// Drains every earlier write message and establishes a final WAL durability boundary before
+    /// Drains every earlier write message and establishes a final record durability boundary before
     /// the dedicated persistence thread exits.
     pub async fn shutdown(&self) -> Result<()> {
         let Some(workers) = self.workers.lock().take() else {
@@ -1216,10 +856,12 @@ impl WriteRuntime {
         let completed = response
             .await
             .map_err(|_| Error::internal("standalone writer stopped before shutdown completed"));
-        let persistence = self.persistence_tx.clone();
+        let persistence = Arc::clone(&self.persistence);
         let joined = tokio::task::spawn_blocking(move || join_workers(workers, &persistence))
             .await
-            .map_err(|error| Error::internal(format!("WAL worker join task failed: {error}")))?;
+            .map_err(|error| {
+                Error::internal(format!("persistence worker join task failed: {error}"))
+            })?;
         sent?;
         completed??;
         joined
@@ -1228,29 +870,32 @@ impl WriteRuntime {
 
 fn join_workers(
     workers: (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>),
-    persistence: &SyncSender<PersistenceMessage>,
+    persistence: &PersistenceMailbox,
 ) -> Result<()> {
     let writer = workers.0.join();
     // A panicked writer cannot send the normal shutdown message. Ensure its sibling is also
-    // stopped before joining; a persistence worker that has already exited rejects this send.
-    let (reply, _response) = mpsc::sync_channel(1);
-    let _ = persistence.send(PersistenceMessage::Shutdown(reply));
+    // stopped before joining. Closing the mailbox is idempotent if its worker already exited.
+    persistence.barrier(None, true);
     let persistence = workers.1.join();
-    writer.map_err(|_| Error::internal("WAL writer panicked"))?;
-    persistence.map_err(|_| Error::internal("WAL persistence panicked"))?;
+    writer.map_err(|_| Error::internal("ordered writer panicked"))?;
+    persistence.map_err(|_| Error::internal("persistence worker panicked"))?;
     Ok(())
 }
 
 impl Drop for WriteRuntime {
     fn drop(&mut self) {
         if let Some(workers) = self.workers.get_mut().take() {
-            let (reply, _response) = tokio::sync::oneshot::channel();
-            // Drop cannot yield back to Tokio to renew an exhausted cooperative budget. Polling
-            // this bounded shutdown send on the synchronous executor must bypass that budget.
-            let _ = futures::executor::block_on(tokio::task::unconstrained(
-                self.writer_tx.send(WriterMessage::Shutdown(reply)),
-            ));
-            let _ = join_workers(workers, &self.persistence_tx);
+            let writer = self.writer_tx.clone();
+            let persistence = Arc::clone(&self.persistence);
+            // Explicit shutdown is the observable durability boundary. Implicit destruction must
+            // not block a Tokio worker on disk synchronization or worker joins.
+            let _ = std::thread::Builder::new()
+                .name("irongraph-persistence-close".to_owned())
+                .spawn(move || {
+                    let (reply, _response) = tokio::sync::oneshot::channel();
+                    let _ = writer.blocking_send(WriterMessage::Shutdown(reply));
+                    let _ = join_workers(workers, &persistence);
+                });
         }
     }
 }
@@ -1306,4 +951,584 @@ impl ClientDeadline {
 
 fn client_deadline_exceeded(message: &'static str) -> Error {
     Error::retryable(ErrorCode::DeadlineExceeded, message, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::engine::{ExecutionClass, MutationApplyResult, NodeIdentity};
+    use crate::storage::MutationKind;
+
+    #[derive(Default)]
+    struct TestBackend {
+        applied: AtomicU64,
+        durable: AtomicU64,
+        reservations: AtomicUsize,
+        first_apply_reservations: AtomicUsize,
+        persistence_calls: AtomicUsize,
+        persistence_attempts: AtomicUsize,
+        last_value: AtomicU64,
+        reached: AtomicBool,
+        entered: tokio::sync::Notify,
+        committed: tokio::sync::Notify,
+        fail: AtomicBool,
+        paused: parking_lot::Mutex<bool>,
+        resume: parking_lot::Condvar,
+    }
+
+    impl TestBackend {
+        fn release(&self) {
+            *self.paused.lock() = false;
+            self.resume.notify_all();
+        }
+    }
+
+    struct ReleaseOnDrop(Arc<TestBackend>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    #[async_trait]
+    impl MutationStateBackend for TestBackend {
+        async fn prepare_command(
+            &self,
+            mut command: WriteCommand,
+            sequencer_time_millis: i64,
+        ) -> Result<WriteCommand> {
+            // Let independent submissions accumulate before the first publication.
+            if self.reservations.load(Ordering::Acquire) == 0 {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            command.commit_time_millis = sequencer_time_millis;
+            Ok(command)
+        }
+
+        async fn reserve_command(
+            &self,
+            _command: &WriteCommand,
+            position: Bookmark,
+        ) -> Result<CommandReservation> {
+            self.reservations.fetch_add(1, Ordering::AcqRel);
+            CommandReservation::pipelined(position)
+        }
+
+        async fn apply_mutation(&self, mutation: &MutationEntry) -> Result<MutationApplyResult> {
+            let previous = self.applied.fetch_add(1, Ordering::AcqRel);
+            if mutation.index() != previous + 1 {
+                return Err(Error::internal("test backend observed an apply gap"));
+            }
+            if previous == 0 {
+                self.first_apply_reservations
+                    .store(self.reservations.load(Ordering::Acquire), Ordering::Release);
+            }
+            Ok(MutationApplyResult {
+                persistence: Some(RecordBatch {
+                    first_index: mutation.index(),
+                    bookmark: mutation.bookmark(),
+                    operations: vec![RecordOp::Put {
+                        key: b"current".to_vec(),
+                        value: mutation.index().to_be_bytes().to_vec(),
+                    }],
+                }),
+                ..MutationApplyResult::default()
+            })
+        }
+
+        async fn applied_bookmark(&self) -> Bookmark {
+            Bookmark {
+                term: 1,
+                index: self.applied.load(Ordering::Acquire),
+            }
+        }
+
+        fn persist(&self, batches: &[RecordBatch]) -> Result<()> {
+            self.persistence_attempts.fetch_add(1, Ordering::AcqRel);
+            if tokio::runtime::Handle::try_current().is_ok() {
+                return Err(Error::internal(
+                    "persistence ran on an async runtime thread",
+                ));
+            }
+            self.reached.store(true, Ordering::Release);
+            self.entered.notify_one();
+            let mut paused = self.paused.lock();
+            while *paused {
+                self.resume.wait(&mut paused);
+            }
+            if self.fail.load(Ordering::Acquire) {
+                return Err(Error::internal("injected persistence failure"));
+            }
+            let mut expected = self.durable.load(Ordering::Acquire) + 1;
+            for batch in batches {
+                if batch.first_index != expected {
+                    return Err(Error::internal(
+                        "persistence did not receive an ordered prefix",
+                    ));
+                }
+                expected = batch.bookmark.index + 1;
+            }
+            self.durable.store(expected - 1, Ordering::Release);
+            for batch in batches {
+                for operation in &batch.operations {
+                    if let RecordOp::Put { key, value } = operation
+                        && key == b"current"
+                    {
+                        self.last_value.store(
+                            u64::from_be_bytes(
+                                value
+                                    .as_slice()
+                                    .try_into()
+                                    .map_err(|_| Error::internal("invalid current value"))?,
+                            ),
+                            Ordering::Release,
+                        );
+                    }
+                }
+            }
+            self.persistence_calls.fetch_add(1, Ordering::AcqRel);
+            self.committed.notify_one();
+            Ok(())
+        }
+    }
+
+    fn request() -> WriteRequest {
+        WriteRequest {
+            command: WriteCommand {
+                kind: MutationKind::Graph,
+                project_id: Some(crate::ProjectId::random()),
+                request_id: Some(uuid::Uuid::new_v4()),
+                commit_time_millis: 0,
+                payload: vec![1],
+            },
+            timeout_millis: 5_000,
+            connection_id: ConnectionId::new(),
+            admission_class: AdmissionClass::Client,
+            transaction_fence: None,
+        }
+    }
+
+    async fn start(backend: Arc<TestBackend>) -> Result<WriteRuntime> {
+        WriteRuntime::start(
+            StandaloneNode {
+                identity: NodeIdentity::generate_genesis().public(),
+                execution_class: ExecutionClass::Cpu,
+            },
+            backend,
+        )
+        .await
+    }
+
+    async fn await_reached(backend: &TestBackend) -> Result<()> {
+        if backend.reached.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        tokio::time::timeout(Duration::from_secs(2), backend.entered.notified())
+            .await
+            .map_err(|_| Error::internal("persistence worker never reached the test gate"))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn acknowledgements_and_async_progress_do_not_wait_for_blocked_persistence() -> Result<()>
+    {
+        let backend = Arc::new(TestBackend::default());
+        *backend.paused.lock() = true;
+        let _release = ReleaseOnDrop(Arc::clone(&backend));
+        let runtime = Arc::new(start(Arc::clone(&backend)).await?);
+        assert_eq!(runtime.write(request()).await?.response.bookmark.index, 1);
+        await_reached(&backend).await?;
+        // The same single async worker can publish another graph mutation while disk is blocked.
+        assert_eq!(runtime.write(request()).await?.response.bookmark.index, 2);
+        let flush_runtime = Arc::clone(&runtime);
+        let flush = tokio::spawn(async move { flush_runtime.flush_persistence().await });
+        let progress = tokio::spawn(async {
+            tokio::task::yield_now().await;
+            7
+        });
+        assert_eq!(
+            progress
+                .await
+                .map_err(|error| Error::internal(error.to_string()))?,
+            7
+        );
+        assert!(!flush.is_finished());
+        assert_eq!(backend.durable.load(Ordering::Acquire), 0);
+        assert_eq!(
+            runtime
+                .persistence
+                .state
+                .lock()
+                .pending
+                .as_ref()
+                .map(|dirty| dirty.points.len()),
+            Some(1)
+        );
+        backend.release();
+        flush
+            .await
+            .map_err(|error| Error::internal(error.to_string()))??;
+        assert_eq!(backend.durable.load(Ordering::Acquire), 2);
+        runtime.shutdown().await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ordered_batches_preserve_all_writes_and_shutdown_drains_them() -> Result<()> {
+        const WRITES: usize = 257;
+        let backend = Arc::new(TestBackend::default());
+        let runtime = Arc::new(start(Arc::clone(&backend)).await?);
+        let mut tasks = Vec::new();
+        for _ in 0..WRITES {
+            let runtime = Arc::clone(&runtime);
+            tasks.push(tokio::spawn(async move { runtime.write(request()).await }));
+        }
+        let mut positions = std::collections::BTreeSet::new();
+        for task in tasks {
+            positions.insert(
+                task.await
+                    .map_err(|error| Error::internal(error.to_string()))??
+                    .response
+                    .bookmark
+                    .index,
+            );
+        }
+        assert_eq!(positions.len(), WRITES);
+        assert_eq!(positions.last(), Some(&(WRITES as u64)));
+        runtime.shutdown().await?;
+        assert_eq!(backend.durable.load(Ordering::Acquire), WRITES as u64);
+        assert!(backend.first_apply_reservations.load(Ordering::Acquire) > 1);
+        assert!(backend.persistence_calls.load(Ordering::Acquire) < WRITES);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn persistence_failure_retains_changes_and_explicit_flush_retries() -> Result<()> {
+        let backend = Arc::new(TestBackend::default());
+        backend.fail.store(true, Ordering::Release);
+        let runtime = start(Arc::clone(&backend)).await?;
+        runtime.write(request()).await?;
+        assert!(runtime.flush_persistence().await.is_err());
+        runtime.write(request()).await?;
+        assert_eq!(backend.applied.load(Ordering::Acquire), 2);
+        assert_eq!(backend.durable.load(Ordering::Acquire), 0);
+        assert!(runtime.persistence.state.lock().deadline.is_none());
+        tokio::time::sleep(PERSISTENCE_GROUP_INTERVAL + Duration::from_millis(25)).await;
+        assert_eq!(backend.persistence_attempts.load(Ordering::Acquire), 1);
+        backend.fail.store(false, Ordering::Release);
+        runtime.flush_persistence().await?;
+        assert_eq!(backend.durable.load(Ordering::Acquire), 2);
+        assert_eq!(backend.last_value.load(Ordering::Acquire), 2);
+        runtime.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn first_write_follows_the_restored_backend_position() -> Result<()> {
+        let backend = Arc::new(TestBackend::default());
+        backend.applied.store(41, Ordering::Release);
+        backend.durable.store(41, Ordering::Release);
+        let runtime = start(Arc::clone(&backend)).await?;
+        assert_eq!(runtime.write(request()).await?.response.bookmark.index, 42);
+        runtime.flush_persistence().await?;
+        assert_eq!(backend.durable.load(Ordering::Acquire), 42);
+        runtime.shutdown().await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oversized_writes_and_thousands_of_publications_ignore_blocked_disk_and_flush()
+    -> Result<()> {
+        let backend = Arc::new(TestBackend::default());
+        *backend.paused.lock() = true;
+        let _release = ReleaseOnDrop(Arc::clone(&backend));
+        let runtime = Arc::new(start(Arc::clone(&backend)).await?);
+        let mut large = request();
+        large.command.payload = vec![5; PERSISTENCE_BATCH_TARGET_BYTES * 2 + 1];
+        assert_eq!(runtime.write(large).await?.response.bookmark.index, 1);
+        await_reached(&backend).await?;
+        let next_runtime = Arc::clone(&runtime);
+        let next = tokio::spawn(async move { next_runtime.write(request()).await });
+        let flush_runtime = Arc::clone(&runtime);
+        let flush = tokio::spawn(async move { flush_runtime.flush_persistence().await });
+        assert_eq!(
+            next.await
+                .map_err(|error| Error::internal(error.to_string()))??
+                .response
+                .bookmark
+                .index,
+            2
+        );
+        for expected in 3..=5_123 {
+            assert_eq!(
+                runtime.write(request()).await?.response.bookmark.index,
+                expected
+            );
+        }
+        {
+            let state = runtime.persistence.state.lock();
+            let dirty = state.pending.as_ref().expect("pending current records");
+            assert_eq!(dirty.points.len(), 1);
+            assert_eq!(dirty.bookmark.index, 5_123);
+            assert_eq!(
+                dirty.points.get(b"current".as_slice()),
+                Some(&Some(5_123_u64.to_be_bytes().to_vec()))
+            );
+        }
+        assert!(!flush.is_finished());
+        assert_eq!(backend.durable.load(Ordering::Acquire), 0);
+        backend.release();
+        flush
+            .await
+            .map_err(|error| Error::internal(error.to_string()))??;
+        runtime.shutdown().await?;
+        assert_eq!(backend.durable.load(Ordering::Acquire), 5_123);
+        assert_eq!(backend.last_value.load(Ordering::Acquire), 5_123);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn publisher_root_restore_wakes_worker_parked_during_merge_without_another_event()
+    -> Result<()> {
+        let mailbox = Arc::new(PersistenceMailbox::new(Bookmark { term: 1, index: 0 }));
+        let batch = |index| PersistenceRecords {
+            batches: vec![RecordBatch {
+                first_index: index,
+                bookmark: Bookmark { term: 1, index },
+                operations: vec![RecordOp::Put {
+                    key: b"current".to_vec(),
+                    value: index.to_be_bytes().to_vec(),
+                }],
+            }],
+        };
+        mailbox.publish(batch(1))?;
+        let pause = Arc::new(PublicationPause::default());
+        *mailbox.publication_pause.lock() = Some(Arc::clone(&pause));
+        let publisher_mailbox = Arc::clone(&mailbox);
+        let publisher = std::thread::spawn(move || publisher_mailbox.publish(batch(2)));
+        let swapped = tokio::time::timeout(Duration::from_secs(2), pause.entered.notified()).await;
+        // Keep a future deadline while the pending root is absent. The actor must park rather
+        // than poll until the publisher restores that root and explicitly wakes its wait state.
+        mailbox.state.lock().deadline = Some(Instant::now() + PERSISTENCE_GROUP_INTERVAL);
+        let backend = Arc::new(TestBackend::default());
+        let persistence_backend: Arc<dyn MutationStateBackend> = backend.clone();
+        let worker_mailbox = Arc::clone(&mailbox);
+        let worker = std::thread::spawn(move || {
+            standalone_persistence_loop(worker_mailbox, persistence_backend)
+        });
+        let parked = tokio::time::timeout(Duration::from_secs(2), mailbox.parked.notified()).await;
+        let parked_before_deadline = {
+            let state = mailbox.state.lock();
+            state.publication_parked
+                && state.pending.is_none()
+                && state
+                    .deadline
+                    .is_some_and(|deadline| deadline > Instant::now())
+        };
+        pause.release();
+        let publication = tokio::task::spawn_blocking(move || publisher.join()).await;
+        // No additional publication, flush, close or wake notification precedes this commit.
+        let committed =
+            tokio::time::timeout(Duration::from_secs(2), backend.committed.notified()).await;
+        let durable = backend.durable.load(Ordering::Acquire);
+        mailbox.barrier(None, true);
+        tokio::task::spawn_blocking(move || worker.join())
+            .await
+            .map_err(|error| Error::internal(error.to_string()))?
+            .map_err(|_| Error::internal("test persistence worker panicked"))?;
+        swapped
+            .map_err(|_| Error::internal("publisher did not pause after swapping pending root"))?;
+        parked.map_err(|_| Error::internal("actor did not park while pending root was absent"))?;
+        assert!(parked_before_deadline);
+        publication
+            .map_err(|error| Error::internal(error.to_string()))?
+            .map_err(|_| Error::internal("test publisher panicked"))??;
+        committed.map_err(|_| {
+            Error::internal("restored dirty root missed its automatic commit deadline")
+        })?;
+        assert_eq!(durable, 2);
+        assert_eq!(backend.last_value.load(Ordering::Acquire), 2);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_actor_does_no_work_and_first_dirty_publication_arms_one_deadline() -> Result<()> {
+        let backend = Arc::new(TestBackend::default());
+        let runtime = start(Arc::clone(&backend)).await?;
+        tokio::time::sleep(PERSISTENCE_GROUP_INTERVAL + Duration::from_millis(25)).await;
+        assert_eq!(backend.persistence_calls.load(Ordering::Acquire), 0);
+        assert!(runtime.persistence.state.lock().deadline.is_none());
+        runtime.flush_persistence().await?;
+        assert!(!runtime.persistence.state.lock().force);
+        runtime.write(request()).await?;
+        let first_deadline = runtime
+            .persistence
+            .state
+            .lock()
+            .deadline
+            .expect("dirty deadline");
+        runtime.write(request()).await?;
+        assert_eq!(
+            runtime.persistence.state.lock().deadline,
+            Some(first_deadline)
+        );
+        assert_eq!(backend.persistence_calls.load(Ordering::Acquire), 0);
+        await_reached(&backend).await?;
+        runtime.flush_persistence().await?;
+        assert_eq!(backend.persistence_calls.load(Ordering::Acquire), 1);
+        assert!(runtime.persistence.state.lock().deadline.is_none());
+        runtime.shutdown().await
+    }
+
+    #[test]
+    fn prefix_coalescing_preserves_unrelated_large_pending_allocations_and_rejects_gaps()
+    -> Result<()> {
+        let mailbox = PersistenceMailbox::new(Bookmark { term: 1, index: 0 });
+        mailbox.publish(PersistenceRecords {
+            batches: vec![RecordBatch {
+                first_index: 1,
+                bookmark: Bookmark { term: 1, index: 1 },
+                operations: (0..64)
+                    .map(|index| RecordOp::Put {
+                        key: format!("unrelated/{index}").into_bytes(),
+                        value: vec![42; 128 * 1024],
+                    })
+                    .chain([RecordOp::Put {
+                        key: b"target/a".to_vec(),
+                        value: vec![1],
+                    }])
+                    .collect(),
+            }],
+        })?;
+        let original = mailbox
+            .state
+            .lock()
+            .pending
+            .as_ref()
+            .expect("pending")
+            .points
+            .get(b"unrelated/0".as_slice())
+            .and_then(Option::as_ref)
+            .expect("large value")
+            .as_ptr();
+        mailbox.publish(PersistenceRecords {
+            batches: vec![RecordBatch {
+                first_index: 2,
+                bookmark: Bookmark { term: 1, index: 2 },
+                operations: vec![RecordOp::DeletePrefix {
+                    prefix: b"target/".to_vec(),
+                }],
+            }],
+        })?;
+        {
+            let state = mailbox.state.lock();
+            let dirty = state.pending.as_ref().expect("pending");
+            assert_eq!(dirty.points.len(), 64);
+            assert_eq!(
+                dirty
+                    .points
+                    .get(b"unrelated/0".as_slice())
+                    .and_then(Option::as_ref)
+                    .expect("large value")
+                    .as_ptr(),
+                original
+            );
+        }
+        assert!(
+            mailbox
+                .publish(PersistenceRecords {
+                    batches: vec![RecordBatch {
+                        first_index: 4,
+                        bookmark: Bookmark { term: 1, index: 4 },
+                        operations: Vec::new(),
+                    }]
+                })
+                .is_err()
+        );
+        assert_eq!(mailbox.state.lock().published, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn coalescing_matches_ordered_prefix_deletions_and_later_point_changes() {
+        fn apply(rows: &mut BTreeMap<Vec<u8>, Vec<u8>>, operation: RecordOp) {
+            match operation {
+                RecordOp::Put { key, value } => {
+                    rows.insert(key, value);
+                }
+                RecordOp::Delete { key } => {
+                    rows.remove(&key);
+                }
+                RecordOp::DeletePrefix { prefix } => {
+                    rows.retain(|key, _| !key.starts_with(&prefix));
+                }
+            }
+        }
+        let initial = BTreeMap::from([(b"a/old".to_vec(), vec![1]), (b"b/old".to_vec(), vec![2])]);
+        let mut expected = initial.clone();
+        let mut dirty = DirtyRecords::default();
+        for index in 1_u64..=512 {
+            let key =
+                format!("{}/{}", if index % 2 == 0 { "a" } else { "b" }, index % 11).into_bytes();
+            let operation = match index % 7 {
+                0 => RecordOp::DeletePrefix {
+                    prefix: b"a/".to_vec(),
+                },
+                1 => RecordOp::DeletePrefix {
+                    prefix: b"b/1".to_vec(),
+                },
+                2 => RecordOp::Delete { key },
+                _ => RecordOp::Put {
+                    key,
+                    value: index.to_be_bytes().to_vec(),
+                },
+            };
+            apply(&mut expected, operation.clone());
+            dirty.absorb(RecordBatch {
+                first_index: index,
+                bookmark: Bookmark { term: 1, index },
+                operations: vec![operation],
+            });
+        }
+        let batch = dirty.into_batch();
+        assert_eq!(batch.first_index, 1);
+        assert_eq!(batch.bookmark.index, 512);
+        assert!(batch.operations.len() < 30);
+        let mut actual = initial;
+        for operation in batch.operations {
+            apply(&mut actual, operation);
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn implicit_drop_does_not_join_blocked_disk_work_on_an_async_worker() -> Result<()> {
+        let backend = Arc::new(TestBackend::default());
+        *backend.paused.lock() = true;
+        let _release = ReleaseOnDrop(Arc::clone(&backend));
+        let runtime = start(Arc::clone(&backend)).await?;
+        runtime.write(request()).await?;
+        await_reached(&backend).await?;
+        while tokio::task::coop::has_budget_remaining() {
+            tokio::task::consume_budget().await;
+        }
+        drop(runtime);
+        let progress = tokio::spawn(async { 1 });
+        assert_eq!(
+            progress
+                .await
+                .map_err(|error| Error::internal(error.to_string()))?,
+            1
+        );
+        backend.release();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while backend.durable.load(Ordering::Acquire) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| Error::internal("implicit background close did not drain persistence"))?;
+        Ok(())
+    }
 }

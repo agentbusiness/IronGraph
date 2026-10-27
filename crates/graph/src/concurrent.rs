@@ -29,6 +29,10 @@ const NONE: u32 = u32::MAX;
 const NO_EDGE: u64 = u64::MAX;
 const LAYERS: usize = 3;
 
+#[path = "graph_persistence.rs"]
+mod persistence;
+pub use persistence::GraphPersistenceSelection;
+
 /// Fixed-radix directory: readers use `OnceLock::get`, never `get_or_init`.
 /// Directory metadata survives until project deletion; payload cells release removed values.
 struct Directory<T> {
@@ -2988,7 +2992,7 @@ impl Serialize for Rows<'_> {
     }
 }
 impl Serialize for GraphStore {
-    /// Caller pauses mutation apply at the committed WAL bookmark before encoding.
+    /// Caller pauses mutation apply at the committed application bookmark before encoding.
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         let mut state = s.serialize_struct("CanonicalCpuGraph", 6)?;
         state.serialize_field("format", &1_u32)?;

@@ -70,7 +70,6 @@ class ActualNativeAsyncTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.sleep(0.002)
             await asyncio.wait_for(drained(), 3)
             await database.flush_async()
-            await database.snapshot_async()
             await database.close_async()
             reopened = await EmbeddedDatabase.open_async(directory, device="cpu", load_embeddings=False)
             async with reopened:

@@ -1,4 +1,4 @@
-//! In-process IronGraph with the same canonical WAL, snapshots, CPU execution, and Cypher
+//! In-process IronGraph with the same asynchronous persistence, CPU execution, and Cypher
 //! semantics as the standalone server.
 
 use std::{
@@ -15,10 +15,7 @@ use irongraph_server::{
         EmbeddingStorage, LocalEmbeddingModel, ModelInstallProgress,
         ensure_default_embedding_model_with_storage,
     },
-    engine::{
-        ExecutionClass, SingleNodeBootstrapConfig, WriteRuntime, WriteStorageLimits,
-        open_standalone,
-    },
+    engine::{ExecutionClass, SingleNodeBootstrapConfig, open_standalone},
     protocol::{QueryExecutor as _, QueryRequest},
     server::Database,
 };
@@ -130,7 +127,6 @@ impl Drop for Operation<'_> {
 // Synchronous query workers can await ordered writer callbacks. Keep bounded callback,
 // inference, and maintenance capacity available even when every query permit is occupied.
 const BLOCKING_CALLBACK_HEADROOM: usize = 16;
-const DEFAULT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
 mod embedding_configuration_tests {
@@ -195,7 +191,6 @@ pub struct EmbeddedOptions {
     pub embedding_policy: EmbeddingPolicy,
     pub model_dir: Option<PathBuf>,
     pub embedding_cache_dir: Option<PathBuf>,
-    pub snapshot_interval: Duration,
     pub worker_threads: usize,
 }
 
@@ -209,7 +204,6 @@ impl EmbeddedOptions {
             embedding_policy: EmbeddingPolicy::Automatic,
             model_dir: None,
             embedding_cache_dir: None,
-            snapshot_interval: DEFAULT_SNAPSHOT_INTERVAL,
             worker_threads: 2,
         }
     }
@@ -278,11 +272,6 @@ impl EmbeddedOptions {
                 "embedded data directory is empty".to_owned(),
             ));
         }
-        if self.snapshot_interval.is_zero() {
-            return Err(EmbeddedError::Configuration(
-                "snapshot interval must be positive".into(),
-            ));
-        }
         Ok(())
     }
 }
@@ -308,7 +297,6 @@ pub type Result<T> = std::result::Result<T, EmbeddedError>;
 #[serde(deny_unknown_fields)]
 struct ResourceBudgets {
     worker_threads: Option<usize>,
-    snapshot_interval_ms: Option<u64>,
 }
 
 /// Validate and apply explicit host resource budgets from a language binding.
@@ -317,9 +305,6 @@ pub fn configure_budgets(options: &mut EmbeddedOptions, budgets: serde_json::Val
         .map_err(|error| EmbeddedError::Configuration(error.to_string()))?;
     if let Some(value) = budgets.worker_threads {
         options.worker_threads = value;
-    }
-    if let Some(value) = budgets.snapshot_interval_ms {
-        options.snapshot_interval = Duration::from_millis(value);
     }
     options.validate()
 }
@@ -344,9 +329,6 @@ impl Drop for InstanceGuard {
 struct EmbeddedCore {
     boot: irongraph_server::engine::BootstrappedNode<Database>,
     database: Database,
-    snapshot_directory: PathBuf,
-    snapshot_shutdown: CancellationToken,
-    snapshot_task: tokio::task::JoinHandle<()>,
     _embedding: Option<std::sync::Arc<LocalEmbeddingModel>>,
     _instance: InstanceGuard,
 }
@@ -362,11 +344,6 @@ impl EmbeddedCore {
             SingleNodeBootstrapConfig {
                 execution_class: ExecutionClass::Cpu,
                 startup_timeout: Duration::ZERO,
-                storage_limits: WriteStorageLimits {
-                    max_log_record_bytes: usize::MAX,
-                    max_log_entries_per_read: 4_096,
-                    max_snapshot_bytes: usize::MAX,
-                },
             },
             move |directory, identity| {
                 Ok(std::sync::Arc::new(Database::open_backend(
@@ -381,12 +358,6 @@ impl EmbeddedCore {
         boot.backend()
             .bind_runtime(std::sync::Arc::downgrade(boot.runtime()))?;
         let database = boot.backend().as_ref().clone();
-        let snapshot_directory = data_dir.join("standalone-snapshots");
-        database.standalone_recover(&snapshot_directory).await?;
-        // Mutations committed after the restored snapshot exist only in the standalone WAL, and
-        // replay must finish before the first write claims an index the WAL already holds.
-        boot.runtime().replay_standalone_wal().await?;
-
         let embedding = if options.embedding_policy == EmbeddingPolicy::Automatic {
             let embedding_device = options.embedding_device;
             let storage = EmbeddingStorage {
@@ -420,20 +391,9 @@ impl EmbeddedCore {
             None
         };
 
-        let snapshot_shutdown = CancellationToken::new();
-        let snapshot_task = spawn_snapshot_maintenance(
-            database.clone(),
-            std::sync::Arc::clone(boot.runtime()),
-            snapshot_directory.clone(),
-            options.snapshot_interval,
-            snapshot_shutdown.clone(),
-        );
         Ok(Self {
             boot,
             database,
-            snapshot_directory,
-            snapshot_shutdown,
-            snapshot_task,
             _embedding: embedding,
             _instance: instance,
         })
@@ -449,19 +409,8 @@ impl EmbeddedCore {
     }
 
     async fn close(self) -> Result<()> {
-        self.snapshot_shutdown.cancel();
-        let joined = self.snapshot_task.await;
         let embedding_shutdown = self.database.shutdown_embedding_jobs().await;
-        let snapshot = self
-            .database
-            .standalone_snapshot(&self.snapshot_directory)
-            .await;
-        // Always stop the writer, including when the final snapshot fails.
         let shutdown = self.boot.runtime().shutdown().await;
-        joined.map_err(|error| {
-            irongraph_types::Error::internal(format!("snapshot worker failed: {error}"))
-        })?;
-        snapshot?;
         shutdown?;
         embedding_shutdown?;
         Ok(())
@@ -629,22 +578,14 @@ impl EmbeddedDatabase {
         })
     }
 
-    pub fn snapshot(&self) -> Result<irongraph_types::Bookmark> {
-        let core = self
-            .core
-            .as_ref()
-            .ok_or_else(|| EmbeddedError::Configuration("database is closed".to_owned()))?;
-        Ok(self
-            .runtime
-            .block_on(core.database.standalone_snapshot(&core.snapshot_directory))?)
-    }
-
     pub fn flush(&self) -> Result<()> {
         let core = self
             .core
             .as_ref()
             .ok_or_else(|| EmbeddedError::Configuration("database is closed".into()))?;
-        Ok(self.runtime.block_on(core.boot.runtime().flush_wal())?)
+        Ok(self
+            .runtime
+            .block_on(core.boot.runtime().flush_persistence())?)
     }
 
     pub fn close(mut self) -> Result<()> {
@@ -670,45 +611,4 @@ fn absolute_path(path: PathBuf) -> Result<PathBuf> {
         return Ok(path);
     }
     Ok(std::env::current_dir()?.join(path))
-}
-
-fn spawn_snapshot_maintenance(
-    database: Database,
-    runtime: std::sync::Arc<WriteRuntime>,
-    directory: PathBuf,
-    interval: Duration,
-    shutdown: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut last = None;
-        loop {
-            tokio::select! {
-                () = shutdown.cancelled() => return,
-                _ = ticker.tick() => {
-                    if last == Some(database.bookmark()) {
-                        continue;
-                    }
-                    // A failure below leaves `last` unset so the next tick retries; background
-                    // upkeep never ends the embedded process.
-                    match database.standalone_snapshot(&directory).await {
-                        Ok(bookmark) => match database.standalone_wal_compaction_bookmark(&directory, bookmark).await {
-                            Ok(prefix) if prefix != irongraph_types::Bookmark::default() => {
-                                let runtime = std::sync::Arc::clone(&runtime);
-                                match tokio::task::spawn_blocking(move || runtime.compact_wal_through(prefix)).await {
-                                    Ok(Ok(())) => last = Some(bookmark),
-                                    Ok(Err(error)) => tracing::warn!(code = ?error.code, message = %error.message, "embedded WAL compaction failed"),
-                                    Err(error) => tracing::warn!(%error, "embedded WAL compaction task failed"),
-                                }
-                            }
-                            Ok(_) => last = Some(bookmark),
-                            Err(error) => tracing::warn!(code = ?error.code, message = %error.message, "embedded snapshot prefix selection failed"),
-                        },
-                        Err(error) => tracing::warn!(code = ?error.code, message = %error.message, "embedded periodic snapshot failed"),
-                    }
-                }
-            }
-        }
-    })
 }

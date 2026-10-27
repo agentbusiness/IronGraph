@@ -73,7 +73,7 @@ fn actual_native_async_lifecycle_timers_parallelism_and_cancellation()
             Ok::<_,irongraph_sdk::Error>(())
         }).await??;
         database.flush_async().await?;
-        database.snapshot_async().await?;
+        database.flush_async().await?;
         Arc::try_unwrap(database).map_err(|_| "SDK owner remains borrowed")?.close_async().await?;
         let reopened = EmbeddedDatabase::open_async(options).await?;
         assert_eq!(reopened.stream_fetch_async(fetch, OperationOptions::default()).await?.high_watermark, 1);

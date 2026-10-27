@@ -8,6 +8,9 @@ const file = fs.statSync(resolved).isDirectory() ? path.join(resolved, 'results.
 const report = JSON.parse(fs.readFileSync(file, 'utf8'));
 
 if (report.schema !== 'irongraph.performance-matrix.v1') throw new Error('unexpected result schema');
+if (!report.process_memory_context?.includes('not the canonical database footprint')) {
+  throw new Error('missing combined harness fixture memory context');
+}
 const requiredSizes = [100, 10_000, 100_000, 1_000_000, 2_000_000];
 if (JSON.stringify(report.config?.sizes) !== JSON.stringify(requiredSizes)) {
   throw new Error(`required sizes missing or reordered: ${JSON.stringify(report.config?.sizes)}`);
@@ -54,22 +57,16 @@ for (const nodes of requiredSizes) {
       }
     }
   }
-  for (const operation of ['wal_background_append_single', 'wal_background_append_batch']) {
-    const entry = report.measurements.find((candidate) => candidate.nodes === nodes && candidate.backend === 'storage' && candidate.operation === operation);
-    if (!entry || entry.durability !== 'eventual' || !Number.isFinite(entry.p50)) {
-      throw new Error(`missing eventual WAL append measurement ${nodes}/${operation}`);
-    }
-  }
   for (const operation of ['eventual_write_ack_single', 'eventual_write_ack_concurrent']) {
     const entry = report.measurements.find((candidate) => candidate.nodes === nodes && candidate.backend === 'standalone' && candidate.operation === operation);
     if (!entry || entry.durability !== 'eventual' || entry.samples !== report.config.samples || !Number.isFinite(entry.p50)) {
       throw new Error(`missing standalone eventual acknowledgement measurement ${nodes}/${operation}`);
     }
   }
-  for (const operation of ['wal_fsync_single', 'wal_fsync_batch']) {
+  for (const operation of ['record_commit_single', 'record_commit_batch']) {
     const entry = report.measurements.find((candidate) => candidate.nodes === nodes && candidate.backend === 'storage' && candidate.operation === operation);
-    if (!entry || entry.durability !== 'background-fsync' || !Number.isFinite(entry.p50)) {
-      throw new Error(`missing background durability-barrier measurement ${nodes}/${operation}`);
+    if (!entry || entry.durability !== 'durable-commit' || entry.samples !== report.config.samples || entry.warmups !== report.config.warmups || !Number.isFinite(entry.p50)) {
+      throw new Error(`missing durable record commit measurement ${nodes}/${operation}`);
     }
   }
   for (const operation of ['initial_node_ingest', 'initial_edge_ingest']) {

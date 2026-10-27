@@ -1,55 +1,29 @@
 //! Standalone state-backend contract: the `MutationStateBackend` trait the write engine applies
 //! mutations through, and its supporting types.
 
-use std::path::Path;
-
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::storage::MutationEntry;
+use crate::storage::{MutationEntry, RecordBatch};
 use crate::{Bookmark, Error, Result};
 
-use super::{BackendSnapshot, WriteCommand};
-
-/// Hard resource limits for the durable write layer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WriteStorageLimits {
-    pub max_log_record_bytes: usize,
-    pub max_log_entries_per_read: usize,
-    pub max_snapshot_bytes: usize,
-}
-
-/// Verified export of the canonical standalone snapshot. The checksum covers the complete framed
-/// snapshot file, including its embedded application checkpoint.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SnapshotBackup {
-    pub bookmark: Bookmark,
-    pub bytes: u64,
-    pub checksum: [u8; 32],
-}
-
-impl WriteStorageLimits {
-    pub(crate) fn validate(self) -> Result<Self> {
-        if self.max_log_record_bytes == 0
-            || self.max_log_entries_per_read == 0
-            || self.max_snapshot_bytes == 0
-        {
-            return Err(Error::invalid_data("write storage limits must be non-zero"));
-        }
-        Ok(self)
-    }
-}
+use super::WriteCommand;
 
 /// Result of applying a deterministic mutation to the canonical local backend.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MutationApplyResult {
     pub response: Vec<u8>,
     pub duplicate: bool,
+    /// Current records captured at this mutation's exact applied position. The persistence
+    /// worker owns these bytes after publication; it never reads a later live graph view.
+    /// A newly applied position requires an explicit span, including for an empty metadata-only
+    /// change. An already-applied entry may omit records when it advances no position.
+    pub persistence: Option<RecordBatch>,
 }
 
 /// Ephemeral local-sequencer ownership for one state-dependent command admission. A pipelined
 /// reservation represents the command's effect in the backend's ordered pending-state overlay;
-/// it is never serialized into the WAL or a snapshot.
+/// it is never part of durable state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommandReservation {
     token: Option<Uuid>,
@@ -99,7 +73,7 @@ impl CommandReservation {
     }
 
     #[must_use]
-    pub const fn may_release_after_append(self) -> bool {
+    pub const fn may_pipeline(self) -> bool {
         self.pipelined
     }
 
@@ -119,13 +93,13 @@ pub enum CommandReservationOutcome {
 /// Production state backend contract used by the local ordered write path.
 ///
 /// `apply_mutation` atomically publishes one ordered mutation and is idempotent for an already
-/// applied bookmark or request ID. The WAL and its snapshots are the sole recovery source;
-/// implementations must not introduce a second durable mutation log.
+/// applied bookmark or request ID. Its captured record batches are the sole database recovery
+/// source; implementations must not retain a durable mutation history alongside them.
 #[async_trait]
 pub trait MutationStateBackend: Send + Sync + 'static {
     /// Resolve sequencer-owned nondeterminism before state-dependent ordered reservation. A
-    /// retried command is prepared again by the local sequencer that can
-    /// actually append it; only the returned command is committed.
+    /// retried command is prepared again by the local sequencer; only the returned command is
+    /// applied.
     async fn prepare_command(
         &self,
         mut command: WriteCommand,
@@ -136,14 +110,14 @@ pub trait MutationStateBackend: Send + Sync + 'static {
         Ok(command)
     }
 
-    /// Validate a resolved command against the sequencer's current applied state before append.
+    /// Validate a resolved command against the sequencer's current applied state before apply.
     /// This is the serialized fallback for backends without an ordered pending-state overlay.
     async fn validate_command(&self, command: &WriteCommand) -> Result<()> {
         command.validate()
     }
 
     /// Atomically validates a prepared command against the latest ordered state and reserves its
-    /// exact next log position. Backends without an ordered pending-state overlay return a
+    /// exact next write position. Backends without an ordered pending-state overlay return a
     /// serialized reservation, which keeps the runtime gate through local application.
     async fn reserve_command(
         &self,
@@ -172,13 +146,10 @@ pub trait MutationStateBackend: Send + Sync + 'static {
     /// mutation with `index = applied.index + 1`.
     async fn applied_bookmark(&self) -> Bookmark;
 
-    /// Return an exact immutable snapshot through `bookmark`, never a later live view.
-    async fn build_snapshot(
-        &self,
-        bookmark: Bookmark,
-        destination: &Path,
-    ) -> Result<BackendSnapshot>;
-
-    /// Atomically install a verified snapshot and make repeated installation idempotent.
-    async fn install_snapshot(&self, bookmark: Bookmark, snapshot: &BackendSnapshot) -> Result<()>;
+    /// Commit captured current-record batches durably. Called only by the dedicated persistence
+    /// thread, never by query readers or asynchronous runtime workers. Backends that return no
+    /// persistence batches need no implementation (for example, in-memory test backends).
+    fn persist(&self, _batches: &[RecordBatch]) -> Result<()> {
+        Ok(())
+    }
 }

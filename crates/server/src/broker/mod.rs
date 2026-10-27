@@ -1,4 +1,4 @@
-//! Stream and Queue messaging over one local WAL-backed broker state machine.
+//! Stream and Queue messaging over one canonical broker state machine with incremental durability.
 //!
 //! Both surfaces are wire-compatible with an existing protocol so off-the-shelf clients work
 //! unmodified — Stream speaks Kafka, Queue speaks AMQP 0-9-1 — but they are one system, not two:
@@ -13,10 +13,10 @@ mod queue;
 mod stream;
 
 pub use engine::{
-    AmqpBatchRecord, AmqpExchangeKind, BrokerCommand, BrokerCommit, BrokerCoordinator, BrokerReply,
-    BrokerStateMachine, ConsumerLagMetrics, Delivery, ExchangeMetrics, IngressMetadata,
-    KafkaBatchRecord, PartitionRead, PayloadRecord, QueueInfo, QueueKind, QueueMetrics,
-    RetentionPolicy, StreamOffset, TopicMetrics,
+    AmqpBatchRecord, AmqpExchangeKind, BrokerCommand, BrokerCommit, BrokerCoordinator,
+    BrokerPersistenceSelection, BrokerReply, BrokerStateMachine, ConsumerLagMetrics, Delivery,
+    ExchangeMetrics, IngressMetadata, KafkaBatchRecord, PartitionRead, PayloadRecord, QueueInfo,
+    QueueKind, QueueMetrics, RetentionPolicy, StreamOffset, TopicMetrics,
 };
 pub use queue::QueueServer;
 pub use stream::StreamServer;

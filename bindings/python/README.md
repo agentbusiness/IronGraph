@@ -73,14 +73,14 @@ asyncio.run(main())
 ```
 
 Expected output: `1`. The async context manager closes the database. Async variants also cover streaming, status,
-cancellation, snapshots, and flushing. Concurrent data calls wait asynchronously for an
+cancellation and flushing. Concurrent data calls wait asynchronously for an
 available worker without a configurable operation quota.
 
 ## Operate the database
 
 Choose projects explicitly with `USE` or `project_id`; there is no implicit default. Each project
 has `OBSERVED`, `KNOWLEDGE`, and `WORKSPACE` layers for source facts, curated facts, and working
-data. Transactions, asynchronous write-ahead logging, recovery, and snapshots apply to embedded
+data. Transactions, asynchronous asynchronous persistence and recovery apply to embedded
 data as they do in a standalone instance.
 
 One process uses one shared CPU graph and one active embedded instance. Text inference selects
@@ -108,8 +108,7 @@ Message producers and consumers use the supported Kafka or AMQP protocols throug
 configured listeners. The SDK query interface does not replace those protocol clients.
 
 Explicit projects and the `OBSERVED`, `KNOWLEDGE`, and `WORKSPACE` layers organize data.
-Indexes and unique constraints, transactions, asynchronous write-ahead logging, recovery, and
-periodic snapshots are part of the database.
+Indexes and unique constraints, transactions, asynchronous persistence and recovery are part of the database.
 
 The standalone instance serves its web console at
 [http://127.0.0.1:18484/web/](http://127.0.0.1:18484/web/) by default and also supports local MCP

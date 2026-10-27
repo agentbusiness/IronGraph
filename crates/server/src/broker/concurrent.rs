@@ -46,8 +46,8 @@ counter!(Counter, AtomicU64, u64);
 counter!(Position, AtomicUsize, usize);
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct CanonicalSet<T: Hash + Eq + Clone>(CanonicalMap<T, ()>);
-impl<T: Hash + Eq + Clone> CanonicalSet<T> {
+pub(crate) struct CanonicalSet<T: Hash + Eq + Clone + 'static>(CanonicalMap<T, ()>);
+impl<T: Hash + Eq + Clone + 'static> CanonicalSet<T> {
     pub fn insert(&self, value: T) -> bool {
         self.0.insert(value, ()).is_none()
     }
@@ -66,11 +66,14 @@ impl<T: Hash + Eq + Clone> CanonicalSet<T> {
     pub fn iter(&self) -> impl Iterator<Item = T> {
         self.0.keys()
     }
+    pub(crate) fn identity(&self) -> usize {
+        self.0.identity()
+    }
     pub fn retain(&self, mut keep: impl FnMut(&T) -> bool) {
         self.0.retain(|key, _| keep(key));
     }
 }
-impl<T: Hash + Eq + Clone + Serialize> Serialize for CanonicalSet<T> {
+impl<T: Hash + Eq + Clone + 'static + Serialize> Serialize for CanonicalSet<T> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq;
         let mut sequence = s.serialize_seq(Some(self.len()))?;
@@ -80,7 +83,7 @@ impl<T: Hash + Eq + Clone + Serialize> Serialize for CanonicalSet<T> {
         sequence.end()
     }
 }
-impl<'de, T: Hash + Eq + Clone + Deserialize<'de>> Deserialize<'de> for CanonicalSet<T> {
+impl<'de, T: Hash + Eq + Clone + 'static + Deserialize<'de>> Deserialize<'de> for CanonicalSet<T> {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let values = Vec::<T>::deserialize(d)?;
         let result = Self(CanonicalMap::default());
@@ -109,12 +112,16 @@ impl<K: Hash + Eq, V> std::fmt::Debug for CanonicalMap<K, V> {
             .finish()
     }
 }
-impl<K: Hash + Eq + Clone, V: Clone> CanonicalMap<K, V> {
-    pub fn get<Q: Hash + Eq + ?Sized>(&self, key: &Q) -> Option<Arc<V>>
+impl<K: Hash + Eq + Clone + 'static, V: Clone + 'static> CanonicalMap<K, V> {
+    pub fn get<Q: Hash + Eq + ToOwned<Owned = K> + ?Sized>(&self, key: &Q) -> Option<Arc<V>>
     where
         K: Borrow<Q>,
     {
-        self.0.pin().get(key).cloned()
+        let value = self.0.pin().get(key).cloned();
+        if let Some(value) = &value {
+            super::engine::persistence::observe(self.identity(), key.to_owned(), value.clone());
+        }
+        value
     }
     pub fn contains_key<Q: Hash + Eq + ?Sized>(&self, key: &Q) -> bool
     where
@@ -123,13 +130,20 @@ impl<K: Hash + Eq + Clone, V: Clone> CanonicalMap<K, V> {
         self.0.pin().contains_key(key)
     }
     pub fn insert(&self, key: K, value: V) -> Option<Arc<V>> {
-        self.0.pin().insert(key, Arc::new(value)).cloned()
+        let value = Arc::new(value);
+        super::engine::persistence::changed(self.identity(), key.clone(), Some(value.clone()));
+        self.0.pin().insert(key, value).cloned()
     }
-    pub fn remove<Q: Hash + Eq + ?Sized>(&self, key: &Q) -> Option<Arc<V>>
+    pub fn remove<Q: Hash + Eq + ToOwned<Owned = K> + ?Sized>(&self, key: &Q) -> Option<Arc<V>>
     where
         K: Borrow<Q>,
     {
-        self.0.pin().remove(key).cloned()
+        let previous = self.0.pin().remove(key).cloned();
+        if let Some(value) = &previous {
+            super::engine::persistence::observe(self.identity(), key.to_owned(), value.clone());
+            super::engine::persistence::changed::<K, V>(self.identity(), key.to_owned(), None);
+        }
+        previous
     }
     pub fn len(&self) -> usize {
         self.0.len()
@@ -141,7 +155,10 @@ impl<K: Hash + Eq + Clone, V: Clone> CanonicalMap<K, V> {
         self.0
             .pin()
             .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| {
+                super::engine::persistence::observe(self.identity(), k.clone(), v.clone());
+                (k.clone(), v.clone())
+            })
             .collect::<Vec<_>>()
             .into_iter()
     }
@@ -159,6 +176,7 @@ impl<K: Hash + Eq + Clone, V: Clone> CanonicalMap<K, V> {
         }
     }
     pub fn clear(&self) {
+        super::engine::persistence::cleared(self.identity());
         self.0.pin().clear();
     }
     pub fn get_mut(&self, key: &K) -> Option<Edit<'_, K, V>> {
@@ -183,36 +201,39 @@ impl<K: Hash + Eq + Clone, V: Clone> CanonicalMap<K, V> {
     {
         self.iter().max_by(|a, b| a.0.cmp(&b.0))
     }
+    pub(crate) fn identity(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
     #[cfg(test)]
     pub fn shared_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
-impl<K: Hash + Eq + Clone, V: Clone> IntoIterator for &CanonicalMap<K, V> {
+impl<K: Hash + Eq + Clone + 'static, V: Clone + 'static> IntoIterator for &CanonicalMap<K, V> {
     type Item = (K, Arc<V>);
     type IntoIter = std::vec::IntoIter<Self::Item>;
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
 }
-pub(crate) struct Edit<'a, K: Hash + Eq + Clone, V: Clone> {
+pub(crate) struct Edit<'a, K: Hash + Eq + Clone + 'static, V: Clone + 'static> {
     map: &'a CanonicalMap<K, V>,
     key: K,
     value: Option<V>,
     original: Arc<V>,
 }
-impl<K: Hash + Eq + Clone, V: Clone> Deref for Edit<'_, K, V> {
+impl<K: Hash + Eq + Clone + 'static, V: Clone + 'static> Deref for Edit<'_, K, V> {
     type Target = V;
     fn deref(&self) -> &V {
         self.value.as_ref().expect("broker edit owns its value")
     }
 }
-impl<K: Hash + Eq + Clone, V: Clone> DerefMut for Edit<'_, K, V> {
+impl<K: Hash + Eq + Clone + 'static, V: Clone + 'static> DerefMut for Edit<'_, K, V> {
     fn deref_mut(&mut self) -> &mut V {
         self.value.as_mut().expect("broker edit owns its value")
     }
 }
-impl<K: Hash + Eq + Clone, V: Clone> Drop for Edit<'_, K, V> {
+impl<K: Hash + Eq + Clone + 'static, V: Clone + 'static> Drop for Edit<'_, K, V> {
     fn drop(&mut self) {
         let Some(value) = self.value.take() else {
             return;
@@ -225,14 +246,19 @@ impl<K: Hash + Eq + Clone, V: Clone> Drop for Edit<'_, K, V> {
                 current.clone()
             }
         });
+        super::engine::persistence::changed(
+            self.map.identity(),
+            self.key.clone(),
+            self.map.get(&self.key),
+        );
     }
 }
-pub(crate) struct Entry<'a, K: Hash + Eq + Clone, V: Clone> {
+pub(crate) struct Entry<'a, K: Hash + Eq + Clone + 'static, V: Clone + 'static> {
     map: &'a CanonicalMap<K, V>,
     key: K,
     modify: Option<Box<dyn FnOnce(&mut V) + 'a>>,
 }
-impl<'a, K: Hash + Eq + Clone, V: Clone> Entry<'a, K, V> {
+impl<'a, K: Hash + Eq + Clone + 'static, V: Clone + 'static> Entry<'a, K, V> {
     pub fn and_modify(mut self, f: impl FnOnce(&mut V) + 'a) -> Self {
         self.modify = Some(Box::new(f));
         self
@@ -265,7 +291,9 @@ impl<'a, K: Hash + Eq + Clone, V: Clone> Entry<'a, K, V> {
         }
     }
 }
-impl<K: Hash + Eq + Clone + Serialize, V: Clone + Serialize> Serialize for CanonicalMap<K, V> {
+impl<K: Hash + Eq + Clone + 'static + Serialize, V: Clone + 'static + Serialize> Serialize
+    for CanonicalMap<K, V>
+{
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         let guard = self.0.pin();
@@ -276,13 +304,16 @@ impl<K: Hash + Eq + Clone + Serialize, V: Clone + Serialize> Serialize for Canon
         map.end()
     }
 }
-impl<'de, K: Hash + Eq + Clone + Deserialize<'de>, V: Clone + Deserialize<'de>> Deserialize<'de>
-    for CanonicalMap<K, V>
+impl<'de, K: Hash + Eq + Clone + 'static + Deserialize<'de>, V: Clone + 'static + Deserialize<'de>>
+    Deserialize<'de> for CanonicalMap<K, V>
 {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         struct Visitor<K, V>(std::marker::PhantomData<(K, V)>);
-        impl<'de, K: Hash + Eq + Clone + Deserialize<'de>, V: Clone + Deserialize<'de>>
-            serde::de::Visitor<'de> for Visitor<K, V>
+        impl<
+            'de,
+            K: Hash + Eq + Clone + 'static + Deserialize<'de>,
+            V: Clone + 'static + Deserialize<'de>,
+        > serde::de::Visitor<'de> for Visitor<K, V>
         {
             type Value = CanonicalMap<K, V>;
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

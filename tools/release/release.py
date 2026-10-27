@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
+import concurrent.futures
 import email.parser
 import fcntl
+import fnmatch
 import hashlib
 import http.client
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -46,9 +50,14 @@ PUBLIC_FILES = {"README.md", "LICENSE.txt", "THIRD_PARTY_NOTICES.txt"}
 def private_audit_pattern(config=None):
     """Personal audit values belong in ignored local configuration, never source."""
     pattern = (config or {}).get("IRONGRAPH_PRIVATE_AUDIT_PATTERN", "")
-    patterns = [rb"/(?:Users|home)/[^/\s]+/", rb"[A-Za-z]:\\Users\\[^\\\s]+\\"]
+    patterns = [rb"/(?:Users|home)/[^/\s]+/", rb"[A-Za-z]:\\Users\\[^\\\s]+\\",
+                rb"/(?:private/)?var/folders/[^\s\x00]+"]
     if pattern:
         patterns.append(pattern.encode())
+    for key in SECRETS:
+        if value := (config or {}).get(key):
+            secret = value.encode()
+            patterns.extend(re.escape(encoded) for encoded in (secret, secret.hex().encode(), base64.b64encode(secret)))
     return re.compile(b"|".join(patterns), re.I)
 
 
@@ -57,6 +66,20 @@ PRIVATE_BYTES = private_audit_pattern()
 
 class ReleaseError(Exception):
     pass
+
+
+class RegistryPending(ReleaseError):
+    """A read-only registry request can be retried without another upload."""
+
+
+def release_config_path():
+    local = ROOT / ".env.publish"
+    if local.exists():
+        return local
+    common = Path(subprocess.check_output(
+        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=ROOT, text=True).strip())
+    shared = common.parent / ".env.publish"
+    return shared if common.name == ".git" and shared.exists() else local
 
 
 def load_config(path: Path) -> dict[str, str]:
@@ -99,10 +122,11 @@ def clean_env(extra=None):
     return env
 
 
-def run(argv, cwd=ROOT, env=None, capture=False):
+def run(argv, cwd=ROOT, env=None, capture=False, noninteractive=False):
     command = [str(a) for a in argv]
     print("Running " + " ".join(command[:5]), flush=True)
     result = subprocess.run(command, cwd=cwd, env=clean_env(env), text=True,
+                            stdin=subprocess.DEVNULL if noninteractive else None,
                             stdout=subprocess.PIPE if capture else None,
                             stderr=subprocess.PIPE if capture else None)
     if result.returncode:
@@ -243,6 +267,18 @@ def fingerprint(root=ROOT):
     return digest.hexdigest()
 
 
+def audit_source_privacy(root, config):
+    pattern = private_audit_pattern(config)
+    paths = source_files(root)
+    for path in paths:
+        data = (root / path).read_bytes()
+        if path.as_posix() == "tools/release/tests/test_npm_privacy.py":
+            data = data.replace(b"/home/" + b"private-owner/", b"/anonymous-fixture/")
+        if pattern.search(path.as_posix().encode() + b"\0" + data):
+            raise ReleaseError(f"Private data in release source: {path}")
+    print(f"Source privacy checks passed: {len(paths)} files", flush=True)
+
+
 def stage_source(destination, version, root=ROOT):
     destination.mkdir(parents=True)
     for path in source_files(root):
@@ -301,7 +337,8 @@ def tool_environment(source, target):
         flags.extend(["-C", "strip=none"])
     env = {"CARGO_TARGET_DIR": str(source.parent / "build" / target),
            "CARGO_ENCODED_RUSTFLAGS": "\x1f".join(flags),
-           "RUSTFLAGS": "", "PYO3_PYTHON": sys.executable}
+           "RUSTFLAGS": "", "PYO3_PYTHON": sys.executable,
+           "CARGO_BUILD_JOBS": "2", "CARGO_INCREMENTAL": "0"}
     if target == "aarch64-apple-darwin":
         env["CARGO_PROFILE_RELEASE_STRIP"] = "none"
     return env
@@ -381,9 +418,13 @@ def host_target():
     raise ReleaseError("Unsupported build host. Use macOS ARM64 for the complete local matrix.")
 
 
-def ensure_console(source):
+def ensure_console(source, packaging_only=False):
     if not (source / "web/dist/index.html").exists():
-        run(["bash", "tools/bindings/verify-web.sh"], source)
+        if packaging_only:
+            run(["npm", "ci", "--ignore-scripts"], source / "web")
+            run(["npm", "run", "build"], source / "web")
+        else:
+            run(["bash", "tools/bindings/verify-web.sh"], source)
 
 
 def standalone_names(target, version):
@@ -405,7 +446,7 @@ def build_standalone(source, output, target, config=None):
         raise ReleaseError("Standalone builds must execute on their target architecture.")
     config = config or {}
     output.mkdir(parents=True, exist_ok=True)
-    ensure_console(source)
+    ensure_console(source, config.get("packaging_only", False))
     env = tool_environment(source, target)
     if sys.platform == "darwin":
         env["MACOSX_DEPLOYMENT_TARGET"] = config.get("MACOSX_DEPLOYMENT_TARGET", "15.0")
@@ -471,12 +512,30 @@ def verify_standalone(source, output, target):
     print(f"standalone installed verification passed: {target}", flush=True)
 
 
+def install_node_build_tools(source):
+    directory = source.parent / "node-build-tools"
+    directory.mkdir(exist_ok=True)
+    for name in ("package.json", "package-lock.json"):
+        document = read_json(source / "bindings/node" / name)
+        document.pop("optionalDependencies", None)
+        if "packages" in document:
+            document["packages"][""].pop("optionalDependencies", None)
+        write_json(directory / name, document)
+    run(["npm", "ci", "--ignore-scripts"], directory)
+    modules = source / "bindings/node/node_modules"
+    if modules.is_symlink():
+        modules.unlink()
+    elif modules.exists():
+        shutil.rmtree(modules)
+    modules.symlink_to(directory / "node_modules", target_is_directory=True)
+
+
 def build_target(source, output, target, qualify=True, config=None):
     if target != host_target():
         raise ReleaseError("Native qualification must execute on its target architecture (Docker emulation is supported).")
     config = config or {}
     output.mkdir(parents=True, exist_ok=True)
-    ensure_console(source)
+    ensure_console(source, config.get("packaging_only", False))
     env = tool_environment(source, target)
     if sys.platform == "darwin":
         env["MACOSX_DEPLOYMENT_TARGET"] = config.get("MACOSX_DEPLOYMENT_TARGET", "15.0")
@@ -487,7 +546,7 @@ def build_target(source, output, target, qualify=True, config=None):
     run(["cargo", "build", "--release", "--locked", "--target", target, "-p", "irongraph-ffi"], source, env)
     notices, inventory = license_notices(source, env)
     package_legal(source, notices)
-    run(["npm", "ci", "--ignore-scripts"], source / "bindings/node")
+    install_node_build_tools(source)
     notices += npm_notices(source / "bindings/node")
     package_legal(source, notices)
     (output / "THIRD_PARTY_NOTICES.txt").write_text(notices)
@@ -505,6 +564,7 @@ def build_target(source, output, target, qualify=True, config=None):
     if sys.platform == "darwin":
         # Mach-O's LC_ID_DYLIB otherwise records the absolute local build path.
         run(["install_name_tool", "-id", f"@rpath/{binary_name}", node_dir / binary_name], source)
+        run(["strip", "-S", node_dir / binary_name], source)
         run(["codesign", "--force", "--sign", "-", node_dir / binary_name], source)
     shutil.copy2(node_dir / binary_name, node_dir / "npm" / TARGETS[target] / binary_name)
     wheels = output / "wheels"
@@ -512,10 +572,52 @@ def build_target(source, output, target, qualify=True, config=None):
     run([python, "-m", "maturin", "build", "--release", "--locked", "--target", target,
          "--manifest-path", "bindings/python/Cargo.toml", "--out", wheels,
          *([] if sys.platform == "darwin" else ["--compatibility", "manylinux_2_28"])], source, env)
+    if sys.platform == "darwin":
+        for wheel in wheels.glob("*.whl"):
+            clean_macos_wheel(wheel)
     npm_pack(node_dir / "npm" / TARGETS[target], output)
     npm_pack(node_dir, output)
     build_standalone(source, output, target, config)
     qualify_target(source, output, target, qualify, config)
+
+
+def clean_macos_wheel(wheel):
+    """Remove native debug paths, re-sign, and repair wheel RECORD hashes."""
+    with zipfile.ZipFile(wheel) as archive:
+        entries = [(info, archive.read(info)) for info in archive.infolist()]
+    replacements = {}
+    for info, data in entries:
+        if info.filename.endswith(".so"):
+            with tempfile.TemporaryDirectory(prefix="irongraph-wheel-") as temporary:
+                binary = Path(temporary) / Path(info.filename).name
+                binary.write_bytes(data)
+                run(["strip", "-S", binary])
+                run(["codesign", "--force", "--sign", "-", binary])
+                replacements[info.filename] = binary.read_bytes()
+    records = [info.filename for info, _ in entries if info.filename.endswith(".dist-info/RECORD")]
+    if len(records) != 1:
+        raise ReleaseError("Wheel must contain exactly one RECORD file.")
+    record = records[0]
+    original = {info.filename: data for info, data in entries}
+    rows, recorded = [], set()
+    for row in csv.reader(io.StringIO(original[record].decode())):
+        if row[0] in replacements:
+            data = replacements[row[0]]
+            row = [row[0], "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode(), str(len(data))]
+            recorded.add(row[0])
+        rows.append(row)
+    if recorded != set(replacements):
+        raise ReleaseError("Wheel RECORD does not cover every native binary.")
+    buffer = io.StringIO()
+    csv.writer(buffer, lineterminator="\n").writerows(rows)
+    replacements[record] = buffer.getvalue().encode()
+    temporary = wheel.with_suffix(".clean")
+    with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        for info, data in entries:
+            info.extra = b""
+            info.comment = b""
+            archive.writestr(info, replacements.get(info.filename, data))
+    temporary.replace(wheel)
 
 
 def qualify_target(source, output, target, qualify=True, config=None):
@@ -523,6 +625,22 @@ def qualify_target(source, output, target, qualify=True, config=None):
     if target != host_target():
         raise ReleaseError("Installed packages must be verified on their target architecture.")
     config = config or {}
+    if config.get("packaging_only"):
+        version = current_version(source)
+        for path in output.glob("*.tgz"):
+            audit_archive(path, "npm", version)
+        for path in (output / "wheels").glob("*.whl"):
+            audit_archive(path, "wheel", version)
+        for path in output.glob("*.tar.gz"):
+            audit_archive(path, "standalone", version)
+        write_json(output / "packaging.json", {
+            "target": target, "version": version, "tests_run": False,
+            "artifacts": {str(path.relative_to(output)): sha256(path) for path in output.rglob("*")
+                          if path.is_file() and path.name != "packaging.json"},
+        })
+        verify_packaging(output, target, version)
+        print(f"Build and package checks complete (runtime tests not run): {target}", flush=True)
+        return
     verify_standalone(source, output, target)
     env = tool_environment(source, target)
     if sys.platform == "darwin":
@@ -733,9 +851,28 @@ def verify_standalone_report(directory, target, version):
             raise ReleaseError(f"{target}: qualified standalone artifact changed: {name}")
 
 
-def verify_qualification(output, version):
+def verify_packaging(directory, target, version):
+    report = read_json(directory / "packaging.json")
+    wheels = list((directory / "wheels").glob("*.whl"))
+    expected = standalone_names(target, version) | {
+        f"libirongraph_ffi-{target}.a", f"irongraph-node-{version}.tgz",
+        f"irongraph-node-{TARGETS[target]}-{version}.tgz", "THIRD_PARTY_NOTICES.txt"}
+    expected.update(str(path.relative_to(directory)) for path in wheels)
+    if (report.get("target") != target or report.get("version") != version or report.get("tests_run") is not False
+            or len(wheels) != 1 or set(report.get("artifacts", {})) != expected):
+        raise ReleaseError(f"{target}: incomplete packaging report.")
+    for name, digest in report["artifacts"].items():
+        path = directory / name
+        if path.is_symlink() or not path.is_file() or sha256(path) != digest:
+            raise ReleaseError(f"{target}: packaged artifact changed: {name}")
+
+
+def verify_qualification(output, version, packaging_only=False):
     for target in TARGETS:
         directory = output / target
+        if packaging_only:
+            verify_packaging(directory, target, version)
+            continue
         report = read_json(directory / "qualification.json")
         if report["target"] != target or report["version"] != version or report["embedding_search"] is not True:
             raise ReleaseError(f"{target}: complete installed-package and embedding-search qualification required.")
@@ -774,7 +911,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database = EmbeddedDatabase::open(options.clone())?;
     database.query(Query::new("CREATE PROJECT packaged"))?;
     database.query(Query::new("USE packaged CREATE (:Document {body: 'From the crate archive'})"))?;
-    database.snapshot()?;
+    database.flush()?;
     database.close()?;
     let reopened = EmbeddedDatabase::open(options)?;
     let result = reopened.query(Query::new("USE packaged MATCH (d:Document) RETURN d.body"))?;
@@ -790,7 +927,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 def package_all(stage, config):
     source, output = stage / "source", stage / "artifacts"
     version = current_version(source)
-    verify_qualification(output, version)
+    packaging_only = config.get("packaging_only", False)
+    verify_qualification(output, version, packaging_only)
     # Cargo can select any native target, so its legal bundle covers the entire matrix.
     notices = "\n".join(f"IronGraph native distribution: {target}\n\n" +
                         (output / target / "THIRD_PARTY_NOTICES.txt").read_text()
@@ -829,7 +967,8 @@ def package_all(stage, config):
         expected_files.add(standalone.name)
     javascript = source / "bindings/javascript"
     run(["npm", "ci", "--ignore-scripts"], javascript)
-    run(["npm", "test"], javascript)
+    if not packaging_only:
+        run(["npm", "test"], javascript)
     run(["npm", "run", "build"], javascript)
     # The remote browser client carries its JavaScript notices; it contains no native engine.
     (javascript / "THIRD_PARTY_NOTICES.txt").write_text(npm_notices(javascript))
@@ -845,10 +984,12 @@ def package_all(stage, config):
     with tempfile.TemporaryDirectory(prefix="irongraph-cargo-package-") as temporary:
         public_sdk = Path(temporary) / "irongraph-sdk"
         shutil.copytree(sdk, public_sdk, ignore=shutil.ignore_patterns("target", "native", ".git"))
-        run(["cargo", "package", "--manifest-path", public_sdk / "Cargo.toml"], public_sdk, env)
+        run(["cargo", "package", *(["--no-verify"] if packaging_only else []),
+             "--manifest-path", public_sdk / "Cargo.toml"], public_sdk, env)
     crate = stage / "sdk-package/package" / f"irongraph-sdk-{version}.crate"
     audit_archive(crate, "cargo", version)
-    verify_cargo_consumer(crate, env)
+    if not packaging_only:
+        verify_cargo_consumer(crate, env)
     shutil.copy2(crate, publication / crate.name)
     expected_files.add(crate.name)
     shutil.copy2(source / "README.md", publication / "README.md")
@@ -867,9 +1008,69 @@ def github(config, route, method="GET", value=None):
         with urllib.request.urlopen(request, timeout=60) as response:
             return json.load(response)
     except urllib.error.HTTPError as error:
-        if error.code == 404:
+        if error.code == 404 and method == "GET":
             return None
         raise ReleaseError(f"GitHub {method} request failed (HTTP {error.code}); check repository permissions.") from None
+
+
+def npm_auth_json(config, route):
+    request = urllib.request.Request("https://registry.npmjs.org" + route, headers={
+        "Authorization": "Bearer " + config["NPM_TOKEN"], "User-Agent": "IronGraph-release"})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        raise ReleaseError(f"npm authentication check failed (HTTP {error.code}); check token permissions.") from None
+
+
+def check_publish_auth(config):
+    """Only GET requests: never creates a release, uploads, or changes settings."""
+    if not config.get("GITHUB_TOKEN") or not config.get("NPM_TOKEN"):
+        raise ReleaseError("Set GITHUB_TOKEN and NPM_TOKEN in the ignored .env.publish file.")
+    identity = github(config, "/user") or {}
+    if identity.get("login") != "agentbusiness":
+        raise ReleaseError("GitHub token must belong to the official agentbusiness account.")
+    repository = validate_binary_repo(config)
+    if not repository.get("permissions", {}).get("push"):
+        raise ReleaseError("GitHub token needs Contents write access to the source repository.")
+    if npm_auth_json(config, "/-/whoami").get("username") != "businessagent":
+        raise ReleaseError("npm token must belong to the official businessagent account.")
+    route, tokens, seen = "/-/npm/v1/tokens", [], set()
+    while route:
+        if route in seen:
+            raise ReleaseError("npm token inspection returned repeated pagination.")
+        seen.add(route)
+        page = npm_auth_json(config, route)
+        tokens.extend(page.get("objects", []))
+        next_url = (page.get("urls") or {}).get("next")
+        route = None
+        if next_url:
+            parsed = urllib.parse.urlsplit(next_url)
+            if parsed.scheme != "https" or parsed.netloc != "registry.npmjs.org" or not parsed.path.startswith("/-/npm/v1/tokens"):
+                raise ReleaseError("Unexpected npm token inspection URL.")
+            route = parsed.path + ("?" + parsed.query if parsed.query else "")
+    matches = []
+    for token in tokens:
+        pattern = re.sub(r"\.{2,}|…", "*", token.get("token", ""))
+        if len(pattern.replace("*", "")) >= 8 and fnmatch.fnmatchcase(config["NPM_TOKEN"], pattern):
+            matches.append(token)
+    if len(matches) != 1:
+        raise ReleaseError("Cannot uniquely verify the supplied npm token's publishing permissions.")
+    token = matches[0]
+    if token.get("revoked") or token.get("bypass_2fa") is not True:
+        raise ReleaseError("npm token needs Bypass 2FA for non-interactive publication; browser fallback is disabled.")
+    if not any(p.get("name") == "package" and p.get("action") == "write" for p in token.get("permissions", [])):
+        raise ReleaseError("npm token needs direct package publishing write access.")
+    scopes = {s.get("name") for s in token.get("scopes", []) if s.get("type") == "package"}
+    packages = [read_json(ROOT / "bindings" / binding / "package.json")["name"]
+                for binding in ("node", "javascript", "cli")]
+    packages += [f"@irongraph/{binding}-{suffix}" for binding in ("node", "cli") for suffix in TARGETS.values()]
+    missing = [name for name in packages if None not in scopes and name not in scopes
+               and not (name.startswith("@") and name.split("/")[0] in scopes)]
+    if missing:
+        raise ReleaseError("npm token does not cover: " + ", ".join(sorted(missing)))
+    print("Token checks passed: GitHub agentbusiness with repository write access; "
+          "npm businessagent with direct write access and Bypass 2FA for all nine packages. No publication performed.", flush=True)
 
 
 def validate_binary_repo(config, allow_missing=False):
@@ -933,17 +1134,45 @@ def public_json(url):
     except urllib.error.HTTPError as error:
         if error.code == 404:
             return None
+        if error.code in (429, 500, 502, 503, 504):
+            raise RegistryPending("Registry metadata is temporarily unavailable; retry the read-only check.") from None
         raise ReleaseError(f"Registry lookup failed (HTTP {error.code}).") from None
+    except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException):
+        raise RegistryPending("Registry metadata connection interrupted; retry the read-only check.") from None
 
 
-def existing_package(path, version):
+def verify_public_download(url, expected):
+    digest = hashlib.sha256()
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "IronGraph-release"})
+        with urllib.request.urlopen(request, timeout=120) as response:
+            while chunk := response.read(1024 * 1024):
+                digest.update(chunk)
+    except urllib.error.HTTPError as error:
+        if error.code in (404, 429, 500, 502, 503, 504):
+            raise RegistryPending("Public download is still propagating; retry the read-only check.") from None
+        raise ReleaseError(f"Public download failed (HTTP {error.code}).") from None
+    except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException):
+        raise RegistryPending("Public download connection interrupted; retry the read-only check.") from None
+    if digest.hexdigest() != expected:
+        raise ReleaseError("Public download checksum differs from the reviewed artifact.")
+
+
+def existing_package(path, version, verify_download=False):
+    url = None
     if path.suffix == ".whl":
         metadata = public_json(f"https://pypi.org/pypi/irongraph/{version}/json")
         existing = next((item for item in (metadata or {}).get("urls", []) if item["filename"] == path.name), None)
         expected = existing and existing["digests"]["sha256"]
+        url = existing and existing["url"]
+        if metadata:
+            audit_npm_metadata(metadata)
     elif path.suffix == ".crate":
         metadata = public_json(f"https://crates.io/api/v1/crates/irongraph-sdk/{version}")
         expected = metadata and metadata["version"]["checksum"]
+        url = metadata and "https://crates.io" + metadata["version"]["dl_path"]
+        if metadata:
+            audit_npm_metadata(metadata)
     else:
         with tarfile.open(path) as archive:
             metadata = json.load(archive.extractfile("package/package.json"))
@@ -955,9 +1184,18 @@ def existing_package(path, version):
         expected_integrity = "sha512-" + base64.b64encode(hashlib.sha512(path.read_bytes()).digest()).decode()
         if remote.get("dist", {}).get("integrity") != expected_integrity:
             raise ReleaseError(f"Published npm version differs from staged archive: {metadata['name']} {version}")
+        if verify_download:
+            latest = public_json(f"https://registry.npmjs.org/{package}") or {}
+            if latest.get("dist-tags", {}).get("latest") != version:
+                return False
+            if remote.get("_npmUser", {}).get("name") != "businessagent":
+                raise ReleaseError("Published npm package has an unexpected publisher identity.")
+            verify_public_download(remote["dist"]["tarball"], sha256(path))
         return True
     if expected and expected != sha256(path):
         raise ReleaseError(f"Published version differs from staged archive: {path.name}")
+    if expected and verify_download:
+        verify_public_download(url, sha256(path))
     return bool(expected)
 
 
@@ -991,6 +1229,12 @@ def audit_npm_metadata(metadata, secrets=()):
 def publish_npm(path, env, registry="https://registry.npmjs.org/"):
     """Publish directory metadata, retaining exactly the reviewed archive bytes."""
     path = Path(path).resolve()
+    if not env.get("NPM_TOKEN"):
+        raise ReleaseError("NPM_TOKEN is required; interactive npm login and browser fallback are disabled.")
+    parsed_registry = urllib.parse.urlsplit(registry)
+    if not (registry == "https://registry.npmjs.org/" or
+            parsed_registry.scheme == "http" and parsed_registry.hostname == "127.0.0.1"):
+        raise ReleaseError("Unexpected npm publication registry.")
     with tarfile.open(path) as archive:
         manifest = json.load(archive.extractfile("package/package.json"))
     secrets = tuple(value for key, value in env.items()
@@ -1001,7 +1245,8 @@ def publish_npm(path, env, registry="https://registry.npmjs.org/"):
         if PurePosixPath(name).name.lower().startswith("readme"):
             audit_npm_metadata(contents.decode(), secrets)
     # A tarball spec makes npm inject its absolute pathname into public metadata.
-    # Directory specs avoid that path, while the CLI retains browser/OTP support.
+    # Directory specs avoid that path. Closed stdin and captured output prevent
+    # npm from falling back to browser/passkey or OTP authentication.
     with tempfile.TemporaryDirectory(prefix="irongraph-npm-", dir="/tmp") as temporary:
         root = Path(temporary).resolve()
         package = root / "package"
@@ -1015,15 +1260,24 @@ def publish_npm(path, env, registry="https://registry.npmjs.org/"):
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_bytes(archive.extractfile(member).read())
                 destination.chmod(member.mode & 0o777)
-        isolated_env = {**env, "NPM_CONFIG_CACHE": str(root / "cache")}
+        npmrc = root / "npmrc"
+        npmrc.touch(mode=0o600)
+        npmrc.write_text(f"registry={registry}\n//{parsed_registry.netloc}/:_authToken=${{NPM_TOKEN}}\n")
+        isolated_env = {**env, "NPM_CONFIG_CACHE": str(root / "cache"),
+                        "NPM_CONFIG_USERCONFIG": str(npmrc), "NPM_CONFIG_GLOBALCONFIG": str(root / "global-npmrc"),
+                        "NPM_CONFIG_BROWSER": "false", "BROWSER": "false", "CI": "true"}
         packed = json.loads(run(["npm", "pack", ".", "--json", "--ignore-scripts", "--registry", registry,
                                  "--pack-destination", output], package, isolated_env, capture=True))
         if len(packed) != 1 or Path(packed[0]["filename"]).name != packed[0]["filename"]:
             raise ReleaseError("Unexpected npm repack output.")
         if sha256(output / packed[0]["filename"]) != sha256(path):
             raise ReleaseError("npm repack differs from reviewed archive; refusing publication.")
-        run(["npm", "publish", ".", "--access", "public", "--ignore-scripts", "--registry", registry],
-            package, isolated_env)
+        try:
+            run(["npm", "publish", ".", "--access", "public", "--ignore-scripts", "--registry", registry],
+                package, isolated_env, capture=True, noninteractive=True)
+        except ReleaseError:
+            raise ReleaseError("Non-interactive npm publish failed. Check token write access, expiry and package "
+                               "2FA policy; no browser was opened. Check registry state before retrying.") from None
 
 
 def npm_publish_order(publication, version):
@@ -1033,11 +1287,95 @@ def npm_publish_order(publication, version):
 
 def wait_for_public_package(path, version):
     deadline = time.monotonic() + 1200
-    while not existing_package(path, version):
+    while True:
+        try:
+            if existing_package(path, version, verify_download=True):
+                return
+        except RegistryPending:
+            pass
         if time.monotonic() >= deadline:
             raise ReleaseError(f"Registry publication is still pending: {path.name}; resume after it becomes public.")
         print(f"Waiting for public registry checksum: {path.name}", flush=True)
         time.sleep(15)
+
+
+def publish_registry_file(stage, config, state, path, python):
+    submitted = state.setdefault("submitted", {})
+    expected = state["checksums"][path.name]
+    if path.name in submitted and submitted[path.name] != expected:
+        raise ReleaseError("Previously submitted artifact checksum changed; refusing publication.")
+    if path.name not in submitted and path.name not in state.get("published", []) and not existing_package(path, state["version"]):
+        if path.suffix == ".tgz":
+            publish_npm(path, {"NPM_TOKEN": config["NPM_TOKEN"]})
+        elif path.suffix == ".whl":
+            run([python, "-m", "twine", "upload", "--non-interactive", "--disable-progress-bar", path], stage,
+                {"TWINE_USERNAME": "__token__", "TWINE_PASSWORD": config["MATURIN_PYPI_TOKEN"],
+                 "TWINE_REPOSITORY_URL": "https://upload.pypi.org/legacy/"}, capture=True, noninteractive=True)
+        else:
+            from cargo_upload import CargoPublishError, publish_crate
+            try:
+                publish_crate(path, config["CARGO_REGISTRY_TOKEN"])
+            except CargoPublishError as error:
+                raise ReleaseError(str(error)) from None
+        # Record acceptance BEFORE waiting for scanning/CDN propagation. A resumed
+        # release must never submit an already accepted version a second time.
+        submitted[path.name] = expected
+        write_json(stage / "state.json", state)
+        print(f"Upload accepted: {path.name}", flush=True)
+    wait_for_public_package(path, state["version"])
+    if path.name not in state.setdefault("published", []):
+        state["published"].append(path.name)
+    write_json(stage / "state.json", state)
+    print(f"Public download and metadata verified: {path.name}", flush=True)
+
+
+def audit_publication(publication, config, version):
+    pattern = private_audit_pattern(config)
+    for path in publication.iterdir():
+        if path.suffix in (".tgz", ".whl", ".crate") or path.name.endswith(".tar.gz"):
+            kind = {".tgz": "npm", ".whl": "wheel", ".crate": "cargo"}.get(path.suffix, "standalone")
+            audit_archive(path, kind, version)
+            contents = archive_files(path)
+        else:
+            contents = [(path.name, path.read_bytes())]
+        for name, data in contents:
+            if pattern.search(name.encode() + b"\0" + data):
+                raise ReleaseError(f"Private data found in publication artifact: {path.name}")
+        if path.suffix == ".a":
+            data = path.read_bytes()
+            if not data.startswith(b"!<arch>\n"):
+                raise ReleaseError("Invalid native library archive.")
+            position = 8
+            while position < len(data):
+                header = data[position:position + 60]
+                if len(header) != 60 or header[58:] != b"`\n":
+                    raise ReleaseError("Invalid native library member header.")
+                if int(header[28:34].strip() or b"0") or int(header[34:40].strip() or b"0"):
+                    raise ReleaseError("Native archive contains local ownership metadata.")
+                size = int(header[48:58])
+                position += 60 + size + size % 2
+            if position != len(data):
+                raise ReleaseError("Truncated native archive member.")
+        elif path.suffix == ".whl":
+            with zipfile.ZipFile(path) as archive:
+                if archive.comment or any(info.extra or info.comment for info in archive.infolist()):
+                    raise ReleaseError("Wheel contains extra archive metadata.")
+        elif path.suffix in (".tgz", ".crate") or path.name.endswith(".tar.gz"):
+            with tarfile.open(path) as archive:
+                if any(member.uid or member.gid or member.uname or member.gname or member.pax_headers for member in archive):
+                    raise ReleaseError("Package contains local archive ownership metadata.")
+            with path.open("rb") as file:
+                header = file.read(1024 * 1024)
+            flags, end = header[3], 10
+            if flags & 4:
+                end += 2 + int.from_bytes(header[end:end + 2], "little")
+            for flag in (8, 16):
+                if flags & flag:
+                    end = header.index(b"\0", end) + 1
+            if flags & 2:
+                end += 2
+            if pattern.search(header[:end]):
+                raise ReleaseError("Private data found in gzip archive metadata.")
 
 
 def publish(stage, config, state):
@@ -1047,6 +1385,7 @@ def publish(stage, config, state):
     for name, digest in state["checksums"].items():
         if (publication / name).is_symlink() or not (publication / name).is_file() or sha256(publication / name) != digest:
             raise ReleaseError("Staged publication artifacts changed; refusing upload.")
+    audit_publication(publication, config, state["version"])
     prepare_binary_repository(config, publication)
     repo = config["IRONGRAPH_BINARY_REPO"]
     base = f"/repos/{repo}"
@@ -1072,41 +1411,45 @@ def publish(stage, config, state):
         raise ReleaseError("GitHub release contains assets outside the three required native libraries.")
     for name in sorted(github_assets):
         upload_asset(config, release, publication / name)
+    uploaded = github(config, base + f"/releases/{release['id']}") or {}
+    assets = {asset["name"]: asset for asset in uploaded.get("assets", [])}
+    if set(assets) != github_assets or any(
+            assets[name].get("digest") != "sha256:" + state["checksums"][name]
+            or assets[name].get("size") != (publication / name).stat().st_size for name in github_assets):
+        raise ReleaseError("GitHub asset inventory or checksums differ; release remains a draft.")
     if release.get("draft"):
         github(config, base + f"/releases/{release['id']}", "PATCH", {"draft": False})
+    public_release = public_json(f"https://api.github.com/repos/{repo}/releases/tags/{tag}")
+    if not public_release or public_release.get("draft") or public_release.get("author", {}).get("login") != "agentbusiness":
+        raise ReleaseError("GitHub release is not publicly visible under the official account; resume verification.")
+    for asset in public_release.get("assets", []):
+        name = asset["name"]
+        if name not in github_assets:
+            raise ReleaseError("Unexpected public GitHub asset.")
+        if state.setdefault("github_verified", {}).get(name) == state["checksums"][name]:
+            continue
+        deadline = time.monotonic() + 1200
+        while True:
+            try:
+                verify_public_download(asset["browser_download_url"], state["checksums"][name])
+                break
+            except RegistryPending:
+                if time.monotonic() >= deadline:
+                    raise ReleaseError("GitHub public download still pending; resume verification.") from None
+                time.sleep(15)
+        state["github_verified"][name] = state["checksums"][name]
+        write_json(stage / "state.json", state)
+    if set(state.get("github_verified", {})) != github_assets:
+        raise ReleaseError("GitHub public assets are incomplete; resume verification.")
     # Cargo's build verifier now has public access to the immutable native artifacts.
     python = venv_python(stage / "publish-tools")
     run([python, "-m", "pip", "install", "twine>=6,<7"])
-    npmrc = stage / "publish.npmrc"
-    fd = os.open(npmrc, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as file:
-        file.write("registry=https://registry.npmjs.org/\n@irongraph:registry=https://registry.npmjs.org/\n//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n")
-    try:
-        # Native npm children must exist before the root optional dependencies are published.
-        packages = npm_publish_order(publication, state["version"])
-        packages += sorted(publication.glob("*.whl"))
-        packages += sorted(publication.glob("*.crate"))
-        for path in packages:
-            if existing_package(path, state["version"]):
-                print(f"Already published, checksum verified: {path.name}", flush=True)
-                continue
-            if path.suffix == ".tgz":
-                publish_npm(path, {"NPM_TOKEN": config["NPM_TOKEN"], "NPM_CONFIG_USERCONFIG": str(npmrc)})
-            elif path.suffix == ".whl":
-                run([python, "-m", "twine", "upload", "--non-interactive", "--disable-progress-bar", path], stage,
-                    {"TWINE_USERNAME": "__token__", "TWINE_PASSWORD": config["MATURIN_PYPI_TOKEN"], "TWINE_REPOSITORY_URL": "https://upload.pypi.org/legacy/"})
-            else:
-                # Metadata and upload bytes both come from the exact reviewed archive.
-                from cargo_upload import CargoPublishError, publish_crate
-                try:
-                    publish_crate(path, config["CARGO_REGISTRY_TOKEN"])
-                except CargoPublishError as error:
-                    raise ReleaseError(str(error)) from None
-            wait_for_public_package(path, state["version"])
-            state.setdefault("published", []).append(path.name)
-            write_json(stage / "state.json", state)
-    finally:
-        npmrc.unlink(missing_ok=True)
+    # Native npm children must exist before the root optional dependencies are published.
+    packages = npm_publish_order(publication, state["version"])
+    packages += sorted(publication.glob("*.whl"))
+    packages += sorted(publication.glob("*.crate"))
+    for path in packages:
+        publish_registry_file(stage, config, state, path, python)
 
 
 def prerequisites(config, upload):
@@ -1125,7 +1468,7 @@ def prerequisites(config, upload):
             raise ReleaseError("Fill .env.publish: " + ", ".join(missing))
         if config.get("IRONGRAPH_RELEASE_REVIEWED") != "yes":
             raise ReleaseError("Review LICENSE.txt and package READMEs, then set IRONGRAPH_RELEASE_REVIEWED=yes.")
-        validate_binary_repo(config, allow_missing=True)
+        check_publish_auth(config)
     elif not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", config.get("IRONGRAPH_BINARY_REPO", "")):
         raise ReleaseError("Set IRONGRAPH_BINARY_REPO for the native artifact URLs before packaging.")
 
@@ -1136,32 +1479,16 @@ def build_matrix(stage, config):
     cache.mkdir(parents=True, exist_ok=True)
     if shared_cache.exists():
         shutil.copytree(shared_cache, cache, dirs_exist_ok=True)
-    ensure_console(source)
+    packaging_only = config.get("packaging_only", False)
+    ensure_console(source, packaging_only)
     host_env = tool_environment(source, "aarch64-apple-darwin")
-    if not (stage / "rust-verified.json").exists():
+    if not packaging_only and not (stage / "rust-verified.json").exists():
         run(["node", "--test", "bindings/cli/test/lifecycle.test.cjs"], source)
         run([sys.executable, "tools/bindings/verify-ports.py"], source)
         run(["bash", "tools/bindings/verify-rust.sh"], source, host_env)
         write_json(stage / "rust-verified.json", {"version": current_version(source)})
-    for target, suffix in TARGETS.items():
-        directory = output / target
-        if (directory / "qualification.json").exists():
-            verify_standalone_report(directory, target, current_version(source))
-            print(f"Reusing completed target: {target}", flush=True)
-            continue
-        if target == "aarch64-apple-darwin":
-            build_target(source, directory, target, config=config)
-            shutil.copytree(cache, shared_cache, dirs_exist_ok=True)
-            continue
-        arch = "arm64" if target.startswith("aarch64") else "amd64"
-        image = config.get("IRONGRAPH_MANYLINUX_" + arch.upper(),
-                           "quay.io/pypa/manylinux_2_28_" + ("aarch64" if arch == "arm64" else "x86_64") + ":latest")
-        if not re.fullmatch(r"[A-Za-z0-9./_:@-]+", image):
-            raise ReleaseError("Invalid manylinux image reference.")
-        tag = "irongraph-release-" + arch
-        run(["docker", "build", "--platform", "linux/" + arch, "--build-arg", "MANYLINUX_IMAGE=" + image,
-             "--tag", tag, source / "tools/release"])
-        # Containers receive a fresh source copy; host node_modules/venvs never cross architectures.
+    # Copy both Linux inputs before any platform build modifies generated files.
+    for arch in ("arm64", "amd64") if TARGETS else ():
         container_stage = stage / ("linux-" + arch)
         container_source = container_stage / "source"
         if not container_source.exists():
@@ -1170,23 +1497,68 @@ def build_matrix(stage, config):
                 raise ReleaseError("Refusing symlinked container staging directory.")
             if partial.exists():
                 shutil.rmtree(partial)
-            shutil.copytree(source, partial, ignore=shutil.ignore_patterns("node_modules", "dist", "target", "*.node", "generated.d.ts"))
+            shutil.copytree(source, partial, ignore=shutil.ignore_patterns("node_modules", "target", "*.node", "generated.d.ts"))
             partial.rename(container_source)
+        # Notice collectors write per-target caches; no concurrent shared writes.
+        shutil.copytree(cache, container_stage / "license-cache", dirs_exist_ok=True)
+    logs = stage / "logs"
+    logs.mkdir(exist_ok=True)
+
+    def build_one(target):
+        directory = output / target
+        report = "packaging.json" if packaging_only else "qualification.json"
+        if (directory / report).exists():
+            if packaging_only:
+                verify_packaging(directory, target, current_version(source))
+            else:
+                verify_standalone_report(directory, target, current_version(source))
+            print(f"Reusing completed target: {target}", flush=True)
+            return
         directory.mkdir(parents=True, exist_ok=True)
-        run(["docker", "run", "--rm", "--platform", "linux/" + arch,
-             "--env", "CARGO_BUILD_JOBS=2",
-             "--mount", f"type=bind,source={container_stage},target=/build",
-             "--mount", f"type=bind,source={directory},target=/out",
-             "--mount", f"type=bind,source={cache},target=/build/license-cache",
-             "--mount", "type=volume,source=irongraph-release-models,target=/root/.irongraph/models",
-             "--mount", "type=volume,source=irongraph-release-registry,target=/root/.cargo/registry",
-             "--workdir", "/build/source", tag, "--source", "/build/source", "--output", "/out", "--target", target])
-        shutil.copytree(cache, shared_cache, dirs_exist_ok=True)
+        options = ["--packaging-only"] if packaging_only else []
+        commands = []
+        if target == "aarch64-apple-darwin":
+            commands.append([sys.executable, source / "tools/release/release.py", "build-target",
+                             "--source", source, "--output", directory, "--target", target, *options])
+        else:
+            arch = "arm64" if target.startswith("aarch64") else "amd64"
+            image = config.get("IRONGRAPH_MANYLINUX_" + arch.upper(),
+                               "quay.io/pypa/manylinux_2_28_" + ("aarch64" if arch == "arm64" else "x86_64") + ":latest")
+            if not re.fullmatch(r"[A-Za-z0-9./_:@-]+", image):
+                raise ReleaseError("Invalid manylinux image reference.")
+            tag = "irongraph-release-" + arch
+            commands.append(["docker", "build", "--platform", "linux/" + arch, "--build-arg", "MANYLINUX_IMAGE=" + image,
+                             "--tag", tag, source / "tools/release"])
+            container_stage = stage / ("linux-" + arch)
+            commands.append(["docker", "run", "--rm", "--platform", "linux/" + arch,
+                 "--env", "CARGO_BUILD_JOBS=2", "--env", "CARGO_INCREMENTAL=0",
+                 "--mount", f"type=bind,source={container_stage},target=/build",
+                 "--mount", f"type=bind,source={directory},target=/out",
+                 "--mount", "type=volume,source=irongraph-release-models,target=/root/.irongraph/models",
+                 "--mount", "type=volume,source=irongraph-release-registry,target=/root/.cargo/registry",
+                 "--workdir", "/build/source", tag, "--source", "/build/source", "--output", "/out", "--target", target, *options])
+        log = logs / (target + ".log")
+        print(f"Building {target}; log: {log}", flush=True)
+        with log.open("a") as output_log:
+            for command in commands:
+                result = subprocess.run([str(arg) for arg in command], cwd=source, env=clean_env(),
+                                        stdin=subprocess.DEVNULL, stdout=output_log, stderr=subprocess.STDOUT)
+                if result.returncode:
+                    raise ReleaseError(f"Build failed for {target}; inspect {log} and resume the same version.")
+        print(f"Build complete: {target}", flush=True)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        for future in concurrent.futures.as_completed([pool.submit(build_one, target) for target in TARGETS]):
+            future.result()
+    for completed_cache in (cache, stage / "linux-arm64/license-cache", stage / "linux-amd64/license-cache"):
+        if completed_cache.exists():
+            shutil.copytree(completed_cache, shared_cache, dirs_exist_ok=True)
 
 
 def release(args, config):
     global PRIVATE_BYTES
     PRIVATE_BYTES = private_audit_pattern(config)
+    config["packaging_only"] = args.packaging_only
     version = (args.resume.removeprefix("v") if args.resume else
                next_version(current_version(), args.bump) if args.bump else current_version())
     if not VERSION_RE.fullmatch(version):
@@ -1197,11 +1569,15 @@ def release(args, config):
               "wrapper -> crates.io; only the three native SDK libraries -> GitHub release.\n"
               "No files changed, builds started, credentials inspected remotely, or uploads performed.")
         return
+    if args.check_auth:
+        check_publish_auth(config)
+        return
     if args.check:
         prerequisites(config, not args.build_only)
         print("release prerequisites passed")
         return
     prerequisites(config, not args.build_only)
+    audit_source_privacy(ROOT, config)
     base = ROOT / "target/releases"
     base.mkdir(parents=True, exist_ok=True)
     with (base / ".lock").open("w") as lock:
@@ -1221,12 +1597,14 @@ def release(args, config):
                 raise ReleaseError("Release stage already exists; use --resume.")
             stage.mkdir()
             state = {"version": version, "source_fingerprint": fingerprint(), "complete": False, "staged": False,
-                     "binary_repo": config["IRONGRAPH_BINARY_REPO"]}
+                     "binary_repo": config["IRONGRAPH_BINARY_REPO"], "packaging_only": args.packaging_only,
+                     "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()}
             write_json(stage / "state.json", state)
         else:
             if not (stage / "state.json").exists():
                 raise ReleaseError("No staged release with that version.")
             state = read_json(stage / "state.json")
+            config["packaging_only"] = state.get("packaging_only", False)
             if state.get("complete"):
                 print(f"Release v{version} is already complete.")
                 return
@@ -1254,13 +1632,26 @@ def release(args, config):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Build and verify IronGraph locally. Publishing requires an explicit --publish flag.")
+    parser = argparse.ArgumentParser(
+        description="Build, privacy-check and publish IronGraph through token-authenticated APIs/CLIs. "
+                    "Publishing requires an explicit --publish flag; browser fallback is disabled.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Commands:\n"
+               "  ./release.sh --check-auth                     Check official tokens without publishing\n"
+               "  ./release.sh --dry-run --bump patch           Preview the next version\n"
+               "  ./release.sh --build-only --bump patch        Build and verify all packages locally\n"
+               "  ./release.sh --publish --resume vX.Y.Z        Publish the reviewed staged version\n"
+               "  ./release.sh --publish --bump patch           Build, verify and publish the next version\n\n"
+               "Credentials: ignored .env.publish (mode 600), with the primary checkout used for managed worktrees.\n"
+               "GITHUB_TOKEN, NPM_TOKEN, MATURIN_PYPI_TOKEN and CARGO_REGISTRY_TOKEN never enter builds.")
     parser.add_argument("command", nargs="?", choices=("release", "build-target", "verify-target", "verify-local", "build-standalone", "verify-standalone"), default="release")
     version = parser.add_mutually_exclusive_group()
     version.add_argument("--bump", choices=("patch", "minor", "major"))
     version.add_argument("--resume", metavar="vMAJOR.MINOR.PATCH")
     parser.add_argument("--dry-run", action="store_true", help="Describe next release without changes or uploads.")
     parser.add_argument("--check", action="store_true", help="Check local tools and publishing prerequisites only.")
+    parser.add_argument("--check-auth", action="store_true", help="Read-only GitHub/npm token checks; no builds or publication.")
+    parser.add_argument("--packaging-only", action="store_true", help="Build and privacy-check packages without runtime or product test suites.")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--publish", dest="build_only", action="store_false", help="Publish the reviewed artifacts after every verification passes.")
     mode.add_argument("--build-only", dest="build_only", action="store_true", help="Build and verify; leave all registries untouched (default).")
@@ -1274,7 +1665,11 @@ def main():
             parser.error(f"{args.command} needs --output and --target")
         operation = {"build-target": build_target, "verify-target": qualify_target,
                      "build-standalone": build_standalone, "verify-standalone": verify_standalone}[args.command]
-        operation(args.source.resolve(), args.output.resolve(), args.target)
+        if args.command == "verify-standalone":
+            operation(args.source.resolve(), args.output.resolve(), args.target)
+        else:
+            operation(args.source.resolve(), args.output.resolve(), args.target,
+                      config={"packaging_only": args.packaging_only})
     elif args.command == "verify-local":
         stage = ROOT / "target/release-local-verification" / fingerprint()[:16]
         # Persistent isolated staging supports expensive native builds without deleting shared work.
@@ -1282,7 +1677,7 @@ def main():
             stage_source(stage / "source", current_version())
         build_target(stage / "source", stage / "artifacts", host_target(), qualify=False)
     else:
-        config = load_config(ROOT / ".env.publish")
+        config = load_config(release_config_path())
         if not config.get("IRONGRAPH_BINARY_REPO"):
             remote = subprocess.check_output(["git", "remote", "get-url", "origin"], cwd=ROOT, text=True).strip()
             match = re.fullmatch(r"(?:https://github.com/|git@github.com:)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?", remote)

@@ -19,7 +19,7 @@ provided by the `procps` or `procps-ng` package.
 You can alternatively obtain the matching standalone archive from the official binary release.
 Extract it and run `./bin/irongraph` from the extracted directory. Direct execution does not require
 Node.js, Python, a Rust compiler, or a separate frontend server. SDK packages are separate from
-the standalone launcher and executable. Reserve storage for the database, snapshots, and model.
+the standalone launcher and executable. Reserve storage for the database and model.
 
 An embedding-enabled first start also needs access to the official artifact source for your IronGraph
 release, or encoder artifacts preprovisioned by your administrator. Reserve the release-specific
@@ -78,7 +78,7 @@ Set an absolute directory before starting IronGraph:
 npx irongraph start --background --data-dir "$HOME/.local/share/irongraph/dev"
 ```
 
-The directory contains the canonical database state and snapshots. Give the IronGraph process
+The directory contains the canonical persisted database records. Give the IronGraph process
 exclusive access, place it on persistent local storage, and include the whole directory in your
 backup policy. Do not open the same directory from another standalone or embedded process.
 Pass the same `--data-dir` to `status`, `logs`, and `stop` when managing this instance.
@@ -174,7 +174,7 @@ Use the following readiness sequence in production:
 
 Use only version-matched database and SDK artifacts from the same IronGraph release. Before an
 upgrade, stop writers, perform a clean shutdown, and preserve a backup of the complete database
-directory. Never copy individual WAL or snapshot files between active installations.
+directory. Never copy database files between active installations.
 
 If startup recovery reports an error, preserve the original directory and startup log. Do not edit
 database files manually. Restore a known-good full-directory backup or follow the recovery procedure

@@ -383,7 +383,7 @@ async function runFixture(nodes) {
         samples: 1, warmups: 0, p50: elapsed, memory: memorySince(memoryStart),
         result_rows: Math.ceil(nodes / config.fixture_batch_rows),
         mutated_elements: operation === 'initial_edge_ingest' ? nodes * 4 : nodes,
-        unit: 'microseconds', status: 'ok', durability: 'database acknowledgement; WAL active' })
+        unit: 'microseconds', status: 'ok', durability: 'database acknowledgement; asynchronous record persistence' })
       console.log(JSON.stringify(records.at(-1)))
       await save()
     }

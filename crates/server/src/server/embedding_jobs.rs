@@ -9,7 +9,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,12 +71,14 @@ pub(super) struct EmbeddingCallbacks {
     pub failed: Arc<ReportFailure>,
 }
 
-/// Pulls one owner from canonical recovery or the committed WAL. No producer-side work queue.
+/// Pulls one owner from canonical recovery or durable pending-owner records.
 pub(super) type NextCommittedOwner =
     dyn Fn(&CancellationToken) -> Result<Option<EmbeddingJob>> + Send + Sync;
 
 pub(super) struct DurableEmbeddingWorker {
     cancellation: CancellationToken,
+    wake: Arc<Notify>,
+    wake_pending: Arc<AtomicBool>,
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
     idle: Arc<AtomicBool>,
 }
@@ -96,8 +98,17 @@ impl DurableEmbeddingWorker {
         let callbacks = Arc::new(callbacks);
         let idle = Arc::new(AtomicBool::new(false));
         let worker_idle = Arc::clone(&idle);
+        let wake = Arc::new(Notify::new());
+        let worker_wake = Arc::clone(&wake);
+        let wake_pending = Arc::new(AtomicBool::new(false));
+        let worker_wake_pending = Arc::clone(&wake_pending);
         let worker = runtime.spawn(async move {
             while !cancel.is_cancelled() {
+                // Register before reading durable work so a commit racing the empty check
+                // cannot be lost between that check and the idle wait.
+                let notified = worker_wake.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 worker_idle.store(false, Ordering::Release);
                 let source = Arc::clone(&next);
                 let token = cancel.clone();
@@ -109,21 +120,26 @@ impl DurableEmbeddingWorker {
                         }
                     }
                     Ok(Ok(None)) => {
+                        // A durable insertion may sort before the current cursor while
+                        // inference runs. Finish this pass, then revisit its beginning.
+                        if worker_wake_pending.swap(false, Ordering::AcqRel) {
+                            continue;
+                        }
                         worker_idle.store(true, Ordering::Release);
                         tokio::select! {
                             _ = cancel.cancelled() => break,
-                            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                            _ = notified => {}
                         }
                     }
                     Ok(Err(error)) => {
-                        tracing::error!(code = ?error.code, message = %error.message, "embedding WAL catch-up failed");
+                        tracing::error!(code = ?error.code, message = %error.message, "embedding owner catch-up failed");
                         tokio::select! {
                             _ = cancel.cancelled() => break,
                             _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
                         }
                     }
                     Err(error) => {
-                        tracing::error!(%error, "embedding WAL reader worker terminated");
+                        tracing::error!(%error, "embedding owner reader worker terminated");
                         break;
                     }
                 }
@@ -131,9 +147,17 @@ impl DurableEmbeddingWorker {
         });
         Ok(Self {
             cancellation,
+            wake,
+            wake_pending,
             worker: Mutex::new(Some(worker)),
             idle,
         })
+    }
+
+    /// Call only after pending owner records become durable.
+    pub fn wake(&self) {
+        self.wake_pending.store(true, Ordering::Release);
+        self.wake.notify_one();
     }
 
     pub async fn shutdown(&self) -> Result<()> {
@@ -742,6 +766,95 @@ mod tests {
         assert_eq!(published.load(Ordering::Relaxed), 2);
         assert_eq!(failures.load(Ordering::Relaxed), 1);
         assert_eq!(encoder.calls.load(Ordering::Relaxed), 4);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn durable_cursor_idle_does_not_poll_and_commit_racing_empty_read_wakes() -> Result<()> {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let pending = Arc::new(AtomicBool::new(false));
+        let loaded = Arc::new(AtomicUsize::new(0));
+        let (source_reads, source_entered, source_release, source_pending) = (
+            reads.clone(),
+            entered.clone(),
+            release.clone(),
+            pending.clone(),
+        );
+        let load_count = loaded.clone();
+        let project = ProjectId::random();
+        let worker = DurableEmbeddingWorker::start(
+            Arc::new(move |cancel| {
+                if source_reads.fetch_add(1, Ordering::AcqRel) == 0 {
+                    source_entered.store(true, Ordering::Release);
+                    while !source_release.load(Ordering::Acquire) && !cancel.is_cancelled() {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    // Return the empty result observed before the racing commit.
+                    return Ok(None);
+                }
+                Ok(source_pending
+                    .swap(false, Ordering::AcqRel)
+                    .then_some(job(project, 7, 1)))
+            }),
+            EmbeddingCallbacks {
+                load: Arc::new(move |_, _| {
+                    load_count.fetch_add(1, Ordering::AcqRel);
+                    Ok(None)
+                }),
+                publish: Arc::new(|_, _, _| panic!("absent owner cannot publish")),
+                failed: Arc::new(|_, error| panic!("unexpected failure: {error}")),
+            },
+        )?;
+        wait_until(|| entered.load(Ordering::Acquire)).await?;
+        pending.store(true, Ordering::Release);
+        worker.wake();
+        release.store(true, Ordering::Release);
+        wait_until(|| loaded.load(Ordering::Acquire) == 1 && worker.is_idle()).await?;
+        let idle_reads = reads.load(Ordering::Acquire);
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        assert_eq!(reads.load(Ordering::Acquire), idle_reads);
+        tokio::time::timeout(std::time::Duration::from_secs(2), worker.shutdown())
+            .await
+            .map_err(|_| Error::internal("idle embedding worker did not cancel"))??;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn durable_cursor_commit_during_inference_revisits_completed_pass() -> Result<()> {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let loaded = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let source_reads = reads.clone();
+        let load_count = loaded.clone();
+        let load_release = release.clone();
+        let project = ProjectId::random();
+        let worker = DurableEmbeddingWorker::start(
+            Arc::new(move |_| {
+                // The second owner sorts before the cursor, so it appears only after
+                // the empty result resets the source's scan position.
+                let pass = source_reads.fetch_add(1, Ordering::AcqRel);
+                Ok(matches!(pass, 0 | 2).then_some(job(project, pass as u64 + 1, 1)))
+            }),
+            EmbeddingCallbacks {
+                load: Arc::new(move |_, cancel| {
+                    if load_count.fetch_add(1, Ordering::AcqRel) == 0 {
+                        while !load_release.load(Ordering::Acquire) && !cancel.is_cancelled() {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                    }
+                    Ok(None)
+                }),
+                publish: Arc::new(|_, _, _| panic!("absent owner cannot publish")),
+                failed: Arc::new(|_, error| panic!("unexpected failure: {error}")),
+            },
+        )?;
+        wait_until(|| loaded.load(Ordering::Acquire) == 1).await?;
+        worker.wake();
+        release.store(true, Ordering::Release);
+        wait_until(|| loaded.load(Ordering::Acquire) == 2 && worker.is_idle()).await?;
+        worker.shutdown().await?;
         Ok(())
     }
 

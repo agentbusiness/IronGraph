@@ -86,15 +86,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Expected output: `1 rows`. Async variants also cover streaming, status, cancellation,
-snapshots, and flushing. Await `close_async` during orderly shutdown. Concurrent data calls have
+flushing. Await `close_async` during orderly shutdown. Concurrent data calls have
 asynchronous worker scheduling without a configurable operation quota.
 
 ## Use the database capabilities
 
 The same `query` method supports text document updates, indexes, temporal data, graph algorithms,
 and topic, queue, exchange, and binding administration. Text documents are ordinary graph nodes;
-their complete text persists through the same transactions, asynchronous write-ahead logging,
-recovery, and snapshots as other data.
+their complete text persists through the same transactions, asynchronous persistence and recovery as other data.
 
 Select projects explicitly with `USE` or `Query::with_project`; there is no implicit default.
 Each project has `OBSERVED`, `KNOWLEDGE`, and `WORKSPACE` layers for source facts, curated facts,
@@ -125,8 +124,7 @@ Message producers and consumers use the supported Kafka or AMQP protocols throug
 configured listeners. The SDK query interface does not replace those protocol clients.
 
 Explicit projects and the `OBSERVED`, `KNOWLEDGE`, and `WORKSPACE` layers organize data.
-Indexes and unique constraints, transactions, asynchronous write-ahead logging, recovery, and
-periodic snapshots are part of the database.
+Indexes and unique constraints, transactions, asynchronous persistence and recovery are part of the database.
 
 The standalone instance serves its web console at
 [http://127.0.0.1:18484/web/](http://127.0.0.1:18484/web/) by default and also supports local MCP

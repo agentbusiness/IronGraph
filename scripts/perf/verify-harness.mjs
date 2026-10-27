@@ -26,10 +26,8 @@ for (const operation of [
   'initial_edge_ingest',
   'eventual_write_ack_single',
   'eventual_write_ack_concurrent',
-  'wal_background_append_single',
-  'wal_background_append_batch',
-  'wal_fsync_single',
-  'wal_fsync_batch',
+  'record_commit_single',
+  'record_commit_batch',
   'resident_batch_publish',
   'resident_edge_insert_publish',
   'point_lookup',
@@ -57,6 +55,7 @@ for (const field of [
   'git_dirty',
   'cpu_model',
   'physical_memory_bytes',
+  'process_memory_context',
   'metal_devices',
   'resident_bytes',
   'durability',
@@ -75,7 +74,7 @@ if (!source.includes('status: "error"') || !source.includes('admit_project') || 
 }
 
 const smokeOutput = path.join(root, 'performance-results/smoke/results.json');
-const smoke = spawnSync('cargo', ['bench', '--profile', 'dev', '--bench', 'performance_matrix'], {
+const smoke = spawnSync('cargo', ['bench', '--profile', 'dev', '--features', 'legacy-graph,perf-harness', '--bench', 'performance_matrix'], {
   cwd: root,
   encoding: 'utf8',
   env: {
@@ -96,6 +95,9 @@ if (smoke.status !== 0) {
 }
 const report = JSON.parse(fs.readFileSync(smokeOutput, 'utf8'));
 if (report.schema !== 'irongraph.performance-matrix.v1') throw new Error('smoke result schema mismatch');
+if (!report.process_memory_context?.includes('not the canonical database footprint')) {
+  throw new Error('smoke matrix must identify combined harness fixture memory');
+}
 const failures = report.measurements.filter((entry) => entry.status !== 'ok');
 if (failures.length > 0) throw new Error(`smoke matrix contains failures: ${JSON.stringify(failures)}`);
 if (!report.cpu_model || !report.physical_memory_bytes || report.metal_devices.length === 0) {

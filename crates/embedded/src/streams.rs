@@ -27,7 +27,7 @@ pub struct StreamAppend {
     pub records: Vec<StreamRecord>,
 }
 
-/// Published acknowledgement uses the same asynchronous WAL durability as graph writes.
+/// Published acknowledgement uses the same asynchronous record persistence as graph writes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StreamAcknowledgement {
     pub bookmark: Bookmark,

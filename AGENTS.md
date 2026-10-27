@@ -46,11 +46,17 @@ including `README.md` and files below `docs/`, is allowed when it describes the 
 - The Rust library exposes both in-process database access and remote API/Bolt access. Python and
   Node.js packages expose the same two modes; the browser and React package is remote-only. An embedded
   caller chooses the database directory, while the embedded node still uses the one canonical
-  WAL/snapshot path, one canonical CPU data representation, and one-process single-node boundary.
+  asynchronous redb persistence path, one canonical CPU data representation, and one-process single-node boundary.
 - Projects and the OBSERVED, KNOWLEDGE, and WORKSPACE graph layers remain first-class database
   semantics. There is no implicit default project.
-- Graph storage, indexes, temporal data, algorithms, transactions, WAL recovery, periodic snapshots,
-  and asynchronous WAL durability remain database core.
+- Graph storage, indexes, temporal data, algorithms, transactions, record recovery,
+  and asynchronous durability remain database core. Persistence uses one redb database file with
+  incremental atomic record batches, no write-ahead log, journal, or whole-database snapshots.
+  Disk persistence never gates in-memory publication on IO, disk queue capacity, or a flush.
+  Pending current records coalesce during a one-second event-triggered window; idle persistence
+  and embedding catch-up sleep without polling. Explicit flush waits only its durability caller.
+  The redb page layout is disk storage only; it must not replace or reshape the canonical
+  in-memory graph, index, vector, ANN, or temporal representations and algorithms.
 - CPU executes all graph queries, mutations, algorithms, vector scoring, and index construction.
   The active database runtime has exactly one canonical in-memory data representation. It must not
   construct a second CPU or GPU resident graph image, publish graph device deltas, or retain old
@@ -65,7 +71,7 @@ including `README.md` and files below `docs/`, is allowed when it describes the 
   work and must not perform inference on an async runtime worker or block graph requests on inference.
   IronGraph does not install, host, or invoke generative language models.
 - Documents are ordinary Cypher-native graph records, for example `(:Document {body: ...})`. They
-  persist through the normal WAL/snapshot path. Meaningful content from all nodes and relationships
+  persist through the normal asynchronous record-persistence path. Meaningful content from all nodes and relationships
   participates in automatic embedding and ranked vector search when the local encoder is enabled;
   declared embedding indexes additionally support explicit text-field selection. Operational metadata
   is excluded from automatic encoder input. No document-specific REST protocol or second store exists.
@@ -118,7 +124,7 @@ control shapes is wrong even if it looks good.
 The product consists exactly of the database capabilities named above. New work must extend one of
 those capabilities directly; it must not introduce a parallel application domain, second data store,
 second query language, or bespoke data endpoint. The database is one process on one node, with CPU
-graph execution, an independently selected embedding device, and one asynchronous WAL/snapshot
+graph execution, an independently selected embedding device, and one asynchronous redb
 durability path. Kafka and AMQP wire
 fields exist solely for client compatibility.
 
@@ -172,7 +178,9 @@ functionality outside the current product boundary.
   versions or a second graph representation.
 - Async request paths use bounded scheduling, cancellation, and backpressure. Parallelize independent
   work; keep dependent mutations ordered. CPU work and blocking IO must not stall async runtime
-  workers. Submicrosecond claims require named workloads and current release-build measurements,
+  workers. Persistence must not impose disk-capacity admission on canonical RAM writes or retain
+  a FIFO history of mutations; keep current dirty records and one active IO batch only.
+  Submicrosecond claims require named workloads and current release-build measurements,
   Match graph size and timing boundaries when comparing prior results. Claims of an implementation
   speedup require matching hardware; comparisons with saved results from another host must state
   that difference and must not attribute the ratio to the implementation alone.
@@ -202,7 +210,7 @@ functionality outside the current product boundary.
   large values whenever a derived structure changes.
 - Source text, including document bodies, remains complete on its owning node. Encoder bounds are
   handled by invisible rebuildable spans that point back to that owner.
-- Credentials remain outside graph properties, query results, WAL records, and snapshots.
+- Credential secrets remain outside graph properties, query results, and database records.
 
 ## Editing and verification
 

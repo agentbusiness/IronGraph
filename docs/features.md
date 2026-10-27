@@ -114,16 +114,15 @@ CREATE (:Document {
 })
 ```
 
-The document follows the normal transaction, WAL, and snapshot path. There is no document-specific
+The document follows the normal transaction and asynchronous persistence path. There is no document-specific
 REST endpoint or second document store. Source text remains complete on its owning node.
 
 The local Bekko a8m text encoder installs, loads, binds to the selected device, and warms at startup
 when embedding support is enabled. Encoder memory must be included in device-capacity planning.
 
-## Transactions, recovery, and snapshots
+## Transactions and recovery
 
-IronGraph provides transactions, write-ahead-log recovery, periodic snapshots, and asynchronous WAL
-durability. The embedded and standalone forms use the same canonical persistence model. Applications
+IronGraph provides transactions, incremental record recovery, and asynchronous durability. The embedded and standalone forms use the same canonical persistence model. Applications
 choose one database directory and should protect and back up that directory as a unit.
 
 ## Application access
@@ -211,7 +210,7 @@ IronGraph is designed around explicit constraints:
 
 - one process on one node;
 - CPU graph execution and one independently selected text inference device;
-- one canonical WAL and snapshot path;
+- one canonical asynchronous persistence path;
 - no implicit default project;
 - one canonical graph in shared host memory; and
 - mutual TLS for every remote Query API, Bolt, Streams, or Queues connection.

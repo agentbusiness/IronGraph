@@ -67,8 +67,7 @@ enabled. Pass `'metal'` instead of `'cpu'` on a supported Mac to use Metal accel
 
 The same `query` method runs text document updates, index and temporal statements, graph algorithms,
 and topic, queue, exchange, and binding administration. Text documents are ordinary graph nodes.
-Their complete text persists through the same transactions, asynchronous write-ahead logging,
-recovery, and snapshots as other graph data.
+Their complete text persists through the same transactions, asynchronous persistence and recovery as other graph data.
 
 Select projects explicitly with `USE` or the `projectId` argument. Each project has `OBSERVED`,
 `KNOWLEDGE`, and `WORKSPACE` layers for source facts, curated facts, and working data. There is
@@ -99,8 +98,7 @@ Message producers and consumers use the supported Kafka or AMQP protocols throug
 configured listeners. The SDK query interface does not replace those protocol clients.
 
 Explicit projects and the `OBSERVED`, `KNOWLEDGE`, and `WORKSPACE` layers organize data.
-Indexes and unique constraints, transactions, asynchronous write-ahead logging, recovery, and
-periodic snapshots are part of the database.
+Indexes and unique constraints, transactions, asynchronous persistence and recovery are part of the database.
 
 The standalone instance serves its web console at
 [http://127.0.0.1:18484/web/](http://127.0.0.1:18484/web/) by default and also supports local MCP

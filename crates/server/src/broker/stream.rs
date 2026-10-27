@@ -2731,9 +2731,7 @@ mod compression_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_database_produce_v0_v3_survives_restart() -> Result<()> {
         use crate::{
-            engine::{
-                ExecutionClass, SingleNodeBootstrapConfig, WriteStorageLimits, open_standalone,
-            },
+            engine::{ExecutionClass, SingleNodeBootstrapConfig, open_standalone},
             protocol::{QueryExecutor, QueryRequest, QueryStreamEvent},
             server::Database,
         };
@@ -2744,11 +2742,6 @@ mod compression_tests {
                 SingleNodeBootstrapConfig {
                     execution_class: ExecutionClass::Cpu,
                     startup_timeout: std::time::Duration::from_secs(30),
-                    storage_limits: WriteStorageLimits {
-                        max_log_record_bytes: 8 * 1024 * 1024,
-                        max_log_entries_per_read: 4096,
-                        max_snapshot_bytes: 64 * 1024 * 1024,
-                    },
                 },
                 |path, identity| {
                     Ok(Arc::new(Database::open_backend(
@@ -2762,9 +2755,6 @@ mod compression_tests {
             .await?;
             let database = boot.backend().clone();
             database.bind_runtime(Arc::downgrade(boot.runtime()))?;
-            let snapshot = directory.path().join("standalone-snapshots");
-            database.standalone_recover(&snapshot).await?;
-            boot.runtime().replay_standalone_wal().await?;
             let query = |statement: &str| -> Result<Option<ProjectId>> {
                 let request: QueryRequest = serde_json::from_value(
                     serde_json::json!({ "request_id":uuid::Uuid::new_v4(), "query":statement }),
@@ -2880,7 +2870,6 @@ mod compression_tests {
             server
                 .await
                 .map_err(|error| Error::internal(error.to_string()))??;
-            database.standalone_snapshot(&snapshot).await?;
             boot.runtime().shutdown().await?;
         }
         Ok(())
@@ -3434,7 +3423,7 @@ mod compression_tests {
             })
         }
 
-        fn snapshot(&self) -> Result<super::super::engine::BrokerStateMachine> {
+        fn canonical_state(&self) -> Result<super::super::engine::BrokerStateMachine> {
             Ok(self.broker.lock().clone())
         }
 
@@ -3516,8 +3505,8 @@ mod compression_tests {
             self.inner.submit(command, wait)
         }
 
-        fn snapshot(&self) -> Result<super::super::engine::BrokerStateMachine> {
-            self.inner.snapshot()
+        fn canonical_state(&self) -> Result<super::super::engine::BrokerStateMachine> {
+            self.inner.canonical_state()
         }
 
         fn fetch_partition(

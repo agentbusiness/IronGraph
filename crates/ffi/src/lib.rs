@@ -5,7 +5,6 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock, RwLock},
-    time::Duration,
 };
 
 use irongraph_client::{ClientError, MutualTls, Query, RemoteClient};
@@ -146,9 +145,6 @@ enum Request {
         handle: u64,
         operation_id: String,
     },
-    Snapshot {
-        handle: u64,
-    },
     Flush {
         handle: u64,
     },
@@ -173,7 +169,6 @@ struct OpenOptions {
     embedding_device_ordinal: u32,
     #[serde(default = "default_embedding")]
     embedding_policy: String,
-    snapshot_interval_ms: Option<u64>,
     worker_threads: Option<usize>,
 }
 fn default_device() -> String {
@@ -229,9 +224,6 @@ impl OpenOptions {
             .with_embedding_policy(embedding);
         options.model_dir = self.model_dir;
         options.embedding_cache_dir = self.embedding_cache_dir;
-        if let Some(value) = self.snapshot_interval_ms {
-            options.snapshot_interval = Duration::from_millis(value);
-        }
         if let Some(value) = self.worker_threads {
             options.worker_threads = value;
         }
@@ -325,22 +317,6 @@ fn dispatch(bytes: &[u8]) -> Result<Vec<u8>> {
                 Connection::Remote(client) => client.query(query).map_err(Failure::from)?,
             };
             return serialize_success(&result);
-        }
-        Request::Snapshot { handle } => {
-            let shared = connection(handle, false)?;
-            let guard = shared
-                .read()
-                .map_err(|_| Failure::new("INTERNAL", "connection is poisoned"))?;
-            match guard.as_ref() {
-                Some(Connection::Embedded(database)) => Ok(serde_json::to_value(
-                    database.snapshot().map_err(Failure::from)?,
-                )?),
-                Some(Connection::Remote(_)) => Err(Failure::new(
-                    "UNSUPPORTED_OPERATION",
-                    "snapshot requires an embedded database",
-                )),
-                None => Err(Failure::new("INVALID_HANDLE", "connection is closed")),
-            }
         }
         Request::Close { handle } => {
             let shared = connection(handle, true)?;
@@ -646,10 +622,7 @@ mod tests {
             let result = call(json!({"action":"query","handle":handle,"query":{"cypher":cypher}}));
             assert_eq!(result["ok"], true, "{result}");
         }
-        assert_eq!(
-            call(json!({"action":"snapshot","handle":handle}))["ok"],
-            true
-        );
+        assert_eq!(call(json!({"action":"flush","handle":handle}))["ok"], true);
         assert_eq!(call(json!({"action":"close","handle":handle}))["ok"], true);
         assert_eq!(
             call(json!({"action":"close","handle":handle}))["error"]["code"],

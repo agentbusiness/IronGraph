@@ -44,7 +44,7 @@ fn empty_writes_preserve_bookmark_and_map_updates_skip_unchanged_values()
         let result = database.query(Query::new(format!("USE empty_write {statement}")))?;
         assert_eq!(
             result.summary.bookmark, bookmark,
-            "empty statement advanced WAL: {statement}"
+            "empty statement advanced the application bookmark: {statement}"
         );
         assert_eq!(result.summary.statistics.updates, 0);
         if statement.ends_with("RETURN n.sid") {
@@ -57,13 +57,13 @@ fn empty_writes_preserve_bookmark_and_map_updates_skip_unchanged_values()
     std::thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
         let first = scope.spawn(|| {
             for _ in 0..4 {
-                database.snapshot()?;
+                database.flush()?;
             }
             Ok::<_, irongraph_embedded::EmbeddedError>(())
         });
         let second = scope.spawn(|| {
             for _ in 0..4 {
-                database.snapshot()?;
+                database.flush()?;
             }
             Ok::<_, irongraph_embedded::EmbeddedError>(())
         });
@@ -107,7 +107,6 @@ fn code_graph_load() -> Result<(), Box<dyn std::error::Error>> {
     if !embedding {
         options = options.with_embedding_policy(EmbeddingPolicy::Disabled);
     }
-    options.snapshot_interval = Duration::from_secs(30);
     let database = Arc::new(EmbeddedDatabase::open(options.clone())?);
     database.query(Query::new("CREATE PROJECT code_load"))?;
     let text = "code graph function documentation signature parameters return values ".repeat(10);
@@ -193,7 +192,7 @@ fn code_graph_load() -> Result<(), Box<dyn std::error::Error>> {
             ))?;
             assert_eq!(integer(&count.rows[0][0]), (nodes * 3 / 2) as i64);
             let tick = Instant::now();
-            database.snapshot()?;
+            database.flush()?;
             record("checkpoint", tick);
             for statement in [
                 "MATCH (n:Code) WHERE n.code IS NOT NULL REMOVE n.code",

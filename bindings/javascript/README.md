@@ -102,8 +102,7 @@ Message producers and consumers use the supported Kafka or AMQP protocols throug
 configured listeners. The SDK query interface does not replace those protocol clients.
 
 Explicit projects and the `OBSERVED`, `KNOWLEDGE`, and `WORKSPACE` layers organize data.
-Indexes and unique constraints, transactions, asynchronous write-ahead logging, recovery, and
-periodic snapshots are part of the database.
+Indexes and unique constraints, transactions, asynchronous persistence and recovery are part of the database.
 
 The standalone instance serves its web console at
 [http://127.0.0.1:18484/web/](http://127.0.0.1:18484/web/) by default and also supports local MCP

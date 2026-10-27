@@ -113,7 +113,7 @@ def embedded_smoke() -> None:
             complete = database.query("UNWIND [1,2,3] AS n RETURN n", project_id=project_id,
                                       query_options={"bookmark": ack["bookmark"]})
             assert len(complete["rows"]) == 3
-            database.snapshot()
+            database.flush()
             database.flush()
         with EmbeddedDatabase(data_dir, device="cpu", load_embeddings=False) as reopened:
             assert reopened.stream_fetch(fetch)["records"] == page["records"]
@@ -184,7 +184,7 @@ def embedding_qualification() -> None:
                            parameters={"body": "Documents remain complete graph records after editing."})
             result = database.query(search, parameters={"text": "editing complete documents"})
             assert result["rows"][0][1]["value"] == "Documents remain complete graph records after editing."
-            database.snapshot()
+            database.flush()
         with EmbeddedDatabase(temporary, device="cpu", embedding_device=device, load_embeddings=True) as reopened:
             assert len(reopened.query(
                 "USE semantic SEARCH entity IN (EMBEDDING INDEX graph_semantic "

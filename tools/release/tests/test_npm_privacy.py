@@ -65,7 +65,7 @@ class NpmPrivacyTests(unittest.TestCase):
             root = Path(temporary)
             config = root / "npmrc"
             config.write_text(f"registry={registry}\n//127.0.0.1:{server.server_port}/:_authToken=loopback-test-only\n")
-            env = {"NPM_CONFIG_USERCONFIG": str(config), "NPM_CONFIG_GLOBALCONFIG": str(root / "empty-global"),
+            env = {"NPM_TOKEN": "loopback-test-only", "NPM_CONFIG_USERCONFIG": str(config), "NPM_CONFIG_GLOBALCONFIG": str(root / "empty-global"),
                    "NPM_CONFIG_CACHE": str(root / "cache"), "NPM_CONFIG_BROWSER": "false"}
             source = root / "source"
             source.mkdir()

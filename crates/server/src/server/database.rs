@@ -1,8 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File, OpenOptions},
-    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
+    io::{BufWriter, Write},
+    path::Path,
     sync::{
         Arc, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
@@ -28,11 +27,10 @@ use crate::{
         TransactionDependencies, bind, parse,
     },
     engine::{
-        ActivationSubject, ApplicationWait, BackendSnapshot, CommandReservation,
-        CommandReservationOutcome, CredentialRecord, EmbeddingProfileActivation,
-        MutationApplyResult, MutationStateBackend, NodeIdentityPublic, ProcessId, SecurityState,
-        SnapshotAttachment, StoreId, TransactionFence, WriteCommand, WriteRequest, WriteResponse,
-        WriteRuntime,
+        ActivationSubject, ApplicationWait, CommandReservation, CommandReservationOutcome,
+        CredentialRecord, EmbeddingProfileActivation, MutationApplyResult, MutationStateBackend,
+        NodeIdentityPublic, ProcessId, SecurityState, StoreId, TransactionFence, WriteCommand,
+        WriteRequest, WriteResponse, WriteRuntime,
     },
     graph::{
         GraphMutation, GraphStore, IndexCatalog, ResolvedVectorMutation, StatisticsSnapshot,
@@ -45,14 +43,12 @@ use crate::{
     },
     storage::{
         AdmissionClass, AdmissionController, ConnectionId, MutationEntry, MutationKind,
-        SegmentDescriptor, SegmentPin, SegmentStore,
+        RecordBatch, RecordOp, RecordStore, SegmentPin, SegmentStore,
     },
 };
-// Durability is the runtime-owned WAL plus this backend's periodic self-contained snapshot.
+#[path = "database/persistence.rs"]
+mod persistence;
 
-const DATABASE_SNAPSHOT_FORMAT: u16 = 6;
-const DATABASE_SNAPSHOT_MAGIC: [u8; 8] = *b"IGDBS006";
-const DATABASE_SNAPSHOT_COPY_BYTES: usize = 1024 * 1024;
 const REQUEST_RESULT_INDEX_WINDOW: u64 = 65_536;
 const MAX_REQUEST_RESULTS: usize = 16_384;
 const MAX_REQUEST_RESULT_BYTES: u64 = 64 * 1024 * 1024;
@@ -83,7 +79,6 @@ const MIN_TRANSACTION_ACCOUNTED_BYTES: usize = 256;
 /// Cold projects above this size may collect empirical cost samples in a background warmup.
 /// Ordinary writes maintain current counts and never queue a periodic full collection.
 const OPTIMIZER_STATISTICS_BACKGROUND_ROWS: usize = 100_000;
-const BROKER_RECLAIM_BATCH_SEGMENTS: usize = 256;
 const QUERY_STREAM_BATCH_ROWS: usize = 4_096;
 
 thread_local! {
@@ -113,11 +108,6 @@ struct BrokerCommittedWrite {
     response: WriteResponse,
     application: ApplicationWait,
     reply: Option<BrokerReply>,
-}
-
-struct PendingBrokerSegment {
-    _pin: SegmentPin,
-    owners: BTreeSet<Uuid>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -597,7 +587,6 @@ struct OrderedMutationReservation {
     payload_digest: [u8; 32],
     request_id: Option<Uuid>,
     commit_time_millis: i64,
-    broker_segments: Vec<SegmentDescriptor>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -606,18 +595,6 @@ struct RequestResultRecord {
     #[serde(default)]
     intent_digest: [u8; 32],
     response: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct DatabaseCheckpointManifest {
-    format_version: u16,
-    store_id: StoreId,
-    included: Bookmark,
-    state_bytes: u64,
-    #[serde(default)]
-    state_checksum: Option<[u8; 32]>,
-    #[serde(default)]
-    broker_segments: Vec<SegmentDescriptor>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -782,9 +759,6 @@ pub(super) enum AdministrativeMutation {
     },
     DropIndex {
         name: String,
-        /// Defaulted so a log record written before this field existed still replays, as the
-        /// non-idempotent drop it was.
-        #[serde(default)]
         if_exists: bool,
     },
     CreateConstraint {
@@ -843,21 +817,12 @@ pub(super) struct DatabaseInner {
     reader_security: ArcSwap<SecurityState>,
     // Serializes local sequencer writes while the mutation is applied.
     pub(super) apply: Mutex<()>,
-    // Checkpoint packaging can continue after releasing apply. Serialize only checkpoint builds.
-    snapshot_build: Mutex<()>,
-    // Publication/pruning share one checkpoint directory, including its temporary attachments.
-    snapshot_publication: tokio::sync::Mutex<()>,
+    records: RecordStore,
     pub(super) admission: AdmissionController,
     transactions: TransactionAdmissionRegistry,
     pub(super) request_timeout: Duration,
     pub(super) segments: SegmentStore,
-    /// Ephemeral retry set for physically obsolete broker payload segments. Canonical liveness
-    /// remains in broker references/checkpoints; exclusive startup discovers crash leftovers.
-    retired_broker_segments: Mutex<BTreeSet<SegmentDescriptor>>,
-    /// Uncommitted immutable payload publications awaiting their write entry. This bounded,
-    /// ephemeral set is only a reclamation fence; the WAL remains the durable queue.
-    pending_broker_segments: Mutex<BTreeMap<SegmentDescriptor, PendingBrokerSegment>>,
-    /// Bounded identity-only work reserved before the ordered WAL append.
+    /// Bounded identity-only work reserved before ordered application.
     ordered_overlay: Mutex<OrderedMutationOverlay>,
     broker_changes: tokio::sync::watch::Sender<u64>,
     text_embedding: RwLock<Option<Arc<dyn TextEmbedding>>>,
@@ -873,7 +838,7 @@ struct WriteBinding {
     handle: tokio::runtime::Handle,
 }
 
-/// Canonical database state machine behind the standalone WAL.
+/// Canonical database state machine backed by incremental records.
 #[derive(Clone)]
 pub struct Database(pub(super) Arc<DatabaseInner>);
 
@@ -896,29 +861,49 @@ impl Database {
     ) -> Result<Self> {
         identity.validate()?;
         std::fs::create_dir_all(directory.as_ref())?;
+        for entry in std::fs::read_dir(directory.as_ref())? {
+            if entry?.file_name() != "database.redb" {
+                return Err(Error::new(
+                    ErrorCode::CorruptStorage,
+                    "database directory contains unsupported persistence files",
+                ));
+            }
+        }
         let admission = AdmissionController::unrestricted();
-        let segments = SegmentStore::open(directory.as_ref(), maximum_write_bytes.max(1 << 20))?;
+        let _ = maximum_write_bytes;
         let transactions = TransactionAdmissionRegistry::unrestricted();
         let (broker_changes, _) = tokio::sync::watch::channel(0);
-        let state = DatabaseState::default();
+        let records = RecordStore::open(
+            directory.as_ref().join("database.redb"),
+            identity.store_id.0,
+        )?;
+        let segments = SegmentStore::with_records(records.clone());
+        let state = persistence::restore(&records)?;
+        state.broker.validate_payload_segments(&segments)?;
         let reader_broker = ArcSwap::from_pointee(state.broker.clone());
         let reader_security = ArcSwap::from_pointee(state.security.clone());
+        let reader_projects = papaya::HashMap::new();
+        let reader_names = papaya::HashMap::new();
+        for (id, project) in &state.projects {
+            reader_projects.pin().insert(*id, Arc::clone(project));
+            reader_names
+                .pin()
+                .insert(normalize_name(&project.display_name.get()), *id);
+        }
+        let recovered = state.applied;
         Ok(Self(Arc::new(DatabaseInner {
             state: RwLock::new(state),
-            reader_projects: papaya::HashMap::new(),
-            reader_names: papaya::HashMap::new(),
-            reader_bookmark: ArcSwap::from_pointee(Bookmark::default()),
+            reader_projects,
+            reader_names,
+            reader_bookmark: ArcSwap::from_pointee(recovered),
             reader_broker,
             reader_security,
             apply: Mutex::new(()),
-            snapshot_build: Mutex::new(()),
-            snapshot_publication: tokio::sync::Mutex::new(()),
+            records,
             admission,
             transactions,
             request_timeout,
             segments,
-            retired_broker_segments: Mutex::new(BTreeSet::new()),
-            pending_broker_segments: Mutex::new(BTreeMap::new()),
             ordered_overlay: Mutex::new(OrderedMutationOverlay::default()),
             broker_changes,
             text_embedding: RwLock::new(None),
@@ -995,14 +980,10 @@ impl Database {
         }
         let load_database = Arc::downgrade(&self.0);
         let publish_database = Arc::downgrade(&self.0);
-        let completed_wal = Arc::new(AtomicU64::new(0));
-        self.write_binding()?
-            .runtime
-            .upgrade()
-            .ok_or_else(|| Error::new(ErrorCode::Cancelled, "write runtime is unavailable"))?
-            .register_embedding_replay_floor(Arc::clone(&completed_wal))?;
+        let published_owner = Arc::new(Mutex::new(None));
+        let completed_owner = Arc::clone(&published_owner);
         let queue = DurableEmbeddingWorker::start(
-            self.committed_embedding_owners(Arc::clone(&completed_wal)),
+            self.committed_embedding_owners(completed_owner),
             EmbeddingCallbacks {
                 load: Arc::new(move |job, cancellation| {
                     if cancellation.is_cancelled() {
@@ -1152,7 +1133,10 @@ impl Database {
                         ConnectionId::new(),
                         None,
                     ) {
-                        Ok(_) => Ok(true),
+                        Ok(_) => {
+                            *published_owner.lock() = Some((job.owner, job.revision));
+                            Ok(true)
+                        }
                         Err(error) if error.code == ErrorCode::TransactionConflict => Ok(false),
                         Err(error) => Err(error),
                     }
@@ -1222,186 +1206,7 @@ impl Database {
             .map_err(|error| Error::internal(format!("query worker failed: {error}")))?
     }
 
-    /// Standalone durability: write a self-contained snapshot of the current committed state into
-    /// `dir` and publish it as the latest. Best-effort — if a racing write advances the applied
-    /// bookmark between reading it and freezing the state, the snapshot is retried at the newer
-    /// bookmark. Broker/streaming payload segments are published beside the state file in a stable,
-    /// content-addressed attachment directory before `LATEST` makes the snapshot visible.
-    pub async fn standalone_snapshot(&self, dir: &Path) -> Result<Bookmark> {
-        let _publication = self.0.snapshot_publication.lock().await;
-        let snapshot_dir = dir.to_owned();
-        tokio::task::spawn_blocking(move || std::fs::create_dir_all(snapshot_dir))
-            .await
-            .map_err(|error| {
-                Error::internal(format!("snapshot directory task failed: {error}"))
-            })??;
-        let mut last_error = None;
-        for _ in 0..16 {
-            let bookmark = self.bookmark();
-            let destination = dir.join(format!(
-                "snapshot-{:020}-{:020}.igdb",
-                bookmark.term, bookmark.index
-            ));
-            let candidate = destination.clone();
-            let complete = tokio::task::spawn_blocking(move || -> Result<bool> {
-                if !candidate.exists() {
-                    return Ok(false);
-                }
-                match standalone_snapshot_is_complete(&candidate) {
-                    Ok(true) => return Ok(true),
-                    Ok(false) => tracing::warn!(
-                        path = %candidate.display(),
-                        "quarantining incomplete standalone snapshot before replacement"
-                    ),
-                    Err(error) => tracing::warn!(
-                        path = %candidate.display(),
-                        code = ?error.code,
-                        message = %error.message,
-                        "quarantining invalid standalone snapshot before replacement"
-                    ),
-                }
-                quarantine_standalone_snapshot(&candidate)?;
-                Ok(false)
-            })
-            .await
-            .map_err(|error| Error::internal(format!("snapshot probe task failed: {error}")))??;
-            if complete {
-                return Ok(bookmark);
-            }
-            match self.build_snapshot(bookmark, &destination).await {
-                Ok(snapshot) => {
-                    let published_destination = destination.clone();
-                    let published_dir = dir.to_owned();
-                    tokio::task::spawn_blocking(move || -> Result<()> {
-                        publish_standalone_snapshot_attachments(&published_destination, &snapshot)?;
-                        if let Some(name) = published_destination
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                        {
-                            crate::storage::atomic_write(
-                                &published_dir.join("LATEST"),
-                                name.as_bytes(),
-                                false,
-                            )?;
-                        }
-                        prune_standalone_snapshots(&published_dir, &published_destination);
-                        Ok(())
-                    })
-                    .await
-                    .map_err(|error| {
-                        Error::internal(format!("snapshot publication task failed: {error}"))
-                    })??;
-                    return Ok(bookmark);
-                }
-                Err(error) => {
-                    let failed_destination = destination.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        std::fs::remove_file(failed_destination)
-                    })
-                    .await;
-                    last_error = Some(error);
-                }
-            }
-        }
-        Err(last_error.unwrap_or_else(|| Error::internal("standalone snapshot did not converge")))
-    }
-
-    /// Returns the newest validated checkpoint that must remain replayable beneath `latest`.
-    /// WAL compaction stops at this older bookmark, so corrupting the newest snapshot still leaves
-    /// a complete previous snapshot plus its ordered durable suffix.
-    pub async fn standalone_wal_compaction_bookmark(
-        &self,
-        dir: &Path,
-        latest: Bookmark,
-    ) -> Result<Bookmark> {
-        let directory = dir.to_owned();
-        tokio::task::spawn_blocking(move || -> Result<Bookmark> {
-            for path in standalone_snapshot_paths(&directory) {
-                let Ok((bookmark, _)) = read_standalone_snapshot_manifest(&path) else {
-                    continue;
-                };
-                if bookmark < latest && standalone_snapshot_is_complete(&path).unwrap_or(false) {
-                    return Ok(bookmark);
-                }
-            }
-            Ok(Bookmark::default())
-        })
-        .await
-        .map_err(|error| Error::internal(format!("snapshot WAL-prefix task failed: {error}")))?
-    }
-
-    /// Standalone recovery: try `LATEST`, then older snapshots newest-first. Each candidate is
-    /// validated before publication; a damaged candidate never turns the process into an empty
-    /// database when a previous snapshot and durable WAL suffix are available.
-    pub async fn standalone_recover(&self, dir: &Path) -> Result<Option<Bookmark>> {
-        let recovery_dir = dir.to_owned();
-        let candidates = tokio::task::spawn_blocking(move || {
-            standalone_snapshot_paths_with_latest_first(&recovery_dir)
-        })
-        .await
-        .map_err(|error| Error::internal(format!("snapshot discovery task failed: {error}")))?;
-        if candidates.is_empty() {
-            return Ok(None);
-        }
-
-        let mut last_error = None;
-        for snapshot_path in candidates {
-            let displayed = snapshot_path.display().to_string();
-            let candidate =
-                tokio::task::spawn_blocking(move || -> Result<(Bookmark, BackendSnapshot)> {
-                    let (bookmark, broker_segments) =
-                        read_standalone_snapshot_manifest(&snapshot_path)?;
-                    let attachment_dir = standalone_snapshot_attachment_directory(&snapshot_path)?;
-                    let mut attachments = Vec::with_capacity(broker_segments.len());
-                    for descriptor in broker_segments {
-                        attachments.push(SnapshotAttachment::new(
-                            attachment_dir.join(hex::encode(descriptor.checksum)),
-                            descriptor.bytes,
-                            descriptor.checksum,
-                        )?);
-                    }
-                    let bytes = std::fs::metadata(&snapshot_path)?.len();
-                    let snapshot = BackendSnapshot::new(snapshot_path, bytes, attachments)?;
-                    Ok((bookmark, snapshot))
-                })
-                .await
-                .map_err(|error| {
-                    Error::internal(format!("snapshot recovery task failed: {error}"))
-                })?;
-            let (bookmark, snapshot) = match candidate {
-                Ok(candidate) => candidate,
-                Err(error) => {
-                    tracing::warn!(
-                        path = %displayed,
-                        code = ?error.code,
-                        message = %error.message,
-                        "standalone snapshot candidate is unreadable; trying previous"
-                    );
-                    last_error = Some(error);
-                    continue;
-                }
-            };
-            match self.install_snapshot(bookmark, &snapshot).await {
-                Ok(()) => return Ok(Some(bookmark)),
-                Err(error) => {
-                    tracing::warn!(
-                        path = %displayed,
-                        code = ?error.code,
-                        message = %error.message,
-                        "standalone snapshot candidate was rejected; trying previous"
-                    );
-                    last_error = Some(error);
-                }
-            }
-        }
-        Err(last_error.unwrap_or_else(|| {
-            Error::new(
-                ErrorCode::CorruptStorage,
-                "no standalone snapshot candidate could be recovered",
-            )
-        }))
-    }
-
+    /// Submit a resolved mutation to ordered application and asynchronous record persistence.
     fn commit_from(
         &self,
         mutation: DatabaseMutation,
@@ -1622,10 +1427,9 @@ impl Database {
 
     fn committed_embedding_owners(
         &self,
-        completed: Arc<AtomicU64>,
+        published_owner: Arc<Mutex<Option<(super::embedding_jobs::EmbeddingOwner, u64)>>>,
     ) -> Arc<super::embedding_jobs::NextCommittedOwner> {
-        use super::embedding_jobs::{EmbeddingJob, EmbeddingOwner, EmbeddingSeed};
-        let initial = self.bookmark();
+        use super::embedding_jobs::EmbeddingSeed;
         let projects = self
             .0
             .reader_projects
@@ -1635,15 +1439,15 @@ impl Database {
             .collect::<Vec<_>>()
             .into_iter();
         let initializer = self.embedding_seed_initializer();
-        let weak = Arc::downgrade(&self.0);
-        // Only one recovered project cursor and one WAL mutation's owner identities are held.
-        // Source text remains on the canonical graph; completed WAL records can be compacted.
+        let records = self.0.records.clone();
+        // Only a project cursor, one owner, and its revision are retained. Source text stays
+        // on the canonical graph; inference backlog is current metadata in the redb file.
         let state = Mutex::new((
             projects,
             None::<EmbeddingSeed>,
-            Vec::<EmbeddingJob>::new().into_iter(),
-            initial.index,
+            None::<(Vec<u8>, Vec<u8>)>,
             false,
+            None::<Vec<u8>>,
         ));
         Arc::new(move |cancellation| {
             let mut state = state.lock();
@@ -1657,10 +1461,19 @@ impl Database {
                     }
                     state.1 = None;
                 }
-                if let Some(job) = state.2.next() {
-                    return Ok(Some(job));
+                if let Some((key, value)) = state.2.take() {
+                    let completed_with_vectors = if key.starts_with(persistence::EMBEDDING_PENDING)
+                    {
+                        let job = persistence::decode_pending(&key, &value)?;
+                        *published_owner.lock() == Some((job.owner, job.revision))
+                    } else {
+                        false
+                    };
+                    if !completed_with_vectors {
+                        records.remove_if_value(&key, &value)?;
+                    }
                 }
-                if !state.4 {
+                if !state.3 {
                     if let Some(project) = state.0.next() {
                         match initializer(project, cancellation) {
                             Ok(seed) => state.1 = seed,
@@ -1669,71 +1482,29 @@ impl Database {
                         }
                         continue;
                     }
-                    state.4 = true;
+                    state.3 = true;
                 }
-                completed.store(state.3, Ordering::Release);
-                let Some(inner) = weak.upgrade() else {
-                    return Ok(None);
-                };
-                let database = Database(inner);
-                let runtime = database.write_binding()?.runtime.upgrade().ok_or_else(|| {
-                    Error::new(ErrorCode::Cancelled, "write runtime is unavailable")
-                })?;
-                let Some(entry) = runtime.committed_embedding_entry(state.3.saturating_add(1))?
-                else {
-                    return Ok(None);
-                };
-                if entry.index() > database.bookmark().index {
-                    return Ok(None);
-                }
-                let mutation = decode_database_mutation(entry.payload())?;
-                if let DatabaseMutation::Graph {
-                    project,
-                    graph,
-                    administrative,
-                    ..
-                } = mutation
-                {
-                    let live = match database.capture_canonical_project(project) {
-                        Ok((live, _)) => Some(live),
-                        Err(error) if error.code == ErrorCode::ProjectNotFound => None,
+                if let Some((key, value)) = records.next_after(b"s/", None)? {
+                    let id = Uuid::from_slice(&key[2..])
+                        .map_err(|e| Error::invalid_data(e.to_string()))?;
+                    match initializer(ProjectId(id), cancellation) {
+                        Ok(seed) => state.1 = seed,
+                        Err(error) if error.code == ErrorCode::ProjectNotFound => {}
                         Err(error) => return Err(error),
-                    };
-                    if let Some(live) = live {
-                        database.initialize_automatic_semantic(project)?;
-                        if matches!(
-                            administrative,
-                            Some(AdministrativeMutation::CreateEmbedding { .. })
-                        ) {
-                            state.1 = initializer(project, cancellation)?;
-                        } else if !graph.is_empty() {
-                            let (nodes, edges) = embedding_changed_owners(&live, &graph)?;
-                            state.2 = nodes
-                                .into_iter()
-                                .map(|id| (crate::types::EntityKind::Node, id.0))
-                                .chain(
-                                    edges
-                                        .into_iter()
-                                        .map(|id| (crate::types::EntityKind::Relationship, id.0)),
-                                )
-                                .map(|(kind, entity_id)| {
-                                    let owner = EmbeddingOwner {
-                                        project,
-                                        kind,
-                                        entity_id,
-                                    };
-                                    let (revision, _) = embedding_owner_dependencies(&live, owner);
-                                    EmbeddingJob {
-                                        owner,
-                                        revision: revision.unwrap_or(entry.index()).max(1),
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .into_iter();
-                        }
                     }
+                    state.2 = Some((key, value));
+                    continue;
                 }
-                state.3 = entry.index();
+                let Some((key, value)) =
+                    records.next_after(persistence::EMBEDDING_PENDING, state.4.as_deref())?
+                else {
+                    state.4 = None;
+                    return Ok(None);
+                };
+                let job = persistence::decode_pending(&key, &value)?;
+                state.4 = Some(key.clone());
+                state.2 = Some((key, value));
+                return Ok(Some(job));
             }
         })
     }
@@ -2095,38 +1866,6 @@ impl Database {
         Ok(())
     }
 
-    fn broker_reclamation_plan_locked(
-        &self,
-        state: &DatabaseState,
-    ) -> (Vec<SegmentDescriptor>, BTreeSet<String>) {
-        let live = state
-            .broker
-            .payload_segments()
-            .into_iter()
-            .map(|descriptor| descriptor.file_name)
-            .collect::<BTreeSet<_>>();
-        let mut retired = self.0.retired_broker_segments.lock();
-        // A stale checkpoint import or content-address collision may enqueue a segment that is
-        // live again. Prune it before applying the bounded batch so live no-ops cannot starve
-        // genuinely obsolete files forever.
-        retired.retain(|descriptor| !live.contains(&descriptor.file_name));
-        let candidates = retired
-            .iter()
-            .take(BROKER_RECLAIM_BATCH_SEGMENTS)
-            .cloned()
-            .collect::<Vec<_>>();
-        (candidates, live)
-    }
-
-    fn finish_broker_reclamation(&self, reclaimed: &[SegmentDescriptor]) -> Result<u64> {
-        let mut retired = self.0.retired_broker_segments.lock();
-        for descriptor in reclaimed {
-            retired.remove(descriptor);
-        }
-        u64::try_from(reclaimed.len())
-            .map_err(|_| Error::internal("reclaimed broker segment count exceeds u64"))
-    }
-
     fn resolve_project(&self, requested: Option<ProjectId>, source: &str) -> Result<ProjectId> {
         if let Some(project) = requested {
             if self.0.reader_projects.pin().contains_key(&project) {
@@ -2182,6 +1921,7 @@ impl Database {
         }
     }
 
+    #[cfg(test)]
     fn publish_reader_registry(&self, state: &DatabaseState) {
         let projects = self.0.reader_projects.pin();
         let names = self.0.reader_names.pin();
@@ -2725,7 +2465,7 @@ impl Database {
                 let (bookmark, _) = match committed {
                     Ok(committed) => committed,
                     // A concurrent creator can win after the precheck. Recheck the guard
-                    // against canonical schema; validation rejected this request before WAL.
+                    // against canonical schema; validation rejected this request before publication.
                     Err(error)
                         if error.code == ErrorCode::QueryType
                             && error.message == "index already exists" =>
@@ -3382,7 +3122,7 @@ impl MutationStateBackend for Database {
         mut command: WriteCommand,
         sequencer_time_millis: i64,
     ) -> Result<WriteCommand> {
-        // Admission and replay resolve values from this authoritative WAL header. The original
+        // Admission resolves values from this authoritative sequencer header. The original
         // journal bytes need no additional decode, clone, encode, or worker round trip here.
         millis_to_nanos(sequencer_time_millis)?;
         command.commit_time_millis = sequencer_time_millis;
@@ -3444,7 +3184,6 @@ impl MutationStateBackend for Database {
             let token = reservation
                 .token()
                 .ok_or_else(|| Error::internal("owned database reservation has no token"))?;
-            let broker_segments = Vec::new();
             ordered.reservations.insert(
                 position.index,
                 OrderedMutationReservation {
@@ -3452,7 +3191,6 @@ impl MutationStateBackend for Database {
                     payload_digest: *blake3::hash(&command.payload).as_bytes(),
                     request_id: command.request_id,
                     commit_time_millis: command.commit_time_millis,
-                    broker_segments,
                 },
             );
             Ok(reservation)
@@ -3472,35 +3210,18 @@ impl MutationStateBackend for Database {
             let Some(token) = reservation.token() else {
                 return Ok(());
             };
-            let mut released = Vec::<(Uuid, Vec<SegmentDescriptor>)>::new();
-            {
-                let _apply = database.0.apply.lock();
-                let mut ordered = database.0.ordered_overlay.lock();
-                let Some(record) = ordered.reservations.get(&reservation.position().index) else {
-                    return Ok(());
-                };
-                if record.token != token {
-                    return Ok(());
-                }
-                if outcome == CommandReservationOutcome::Rejected
-                    && reservation.may_release_after_append()
-                {
-                    released.extend(
-                        ordered
-                            .reservations
-                            .values()
-                            .map(|record| (record.token, record.broker_segments.clone())),
-                    );
-                    ordered.reservations.clear();
-                } else if let Some(record) =
-                    ordered.reservations.remove(&reservation.position().index)
-                {
-                    released.push((record.token, record.broker_segments));
-                }
+            let _apply = database.0.apply.lock();
+            let mut ordered = database.0.ordered_overlay.lock();
+            let Some(record) = ordered.reservations.get(&reservation.position().index) else {
+                return Ok(());
+            };
+            if record.token != token {
+                return Ok(());
             }
-            let rejected = outcome == CommandReservationOutcome::Rejected;
-            for (owner, descriptors) in released {
-                release_pending_broker_segments(&database.0, owner, &descriptors, rejected);
+            if outcome == CommandReservationOutcome::Rejected && reservation.may_pipeline() {
+                ordered.reservations.clear();
+            } else {
+                ordered.reservations.remove(&reservation.position().index);
             }
             Ok(())
         })
@@ -3535,8 +3256,11 @@ impl MutationStateBackend for Database {
                 DatabaseMutation::DropProject { .. }
                     | DatabaseMutation::Broker {
                         command: BrokerCommand::DeleteTopic { .. }
+                            | BrokerCommand::DeleteQueue { .. }
                             | BrokerCommand::ClearTopic { .. }
                             | BrokerCommand::Retain { .. }
+                            | BrokerCommand::UnregisterConsumer { .. }
+                            | BrokerCommand::ReleaseConnection { .. }
                     }
             );
             let is_broker_mutation = matches!(&mutation, DatabaseMutation::Broker { .. });
@@ -3573,6 +3297,7 @@ impl MutationStateBackend for Database {
                 return Ok(MutationApplyResult {
                     response,
                     duplicate: true,
+                    persistence: None,
                 });
             }
             if entry.index() == state.applied.index {
@@ -3586,6 +3311,7 @@ impl MutationStateBackend for Database {
                 return Ok(MutationApplyResult {
                     response: state.last_response.clone(),
                     duplicate: true,
+                    persistence: None,
                 });
             }
             if entry.index() != state.applied.index.saturating_add(1) {
@@ -3610,13 +3336,25 @@ impl MutationStateBackend for Database {
                 database.0.reader_bookmark.store(Arc::new(entry.bookmark()));
                 state.last_payload_checksum = Some(entry.checksum());
                 state.last_response = response.clone();
-                if let Err(error) = prune_request_results(&mut state) {
+                let mut removed_requests = Vec::new();
+                if let Err(error) =
+                    prune_request_results_captured(&mut state, &mut removed_requests)
+                {
                     database.0.fatal_apply.store(true, Ordering::Release);
                     return Err(error);
                 }
+                let capture = persistence::prepare(
+                    &state,
+                    &DatabaseMutation::Security {
+                        command: SecurityCommand::CleanupExpired,
+                    },
+                )?;
+                let batch =
+                    persistence::finish(&state, capture, Vec::new(), None, &removed_requests)?;
                 return Ok(MutationApplyResult {
                     response,
                     duplicate: true,
+                    persistence: Some(batch),
                 });
             }
 
@@ -3659,66 +3397,99 @@ impl MutationStateBackend for Database {
                     commit_time_nanos,
                 )?;
             }
-            let result = (|| -> Result<MutationApplyResult> {
-                // Any error past this point is a local invariant/device/storage failure: in-place
-                // publication has begun and the preflight above already accepted the mutation.
-                let previous_broker_segments = broker_may_retire_segments.then(|| {
-                    state
-                        .broker
-                        .payload_segments()
-                        .into_iter()
-                        .collect::<BTreeSet<_>>()
-                });
-                let reply = apply_mutation(
-                    &mut state,
-                    mutation,
-                    entry.bookmark(),
-                    commit_time_nanos,
-                    Some(&database.0.segments),
-                )?;
-                let response = encode_database_value(&reply, "apply response")?;
-                let staged_state = &mut *state;
-                if let Some(previous_cursor) = broker_publish_cursor {
-                    committed_broker_segment = staged_state
-                        .broker
-                        .newest_payload_segment_after(previous_cursor);
-                }
-                staged_state.applied = entry.bookmark();
-                staged_state.last_payload_checksum = Some(entry.checksum());
-                staged_state.last_response = response.clone();
-                if let Some(request_id) = entry.request_id() {
-                    retain_request_result(
-                        staged_state,
-                        request_id,
-                        intent_digest,
-                        response.clone(),
+            let result =
+                (|| -> Result<MutationApplyResult> {
+                    // Any error past this point is a local invariant/device/storage failure: in-place
+                    // publication has begun and the preflight above already accepted the mutation.
+                    let previous_broker_segments = broker_may_retire_segments.then(|| {
+                        state
+                            .broker
+                            .payload_segments()
+                            .into_iter()
+                            .collect::<BTreeSet<_>>()
+                    });
+                    let capture = persistence::prepare(&state, &mutation)?;
+                    let mut records = Vec::new();
+                    let reply = apply_mutation_inner(
+                        &mut state,
+                        mutation,
+                        entry.bookmark(),
+                        commit_time_nanos,
+                        Some(&database.0.segments),
+                        Some(&mut records),
                     )?;
-                }
-                prune_request_results(staged_state)?;
-                if let Some(previous) = previous_broker_segments {
-                    let current = staged_state
-                        .broker
-                        .payload_segments()
-                        .into_iter()
-                        .collect::<BTreeSet<_>>();
-                    retired_broker_segments.extend(previous.difference(&current).cloned());
-                }
-                if let Some(project) = affected_project {
-                    database.publish_reader_project(staged_state, project);
-                    if let Some(previous_name) = &previous_project_name
-                        && staged_state.projects.get(&project).is_none_or(|live| {
-                            normalize_name(&live.display_name.get()) != *previous_name
-                        })
-                    {
-                        database.0.reader_names.pin().remove(previous_name);
+                    let response = encode_database_value(&reply, "apply response")?;
+                    let staged_state = &mut *state;
+                    if let Some(previous_cursor) = broker_publish_cursor {
+                        committed_broker_segment = staged_state
+                            .broker
+                            .newest_payload_segment_after(previous_cursor);
                     }
-                }
-                database.0.reader_bookmark.store(Arc::new(entry.bookmark()));
-                Ok(MutationApplyResult {
-                    response,
-                    duplicate: false,
-                })
-            })();
+                    staged_state.applied = entry.bookmark();
+                    staged_state.last_payload_checksum = Some(entry.checksum());
+                    staged_state.last_response = response.clone();
+                    if let Some(request_id) = entry.request_id() {
+                        retain_request_result(
+                            staged_state,
+                            request_id,
+                            intent_digest,
+                            response.clone(),
+                        )?;
+                    }
+                    let mut removed_requests = Vec::new();
+                    prune_request_results_captured(staged_state, &mut removed_requests)?;
+                    if let Some(previous) = previous_broker_segments {
+                        let current = staged_state
+                            .broker
+                            .payload_segments()
+                            .into_iter()
+                            .collect::<BTreeSet<_>>();
+                        retired_broker_segments.extend(previous.difference(&current).cloned());
+                    }
+                    if let Some(project) = affected_project {
+                        database.publish_reader_project(staged_state, project);
+                        if let Some(previous_name) = &previous_project_name
+                            && staged_state.projects.get(&project).is_none_or(|live| {
+                                normalize_name(&live.display_name.get()) != *previous_name
+                            })
+                        {
+                            database.0.reader_names.pin().remove(previous_name);
+                        }
+                    }
+                    if let Some(descriptor) = &committed_broker_segment {
+                        records.extend(database.0.segments.pending_operations(
+                            std::slice::from_ref(descriptor),
+                            entry.bookmark(),
+                        )?);
+                    }
+                    if !retired_broker_segments.is_empty() {
+                        let live_segments = staged_state
+                            .broker
+                            .payload_segments()
+                            .into_iter()
+                            .map(|descriptor| descriptor.file_name)
+                            .collect();
+                        records.extend(
+                            database
+                                .0
+                                .segments
+                                .reclamation_operations(&retired_broker_segments, &live_segments)?,
+                        );
+                    }
+                    let batch = persistence::finish(
+                        staged_state,
+                        capture,
+                        records,
+                        entry.request_id(),
+                        &removed_requests,
+                    )?;
+                    database.0.reader_bookmark.store(Arc::new(entry.bookmark()));
+                    Ok(MutationApplyResult {
+                        response,
+                        duplicate: false,
+                        persistence: Some(batch),
+                    })
+                })();
             if let Err(error) = &result {
                 tracing::error!(
                     code = ?error.code,
@@ -3734,49 +3505,35 @@ impl MutationStateBackend for Database {
                 if is_broker_mutation {
                     database.0.broker_changes.send_replace(entry.index());
                 }
-                if let Some(descriptor) = committed_broker_segment {
-                    database
-                        .0
-                        .pending_broker_segments
-                        .lock()
-                        .remove(&descriptor);
-                }
-                if !retired_broker_segments.is_empty() {
-                    database
-                        .0
-                        .retired_broker_segments
-                        .lock()
-                        .extend(retired_broker_segments);
-                }
             }
             result
         })
         .await
-        .map_err(|error| Error::internal(format!("apply_mutation worker failed: {error}")))?
+        .map_err(|error| {
+            self.0.fatal_apply.store(true, Ordering::Release);
+            Error::internal(format!("apply_mutation worker failed: {error}"))
+        })?
     }
 
-    async fn build_snapshot(
-        &self,
-        bookmark: Bookmark,
-        destination: &Path,
-    ) -> Result<BackendSnapshot> {
-        let database = self.clone();
-        let destination = destination.to_owned();
-        tokio::task::spawn_blocking(move || {
-            build_database_snapshot_file(&database, bookmark, &destination)
-        })
-        .await
-        .map_err(|error| Error::internal(format!("snapshot build task failed: {error}")))?
-    }
-
-    async fn install_snapshot(&self, bookmark: Bookmark, snapshot: &BackendSnapshot) -> Result<()> {
-        let database = self.clone();
-        let snapshot = snapshot.clone();
-        tokio::task::spawn_blocking(move || {
-            install_database_snapshot_file(&database, bookmark, &snapshot)
-        })
-        .await
-        .map_err(|error| Error::internal(format!("snapshot install task failed: {error}")))?
+    fn persist(&self, batches: &[RecordBatch]) -> Result<()> {
+        self.0.records.commit(batches)?;
+        // Only committed owner/seed insertions can create catch-up work. Idle workers
+        // perform no disk reads until this notification or process recovery.
+        if batches
+            .iter()
+            .flat_map(|batch| &batch.operations)
+            .any(|op| {
+                matches!(op, RecordOp::Put { key, .. }
+                if key.starts_with(persistence::EMBEDDING_PENDING) || key.starts_with(b"s/"))
+            })
+            && let Some(worker) = self.0.embedding_jobs.get()
+        {
+            worker.wake();
+        }
+        if let Some(batch) = batches.last() {
+            self.0.segments.release_committed_through(batch.bookmark)?;
+        }
+        Ok(())
     }
 }
 
@@ -4519,34 +4276,8 @@ impl BrokerCoordinator for Database {
         })
     }
 
-    fn snapshot(&self) -> Result<BrokerStateMachine> {
+    fn canonical_state(&self) -> Result<BrokerStateMachine> {
         Ok(self.0.reader_broker.load().as_ref().clone())
-    }
-
-    fn reclaim_payload_storage(&self) -> Result<u64> {
-        // Discovery must remain under the publication lock. A liveness set captured and then
-        // used after releasing this lock could unlink a content-addressed file that a concurrent
-        // mutation just made canonical. The batch is deliberately small, and unlink/sync does
-        // no payload reads.
-        let _apply = self.0.apply.lock();
-        let state = self.0.state.read();
-        let (candidates, live) = self.broker_reclamation_plan_locked(&state);
-        let reclaimed = self.0.segments.reclaim_unreferenced(&candidates, &live)?;
-        let known = self.finish_broker_reclamation(&reclaimed)?;
-        let remaining = BROKER_RECLAIM_BATCH_SEGMENTS.saturating_sub(reclaimed.len());
-        if remaining == 0 {
-            return Ok(known);
-        }
-        let discovered = self
-            .0
-            .segments
-            .reclaim_discovered_unreferenced(&live, remaining)?;
-        known
-            .checked_add(
-                u64::try_from(discovered.len())
-                    .map_err(|_| Error::internal("discovered broker segment count exceeds u64"))?,
-            )
-            .ok_or_else(|| Error::internal("reclaimed broker segment count overflow"))
     }
 
     fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -4832,6 +4563,7 @@ fn execute_on_project_inner(
     }
 }
 
+#[cfg(test)]
 pub(super) fn apply_mutation(
     state: &mut DatabaseState,
     mutation: DatabaseMutation,
@@ -4839,7 +4571,7 @@ pub(super) fn apply_mutation(
     commit_time_nanos: i64,
     segments: Option<&SegmentStore>,
 ) -> Result<Option<BrokerReply>> {
-    apply_mutation_inner(state, mutation, bookmark, commit_time_nanos, segments)
+    apply_mutation_inner(state, mutation, bookmark, commit_time_nanos, segments, None)
 }
 
 fn apply_mutation_inner(
@@ -4848,177 +4580,352 @@ fn apply_mutation_inner(
     bookmark: Bookmark,
     commit_time_nanos: i64,
     segments: Option<&SegmentStore>,
+    mut persistence: Option<&mut Vec<RecordOp>>,
 ) -> Result<Option<BrokerReply>> {
-    match mutation {
-        DatabaseMutation::CreateProject { id, display_name } => {
-            validate_project_name(&display_name)?;
-            let normalized = normalize_name(&display_name);
-            if state.projects.contains_key(&id) || state.names.contains_key(&normalized) {
-                return Err(Error::new(
-                    ErrorCode::TransactionConflict,
-                    "project already exists",
-                ));
-            }
-            state.names.insert(normalized, id);
-            state.projects.insert(
-                id,
-                Arc::new(ProjectState {
+    let broker_capture = if persistence.is_some()
+        && matches!(
+            &mutation,
+            DatabaseMutation::Broker { .. } | DatabaseMutation::DropProject { .. }
+        ) {
+        Some(state.broker.begin_persistence()?)
+    } else {
+        None
+    };
+    let result =
+        match mutation {
+            DatabaseMutation::CreateProject { id, display_name } => {
+                validate_project_name(&display_name)?;
+                let normalized = normalize_name(&display_name);
+                if state.projects.contains_key(&id) || state.names.contains_key(&normalized) {
+                    return Err(Error::new(
+                        ErrorCode::TransactionConflict,
+                        "project already exists",
+                    ));
+                }
+                state.names.insert(normalized, id);
+                state.projects.insert(
                     id,
-                    display_name: display_name.into(),
-                    graph: GraphStore::default(),
-                    temporal: TemporalStore::default(),
-                    predicate_versions: BTreeMap::new(),
-                    indexes: IndexCatalog::default(),
-                    next_node_id: 1.into(),
-                    next_edge_id: 1.into(),
-                    authority_revision: bookmark.index.into(),
-                    optimizer_statistics: OnceLock::new().into(),
-                }),
-            );
-            Ok(None)
-        }
-        DatabaseMutation::RenameProject { id, display_name } => {
-            validate_project_name(&display_name)?;
-            let normalized = normalize_name(&display_name);
-            if state
-                .names
-                .get(&normalized)
-                .is_some_and(|existing| *existing != id)
-            {
-                return Err(Error::new(
-                    ErrorCode::TransactionConflict,
-                    "project name already exists",
-                ));
+                    Arc::new(ProjectState {
+                        id,
+                        display_name: display_name.into(),
+                        graph: GraphStore::default(),
+                        temporal: TemporalStore::default(),
+                        predicate_versions: BTreeMap::new(),
+                        indexes: IndexCatalog::default(),
+                        next_node_id: 1.into(),
+                        next_edge_id: 1.into(),
+                        authority_revision: bookmark.index.into(),
+                        optimizer_statistics: OnceLock::new().into(),
+                    }),
+                );
+                Ok(None)
             }
-            let project = state
-                .projects
-                .get_mut(&id)
-                .ok_or_else(|| Error::new(ErrorCode::ProjectNotFound, "project does not exist"))?;
-            let project = project.as_ref();
-            state
-                .names
-                .remove(&normalize_name(&project.display_name.get()));
-            project.display_name.set(display_name);
-            state.names.insert(normalized, id);
-            Ok(None)
-        }
-        DatabaseMutation::DropProject { id, cascade } => {
-            if !cascade && project_has_data(state, id)? {
-                return Err(Error::new(
-                    ErrorCode::CorruptStorage,
-                    "committed non-cascade project drop targets non-empty data",
-                ));
+            DatabaseMutation::RenameProject { id, display_name } => {
+                validate_project_name(&display_name)?;
+                let normalized = normalize_name(&display_name);
+                if state
+                    .names
+                    .get(&normalized)
+                    .is_some_and(|existing| *existing != id)
+                {
+                    return Err(Error::new(
+                        ErrorCode::TransactionConflict,
+                        "project name already exists",
+                    ));
+                }
+                let project = state.projects.get_mut(&id).ok_or_else(|| {
+                    Error::new(ErrorCode::ProjectNotFound, "project does not exist")
+                })?;
+                let project = project.as_ref();
+                state
+                    .names
+                    .remove(&normalize_name(&project.display_name.get()));
+                project.display_name.set(display_name);
+                state.names.insert(normalized, id);
+                Ok(None)
             }
-            let project = state
-                .projects
-                .remove(&id)
-                .ok_or_else(|| Error::new(ErrorCode::ProjectNotFound, "project does not exist"))?;
-            state
-                .names
-                .remove(&normalize_name(&project.display_name.get()));
-            state.broker.drop_project(id)?;
-            Ok(None)
-        }
-        DatabaseMutation::Graph {
-            project,
-            validation: _,
-            graph,
-            temporal,
-            vectors,
-            administrative,
-        } => {
-            let project_state = state
-                .projects
-                .get_mut(&project)
-                .ok_or_else(|| Error::new(ErrorCode::ProjectFenced, "project does not exist"))?;
-            let project_state = project_state.as_ref();
-            let changes_graph =
-                !graph.is_empty() || !temporal.is_empty() || administrative.is_some();
-            project_state
-                .indexes
-                .bind_catalog_graph(&project_state.graph);
-            let freshness = embedding_freshness_updates(project_state, &graph)?;
-            for mutation in graph {
-                let mutation = retag_graph_mutation(mutation, bookmark.index);
-                update_next_ids(project_state, &mutation);
+            DatabaseMutation::DropProject { id, cascade } => {
+                if !cascade && project_has_data(state, id)? {
+                    return Err(Error::new(
+                        ErrorCode::CorruptStorage,
+                        "committed non-cascade project drop targets non-empty data",
+                    ));
+                }
+                let project = state.projects.remove(&id).ok_or_else(|| {
+                    Error::new(ErrorCode::ProjectNotFound, "project does not exist")
+                })?;
+                state
+                    .names
+                    .remove(&normalize_name(&project.display_name.get()));
+                state.broker.drop_project(id)?;
+                Ok(None)
+            }
+            DatabaseMutation::Graph {
+                project,
+                validation: _,
+                graph,
+                temporal,
+                vectors,
+                administrative,
+            } => {
+                let project_state = state.projects.get_mut(&project).ok_or_else(|| {
+                    Error::new(ErrorCode::ProjectFenced, "project does not exist")
+                })?;
+                let project_state = project_state.as_ref();
+                let changes_graph =
+                    !graph.is_empty() || !temporal.is_empty() || administrative.is_some();
                 project_state
                     .indexes
-                    .before_graph_apply(&project_state.graph, &mutation)?;
-                project_state.graph.apply(mutation.clone())?;
-                project_state
-                    .indexes
-                    .after_graph_apply(&project_state.graph, &mutation)?;
-            }
-            for (owner, index, previous_vector_revision) in freshness {
-                if let (Some(index), Some(revision)) = (
-                    project_state.indexes.vector_search_source(&index),
-                    embedding_owner_dependencies(project_state, owner).0,
-                ) {
-                    index.0.advance_row_revision(
-                        owner.entity_id,
-                        previous_vector_revision,
-                        revision,
-                    );
+                    .bind_catalog_graph(&project_state.graph);
+                let freshness = embedding_freshness_updates(project_state, &graph)?;
+                for source in &graph {
+                    let mutation = retag_graph_mutation(source.clone(), bookmark.index);
+                    let selected = persistence
+                        .as_ref()
+                        .map(|_| -> Result<_> {
+                            Ok((
+                                project_state
+                                    .graph
+                                    .prepare_persistence(std::slice::from_ref(&mutation))?,
+                                project_state.indexes.prepare_persistence(
+                                    &project_state.graph,
+                                    std::slice::from_ref(&mutation),
+                                    &[],
+                                )?,
+                            ))
+                        })
+                        .transpose()?;
+                    update_next_ids(project_state, &mutation);
+                    project_state
+                        .indexes
+                        .before_graph_apply(&project_state.graph, &mutation)?;
+                    project_state.graph.apply(mutation.clone())?;
+                    project_state
+                        .indexes
+                        .after_graph_apply(&project_state.graph, &mutation)?;
+                    if let (Some(records), Some((graph_selection, index_selection))) =
+                        (persistence.as_deref_mut(), selected)
+                    {
+                        persistence::append_project_operations(
+                            records,
+                            project,
+                            project_state.graph.persistence_changes(&graph_selection)?,
+                        );
+                        persistence::append_project_operations(
+                            records,
+                            project,
+                            project_state.indexes.persistence_changes(
+                                &project_state.graph,
+                                &index_selection,
+                                false,
+                            )?,
+                        );
+                    }
                 }
-            }
-            for mut mutation in temporal {
-                mutation.sample.sequence_index = bookmark.index;
-                if mutation.uses_commit_time {
-                    mutation.sample.event_time_nanos = commit_time_nanos;
+                let freshness_owners = freshness
+                    .iter()
+                    .map(|(owner, _, _)| owner.entity_id)
+                    .collect::<Vec<_>>();
+                for (owner, index, previous_vector_revision) in freshness {
+                    if let (Some(index), Some(revision)) = (
+                        project_state.indexes.vector_search_source(&index),
+                        embedding_owner_dependencies(project_state, owner).0,
+                    ) {
+                        index.0.advance_row_revision(
+                            owner.entity_id,
+                            previous_vector_revision,
+                            revision,
+                        );
+                    }
                 }
-                project_state.temporal.append(
-                    mutation.entity_kind,
-                    mutation.target,
-                    mutation.sample,
-                    commit_time_nanos,
+                let temporal_targets = temporal
+                    .iter()
+                    .map(|change| (change.entity_kind, change.target, change.sample.property))
+                    .collect::<Vec<_>>();
+                let temporal_selection = persistence
+                    .as_ref()
+                    .map(|_| {
+                        project_state
+                            .temporal
+                            .prepare_persistence(&temporal_targets, commit_time_nanos)
+                    })
+                    .transpose()?;
+                let declaration_selection = persistence
+                    .as_ref()
+                    .map(|_| {
+                        if let Some(AdministrativeMutation::DeclareTemporal {
+                            entity_kind,
+                            label_or_type,
+                            property,
+                            scalar_type,
+                            retention_nanos,
+                        }) = &administrative
+                        {
+                            let catalog = project_state.graph.catalog();
+                            let target = match entity_kind {
+                                crate::types::EntityKind::Node => {
+                                    catalog.label(label_or_type).map(|id| id.0)
+                                }
+                                crate::types::EntityKind::Relationship => {
+                                    catalog.relationship_type(label_or_type).map(|id| id.0)
+                                }
+                            }
+                            .ok_or_else(|| Error::invalid_data("temporal target is missing"))?;
+                            let property = catalog.property(property).ok_or_else(|| {
+                                Error::invalid_data("temporal property is missing")
+                            })?;
+                            project_state
+                                .temporal
+                                .prepare_declaration_persistence(
+                                    &crate::graph::TemporalDeclaration {
+                                        entity_kind: *entity_kind,
+                                        target,
+                                        property,
+                                        value_type: temporal_type(scalar_type)?,
+                                        retention_nanos: *retention_nanos,
+                                    },
+                                    commit_time_nanos,
+                                )
+                                .map(Some)
+                        } else {
+                            Ok(None)
+                        }
+                    })
+                    .transpose()?
+                    .flatten();
+                let index_selection = persistence
+                    .as_ref()
+                    .map(|_| -> Result<_> {
+                        let mut selected = project_state.indexes.prepare_persistence(
+                            &project_state.graph,
+                            &graph,
+                            &vectors,
+                        )?;
+                        for owner in &freshness_owners {
+                            project_state
+                                .indexes
+                                .include_persistence_owner(&mut selected, *owner);
+                        }
+                        Ok(selected)
+                    })
+                    .transpose()?;
+                let catalog_changed = administrative.is_some();
+                for mut mutation in temporal {
+                    mutation.sample.sequence_index = bookmark.index;
+                    if mutation.uses_commit_time {
+                        mutation.sample.event_time_nanos = commit_time_nanos;
+                    }
+                    project_state.temporal.append(
+                        mutation.entity_kind,
+                        mutation.target,
+                        mutation.sample,
+                        commit_time_nanos,
+                    )?;
+                }
+                if let Some(administrative) = administrative {
+                    apply_administrative(
+                        project_state,
+                        retag_administrative_mutation(administrative, bookmark.index),
+                        commit_time_nanos,
+                    )?;
+                }
+                for mutation in vectors {
+                    project_state.indexes.apply_vector_mutation_from_graph(
+                        &project_state.graph,
+                        &retag_vector_mutation(mutation, bookmark.index),
+                    )?;
+                }
+                if let Some(records) = persistence.as_deref_mut() {
+                    if let Some(selection) = index_selection {
+                        persistence::append_project_operations(
+                            records,
+                            project,
+                            project_state.indexes.persistence_changes(
+                                &project_state.graph,
+                                &selection,
+                                catalog_changed,
+                            )?,
+                        );
+                    }
+                    if let Some(selection) = temporal_selection {
+                        persistence::append_project_operations(
+                            records,
+                            project,
+                            project_state
+                                .temporal
+                                .persistence_changes(&selection, catalog_changed)?,
+                        );
+                    }
+                    if let Some(selection) = declaration_selection {
+                        persistence::append_project_operations(
+                            records,
+                            project,
+                            project_state
+                                .temporal
+                                .persistence_changes(&selection, catalog_changed)?,
+                        );
+                    }
+                }
+                if changes_graph {
+                    project_state.authority_revision.set(bookmark.index);
+                    refresh_optimizer_statistics(project_state);
+                }
+                Ok(None)
+            }
+            DatabaseMutation::Broker { command } => {
+                let project = broker_project(&command);
+                if !state.projects.contains_key(&project) {
+                    return Err(Error::new(
+                        ErrorCode::ProjectFenced,
+                        "broker mutation references a missing project",
+                    ));
+                }
+                let segments = segments.ok_or_else(|| {
+                    Error::internal("broker mutation requires the canonical payload segment store")
+                })?;
+                state.broker.apply(command, segments).map(Some)
+            }
+            DatabaseMutation::EmbeddingProfile { command } => {
+                apply_embedding_profile_command(state, &command)?;
+                if let Some(records) = persistence.as_deref_mut() {
+                    let id = match command {
+                        EmbeddingProfileCommand::Begin { project, .. }
+                        | EmbeddingProfileCommand::Acknowledge { project, .. }
+                        | EmbeddingProfileCommand::Activate { project, .. }
+                        | EmbeddingProfileCommand::Abort { project, .. } => project,
+                    };
+                    if let Some(project) = state.projects.get(&id) {
+                        let selected =
+                            project
+                                .indexes
+                                .prepare_persistence(&project.graph, &[], &[])?;
+                        persistence::append_project_operations(
+                            records,
+                            id,
+                            project
+                                .indexes
+                                .persistence_changes(&project.graph, &selected, true)?,
+                        );
+                    }
+                }
+                Ok(None)
+            }
+            DatabaseMutation::Security { command } => {
+                apply_security_command(
+                    &state.security,
+                    &command,
+                    bookmark,
+                    commit_time_nanos / 1_000_000,
                 )?;
+                Ok(None)
             }
-            if let Some(administrative) = administrative {
-                apply_administrative(
-                    project_state,
-                    retag_administrative_mutation(administrative, bookmark.index),
-                    commit_time_nanos,
-                )?;
-            }
-            for mutation in vectors {
-                project_state.indexes.apply_vector_mutation_from_graph(
-                    &project_state.graph,
-                    &retag_vector_mutation(mutation, bookmark.index),
-                )?;
-            }
-            if changes_graph {
-                project_state.authority_revision.set(bookmark.index);
-                refresh_optimizer_statistics(project_state);
-            }
-            Ok(None)
-        }
-        DatabaseMutation::Broker { command } => {
-            let project = broker_project(&command);
-            if !state.projects.contains_key(&project) {
-                return Err(Error::new(
-                    ErrorCode::ProjectFenced,
-                    "broker mutation references a missing project",
-                ));
-            }
-            let segments = segments.ok_or_else(|| {
-                Error::internal("broker mutation requires the canonical payload segment store")
-            })?;
-            state.broker.apply(command, segments).map(Some)
-        }
-        DatabaseMutation::EmbeddingProfile { command } => {
-            apply_embedding_profile_command(state, &command)?;
-            Ok(None)
-        }
-        DatabaseMutation::Security { command } => {
-            apply_security_command(
-                &state.security,
-                &command,
-                bookmark,
-                commit_time_nanos / 1_000_000,
-            )?;
-            Ok(None)
+        };
+    if result.is_ok() {
+        if let (Some(records), Some(capture)) = (persistence, broker_capture.as_ref()) {
+            records.extend(state.broker.persistence_changes(capture)?);
         }
     }
+    result
 }
 
 type StagedEmbeddingProfile = (
@@ -5249,30 +5156,6 @@ fn validate_resolved_database_command(
     Ok(mutation)
 }
 
-fn release_pending_broker_segments(
-    database: &DatabaseInner,
-    owner: Uuid,
-    descriptors: &[SegmentDescriptor],
-    rejected: bool,
-) {
-    let mut pending = database.pending_broker_segments.lock();
-    let mut unpinned = Vec::new();
-    for descriptor in descriptors {
-        let remove = pending.get_mut(descriptor).is_some_and(|record| {
-            record.owners.remove(&owner);
-            record.owners.is_empty()
-        });
-        if remove {
-            pending.remove(descriptor);
-            unpinned.push(descriptor.clone());
-        }
-    }
-    drop(pending);
-    if rejected && !unpinned.is_empty() {
-        database.retired_broker_segments.lock().extend(unpinned);
-    }
-}
-
 fn validate_sequencer_mutation(
     state: &DatabaseState,
     mutation: &DatabaseMutation,
@@ -5472,310 +5355,7 @@ fn retain_request_result(
     Ok(())
 }
 
-fn build_database_snapshot_file(
-    database: &Database,
-    bookmark: Bookmark,
-    destination: &Path,
-) -> Result<BackendSnapshot> {
-    let _snapshot = database.0.snapshot_build.lock();
-    // Checkpoints represent an exact committed WAL prefix. Pause mutation application while
-    // streaming the canonical state; do not create an in-memory graph generation for encoding.
-    // Canonical concurrent graph readers do not acquire this writer ordering gate.
-    let _apply = database.0.apply.lock();
-    let (state, segment_pins) = {
-        database.ensure_apply_healthy()?;
-        let state = database.0.state.read();
-        if state.applied != bookmark {
-            return Err(Error::new(
-                ErrorCode::CorruptStorage,
-                "database state does not exactly match the requested snapshot bookmark",
-            ));
-        }
-        let mut segment_pins = BTreeMap::<[u8; 32], (SegmentDescriptor, SegmentPin)>::new();
-        for descriptor in state.broker.payload_segments() {
-            if let Some((existing, _)) = segment_pins.get(&descriptor.checksum) {
-                if existing.bytes != descriptor.bytes {
-                    return Err(Error::new(
-                        ErrorCode::CorruptStorage,
-                        "snapshot content address has inconsistent segment lengths",
-                    ));
-                }
-                continue;
-            }
-            let pin = database.0.segments.pin(&descriptor)?;
-            segment_pins.insert(descriptor.checksum, (descriptor, pin));
-        }
-        (state, segment_pins)
-    };
-    let state_path = snapshot_temporary_path(destination, "state")?;
-    let attachment_directory = snapshot_attachment_staging_directory(destination)?;
-    let result = (|| -> Result<BackendSnapshot> {
-        let mut state_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&state_path)?;
-        let mut output = BufWriter::with_capacity(64 * 1024, &mut state_file);
-        ciborium::ser::into_writer(&*state, &mut output).map_err(|error| {
-            Error::invalid_data(format!(
-                "database checkpoint state encoding failed: {error}"
-            ))
-        })?;
-        output.flush()?;
-        drop(output);
-        let state_bytes = state_file.metadata()?.len();
-        let mut manifest = DatabaseCheckpointManifest {
-            format_version: DATABASE_SNAPSHOT_FORMAT,
-            store_id: database.0.store_id,
-            included: bookmark,
-            state_bytes,
-            state_checksum: None,
-            broker_segments: state.broker.payload_segments(),
-        };
-        // The encoded file now owns the exact committed prefix. Keep only immutable segment
-        // pins during packaging; neither filesystem durability nor checksum/copy passes need
-        // to stop graph writers. The intermediate file is never a recovery authority.
-        drop(state);
-        drop(_apply);
-        drop(state_file);
-        let mut state_hash = checkpoint_state_hasher(&manifest)?;
-        state_hash.update_reader(File::open(&state_path)?)?;
-        manifest.state_checksum = Some(*state_hash.finalize().as_bytes());
-        let manifest_bytes = encode_database_value(&manifest, "database checkpoint manifest")?;
-        if manifest_bytes.is_empty() {
-            return Err(Error::new(
-                ErrorCode::ResultBudgetExceeded,
-                "database checkpoint manifest is oversized",
-            ));
-        }
-        let manifest_len = u32::try_from(manifest_bytes.len()).map_err(|_| {
-            Error::new(
-                ErrorCode::ResultBudgetExceeded,
-                "database checkpoint manifest is oversized",
-            )
-        })?;
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(destination)?;
-        output.write_all(&DATABASE_SNAPSHOT_MAGIC)?;
-        output.write_all(&manifest_len.to_be_bytes())?;
-        output.write_all(&manifest_bytes)?;
-        copy_exact_file(&state_path, &mut output, state_bytes)?;
-        crate::storage::sync_durable(&output)?;
-        let output_bytes = output.metadata()?.len();
-        drop(output);
-
-        fs::create_dir(&attachment_directory)?;
-        let mut attachments = Vec::new();
-        for (checksum, (descriptor, pin)) in &segment_pins {
-            let path = attachment_directory.join(hex::encode(checksum));
-            pin.link_raw_to(&path)?;
-            attachments.push(SnapshotAttachment::new(path, descriptor.bytes, *checksum)?);
-        }
-        crate::storage::sync_durable(&File::open(&attachment_directory)?)?;
-        BackendSnapshot::new(destination.to_owned(), output_bytes, attachments)
-    })();
-    let _ignored = fs::remove_file(&state_path);
-    if result.is_err() {
-        let _ignored = fs::remove_file(destination);
-        let _ignored = fs::remove_dir_all(&attachment_directory);
-    }
-    result
-}
-
-fn install_database_snapshot_file(
-    database: &Database,
-    bookmark: Bookmark,
-    snapshot: &BackendSnapshot,
-) -> Result<()> {
-    let snapshot_path = snapshot.state_path();
-    let (mut file, manifest, manifest_len) = open_database_checkpoint(snapshot_path)?;
-    if manifest.format_version != DATABASE_SNAPSHOT_FORMAT
-        || manifest.store_id != database.0.store_id
-        || manifest.included != bookmark
-        || manifest.state_bytes == 0
-    {
-        return Err(Error::new(
-            ErrorCode::CorruptStorage,
-            "database checkpoint metadata is invalid",
-        ));
-    }
-    verify_checkpoint_state_checksum(&mut file, &manifest)?;
-    let mut state_reader = (&mut file).take(manifest.state_bytes);
-    let state: DatabaseState = ciborium::de::from_reader(&mut state_reader).map_err(|error| {
-        Error::new(
-            ErrorCode::CorruptStorage,
-            format!("database checkpoint state is invalid: {error}"),
-        )
-    })?;
-    if state_reader.limit() != 0 || state.applied != bookmark {
-        return Err(Error::new(
-            ErrorCode::CorruptStorage,
-            "database checkpoint state length or bookmark is invalid",
-        ));
-    }
-    // Graph deserialization validates canonical structure. The database owns metadata and
-    // attachment consistency; it must not rescan every decoded graph again.
-    validate_database_checkpoint_metadata(&state)?;
-    let expected_broker_segments = state.broker.payload_segments();
-    if expected_broker_segments != manifest.broker_segments {
-        return Err(Error::new(
-            ErrorCode::CorruptStorage,
-            "database checkpoint broker payload segment set is incomplete",
-        ));
-    }
-    let broker_segments = expected_broker_segments;
-    validate_database_checkpoint_state_extent(
-        &manifest,
-        file.get_ref().metadata()?.len(),
-        manifest_len,
-    )?;
-    let attachments = validate_database_snapshot_attachments(snapshot, &broker_segments)?;
-
-    if database.0.state.read().applied.index > bookmark.index {
-        return Ok(());
-    }
-
-    // Immutable attachment installation is content-addressed and may safely run before the
-    // publication gate. A stale snapshot can leave only reusable orphan files, never visible
-    // canonical state, while large file copies do not block current reads or mutation apply.
-    for descriptor in &broker_segments {
-        let attachment = attachments.get(&descriptor.checksum).ok_or_else(|| {
-            Error::new(
-                ErrorCode::CorruptStorage,
-                "database checkpoint broker attachment is absent",
-            )
-        })?;
-        database.0.segments.import_raw_from(
-            descriptor,
-            &mut File::open(&attachment.path)?,
-            DATABASE_SNAPSHOT_COPY_BYTES,
-        )?;
-    }
-    state
-        .broker
-        .validate_payload_segments(&database.0.segments)?;
-    let _apply = database.0.apply.lock();
-    let mut current = database.0.state.write();
-    if current.applied.index > bookmark.index {
-        let current_broker_segments = current
-            .broker
-            .payload_segments()
-            .into_iter()
-            .map(|descriptor| descriptor.file_name)
-            .collect::<BTreeSet<_>>();
-        database.0.retired_broker_segments.lock().extend(
-            broker_segments
-                .iter()
-                .filter(|descriptor| !current_broker_segments.contains(&descriptor.file_name))
-                .cloned(),
-        );
-        return Ok(());
-    }
-    reset_ephemeral_after_snapshot_install(&database.0)?;
-    *current = state;
-    database.publish_reader_registry(&current);
-    Ok(())
-}
-
-fn validate_database_snapshot_attachments<'a>(
-    snapshot: &'a BackendSnapshot,
-    broker_segments: &[SegmentDescriptor],
-) -> Result<BTreeMap<[u8; 32], &'a SnapshotAttachment>> {
-    let mut expected = BTreeMap::<[u8; 32], u64>::new();
-    for descriptor in broker_segments {
-        if let Some(previous) = expected.insert(descriptor.checksum, descriptor.bytes)
-            && previous != descriptor.bytes
-        {
-            return Err(Error::new(
-                ErrorCode::CorruptStorage,
-                "database checkpoint content address has inconsistent lengths",
-            ));
-        }
-    }
-    if expected.len() != snapshot.attachments.len() {
-        return Err(Error::new(
-            ErrorCode::CorruptStorage,
-            "database checkpoint attachment set is incomplete",
-        ));
-    }
-    let mut actual = BTreeMap::new();
-    for attachment in &snapshot.attachments {
-        if expected.get(&attachment.checksum) != Some(&attachment.bytes)
-            || actual.insert(attachment.checksum, attachment).is_some()
-        {
-            return Err(Error::new(
-                ErrorCode::CorruptStorage,
-                "database checkpoint attachment metadata is invalid",
-            ));
-        }
-        let metadata = fs::symlink_metadata(&attachment.path)?;
-        if !metadata.is_file()
-            || metadata.file_type().is_symlink()
-            || metadata.len() != attachment.bytes
-        {
-            return Err(Error::new(
-                ErrorCode::CorruptStorage,
-                "database checkpoint attachment file is invalid",
-            ));
-        }
-    }
-    Ok(actual)
-}
-
-fn validate_database_checkpoint_state_extent(
-    manifest: &DatabaseCheckpointManifest,
-    file_bytes: u64,
-    manifest_bytes: usize,
-) -> Result<()> {
-    let manifest_bytes = u64::try_from(manifest_bytes)
-        .map_err(|_| Error::new(ErrorCode::CorruptStorage, "manifest size exceeds u64"))?;
-    let declared = 12_u64
-        .checked_add(manifest_bytes)
-        .and_then(|bytes| bytes.checked_add(manifest.state_bytes))
-        .ok_or_else(|| {
-            Error::new(
-                ErrorCode::CorruptStorage,
-                "database checkpoint declared length overflow",
-            )
-        })?;
-    if declared != file_bytes {
-        return Err(Error::new(
-            ErrorCode::CorruptStorage,
-            "database checkpoint declared extent differs from its file",
-        ));
-    }
-    Ok(())
-}
-
-/// Snapshot publication is serialized with state-machine apply. A state-dependent sequencer
-/// reservation must therefore be absent: installing over one would detach its ordered overlay
-/// from the log position it validated. Any owner pins left without a reservation are definitive
-/// crash/abort leftovers; the installed snapshot is authoritative, so release and enqueue them
-/// for bounded reclamation before exposing the replacement state.
-fn reset_ephemeral_after_snapshot_install(database: &DatabaseInner) -> Result<()> {
-    let ordered = database.ordered_overlay.lock();
-    if !ordered.reservations.is_empty() {
-        return Err(Error::new(
-            ErrorCode::CorruptStorage,
-            "cannot install a snapshot over ordered command reservations",
-        ));
-    }
-    drop(ordered);
-
-    let abandoned = {
-        let mut pending = database.pending_broker_segments.lock();
-        let abandoned = pending.keys().cloned().collect::<Vec<_>>();
-        pending.clear();
-        abandoned
-    };
-    if !abandoned.is_empty() {
-        database.retired_broker_segments.lock().extend(abandoned);
-    }
-    Ok(())
-}
-
-fn validate_database_checkpoint_metadata(state: &DatabaseState) -> Result<()> {
+fn validate_durable_state(state: &DatabaseState) -> Result<()> {
     for project in state.projects.values() {
         project.indexes.bind_catalog_graph(&project.graph);
     }
@@ -5789,7 +5369,7 @@ fn validate_database_checkpoint_metadata(state: &DatabaseState) -> Result<()> {
         if id != &project.id {
             return Err(Error::new(
                 ErrorCode::CorruptStorage,
-                "checkpoint project key differs from its immutable ID",
+                "durable project key differs from its immutable ID",
             ));
         }
         if state
@@ -5799,332 +5379,28 @@ fn validate_database_checkpoint_metadata(state: &DatabaseState) -> Result<()> {
         {
             return Err(Error::new(
                 ErrorCode::CorruptStorage,
-                "checkpoint project name index is inconsistent",
+                "durable project name index is inconsistent",
             ));
         }
     }
     if state.names.len() != state.projects.len() {
         return Err(Error::new(
             ErrorCode::CorruptStorage,
-            "checkpoint project catalog cardinality is inconsistent",
+            "durable project catalog cardinality is inconsistent",
         ));
     }
     Ok(())
 }
 
-fn copy_exact_file(path: &Path, output: &mut impl Write, expected: u64) -> Result<()> {
-    let mut input = File::open(path)?;
-    let mut remaining = expected;
-    let mut buffer = vec![0_u8; DATABASE_SNAPSHOT_COPY_BYTES];
-    while remaining > 0 {
-        let requested = usize::try_from(remaining.min(buffer.len() as u64))
-            .map_err(|_| Error::internal("checkpoint copy length overflow"))?;
-        input.read_exact(&mut buffer[..requested])?;
-        output.write_all(&buffer[..requested])?;
-        remaining -= requested as u64;
-    }
-    let mut trailing = [0_u8; 1];
-    if input.read(&mut trailing)? != 0 {
-        return Err(Error::new(
-            ErrorCode::CorruptStorage,
-            "checkpoint state exceeds its declared length",
-        ));
-    }
-    Ok(())
-}
-
-fn snapshot_temporary_path(path: &Path, role: &str) -> Result<PathBuf> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| Error::invalid_data("checkpoint path has no parent"))?;
-    Ok(parent.join(format!(".{role}.{}.checkpoint.tmp", Uuid::new_v4())))
-}
-
-fn snapshot_attachment_staging_directory(path: &Path) -> Result<PathBuf> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| Error::invalid_data("checkpoint path has no parent"))?;
-    Ok(parent.join(format!(".attachments.{}.checkpoint.tmp", Uuid::new_v4())))
-}
-
-fn standalone_snapshot_attachment_directory(path: &Path) -> Result<PathBuf> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| Error::invalid_data("standalone snapshot path has no parent"))?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| Error::invalid_data("standalone snapshot has no UTF-8 file name"))?;
-    Ok(parent.join(format!("{name}.attachments")))
-}
-
-/// Move the verified attachment set built with the canonical state file into its durable name.
-/// `LATEST` is written only after this returns, so recovery can never observe a snapshot whose
-/// broker bytes have not been published yet.
-fn publish_standalone_snapshot_attachments(
-    destination: &Path,
-    snapshot: &BackendSnapshot,
-) -> Result<()> {
-    if snapshot.attachments.is_empty() {
-        return Ok(());
-    }
-    let staging = snapshot.attachments[0]
-        .path
-        .parent()
-        .ok_or_else(|| Error::invalid_data("snapshot attachment has no parent directory"))?;
-    if snapshot
-        .attachments
-        .iter()
-        .any(|attachment| attachment.path.parent() != Some(staging))
-    {
-        return Err(Error::new(
-            ErrorCode::CorruptStorage,
-            "standalone snapshot attachments do not share one staging directory",
-        ));
-    }
-    let published = standalone_snapshot_attachment_directory(destination)?;
-    if published.exists() {
-        return Err(Error::new(
-            ErrorCode::CorruptStorage,
-            "standalone snapshot attachment directory already exists",
-        ));
-    }
-    std::fs::rename(staging, &published)?;
-    if let Some(parent) = published.parent() {
-        crate::storage::sync_durable(&File::open(parent)?)?;
-    }
-    Ok(())
-}
-
-fn standalone_snapshot_paths(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut paths = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("snapshot-") && name.ends_with(".igdb"))
-        })
-        .collect::<Vec<_>>();
-    paths.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
-    paths
-}
-
-fn standalone_snapshot_paths_with_latest_first(dir: &Path) -> Vec<PathBuf> {
-    let mut paths = standalone_snapshot_paths(dir);
-    let latest = std::fs::read_to_string(dir.join("LATEST"))
-        .ok()
-        .map(|name| dir.join(name.trim()))
-        .filter(|path| path.exists());
-    if let Some(latest) = latest
-        && let Some(position) = paths.iter().position(|path| *path == latest)
-    {
-        paths.remove(position);
-        paths.insert(0, latest);
-    }
-    paths
-}
-
-fn quarantine_standalone_snapshot(path: &Path) -> Result<PathBuf> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| Error::invalid_data("standalone snapshot has no parent directory"))?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| Error::invalid_data("standalone snapshot has no UTF-8 file name"))?;
-    let quarantined = parent.join(format!("{name}.corrupt-{}", Uuid::new_v4()));
-    std::fs::rename(path, &quarantined)?;
-    let attachments = standalone_snapshot_attachment_directory(path)?;
-    if attachments.exists() {
-        let quarantined_name = quarantined
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| Error::invalid_data("quarantined snapshot name is not UTF-8"))?;
-        std::fs::rename(
-            attachments,
-            parent.join(format!("{quarantined_name}.attachments")),
-        )?;
-    }
-    crate::storage::sync_durable(&File::open(parent)?)?;
-    Ok(quarantined)
-}
-
-fn open_database_checkpoint(
-    path: &Path,
-) -> Result<(BufReader<File>, DatabaseCheckpointManifest, usize)> {
-    let mut file = BufReader::with_capacity(64 * 1024, File::open(path)?);
-    let mut magic = [0_u8; 8];
-    file.read_exact(&mut magic)?;
-    if magic != DATABASE_SNAPSHOT_MAGIC {
-        return Err(Error::new(
-            ErrorCode::CorruptStorage,
-            "standalone snapshot format is unsupported",
-        ));
-    }
-    let mut length = [0_u8; 4];
-    file.read_exact(&mut length)?;
-    let manifest_len = u32::from_be_bytes(length) as usize;
-    if manifest_len == 0
-        || manifest_len as u64 > file.get_ref().metadata()?.len().saturating_sub(12)
-    {
-        return Err(Error::new(
-            ErrorCode::CorruptStorage,
-            "standalone snapshot manifest is oversized",
-        ));
-    }
-    let mut manifest_bytes = vec![0_u8; manifest_len];
-    file.read_exact(&mut manifest_bytes)?;
-    let manifest: DatabaseCheckpointManifest =
-        decode_database_value(&manifest_bytes, "standalone snapshot manifest")?;
-    if manifest.format_version != DATABASE_SNAPSHOT_FORMAT || manifest.state_bytes == 0 {
-        return Err(Error::new(
-            ErrorCode::CorruptStorage,
-            "standalone snapshot format version or state length is invalid",
-        ));
-    }
-    validate_database_checkpoint_state_extent(
-        &manifest,
-        file.get_ref().metadata()?.len(),
-        manifest_len,
-    )?;
-    Ok((file, manifest, manifest_len))
-}
-
-fn checkpoint_state_hasher(manifest: &DatabaseCheckpointManifest) -> Result<blake3::Hasher> {
-    let mut metadata = manifest.clone();
-    metadata.state_checksum = None;
-    let mut hash = blake3::Hasher::new_derive_key("irongraph.checkpoint-state.v1");
-    hash.update(&encode_database_value(
-        &metadata,
-        "checkpoint checksum metadata",
-    )?);
-    Ok(hash)
-}
-
-fn verify_checkpoint_state_checksum(
-    file: &mut BufReader<File>,
-    manifest: &DatabaseCheckpointManifest,
-) -> Result<()> {
-    let Some(expected) = manifest.state_checksum else {
-        return Ok(());
-    };
-    let start = file.stream_position()?;
-    let mut hash = checkpoint_state_hasher(manifest)?;
-    hash.update_reader((&mut *file).take(manifest.state_bytes))?;
-    if hash.finalize().as_bytes() != &expected {
-        return Err(Error::new(
-            ErrorCode::CorruptStorage,
-            "checkpoint state checksum differs",
-        ));
-    }
-    file.seek(SeekFrom::Start(start))?;
-    Ok(())
-}
-
-fn standalone_snapshot_is_complete(path: &Path) -> Result<bool> {
-    let (mut file, manifest, _) = open_database_checkpoint(path)?;
-    // A file without a persisted checksum can be recovered by the full reader, but cannot
-    // authorize online WAL compaction. Never rebuild a second graph to probe its readiness.
-    if manifest.state_checksum.is_none() {
-        return Ok(false);
-    }
-    verify_checkpoint_state_checksum(&mut file, &manifest)?;
-    let segments = manifest.broker_segments;
-    if segments.is_empty() {
-        return Ok(true);
-    }
-    let attachments = standalone_snapshot_attachment_directory(path)?;
-    for descriptor in segments {
-        if SnapshotAttachment::new(
-            attachments.join(hex::encode(descriptor.checksum)),
-            descriptor.bytes,
-            descriptor.checksum,
-        )
-        .is_err()
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-/// Reads the manifest header of a standalone snapshot file (`MAGIC | len | manifest | state`),
-/// returning the committed bookmark and any referenced broker payload segments without decoding
-/// the full state body.
-fn read_standalone_snapshot_manifest(path: &Path) -> Result<(Bookmark, Vec<SegmentDescriptor>)> {
-    let (_, manifest, _) = open_database_checkpoint(path)?;
-    Ok((manifest.included, manifest.broker_segments))
-}
-
-/// Retains the newly published snapshot and one validated predecessor. The WAL is compacted only
-/// through that predecessor, so either retained snapshot is a real recovery authority rather than
-/// a stale file whose suffix has already been discarded. Invalid snapshots are renamed for
-/// forensic inspection; only older validated generations are pruned.
-fn prune_standalone_snapshots(dir: &Path, keep: &Path) {
-    let mut retained = BTreeSet::from([keep.to_owned()]);
-    let mut verified = 1;
-    for path in standalone_snapshot_paths(dir) {
-        if path == keep {
-            continue;
-        }
-        if open_database_checkpoint(&path)
-            .is_ok_and(|(_, manifest, _)| manifest.state_checksum.is_none())
-        {
-            // Keep existing recovery authorities until two checksummed checkpoints exist.
-            // Probing a file must not instantiate its graph beside the running database.
-            if verified < 2 {
-                retained.insert(path);
-            } else {
-                let _ = std::fs::remove_file(&path);
-            }
-            continue;
-        }
-        match standalone_snapshot_is_complete(&path) {
-            Ok(true) if verified < 2 => {
-                retained.insert(path);
-                verified += 1;
-            }
-            Ok(true) => {
-                let _ = std::fs::remove_file(&path);
-                if let Ok(attachments) = standalone_snapshot_attachment_directory(&path) {
-                    let _ = std::fs::remove_dir_all(attachments);
-                }
-            }
-            Ok(false) | Err(_) => {
-                let _ = quarantine_standalone_snapshot(&path);
-            }
-        }
-    }
-
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if name.starts_with(".attachments.") && name.ends_with(".checkpoint.tmp") {
-            let _ = std::fs::remove_dir_all(&path);
-        } else if name.starts_with("snapshot-") && name.ends_with(".igdb.attachments") {
-            let retained_attachment = retained.iter().any(|snapshot| {
-                standalone_snapshot_attachment_directory(snapshot)
-                    .ok()
-                    .as_ref()
-                    == Some(&path)
-            });
-            if !retained_attachment {
-                let _ = std::fs::remove_dir_all(&path);
-            }
-        }
-    }
-}
-
+#[cfg(test)]
 fn prune_request_results(state: &mut DatabaseState) -> Result<()> {
+    prune_request_results_captured(state, &mut Vec::new())
+}
+
+fn prune_request_results_captured(
+    state: &mut DatabaseState,
+    removed_requests: &mut Vec<Uuid>,
+) -> Result<()> {
     let minimum_index = state
         .applied
         .index
@@ -6137,6 +5413,7 @@ fn prune_request_results(state: &mut DatabaseState) -> Result<()> {
             break;
         }
         state.request_result_order.remove(&index);
+        removed_requests.push(request_id);
         let removed = state.request_results.remove(&request_id).ok_or_else(|| {
             Error::new(
                 ErrorCode::CorruptStorage,
@@ -6158,7 +5435,7 @@ fn prune_request_results(state: &mut DatabaseState) -> Result<()> {
             .ok_or_else(|| Error::internal("idempotency result byte accounting underflow"))?;
     }
     // Retention changes update both indexes and byte accounting locally. Full validation
-    // belongs to checkpoint/recovery, rather than scanning every unchanged cached response
+    // belongs to recovery, rather than scanning every unchanged cached response
     // after each write.
     Ok(())
 }
@@ -8363,14 +7640,12 @@ mod automatic_semantic_tests;
 #[cfg(test)]
 mod project_lifecycle_tests {
     use crate::{
-        EdgeId,
         Layer,
         NodeId,
         ScalarValue,
         // Tests import the private identity owner directly to construct isolated stores.
         engine::NodeIdentity,
-        graph::{DocumentItem, EdgeInput, LayerMask, NodeInput},
-        storage::{SegmentFamily, SegmentRecord},
+        graph::{DocumentItem, LayerMask, NodeInput},
         types::DocumentList,
     };
 
@@ -8554,7 +7829,10 @@ mod project_lifecycle_tests {
         };
         let encoded = encode_database_mutation_bounded(&mutation, 1024 * 1024)?;
         assert!(encoded.starts_with(COMPACT_UNIFORM_VALUE_KAFKA_MUTATION_MAGIC));
-        assert!(encoded.len() < 4_096, "uniform Kafka WAL shape regressed");
+        assert!(
+            encoded.len() < 4_096,
+            "uniform Kafka command shape regressed"
+        );
         let decoded = decode_database_mutation(&encoded)?;
         let DatabaseMutation::Broker {
             command: BrokerCommand::PublishKafkaBatch { records, .. },
@@ -8569,311 +7847,6 @@ mod project_lifecycle_tests {
         assert_eq!(records[399].create_time_ms, Some(10_399));
         assert!(records.iter().all(|record| record.payload == vec![7; 64]));
         Ok(())
-    }
-
-    fn write_unchecked_test_snapshot(
-        database: &Database,
-        state: &impl Serialize,
-        included: Bookmark,
-        destination: &Path,
-    ) -> Result<BackendSnapshot> {
-        let mut state_bytes = Vec::new();
-        ciborium::ser::into_writer(state, &mut state_bytes).map_err(|error| {
-            Error::invalid_data(format!("test checkpoint state encoding failed: {error}"))
-        })?;
-        let mut manifest = DatabaseCheckpointManifest {
-            format_version: DATABASE_SNAPSHOT_FORMAT,
-            store_id: database.0.store_id,
-            included,
-            state_bytes: state_bytes.len() as u64,
-            state_checksum: None,
-            broker_segments: Vec::new(),
-        };
-        let mut state_hash = checkpoint_state_hasher(&manifest)?;
-        state_hash.update(&state_bytes);
-        manifest.state_checksum = Some(*state_hash.finalize().as_bytes());
-        let manifest_bytes = encode_database_value(&manifest, "test checkpoint manifest")?;
-        let mut output = File::create(destination)?;
-        output.write_all(&DATABASE_SNAPSHOT_MAGIC)?;
-        output.write_all(&(manifest_bytes.len() as u32).to_be_bytes())?;
-        output.write_all(&manifest_bytes)?;
-        output.write_all(&state_bytes)?;
-        output.flush()?;
-        let bytes = output.metadata()?.len();
-        drop(output);
-        BackendSnapshot::new(destination.to_owned(), bytes, Vec::new())
-    }
-
-    #[tokio::test]
-    async fn snapshot_readiness_streams_dirty_state_and_detects_body_corruption() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let snapshots = tempfile::tempdir()?;
-        let identity = NodeIdentity::generate_genesis().public();
-        let database =
-            Database::open_backend(directory.path(), usize::MAX, Duration::ZERO, identity)?;
-        let (project, entry) = wal_test_project_entry(1)?;
-        database.apply_mutation(&entry).await?;
-        let graph = database.0.state.read().projects[&project].graph.clone();
-        let body = graph.catalog().intern_property("body")?;
-        for id in 1..=64 {
-            graph.insert_node(NodeInput {
-                id: NodeId(id),
-                layer: Layer::Observed,
-                revision: 1,
-                labels: vec![],
-                properties: vec![(
-                    body,
-                    ScalarValue::String(
-                        format!("{id}:{}", "complete domain content ".repeat(8192)).into(),
-                    ),
-                )],
-            })?;
-        }
-        database.0.state.read().projects[&project]
-            .next_node_id
-            .advance(65);
-        let bytes = graph.resident_bytes();
-        database.standalone_snapshot(snapshots.path()).await?;
-        let path = standalone_snapshot_paths(snapshots.path()).remove(0);
-        for _ in 0..8 {
-            assert!(standalone_snapshot_is_complete(&path)?);
-        }
-        assert_eq!(graph.resident_bytes(), bytes);
-        let (mut file, manifest, _) = open_database_checkpoint(&path)?;
-        assert!(manifest.state_checksum.is_some());
-        let position = file.stream_position()?;
-        let mut altered_metadata = manifest.clone();
-        altered_metadata.included.index += 1;
-        assert_eq!(
-            verify_checkpoint_state_checksum(&mut file, &altered_metadata)
-                .unwrap_err()
-                .code,
-            ErrorCode::CorruptStorage
-        );
-        drop(file);
-        let (mut original, mut unsigned_manifest, _) = open_database_checkpoint(&path)?;
-        unsigned_manifest.state_checksum = None;
-        let older = snapshots
-            .path()
-            .join("snapshot-00000000000000000001-00000000000000000000.igdb");
-        let metadata = encode_database_value(&unsigned_manifest, "test existing checkpoint")?;
-        let mut output = BufWriter::new(File::create(&older)?);
-        output.write_all(&DATABASE_SNAPSHOT_MAGIC)?;
-        output.write_all(&(metadata.len() as u32).to_be_bytes())?;
-        output.write_all(&metadata)?;
-        std::io::copy(&mut (&mut original).take(manifest.state_bytes), &mut output)?;
-        output.flush()?;
-        drop(output);
-        assert!(!standalone_snapshot_is_complete(&older)?);
-        prune_standalone_snapshots(snapshots.path(), &path);
-        assert!(
-            older.exists(),
-            "existing recovery authority must remain available"
-        );
-        let mut writable = OpenOptions::new().read(true).write(true).open(&path)?;
-        writable.seek(SeekFrom::Start(position + manifest.state_bytes - 1))?;
-        let mut byte = [0];
-        writable.read_exact(&mut byte)?;
-        writable.seek(SeekFrom::Current(-1))?;
-        writable.write_all(&[byte[0] ^ 1])?;
-        drop(writable);
-        assert_eq!(
-            standalone_snapshot_is_complete(&path).unwrap_err().code,
-            ErrorCode::CorruptStorage
-        );
-        assert_eq!(graph.resident_bytes(), bytes);
-        let restored_directory = tempfile::tempdir()?;
-        let restored = Database::open_backend(
-            restored_directory.path(),
-            usize::MAX,
-            Duration::ZERO,
-            identity,
-        )?;
-        assert_eq!(
-            restored.standalone_recover(snapshots.path()).await?,
-            Some(Bookmark { term: 1, index: 1 })
-        );
-        assert_eq!(
-            restored.0.state.read().projects[&project]
-                .graph
-                .node_count(),
-            64
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn standalone_snapshot_retains_previous_replay_authority() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let snapshot_directory = tempfile::tempdir()?;
-        let database = Database::open_backend(
-            directory.path(),
-            2 * 1024 * 1024,
-            Duration::from_secs(1),
-            NodeIdentity::generate_genesis().public(),
-        )?;
-        for index in 1..=3 {
-            let (_, entry) = wal_test_project_entry(index)?;
-            database.apply_mutation(&entry).await?;
-            database
-                .standalone_snapshot(snapshot_directory.path())
-                .await?;
-        }
-
-        let retained = standalone_snapshot_paths(snapshot_directory.path());
-        assert_eq!(retained.len(), 2);
-        assert_eq!(
-            database
-                .standalone_wal_compaction_bookmark(
-                    snapshot_directory.path(),
-                    Bookmark { term: 1, index: 3 },
-                )
-                .await?,
-            Bookmark { term: 1, index: 2 }
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn standalone_recovery_falls_back_from_damaged_latest_snapshot() -> Result<()> {
-        let source_directory = tempfile::tempdir()?;
-        let snapshot_directory = tempfile::tempdir()?;
-        let identity = NodeIdentity::generate_genesis().public();
-        let database = Database::open_backend(
-            source_directory.path(),
-            2 * 1024 * 1024,
-            Duration::from_secs(1),
-            identity,
-        )?;
-        for index in 1..=2 {
-            let (_, entry) = wal_test_project_entry(index)?;
-            database.apply_mutation(&entry).await?;
-            database
-                .standalone_snapshot(snapshot_directory.path())
-                .await?;
-        }
-        let latest_name = std::fs::read_to_string(snapshot_directory.path().join("LATEST"))?;
-        let latest = snapshot_directory.path().join(latest_name.trim());
-        let mut bytes = std::fs::read(&latest)?;
-        bytes[0] ^= 0xff;
-        std::fs::write(&latest, bytes)?;
-
-        let restored_directory = tempfile::tempdir()?;
-        let restored = Database::open_backend(
-            restored_directory.path(),
-            2 * 1024 * 1024,
-            Duration::from_secs(1),
-            identity,
-        )?;
-        assert_eq!(
-            restored
-                .standalone_recover(snapshot_directory.path())
-                .await?,
-            Some(Bookmark { term: 1, index: 1 })
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn checkpoint_recovery_quarantines_only_invalid_relationship_rows() -> Result<()> {
-        let source_directory = tempfile::tempdir()?;
-        let identity = NodeIdentity::generate_genesis().public();
-        let source = Database::open_backend(
-            source_directory.path(),
-            2 * 1024 * 1024,
-            Duration::from_secs(1),
-            identity,
-        )?;
-        let project = ProjectId::random();
-        let project_state = ordered_graph_project(project, 1)?;
-        {
-            let project_state = project_state.as_ref();
-            let relationship_type = project_state
-                .graph
-                .catalog_mut()
-                .intern_relationship_type("CONNECTED")?;
-            project_state.graph.insert_node(NodeInput {
-                id: NodeId(2),
-                layer: Layer::Observed,
-                revision: 2,
-                labels: Vec::new(),
-                properties: Vec::new(),
-            })?;
-            project_state.graph.insert_edge(EdgeInput {
-                id: EdgeId(1),
-                source: NodeId(1),
-                target: NodeId(2),
-                relationship_type,
-                layer: Layer::Observed,
-                revision: 3,
-                properties: Vec::new(),
-            })?;
-            project_state.next_node_id.set(3);
-            project_state.next_edge_id.set(2);
-        }
-        let bookmark = Bookmark { term: 1, index: 3 };
-        let mut state = DatabaseState {
-            applied: bookmark,
-            ..DatabaseState::default()
-        };
-        state
-            .names
-            .insert(normalize_name(&project_state.display_name.get()), project);
-        state.projects.insert(project, project_state);
-        validate_database_checkpoint_metadata(&state)?;
-
-        let mut encoded_bytes = Vec::new();
-        ciborium::ser::into_writer(&state, &mut encoded_bytes)
-            .map_err(|e| Error::internal(e.to_string()))?;
-        let mut encoded: ciborium::value::Value =
-            ciborium::de::from_reader(encoded_bytes.as_slice())
-                .map_err(|e| Error::internal(e.to_string()))?;
-        fn field<'a>(
-            value: &'a mut ciborium::value::Value,
-            key: &str,
-        ) -> Result<&'a mut ciborium::value::Value> {
-            let ciborium::value::Value::Map(entries) = value else {
-                return Err(Error::internal("corruption fixture expected map"));
-            };
-            entries
-                .iter_mut()
-                .find_map(|(name, value)| {
-                    matches!(name,ciborium::value::Value::Text(text) if text==key).then_some(value)
-                })
-                .ok_or_else(|| Error::internal(format!("corruption fixture missing {key}")))
-        }
-        let ciborium::value::Value::Map(projects) = field(&mut encoded, "projects")? else {
-            return Err(Error::internal("project fixture expected map"));
-        };
-        let project_value = &mut projects
-            .first_mut()
-            .ok_or_else(|| Error::internal("project fixture absent"))?
-            .1;
-        let ciborium::value::Value::Array(edges) = field(field(project_value, "graph")?, "edges")?
-        else {
-            return Err(Error::internal("edge fixture expected array"));
-        };
-        *field(
-            edges
-                .first_mut()
-                .ok_or_else(|| Error::internal("edge fixture absent"))?,
-            "source",
-        )? = ciborium::value::Value::Integer(u32::MAX.into());
-        let snapshot_path = source_directory.path().join("corrupt.igdb");
-        let snapshot = write_unchecked_test_snapshot(&source, &encoded, bookmark, &snapshot_path)?;
-        let restored_directory = tempfile::tempdir()?;
-        let restored = Database::open_backend(
-            restored_directory.path(),
-            2 * 1024 * 1024,
-            Duration::from_secs(1),
-            identity,
-        )?;
-        install_database_snapshot_file(&restored, bookmark, &snapshot)?;
-        let restored_state = restored.0.state.read();
-        let graph = &restored_state.projects[&project].graph;
-        assert_eq!(graph.node_count(), 2);
-        assert_eq!(graph.edge_count(), 0);
-        graph.validate_structure()
     }
 
     /// Publication keeps cold samples while advancing the exact canonical count revision.
@@ -9292,7 +8265,7 @@ mod project_lifecycle_tests {
         database.0.state.write().projects.insert(project, state);
         database.publish_reader_registry(&database.0.state.read());
         let before = database.bookmark();
-        // No runtime is bound: an attempted cold-build WAL command would fail this call.
+        // No runtime is bound: an attempted cold-build mutation command would fail this call.
         database.initialize_automatic_semantic(project)?;
         assert_eq!(database.bookmark(), before);
         Ok(())
@@ -10010,264 +8983,6 @@ mod project_lifecycle_tests {
         Ok(())
     }
 
-    #[test]
-    fn uncommitted_broker_prestage_pin_fences_running_reclamation() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let database = Database::open_backend(
-            directory.path(),
-            2 * 1024 * 1024,
-            Duration::from_millis(1),
-            NodeIdentity::generate_genesis().public(),
-        )?;
-        let project = ProjectId::random();
-        let command = BrokerCommand::PublishKafkaBatch {
-            project,
-            topic: "events".to_owned(),
-            partition: 0,
-            resolved_time_ms: 1,
-            records: vec![crate::broker::KafkaBatchRecord {
-                create_time_ms: None,
-                key: None,
-                headers: BTreeMap::new(),
-                payload: b"uncommitted".to_vec(),
-                value_is_null: false,
-            }],
-        };
-        let staged = {
-            let state = database.0.state.write();
-            state.broker.apply(
-                BrokerCommand::CreateTopic {
-                    project,
-                    name: "events".to_owned(),
-                    partitions: 1,
-                    retention: crate::broker::RetentionPolicy {
-                        max_age_ms: None,
-                        max_bytes: None,
-                    },
-                },
-                &database.0.segments,
-            )?;
-            state
-                .broker
-                .prestage_command_payload(&command, &database.0.segments)?
-        };
-        assert_eq!(staged.len(), 1);
-        let pin = database.0.segments.pin(&staged[0])?;
-        database.0.pending_broker_segments.lock().insert(
-            staged[0].clone(),
-            PendingBrokerSegment {
-                _pin: pin,
-                owners: BTreeSet::from([Uuid::new_v4()]),
-            },
-        );
-        database
-            .0
-            .retired_broker_segments
-            .lock()
-            .insert(staged[0].clone());
-        assert_eq!(database.0.segments.immutable_file_names()?.len(), 1);
-        assert_eq!(database.reclaim_payload_storage()?, 0);
-        assert_eq!(database.0.segments.immutable_file_names()?.len(), 1);
-        database.0.pending_broker_segments.lock().clear();
-        assert_eq!(database.reclaim_payload_storage()?, 1);
-        assert!(database.0.segments.immutable_file_names()?.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn database_snapshot_keeps_broker_payload_as_verified_attachment() -> Result<()> {
-        let source_directory = tempfile::tempdir()?;
-        let identity = NodeIdentity::generate_genesis().public();
-        let database = Database::open_backend(
-            source_directory.path(),
-            4 * 1024 * 1024,
-            Duration::from_secs(1),
-            identity,
-        )?;
-        let project = ProjectId::random();
-        let bookmark = Bookmark { term: 3, index: 17 };
-        let payload = vec![0x6d; 1024 * 1024 + 257];
-        {
-            let mut state = database.0.state.write();
-            state.applied = bookmark;
-            state.broker.apply(
-                BrokerCommand::CreateTopic {
-                    project,
-                    name: "events".to_owned(),
-                    partitions: 1,
-                    retention: crate::broker::RetentionPolicy {
-                        max_age_ms: None,
-                        max_bytes: None,
-                    },
-                },
-                &database.0.segments,
-            )?;
-            state.broker.apply(
-                BrokerCommand::PublishKafkaBatch {
-                    project,
-                    topic: "events".to_owned(),
-                    partition: 0,
-                    resolved_time_ms: 10,
-                    records: vec![crate::broker::KafkaBatchRecord {
-                        create_time_ms: None,
-                        key: None,
-                        headers: BTreeMap::new(),
-                        payload: payload.clone(),
-                        value_is_null: false,
-                    }],
-                },
-                &database.0.segments,
-            )?;
-        }
-        database.publish_reader_registry(&database.0.state.read());
-
-        let state_path = source_directory.path().join("database.snapshot");
-        let snapshot = build_database_snapshot_file(&database, bookmark, &state_path)?;
-        assert_eq!(snapshot.attachments.len(), 1);
-        assert!(snapshot.state_bytes < payload.len() as u64);
-        assert_eq!(
-            fs::metadata(&snapshot.attachments[0].path)?.len(),
-            snapshot.attachments[0].bytes
-        );
-
-        let restored_directory = tempfile::tempdir()?;
-        let restored = Database::open_backend(
-            restored_directory.path(),
-            4 * 1024 * 1024,
-            Duration::from_secs(1),
-            identity,
-        )?;
-        let orphan = restored.0.segments.write_immutable(
-            SegmentFamily::Catalog,
-            None,
-            &[SegmentRecord {
-                kind: 99,
-                payload: b"crash-leftover".to_vec(),
-            }],
-        )?;
-        install_database_snapshot_file(&restored, bookmark, &snapshot)?;
-        assert_eq!(restored.bookmark(), bookmark);
-        let state = restored.0.state.read();
-        state
-            .broker
-            .validate_payload_segments(&restored.0.segments)?;
-        let fetched = state.broker.fetch_partition(
-            project,
-            "events",
-            0,
-            0,
-            payload.len() + 4096,
-            &restored.0.segments,
-        )?;
-        assert_eq!(fetched.len(), 1);
-        assert_eq!(fetched[0].1.payload.as_ref(), payload.as_slice());
-        drop(state);
-        let live = restored.0.state.read().broker.payload_segments()[0]
-            .file_name
-            .clone();
-        assert_ne!(live, orphan.file_name);
-        assert!(
-            restored
-                .0
-                .segments
-                .immutable_file_names()?
-                .contains(&orphan.file_name)
-        );
-        assert_eq!(restored.reclaim_payload_storage()?, 1);
-        let files = restored.0.segments.immutable_file_names()?;
-        assert!(files.contains(&live));
-        assert!(!files.contains(&orphan.file_name));
-        restored
-            .0
-            .state
-            .read()
-            .broker
-            .validate_payload_segments(&restored.0.segments)?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn standalone_snapshot_recovers_live_broker_payloads() -> Result<()> {
-        let source_directory = tempfile::tempdir()?;
-        let snapshot_directory = tempfile::tempdir()?;
-        let identity = NodeIdentity::generate_genesis().public();
-        let database = Database::open_backend(
-            source_directory.path(),
-            4 * 1024 * 1024,
-            Duration::from_secs(1),
-            identity,
-        )?;
-        let project = ProjectId::random();
-        let bookmark = Bookmark { term: 1, index: 1 };
-        let payload = b"internal arrival".to_vec();
-        {
-            let mut state = database.0.state.write();
-            state.applied = bookmark;
-            state.broker.apply(
-                BrokerCommand::CreateTopic {
-                    project,
-                    name: "channel.events".to_owned(),
-                    partitions: 1,
-                    retention: crate::broker::RetentionPolicy {
-                        max_age_ms: None,
-                        max_bytes: None,
-                    },
-                },
-                &database.0.segments,
-            )?;
-            state.broker.apply(
-                BrokerCommand::PublishKafkaBatch {
-                    project,
-                    topic: "channel.events".to_owned(),
-                    partition: 0,
-                    resolved_time_ms: 1,
-                    records: vec![crate::broker::KafkaBatchRecord {
-                        create_time_ms: None,
-                        key: None,
-                        headers: BTreeMap::new(),
-                        payload: payload.clone(),
-                        value_is_null: false,
-                    }],
-                },
-                &database.0.segments,
-            )?;
-        }
-        database.publish_reader_registry(&database.0.state.read());
-
-        assert_eq!(
-            database
-                .standalone_snapshot(snapshot_directory.path())
-                .await?,
-            bookmark
-        );
-
-        let restored_directory = tempfile::tempdir()?;
-        let restored = Database::open_backend(
-            restored_directory.path(),
-            4 * 1024 * 1024,
-            Duration::from_secs(1),
-            identity,
-        )?;
-        assert_eq!(
-            restored
-                .standalone_recover(snapshot_directory.path())
-                .await?,
-            Some(bookmark)
-        );
-        let state = restored.0.state.read();
-        let records = state.broker.fetch_partition(
-            project,
-            "channel.events",
-            0,
-            0,
-            4096,
-            &restored.0.segments,
-        )?;
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].1.payload.as_ref(), payload.as_slice());
-        Ok(())
-    }
-
     #[tokio::test]
     async fn standalone_broker_publish_consumes_its_once_materialized_payload() -> Result<()> {
         let directory = tempfile::tempdir()?;
@@ -10408,14 +9123,13 @@ mod project_lifecycle_tests {
         let reservation = database
             .reserve_command(&command, Bookmark { term: 2, index: 11 })
             .await?;
-        assert!(!reservation.may_release_after_append());
-        let retained = database.0.pending_broker_segments.lock().len();
+        assert!(!reservation.may_pipeline());
+        assert!(database.0.segments.immutable_file_names()?.is_empty());
         assert!(database.0.state.read().broker.payload_segments().is_empty());
         database
             .complete_command_reservation(reservation, CommandReservationOutcome::Rejected)
             .await?;
-        assert!(database.0.pending_broker_segments.lock().is_empty());
-        assert_eq!(database.0.retired_broker_segments.lock().len(), retained);
+        assert!(database.0.segments.immutable_file_names()?.is_empty());
         Ok(())
     }
 
@@ -11611,14 +10325,14 @@ mod project_lifecycle_tests {
         Ok(())
     }
 
-    fn wal_test_project_entry(index: u64) -> Result<(ProjectId, MutationEntry)> {
+    fn record_test_project_entry(index: u64) -> Result<(ProjectId, MutationEntry)> {
         let id = ProjectId::random();
         let payload = encode_database_value(
             &DatabaseMutation::CreateProject {
                 id,
-                display_name: format!("wal-project-{index}"),
+                display_name: format!("record-project-{index}"),
             },
-            "wal test create project",
+            "record test create project",
         )?;
         let entry = MutationEntry::new(
             1,
@@ -11633,46 +10347,128 @@ mod project_lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn standalone_snapshot_recovers_committed_writes_after_restart() -> Result<()> {
+    async fn redb_restores_committed_project_records_without_replay() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let snapshot_dir = directory.path().join("standalone-snapshots");
-        // The same node identity across both lifetimes — a snapshot is bound to its store ID.
         let identity = NodeIdentity::generate_genesis().public();
         let entries = (1..=3)
-            .map(wal_test_project_entry)
+            .map(record_test_project_entry)
             .collect::<Result<Vec<_>>>()?;
-
-        // First lifetime: commit three project creates, take a periodic-style snapshot, then drop.
         {
+            let database =
+                Database::open_backend(directory.path(), usize::MAX, Duration::ZERO, identity)?;
+            for (_, entry) in &entries {
+                let applied = database.apply_mutation(entry).await?;
+                database.persist(&[applied
+                    .persistence
+                    .ok_or_else(|| Error::internal("missing durable batch"))?])?;
+            }
+        }
+        let database =
+            Database::open_backend(directory.path(), usize::MAX, Duration::ZERO, identity)?;
+        assert_eq!(database.bookmark().index, 3);
+        for (id, _) in entries {
+            assert!(database.0.state.read().projects.contains_key(&id));
+        }
+        assert!(directory.path().join("database.redb").is_file());
+        assert_eq!(std::fs::read_dir(directory.path())?.count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue_retirement_removes_durable_payload_records() -> Result<()> {
+        for retirement in 0..3 {
+            let directory = tempfile::tempdir()?;
             let database = Database::open_backend(
                 directory.path(),
-                2 * 1024 * 1024,
-                Duration::from_secs(1),
-                identity,
+                usize::MAX,
+                Duration::ZERO,
+                NodeIdentity::generate_genesis().public(),
             )?;
-            for (_, entry) in &entries {
-                database.apply_mutation(entry).await?;
+            let (project, entry) = record_test_project_entry(1)?;
+            let applied = database.apply_mutation(&entry).await?;
+            database.persist(&[applied.persistence.expect("project batch")])?;
+            let owner = Uuid::new_v4();
+            let commands = [
+                BrokerCommand::CreateQueue {
+                    project,
+                    name: "retiring".into(),
+                    kind: QueueKind::Classic,
+                    durable: true,
+                    passive: false,
+                    dead_letter_exchange: None,
+                    dead_letter_routing_key: None,
+                    retention: RetentionPolicy {
+                        max_age_ms: None,
+                        max_bytes: None,
+                    },
+                    exclusive_owner: (retirement == 2).then_some(owner),
+                    auto_delete: retirement == 1,
+                },
+                BrokerCommand::RegisterConsumer {
+                    project,
+                    queue: "retiring".into(),
+                    owner,
+                    consumer: 1,
+                },
+                BrokerCommand::PublishAmqp {
+                    project,
+                    exchange: String::new(),
+                    routing_key: "retiring".into(),
+                    mandatory: true,
+                    resolved_time_ms: 1,
+                    properties: BTreeMap::new(),
+                    headers: BTreeMap::new(),
+                    payload: vec![42; 4096],
+                },
+                match retirement {
+                    0 => BrokerCommand::DeleteQueue {
+                        project,
+                        name: "retiring".into(),
+                        if_unused: false,
+                        if_empty: false,
+                    },
+                    1 => BrokerCommand::UnregisterConsumer {
+                        project,
+                        queue: "retiring".into(),
+                        owner,
+                        consumer: 1,
+                    },
+                    _ => BrokerCommand::ReleaseConnection { project, owner },
+                },
+            ];
+            for (position, command) in commands.into_iter().enumerate() {
+                let entry = MutationEntry::new(
+                    1,
+                    position as u64 + 2,
+                    MutationKind::Broker,
+                    Some(project),
+                    None,
+                    1,
+                    encode_database_value(
+                        &DatabaseMutation::Broker { command },
+                        "retirement test",
+                    )?,
+                )?;
+                let applied = database.apply_mutation(&entry).await?;
+                database.persist(&[applied.persistence.expect("broker batch")])?;
+                if position == 2 {
+                    assert!(
+                        database
+                            .0
+                            .records
+                            .next_after(b"\xffpayload/", None)?
+                            .is_some(),
+                        "publish must persist payload bytes"
+                    );
+                }
             }
-            assert_eq!(database.bookmark().index, 3);
-            database.standalone_snapshot(&snapshot_dir).await?;
-        }
-
-        // Second lifetime: a fresh backend recovers from the snapshot alone — no journal.
-        let database = Database::open_backend(
-            directory.path(),
-            2 * 1024 * 1024,
-            Duration::from_secs(1),
-            identity,
-        )?;
-        assert_eq!(database.bookmark().index, 0);
-        let recovered = database.standalone_recover(&snapshot_dir).await?;
-        assert_eq!(recovered.map(|bookmark| bookmark.index), Some(3));
-        assert_eq!(database.bookmark().index, 3);
-        let state = database.0.state.read();
-        for (id, _) in &entries {
             assert!(
-                state.projects.contains_key(id),
-                "committed project {id:?} was not recovered from the snapshot"
+                database
+                    .0
+                    .records
+                    .next_after(b"\xffpayload/", None)?
+                    .is_none(),
+                "retirement {retirement} must delete payload bytes"
             );
         }
         Ok(())

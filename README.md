@@ -30,7 +30,7 @@
 
 Projects isolate graphs and indexes. `OBSERVED`, `KNOWLEDGE`, and `WORKSPACE` distinguish source,
 curated, and provisional data. Embedded and standalone deployments share transactions,
-write-ahead logging, recovery, and snapshots. The standalone distribution includes a web console,
+asynchronous persistence and recovery. The standalone distribution includes a web console,
 Bolt, an HTTP Query API, and local MCP over stdio or Streamable HTTP.
 
 ## Performance

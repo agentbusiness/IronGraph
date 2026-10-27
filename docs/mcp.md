@@ -97,7 +97,7 @@ REQUIRE document.id IS UNIQUE
 
 The host can now call `irongraph_save_document` with project `memory`. Supplying the same
 `document_id` updates that document. Omitting it creates a new UUID. Document bodies remain ordinary
-graph properties and follow the normal WAL and snapshot durability path.
+graph properties and follow the normal asynchronous durability path.
 
 ## Search by meaning
 

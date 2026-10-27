@@ -5017,7 +5017,7 @@ mod tests {
             })
         }
 
-        fn snapshot(&self) -> Result<super::super::engine::BrokerStateMachine> {
+        fn canonical_state(&self) -> Result<super::super::engine::BrokerStateMachine> {
             Ok(self.broker.lock().clone())
         }
 
@@ -5121,7 +5121,7 @@ mod tests {
             })
         }
 
-        fn snapshot(&self) -> Result<super::super::engine::BrokerStateMachine> {
+        fn canonical_state(&self) -> Result<super::super::engine::BrokerStateMachine> {
             Ok(super::super::engine::BrokerStateMachine::default())
         }
 

@@ -21,7 +21,7 @@ Application
                   |-- Cypher query and administration surface
                   |-- CPU graph and independent text inference device
                   |-- Graph, temporal, text, and vector indexes
-                  `-- Canonical WAL and periodic snapshots
+                  `-- Asynchronous incremental record persistence
                          |
                 Caller-selected data directory
 ```
@@ -103,16 +103,22 @@ device memory for the encoder and its working allocations.
 ## Transactions and durability
 
 Graph writes, index declarations, temporal declarations, and supported administration changes use
-the database transaction and durability path. Committed changes are recorded in the canonical
-write-ahead log. Periodic snapshots bound recovery work, and clean embedded shutdown creates a
-snapshot before releasing the database.
+the database transaction and durability path. Accepted changes are published in the canonical
+in-memory graph and persisted asynchronously as incremental atomic record batches in one database
+file. Recovery restores committed records. Clean shutdown drains pending persistence before
+releasing the database directory.
 
-WAL durability is asynchronous. Applications that coordinate dependent work should retain and use
+Pending changes normally coalesce for about one second before disk persistence starts. A mutation
+arms this window; an idle database does not poll for changes. In-memory graph reads and writes do
+not wait for disk commits. An explicit embedded flush waits for its requested durability boundary
+while later graph operations continue. Flush and close report persistence errors.
+
+Durability is asynchronous. Applications that coordinate dependent work should retain and use
 the bookmark returned with a result where the client surface supports bookmarks. Treat the database
 directory as one unit for storage, backup, and access control; do not share it between processes.
 
 Documents are normal graph nodes, for example `(:Document {body: ...})`. Their source text remains
-on the owning node and follows the same WAL and snapshot path as other graph data. There is no
+on the owning node and follows the same asynchronous persistence path as other graph data. There is no
 document-specific store or REST endpoint.
 
 ## Derived indexes and text embedding

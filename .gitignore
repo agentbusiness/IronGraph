@@ -22,7 +22,6 @@ pnpm-debug.log*
 /data.*
 node-identity.bin
 .node-process.lock
-standalone-snapshots/
 
 # Environment and credentials
 .env

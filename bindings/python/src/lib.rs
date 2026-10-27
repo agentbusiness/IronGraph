@@ -342,17 +342,7 @@ impl EmbeddedDatabase {
             true,
         )
     }
-    fn snapshot_async<'py>(slf: PyRef<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        async_call(
-            py,
-            slf.into_pyobject(py)?.into_any(),
-            "snapshot",
-            PyTuple::empty(py),
-            PyDict::new(py),
-            None,
-            true,
-        )
-    }
+
     fn status_async<'py>(slf: PyRef<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         async_call(
             py,
@@ -511,21 +501,6 @@ impl EmbeddedDatabase {
                 .map_err(python_error)
         })?;
         python_query_result(py, result)
-    }
-
-    fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let bookmark = py.detach(|| {
-            let guard = self
-                .database
-                .read()
-                .map_err(|_| PyRuntimeError::new_err("embedded database lock is poisoned"))?;
-            guard
-                .as_ref()
-                .ok_or_else(|| PyRuntimeError::new_err("embedded database is closed"))?
-                .snapshot()
-                .map_err(python_error)
-        })?;
-        pythonize::pythonize(py, &bookmark).map_err(python_error)
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {

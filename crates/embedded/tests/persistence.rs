@@ -129,63 +129,129 @@ fn caller_selected_directory_persists_across_clean_reopen() -> Result<(), Box<dy
     Ok(())
 }
 
+fn assert_record_files_only(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    assert!(!root.join("write").exists());
+    assert!(!root.join("standalone-snapshots").exists());
+    let directory = root.join("database");
+    let names = std::fs::read_dir(directory)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    assert_eq!(names, [std::ffi::OsString::from("database.redb")]);
+    Ok(())
+}
+
 #[test]
-fn snapshot_maintenance_compacts_the_standalone_wal() -> Result<(), Box<dyn std::error::Error>> {
+fn current_records_restore_indexes_and_large_untouched_properties()
+-> Result<(), Box<dyn std::error::Error>> {
     let _guard = test_guard();
     let directory = tempfile::tempdir()?;
-    let interval = std::time::Duration::from_millis(250);
     let options = || {
-        let mut options = EmbeddedOptions::new(directory.path())
+        EmbeddedOptions::new(directory.path())
             .with_execution_device(ExecutionDevice::Cpu)
-            .with_embedding_policy(EmbeddingPolicy::Disabled);
-        options.snapshot_interval = interval;
-        options
+            .with_embedding_policy(EmbeddingPolicy::Disabled)
     };
-    let wal_path = directory.path().join("write").join("standalone.wal");
-
     let database = EmbeddedDatabase::open(options())?;
     database.query(Query::new("CREATE PROJECT app"))?;
-
-    // Several write bursts spread across snapshot intervals; retaining every burst would keep the
-    // WAL at least as large as the total payload.
-    let payload = "x".repeat(2_048);
-    let mut total_payload_bytes = 0u64;
-    for round in 0..3u32 {
-        for item in 0..50u32 {
-            database.query(Query::new(format!(
-                "USE app CREATE (:Item {{round: {round}, item: {item}, payload: '{payload}'}})"
-            )))?;
-            total_payload_bytes += payload.len() as u64;
-        }
-        std::thread::sleep(interval * 2);
+    let body = "unaltered source text ".repeat(16_384);
+    for id in 0..16 {
+        database.query(Query::new(format!(
+            "USE app CREATE (:Item {{id: {id}, revision: 0, body: '{body}'}})"
+        )))?;
     }
-
-    // A snapshot at the latest bookmark plus one further write lets the next maintenance tick
-    // compact the WAL through that snapshot, whatever the earlier snapshot cadence was.
-    database.snapshot()?;
-    database.query(Query::new("USE app CREATE (:Item {round: 3, item: 0})"))?;
-
-    let bound = total_payload_bytes / 4;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let mut wal_bytes = u64::MAX;
-    while std::time::Instant::now() < deadline {
-        wal_bytes = std::fs::metadata(&wal_path)?.len();
-        if wal_bytes < bound {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    database.query(Query::new(
+        "USE app CREATE INDEX item_id FOR (n:Item) ON (n.id)",
+    ))?;
+    database.flush()?;
+    let initial = std::fs::metadata(directory.path().join("database/database.redb"))?.len();
+    for revision in 1..=100 {
+        database.query(Query::new(format!(
+            "USE app MATCH (n:Item {{id: 0}}) SET n.revision = {revision}"
+        )))?;
     }
+    database.query(Query::new("USE app MATCH (n:Item {id: 1}) DETACH DELETE n"))?;
+    database.query(Query::new(
+        "USE app CREATE (:Item {id: 99, revision: 7, body: 'replacement'})",
+    ))?;
+    database.flush()?;
+    let after = std::fs::metadata(directory.path().join("database/database.redb"))?.len();
     assert!(
-        wal_bytes < bound,
-        "standalone WAL held {wal_bytes} bytes after {total_payload_bytes} payload bytes and repeated snapshots"
+        after < initial * 3,
+        "tiny updates repeatedly expanded the complete persisted graph"
+    );
+    assert_record_files_only(directory.path())?;
+    database.close()?;
+    let database = EmbeddedDatabase::open(options())?;
+    let result = database.query(Query::new(
+        "USE app MATCH (n:Item {id: 0}) RETURN n.revision, n.body",
+    ))?;
+    assert!(
+        matches!(result.rows[0].as_slice(), [TypedValue::Integer(revision), TypedValue::String(text)] if revision == "100" && text == &body)
+    );
+    let result = database.query(Query::new("USE app MATCH (n:Item {id: 1}) RETURN n"))?;
+    assert!(result.rows.is_empty());
+    let result = database.query(Query::new(
+        "USE app MATCH (n:Item {id: 99}) RETURN n.revision",
+    ))?;
+    assert!(
+        matches!(result.rows[0].as_slice(), [TypedValue::Integer(revision)] if revision == "7")
     );
     database.close()?;
+    assert_record_files_only(directory.path())?;
+    Ok(())
+}
 
-    // Compaction may only drop entries the retained snapshots already cover.
-    let reopened = EmbeddedDatabase::open(options())?;
-    let result = reopened.query(Query::new("USE app MATCH (n:Item) RETURN n.item AS item"))?;
-    assert_eq!(result.rows.len(), 151);
-    reopened.close()?;
+#[test]
+fn durable_records_recover_after_killed_process_without_close()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{BufRead, Write};
+    const CHILD_DIRECTORY: &str = "IRONGRAPH_RECORD_CRASH_DIRECTORY";
+    let options = |path: &std::path::Path| {
+        EmbeddedOptions::new(path)
+            .with_execution_device(ExecutionDevice::Cpu)
+            .with_embedding_policy(EmbeddingPolicy::Disabled)
+    };
+    if let Some(directory) = std::env::var_os(CHILD_DIRECTORY) {
+        let database = EmbeddedDatabase::open(options(std::path::Path::new(&directory)))?;
+        database.query(Query::new("CREATE PROJECT app"))?;
+        database.query(Query::new("USE app CREATE (:Item {value: 1})"))?;
+        database.query(Query::new("USE app MATCH (n:Item) SET n.value = 2"))?;
+        database.flush()?;
+        println!("durable-records-ready");
+        std::io::stdout().flush()?;
+        loop {
+            std::thread::park();
+        }
+    }
+    let _guard = test_guard();
+    let directory = tempfile::tempdir()?;
+    let mut child = std::process::Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "durable_records_recover_after_killed_process_without_close",
+            "--nocapture",
+        ])
+        .env(CHILD_DIRECTORY, directory.path())
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    let output = child.stdout.take().ok_or("missing child output")?;
+    let mut ready = false;
+    for line in std::io::BufReader::new(output).lines() {
+        if line?.contains("durable-records-ready") {
+            ready = true;
+            break;
+        }
+    }
+    if !ready {
+        let status = child.wait()?;
+        return Err(format!("child exited before durability: {status}").into());
+    }
+    child.kill()?;
+    child.wait()?;
+    let database = EmbeddedDatabase::open(options(directory.path()))?;
+    let result = database.query(Query::new("USE app MATCH (n:Item) RETURN n.value"))?;
+    assert!(matches!(result.rows[0].as_slice(), [TypedValue::Integer(value)] if value == "2"));
+    database.close()?;
+    assert_record_files_only(directory.path())?;
     Ok(())
 }
 

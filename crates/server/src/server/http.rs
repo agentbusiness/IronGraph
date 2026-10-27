@@ -23,11 +23,11 @@ use super::{
     },
 };
 use crate::{
-    Bookmark, CommitAcknowledgement, Error, ErrorCode, ProjectId, Result,
+    CommitAcknowledgement, Error, ErrorCode, ProjectId, Result,
     broker::{BrokerCommand, BrokerCoordinator, QueueServer, StreamServer},
     config::Config,
     engine::{
-        ExecutionClass, SingleNodeBootstrapConfig, WriteStorageLimits, load_existing_node_identity,
+        ExecutionClass, SingleNodeBootstrapConfig, load_existing_node_identity,
         load_or_generate_genesis_identity, open_standalone,
     },
     protocol::{BoltServer, QueryExecutor, QueryRequest, QueryStreamEvent, ndjson_channel},
@@ -133,11 +133,6 @@ async fn run_with_startup(
     let bootstrap_options = SingleNodeBootstrapConfig {
         execution_class: ExecutionClass::Cpu,
         startup_timeout: config.startup_timeout(),
-        storage_limits: WriteStorageLimits {
-            max_log_record_bytes: usize::MAX,
-            max_log_entries_per_read: 4_096,
-            max_snapshot_bytes: usize::MAX,
-        },
     };
     let max_write_bytes = usize::MAX;
     let request_timeout = config.request_timeout();
@@ -157,33 +152,6 @@ async fn run_with_startup(
     boot.backend()
         .bind_runtime(Arc::downgrade(boot.runtime()))?;
     let database = boot.backend().as_ref().clone();
-
-    let snapshot_directory = config.data_dir.join("standalone-snapshots");
-    let recovered = database.standalone_recover(&snapshot_directory).await?;
-    // The snapshot restores a prefix of the committed history; mutations written after it exist
-    // only in the standalone WAL. Replaying must finish before any listener or maintenance task
-    // can submit new writes, or the first write reuses an index the WAL already holds and the
-    // durable write path shuts down.
-    let replayed = boot.runtime().replay_standalone_wal().await?;
-    if let Some(bookmark) = recovered {
-        tracing::info!(
-            index = bookmark.index,
-            replayed_through = replayed.index,
-            "recovered standalone snapshot and WAL"
-        );
-    } else if replayed != Bookmark::default() {
-        tracing::info!(
-            replayed_through = replayed.index,
-            "replayed standalone WAL without a snapshot"
-        );
-    }
-
-    let snapshot_task = spawn_snapshot_maintenance(
-        database.clone(),
-        Arc::clone(boot.runtime()),
-        snapshot_directory,
-        shutdown.clone(),
-    );
 
     let broker_project = config.broker_project.map(ProjectId);
     if let Some(project) = broker_project {
@@ -394,8 +362,6 @@ async fn run_with_startup(
             tracing::warn!(%error, "server component did not shut down cleanly");
         }
     }
-    snapshot_task.abort();
-    let _ = snapshot_task.await;
     let embedding_shutdown = database.shutdown_embedding_jobs().await;
     outcome
         .and(embedding_shutdown)
@@ -779,43 +745,6 @@ async fn bind_remote_listener(
     ))
 }
 
-fn spawn_snapshot_maintenance(
-    database: Database,
-    runtime: Arc<crate::engine::WriteRuntime>,
-    directory: std::path::PathBuf,
-    shutdown: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let interval = Duration::from_secs(30);
-        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut last = None;
-        loop {
-            tokio::select! {
-                () = shutdown.cancelled() => break,
-                _ = ticker.tick() => {
-                    if last == Some(database.bookmark().index) { continue; }
-                    match database.standalone_snapshot(&directory).await {
-                        Ok(bookmark) => match database.standalone_wal_compaction_bookmark(&directory, bookmark).await {
-                            Ok(prefix) if prefix != Bookmark::default() => {
-                                let runtime = Arc::clone(&runtime);
-                                match tokio::task::spawn_blocking(move || runtime.compact_wal_through(prefix)).await {
-                                    Ok(Ok(())) => last = Some(bookmark.index),
-                                    Ok(Err(error)) => tracing::warn!(code = ?error.code, message = %error.message, "WAL compaction failed"),
-                                    Err(error) => tracing::warn!(%error, "WAL compaction task failed"),
-                                }
-                            }
-                            Ok(_) => last = Some(bookmark.index),
-                            Err(error) => tracing::warn!(code = ?error.code, message = %error.message, "snapshot prefix selection failed"),
-                        },
-                        Err(error) => tracing::warn!(code = ?error.code, message = %error.message, "periodic snapshot failed"),
-                    }
-                }
-            }
-        }
-    })
-}
-
 async fn broker_retention(
     broker: Arc<dyn BrokerCoordinator>,
     interval: Duration,
@@ -829,7 +758,6 @@ async fn broker_retention(
             _ = ticker.tick() => {
                 let coordinator = Arc::clone(&broker);
                 let outcome = tokio::task::spawn_blocking(move || {
-                    coordinator.reclaim_payload_storage()?;
                     let resolved_time_ms = chrono::Utc::now().timestamp_millis();
                     for project in coordinator.projects_with_state()? {
                         coordinator.submit(

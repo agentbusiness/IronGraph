@@ -2670,7 +2670,7 @@ checksum = "6a756c3fac73139e83f14c2d742155dd2b78d3ee56597b419a0579b7bdd6dd78"
 
 [[package]]
 name = "irongraph"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2706,7 +2706,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-artifact-loader"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -2717,7 +2717,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-client"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "axum",
  "chrono",
@@ -2738,7 +2738,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-cypher"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "blake3",
  "chrono",
@@ -2763,7 +2763,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-embedded"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "irongraph-client",
  "irongraph-server",
@@ -2780,7 +2780,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-embedding"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "blake3",
  "candle-core",
@@ -2808,7 +2808,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-execution"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "blake3",
  "chrono",
@@ -2826,7 +2826,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-ffi"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "irongraph-client",
  "irongraph-embedded",
@@ -2837,7 +2837,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-gpu"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "blake3",
  "block2",
@@ -2860,7 +2860,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-graph"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "arc-swap",
  "bitflags 2.13.1",
@@ -2883,7 +2883,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-mcp"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "axum",
@@ -2900,7 +2900,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-node"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "irongraph-client",
  "irongraph-embedded",
@@ -2915,7 +2915,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-python"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "irongraph-client",
  "irongraph-embedded",
@@ -2930,7 +2930,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-server"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2998,16 +2998,15 @@ dependencies = [
 
 [[package]]
 name = "irongraph-storage"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "blake3",
- "crc32c",
- "crc32fast",
  "hex",
  "irongraph-types",
  "libc",
  "parking_lot",
  "postcard",
+ "redb",
  "serde",
  "tempfile",
  "uuid",
@@ -3015,7 +3014,7 @@ dependencies = [
 
 [[package]]
 name = "irongraph-types"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "ordered-float",
  "serde",
@@ -4634,6 +4633,15 @@ name = "reborrow"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03251193000f4bd3b042892be858ee50e8b3719f2b08e5833ac4353724632430"
+
+[[package]]
+name = "redb"
+version = "4.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39178e0a867f9e3eaa6292a4ab1dd3613f2519c5b564341e1e7b29b270736cc4"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "redox_syscall"

@@ -240,12 +240,12 @@ fn crash_child() -> Result<(), Box<dyn std::error::Error>> {
         Default::default(),
     )?;
     database.flush()?;
-    // Exit without destructors, snapshots, or runtime close. Recovery must read the flushed WAL.
+    // Exit without destructors or runtime close. Recovery must read the flushed records.
     std::process::exit(86);
 }
 
 #[test]
-fn flushed_wal_survives_abrupt_host_exit_and_directory_lock_is_exclusive()
+fn flushed_records_survive_abrupt_host_exit_and_directory_lock_is_exclusive()
 -> Result<(), Box<dyn std::error::Error>> {
     let _guard = NATIVE_TESTS.lock().unwrap();
     let directory = tempfile::tempdir()?;

@@ -19,7 +19,7 @@ use super::{
 
 #[path = "concurrent_temporal.rs"]
 mod concurrent_temporal;
-pub use concurrent_temporal::TemporalStore;
+pub use concurrent_temporal::{TemporalPersistenceSelection, TemporalStore};
 
 /// Declared scalar type of a temporal property.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

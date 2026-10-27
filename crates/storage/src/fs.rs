@@ -1,7 +1,7 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use uuid::Uuid;
@@ -12,11 +12,9 @@ use irongraph_types::{Error, ErrorCode, Result};
 ///
 /// On Apple platforms `fsync(2)` returns once the data reaches the drive and deliberately does not
 /// wait for the drive to flush its own volatile write cache; only `fcntl(F_FULLFSYNC)` does. Every
-/// completed WAL fsync and snapshot publication is built on this call, so the durability boundary
-/// would otherwise be vulnerable to sudden power loss on the primary platform.
+/// completed identity and directory publication uses this barrier.
 ///
-/// Every durability-critical write in the storage, WAL, and snapshot paths goes through this
-/// one function so the platform difference is stated and handled in a single place.
+/// The transactional record engine uses Rust's equivalent file-content barrier internally.
 pub fn sync_durable(file: &File) -> Result<()> {
     #[cfg(target_vendor = "apple")]
     {
@@ -35,6 +33,7 @@ pub fn sync_durable(file: &File) -> Result<()> {
 /// semantics — the log writer extends a file whose metadata it does not depend on, and skipping the
 /// inode update is worth real throughput. `F_FULLFSYNC` has no data-only variant, so on Apple this
 /// is the same call; the distinction is preserved for every other platform.
+#[cfg(test)]
 pub(crate) fn sync_durable_data(file: &File) -> Result<()> {
     #[cfg(target_vendor = "apple")]
     {
@@ -196,17 +195,6 @@ fn sync_directory(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
-}
-
-pub fn temporary_path(path: &Path) -> Result<PathBuf> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| Error::invalid_data("durable file has no parent directory"))?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| Error::invalid_data("durable file name is not valid UTF-8"))?;
-    Ok(parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4())))
 }
 
 #[cfg(test)]

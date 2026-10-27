@@ -3,7 +3,7 @@
 Embedding runs IronGraph in the same process as your application. It is designed for software that
 owns the database lifecycle and benefits from local calls without a network service.
 
-The embedded database has the same project, layer, Cypher, transaction, WAL, snapshot, index, text
+The embedded database has the same project, layer, Cypher, transaction, persistence, index, text
 embedding, and execution-device semantics as the standalone instance.
 
 Native queries and stream append/fetch execute inside your process. Opening an embedded database
@@ -75,14 +75,15 @@ is cooperative. A stream append cancelled before dispatch is rejected; after dis
 for the authoritative result or deadline. A dispatched write that times out has an uncertain
 outcome and must not be retried automatically.
 
-Acknowledgements mean the mutation has been published in memory. WAL persistence is asynchronous;
+Acknowledgements mean the mutation has been published in memory. Persistence is asynchronous;
 an abrupt process or host failure can lose recently acknowledged mutations that have not reached
 durable storage. Call `flush` to make earlier acknowledged writes durable while keeping the handle
-open. Explicit `close` drains and joins the WAL workers, establishes the final durable
+open. Explicit `close` drains and joins the persistence workers, establishes the final durable
 boundary, and releases directory ownership. Independent query and stream calls are not one atomic
 transaction. Always observe errors from explicit close.
 
-Runtime options include `worker_threads` and `snapshot_interval_ms`.
+Runtime options include `worker_threads`. Persistence writes incremental atomic batches in the background;
+there is no periodic whole-database save or write-ahead log.
 
 ## Keep embedding files with your application
 
@@ -251,7 +252,7 @@ Expected output:
 [[{ type: 'string', value: 'Trail camera' }]]
 ```
 
-Call `close` during orderly shutdown so IronGraph can complete its snapshot and release the data
+Call `close` during orderly shutdown so IronGraph can finish persisting accepted writes and release the data
 directory.
 
 ## Select a text inference device
@@ -280,7 +281,7 @@ language model or falls back to an external inference service.
 - Keep the database object open for the owning process lifetime.
 - Do not share the directory with another process or embedded instance.
 - Use parameters for application values.
-- Call `snapshot` when the application needs an explicit snapshot boundary.
+- Call `flush` when earlier accepted writes must be durable before continuing.
 - Close the database and wait for completion during graceful shutdown.
 - Back up and restore the complete directory as one unit.
 

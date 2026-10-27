@@ -214,7 +214,6 @@ pub struct EmbeddedOptions {
     pub execution_device: ExecutionDevice,
     pub embedding_device: EmbeddingDevice,
     pub embedding_policy: EmbeddingPolicy,
-    pub snapshot_interval_ms: Option<u64>,
     pub worker_threads: Option<usize>,
 }
 impl EmbeddedOptions {
@@ -226,7 +225,6 @@ impl EmbeddedOptions {
             execution_device: ExecutionDevice::Auto,
             embedding_device: EmbeddingDevice::Auto,
             embedding_policy: EmbeddingPolicy::Automatic,
-            snapshot_interval_ms: None,
             worker_threads: None,
         }
     }
@@ -265,7 +263,7 @@ impl EmbeddedOptions {
         };
         json!({"data_dir":self.data_dir,"model_dir":self.model_dir,"embedding_cache_dir":self.embedding_cache_dir,"execution_device":device,"device_ordinal":ordinal,"embedding_policy":self.embedding_policy,
             "embedding_device":embedding_device,"embedding_device_ordinal":embedding_ordinal,
-            "snapshot_interval_ms":self.snapshot_interval_ms,"worker_threads":self.worker_threads})
+            "worker_threads":self.worker_threads})
     }
 }
 
@@ -730,13 +728,6 @@ impl EmbeddedDatabase {
         })
         .await
     }
-    pub async fn snapshot_async(&self) -> Result<Bookmark> {
-        let handle = self.0.0;
-        blocking(None, true, move || {
-            decode(json!({"action":"snapshot","handle":handle}))
-        })
-        .await
-    }
     pub async fn flush_async(&self) -> Result<()> {
         let handle = self.0.0;
         blocking(None, true, move || {
@@ -783,9 +774,6 @@ impl EmbeddedDatabase {
     }
     pub fn cancel(&self, operation_id: &str) -> Result<bool> {
         call_typed(json!({"action":"cancel","handle":self.0.0,"operation_id":operation_id}))
-    }
-    pub fn snapshot(&self) -> Result<Bookmark> {
-        call_typed(json!({"action":"snapshot","handle":self.0.0}))
     }
     pub fn flush(&self) -> Result<()> {
         call(json!({"action":"flush","handle":self.0.0}))?;

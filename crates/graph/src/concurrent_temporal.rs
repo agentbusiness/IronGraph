@@ -17,6 +17,10 @@ use std::{
 
 type Key = (u8, u64, PropertyId);
 
+#[path = "temporal_persistence.rs"]
+mod persistence;
+pub use persistence::TemporalPersistenceSelection;
+
 #[derive(Debug)]
 struct Column {
     declaration: ArcSwap<TemporalDeclaration>,
@@ -312,7 +316,7 @@ impl TemporalStore {
         }
         Ok(first)
     }
-    /// Pure pre-WAL validation; never publishes schema or expires samples.
+    /// Pure pre-application validation; never publishes schema or expires samples.
     pub fn validate_declare(&self, declaration: &TemporalDeclaration) -> Result<()> {
         if declaration.retention_nanos <= 0 {
             return Err(Error::new(
@@ -560,7 +564,7 @@ impl TemporalStore {
         }
         Ok(())
     }
-    /// Pure pre-WAL validation; never registers or fills a derived rollup.
+    /// Pure pre-application validation; never registers or fills a derived rollup.
     pub fn validate_create_rollup(&self, definition: &TemporalRollupDefinition) -> Result<()> {
         if definition.name.is_empty()
             || definition.name.len() > 255

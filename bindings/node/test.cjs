@@ -133,7 +133,6 @@ async function main() {
     const complete = await database.query('UNWIND [1,2,3] AS n RETURN n', projectId, null, { bookmark: append.bookmark })
     assert.equal(complete.rows.length, 3)
     await assert.rejects(database.query('CREATE (:Rejected)', projectId, null, null, { timeout_ms: 0 }))
-    await database.snapshot()
     await database.flush()
     await database.close()
 
@@ -180,7 +179,7 @@ async function main() {
           await new Promise(resolve => setTimeout(resolve, 10))
         } while (true)
         assert.equal(updated.rows[0][0].type, 'relationship')
-        await semantic.snapshot()
+        await semantic.flush()
       } finally {
         await semantic.close()
       }

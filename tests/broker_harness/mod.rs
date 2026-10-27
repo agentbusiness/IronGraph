@@ -69,7 +69,7 @@ impl BrokerCoordinator for LocalCoordinator {
         })
     }
 
-    fn snapshot(&self) -> Result<BrokerStateMachine> {
+    fn canonical_state(&self) -> Result<BrokerStateMachine> {
         Ok(self.broker.lock().clone())
     }
 

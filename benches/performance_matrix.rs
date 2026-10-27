@@ -25,12 +25,12 @@ use irongraph::{
     Bookmark, EdgeId, Layer, NodeId, ProjectId, Result, ScalarValue,
     cypher::{BindCapabilities, ExecutionContext, ExecutionOutput, QueryEngine},
     engine::{
-        BackendSnapshot, CommandReservation, ExecutionClass, MutationApplyResult,
-        MutationStateBackend, NodeIdentity, StandaloneNode, WriteCommand, WriteRequest,
-        WriteRuntime, WriteStorageLimits,
+        CommandReservation, ExecutionClass, MutationApplyResult, MutationStateBackend,
+        NodeIdentity, StandaloneNode, WriteCommand, WriteRequest, WriteRuntime,
     },
     execution::{
         ResidentGraphProcedure, ResidentGraphProcedureRequest, ResidentGraphProcedureResult,
+        graph::{GraphStore as InactiveGraphStore, TemporalStore as InactiveTemporalStore},
     },
     gpu::{CpuBackend, ExecutionBackend, ResidentProjectDelta, ResidentProjectImage},
     graph::{
@@ -39,7 +39,10 @@ use irongraph::{
         louvain_communities, page_rank, shortest_path, strongly_connected_components,
         triangle_count, weakly_connected_components,
     },
-    storage::{AdmissionClass, ConnectionId, DurableLog, MutationEntry, MutationKind},
+    storage::{
+        AdmissionClass, ConnectionId, MutationEntry, MutationKind, RecordBatch, RecordOp,
+        RecordStore,
+    },
 };
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
@@ -84,6 +87,7 @@ struct Report {
     arch: &'static str,
     cpu_model: String,
     physical_memory_bytes: Option<u64>,
+    process_memory_context: &'static str,
     metal_devices: Vec<String>,
     parallelism: usize,
     config: ReportConfig,
@@ -137,9 +141,9 @@ struct GraphIds {
     relationship: irongraph::types::RelationshipTypeId,
 }
 
-#[derive(Default)]
 struct AckBenchmarkBackend {
     applied: AtomicU64,
+    records: RecordStore,
 }
 
 #[async_trait]
@@ -159,7 +163,17 @@ impl MutationStateBackend for AckBenchmarkBackend {
                 "ack benchmark observed a mutation-order gap",
             ));
         }
-        Ok(MutationApplyResult::default())
+        Ok(MutationApplyResult {
+            persistence: Some(RecordBatch {
+                first_index: mutation.index(),
+                bookmark: mutation.bookmark(),
+                operations: vec![RecordOp::Put {
+                    key: mutation.index().to_be_bytes().to_vec(),
+                    value: mutation.payload().to_vec(),
+                }],
+            }),
+            ..MutationApplyResult::default()
+        })
     }
 
     async fn applied_bookmark(&self) -> Bookmark {
@@ -169,24 +183,8 @@ impl MutationStateBackend for AckBenchmarkBackend {
         }
     }
 
-    async fn build_snapshot(
-        &self,
-        _bookmark: Bookmark,
-        _destination: &Path,
-    ) -> Result<BackendSnapshot> {
-        Err(irongraph::Error::internal(
-            "snapshot is outside the acknowledgement benchmark",
-        ))
-    }
-
-    async fn install_snapshot(
-        &self,
-        _bookmark: Bookmark,
-        _snapshot: &BackendSnapshot,
-    ) -> Result<()> {
-        Err(irongraph::Error::internal(
-            "snapshot is outside the acknowledgement benchmark",
-        ))
+    fn persist(&self, batches: &[RecordBatch]) -> Result<()> {
+        self.records.commit(batches)
     }
 }
 
@@ -258,7 +256,7 @@ fn build_graph(
     fanout: usize,
     dirty_body_bytes: usize,
 ) -> (GraphStore, GraphIds, Duration, Duration) {
-    let mut graph = GraphStore::default();
+    let graph = GraphStore::default();
     let ids = GraphIds {
         label: required(graph.catalog_mut().intern_label("Node"), "intern label"),
         value: required(
@@ -780,18 +778,63 @@ fn cpu_algorithm(graph: &GraphSnapshot, procedure: ResidentGraphProcedure) -> Re
     }
 }
 
+fn inactive_fixture(graph: &GraphStore) -> Result<InactiveGraphStore> {
+    let mut fixture = InactiveGraphStore::default();
+    let mut labels = graph.catalog().labels().collect::<Vec<_>>();
+    labels.sort_by_key(|(id, _)| *id);
+    for (id, name) in labels {
+        if fixture.catalog_mut().intern_label(&name)? != id {
+            return Err(irongraph::Error::internal(
+                "inactive fixture label identity mismatch",
+            ));
+        }
+    }
+    let mut properties = graph.catalog().properties().collect::<Vec<_>>();
+    properties.sort_by_key(|(id, _)| *id);
+    for (id, name) in properties {
+        if fixture.catalog_mut().intern_property(&name)? != id {
+            return Err(irongraph::Error::internal(
+                "inactive fixture property identity mismatch",
+            ));
+        }
+    }
+    let mut relationships = graph.catalog().relationship_types().collect::<Vec<_>>();
+    relationships.sort_by_key(|(id, _)| *id);
+    for (id, name) in relationships {
+        if fixture.catalog_mut().intern_relationship_type(&name)? != id {
+            return Err(irongraph::Error::internal(
+                "inactive fixture relationship identity mismatch",
+            ));
+        }
+    }
+    for node in graph.nodes() {
+        fixture.insert_node(NodeInput {
+            id: node.id(),
+            layer: node.layer(),
+            revision: node.revision(),
+            labels: node.labels().to_vec(),
+            properties: node.properties(),
+        })?;
+    }
+    for edge in graph.edges() {
+        fixture.insert_edge(EdgeInput {
+            id: edge.id(),
+            source: edge.source(),
+            target: edge.target(),
+            relationship_type: edge.relationship_type(),
+            layer: edge.layer(),
+            revision: edge.revision(),
+            properties: edge.properties(),
+        })?;
+    }
+    Ok(fixture)
+}
+
 fn backend(name: &str) -> Result<Box<dyn ExecutionBackend>> {
     match name {
-        "cpu" => Ok(Box::new(CpuBackend::new(
-            irongraph::config::UNBOUNDED_DEVICE_MEMORY_BYTES,
-            0,
-        ))),
+        "cpu" => Ok(Box::new(CpuBackend::new(usize::MAX, 0))),
         #[cfg(all(feature = "accelerator", target_os = "macos"))]
-        "metal" => Ok(Box::new(MetalBackend::new(
-            0,
-            irongraph::config::UNBOUNDED_DEVICE_MEMORY_BYTES,
-            0,
-        )?)),
+        "metal" => Ok(Box::new(MetalBackend::new(0, usize::MAX, 0)?)),
         _ => Err(irongraph::Error::invalid_data("unknown benchmark backend")),
     }
 }
@@ -804,6 +847,22 @@ fn benchmark_backend(
     backend_name: &str,
     output: &mut Vec<Measurement>,
 ) {
+    let canonical_graph = graph;
+    let inactive_graph = match inactive_fixture(graph) {
+        Ok(graph) => graph,
+        Err(error) => {
+            output.push(failure(
+                backend_name,
+                nodes,
+                graph.edge_count(),
+                "admission",
+                "build_inactive_fixture",
+                error.to_string(),
+            ));
+            return;
+        }
+    };
+    let graph = &inactive_graph;
     let edges = graph.edge_count();
     let mut execution = match backend(backend_name) {
         Ok(backend) => backend,
@@ -827,7 +886,7 @@ fn benchmark_backend(
             index: 1,
         },
         graph,
-        &TemporalStore::default(),
+        &InactiveTemporalStore::default(),
         &IndexCatalog::default(),
     ) {
         Ok(image) => image,
@@ -886,7 +945,7 @@ fn benchmark_backend(
     ));
 
     let statistics = StatisticsSnapshot::collect_project(
-        graph,
+        canonical_graph,
         Some(&TemporalStore::default()),
         Some(&IndexCatalog::default()),
     );
@@ -909,7 +968,7 @@ fn benchmark_backend(
             continue;
         }
         match measure(config.warmups, config.samples, || {
-            run_query(graph, execution.as_ref(), &statistics, query)
+            run_query(canonical_graph, execution.as_ref(), &statistics, query)
         }) {
             Ok((times, value)) => output.push(distribution(
                 backend_name,
@@ -933,7 +992,7 @@ fn benchmark_backend(
             continue;
         }
         match measure(config.warmups, config.samples, || {
-            run_query(graph, execution.as_ref(), &statistics, &query)
+            run_query(canonical_graph, execution.as_ref(), &statistics, &query)
         }) {
             Ok((times, value)) => output.push(distribution(
                 backend_name,
@@ -963,7 +1022,7 @@ fn benchmark_backend(
             continue;
         }
         match measure(config.warmups, config.samples, || {
-            run_native_query(graph, execution.as_ref(), &statistics, &query)
+            run_native_query(canonical_graph, execution.as_ref(), &statistics, &query)
         }) {
             Ok((times, value)) => output.push(distribution(
                 backend_name,
@@ -1239,17 +1298,18 @@ fn eventual_write_acknowledgements(
         async_runtime.block_on(async {
             let identity = NodeIdentity::generate_genesis().public();
             let runtime = WriteRuntime::start(
-                directory.path(),
                 StandaloneNode {
                     identity,
                     execution_class: ExecutionClass::Cpu,
                 },
-                Arc::new(AckBenchmarkBackend::default()),
-                WriteStorageLimits {
-                    max_log_record_bytes: 1024 * 1024,
-                    max_log_entries_per_read: 8_192,
-                    max_snapshot_bytes: 1024 * 1024,
-                },
+                Arc::new(AckBenchmarkBackend {
+                    applied: AtomicU64::new(0),
+                    records: RecordStore::open(
+                        directory.path().join("database.redb"),
+                        Uuid::new_v4(),
+                    )
+                    .map_err(|error| error.to_string())?,
+                }),
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -1352,115 +1412,71 @@ fn eventual_write_acknowledgements(
 }
 
 fn durable_writes(config: &Config, nodes: usize, edges: usize, output: &mut Vec<Measurement>) {
-    let directory = match tempfile::tempdir() {
-        Ok(directory) => directory,
-        Err(error) => {
-            output.push(failure(
-                "storage",
-                nodes,
-                edges,
-                "write",
-                "wal_fsync",
-                error.to_string(),
-            ));
-            return;
+    for (operation, rows) in [
+        ("record_commit_single", 1_usize),
+        ("record_commit_batch", config.durable_batch_rows),
+    ] {
+        if !config.wants(operation) {
+            continue;
         }
-    };
-    let mut log = match DurableLog::open(
-        directory.path().join("benchmark.wal"),
-        16 * 1024 * 1024,
-        Bookmark::default(),
-    ) {
-        Ok(log) => log,
-        Err(error) => {
-            output.push(failure(
-                "storage",
-                nodes,
-                edges,
-                "write",
-                "wal_fsync",
-                error.to_string(),
-            ));
-            return;
-        }
-    };
-    let payloads = [
-        ("wal_background_append_single", 1_usize, false),
-        (
-            "wal_background_append_batch",
-            config.durable_batch_rows,
-            false,
-        ),
-        ("wal_fsync_single", 1_usize, true),
-        ("wal_fsync_batch", config.durable_batch_rows, true),
-    ];
-    for (operation, rows, sync) in payloads {
-        let mut samples = Vec::with_capacity(config.samples);
-        let mut failed = None;
-        for sample in 0..config.samples {
-            let first_index = log.last_bookmark().index + 1;
-            let entries = (0..rows)
-                .map(|offset| {
-                    MutationEntry::new(
-                        TERM,
-                        first_index + offset as u64,
-                        MutationKind::Graph,
-                        Some(PROJECT),
-                        Some(Uuid::new_v4()),
-                        sample as i64 + 1,
-                        vec![7_u8; 256],
-                    )
-                })
-                .collect::<Result<Vec<_>>>();
-            let entries = match entries {
-                Ok(entries) => entries,
-                Err(error) => {
-                    failed = Some(error.to_string());
-                    break;
+        let measured = (|| -> Result<Vec<Duration>> {
+            let directory = tempfile::tempdir()?;
+            let records =
+                RecordStore::open(directory.path().join("database.redb"), Uuid::new_v4())?;
+            let mut samples = Vec::with_capacity(config.samples);
+            for sample in 0..config.warmups + config.samples {
+                let bookmark = Bookmark {
+                    term: TERM,
+                    index: sample as u64 + 1,
+                };
+                // Materialization is outside the commit timing. Each transaction atomically
+                // replaces these current rows and synchronizes its durable bookmark.
+                let batch = RecordBatch {
+                    first_index: bookmark.index,
+                    bookmark,
+                    operations: (0..rows)
+                        .map(|row| RecordOp::Put {
+                            key: (row as u64).to_be_bytes().to_vec(),
+                            value: vec![7_u8; 256],
+                        })
+                        .collect(),
+                };
+                let started = Instant::now();
+                records.commit(&[batch])?;
+                let elapsed = started.elapsed();
+                if records.bookmark()? != bookmark {
+                    return Err(irongraph::Error::internal(
+                        "record commit bookmark mismatch",
+                    ));
                 }
-            };
-            let started = Instant::now();
-            let append = if rows == 1 {
-                match entries.into_iter().next() {
-                    Some(entry) if sync => log.append(entry),
-                    Some(entry) => log.append_buffered(entry),
-                    None => Err(irongraph::Error::internal(
-                        "single WAL benchmark produced no entry",
-                    )),
+                if sample >= config.warmups {
+                    samples.push(elapsed);
                 }
-            } else if sync {
-                log.append_batch(entries)
-            } else {
-                log.append_batch_buffered(entries)
-            };
-            if let Err(error) = append {
-                failed = Some(error.to_string());
-                break;
             }
-            samples.push(started.elapsed());
-        }
-        if failed.is_none()
-            && !sync
-            && let Err(error) = log.sync()
-        {
-            failed = Some(error.to_string());
-        }
-        if let Some(error) = failed {
-            output.push(failure("storage", nodes, edges, "write", operation, error));
-        } else {
-            output.push(distribution(
+            Ok(samples)
+        })();
+        match measured {
+            Ok(samples) => output.push(distribution(
                 "storage",
                 nodes,
                 edges,
                 "write",
                 operation,
                 samples,
-                0,
+                config.warmups,
                 rows,
                 None,
-                if sync { "background-fsync" } else { "eventual" },
+                "durable-commit",
                 Some(rows),
-            ));
+            )),
+            Err(error) => output.push(failure(
+                "storage",
+                nodes,
+                edges,
+                "write",
+                operation,
+                error.to_string(),
+            )),
         }
     }
 }
@@ -1562,16 +1578,25 @@ pub fn main() {
         if config.wants_any(&["eventual_write_ack_single", "eventual_write_ack_concurrent"]) {
             eventual_write_acknowledgements(&config, nodes, edges, &mut measurements);
         }
-        if config.wants_any(&[
-            "wal_background_append_single",
-            "wal_background_append_batch",
-            "wal_fsync_single",
-            "wal_fsync_batch",
-        ]) {
+        if config.wants_any(&["record_commit_single", "record_commit_batch"]) {
             durable_writes(&config, nodes, edges, &mut measurements);
         }
-        for backend in &config.backends {
-            benchmark_backend(&config, &graph, nodes, ids, backend, &mut measurements);
+        let needs_resident_fixture = config.operations.is_empty()
+            || config.operations.iter().any(|operation| {
+                !matches!(
+                    operation.as_str(),
+                    "initial_node_ingest"
+                        | "initial_edge_ingest"
+                        | "eventual_write_ack_single"
+                        | "eventual_write_ack_concurrent"
+                        | "record_commit_single"
+                        | "record_commit_batch"
+                )
+            });
+        if needs_resident_fixture {
+            for backend in &config.backends {
+                benchmark_backend(&config, &graph, nodes, ids, backend, &mut measurements);
+            }
         }
     }
     let report = Report {
@@ -1592,6 +1617,7 @@ pub fn main() {
             }
         },
         physical_memory_bytes: physical_memory_bytes(),
+        process_memory_context: "Combined canonical query and inactive resident benchmark fixtures; process memory is not the canonical database footprint. resident_bytes reports the named structure only.",
         metal_devices: metal_devices(),
         parallelism: std::thread::available_parallelism().map_or(1, usize::from),
         config: ReportConfig {

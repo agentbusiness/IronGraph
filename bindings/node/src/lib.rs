@@ -426,24 +426,6 @@ impl EmbeddedDatabase {
     }
 
     #[napi]
-    pub async fn snapshot(&self) -> Result<serde_json::Value> {
-        let database = Arc::clone(&self.database);
-        napi::tokio::task::spawn_blocking(move || {
-            let guard = database
-                .read()
-                .map_err(|_| Error::new(Status::GenericFailure, "database lock is poisoned"))?;
-            let bookmark = guard
-                .as_ref()
-                .ok_or_else(|| Error::new(Status::GenericFailure, "database is closed"))?
-                .snapshot()
-                .map_err(node_error)?;
-            serde_json::to_value(bookmark).map_err(node_error)
-        })
-        .await
-        .map_err(node_error)?
-    }
-
-    #[napi]
     pub async fn close(&self) -> Result<()> {
         let database = Arc::clone(&self.database);
         napi::tokio::task::spawn_blocking(move || database.close().map_err(node_error))

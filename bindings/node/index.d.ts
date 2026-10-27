@@ -10,7 +10,6 @@ export interface QueryOptions {
 export interface OperationOptions { operation_id?: string; timeout_ms?: number }
 export interface ResourceBudgets {
   worker_threads?: number
-  snapshot_interval_ms?: number
 }
 export interface StreamRecord {
   key?: number[] | null
@@ -81,7 +80,6 @@ export declare class EmbeddedDatabase {
   streamFetch(request: StreamFetch, options?: OperationOptions | null): Promise<StreamPage>
   status(): RuntimeStatus
   cancel(operationId: string): boolean
-  snapshot(): Promise<Bookmark>
   flush(): Promise<void>
   close(): Promise<void>
 }

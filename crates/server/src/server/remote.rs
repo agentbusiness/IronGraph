@@ -655,9 +655,9 @@ impl BrokerCoordinator for ScopedBrokerCoordinator {
             .submit_with_timeout_from(connection, command, wait, timeout_millis)
     }
 
-    fn snapshot(&self) -> Result<BrokerStateMachine> {
+    fn canonical_state(&self) -> Result<BrokerStateMachine> {
         self.authorize(self.project)?;
-        self.database.snapshot()
+        self.database.canonical_state()
     }
 
     fn fetch_partition(

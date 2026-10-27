@@ -16,7 +16,7 @@ fn packaged_sdk_preserves_documents_and_integer_precision() -> Result<(), Box<dy
         Query::new("USE sdk CREATE (:Document {body: $body, count: 9007199254740993})")
             .with_parameter("body", "Cargo binary persistence"),
     )?;
-    database.snapshot()?;
+    database.flush()?;
     let project_id = database
         .query(Query::new("USE sdk RETURN 1"))?
         .catalog

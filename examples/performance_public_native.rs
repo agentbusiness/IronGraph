@@ -18,6 +18,14 @@ enum Surface {
     Remote(RemoteClient),
 }
 impl Surface {
+    fn close(self) -> Result<()> {
+        match self {
+            Self::Embedded(database) => database.close()?,
+            Self::Remote(client) => drop(client),
+        }
+        Ok(())
+    }
+
     fn query(&self, query: Query) -> Result<QueryResult> {
         Ok(match self {
             Self::Embedded(database) => database.query(query)?,
@@ -76,7 +84,8 @@ fn measured(
     )
 }
 // Keep the complete fixture sequence and timing boundaries visible in one driver.
-#[allow(clippy::too_many_lines)]
+// The surface must remain alive through the final memory checkpoint and is consumed by close.
+#[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
 fn main() -> Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
     let option = |name: &str, fallback: &str| {
@@ -332,10 +341,7 @@ fn main() -> Result<()> {
             measured(name, nodes, &durations, rows, None)?;
         }
     }
-    checkpoint("before_close_and_durable_snapshot")?;
-    match surface {
-        Surface::Embedded(database) => database.close()?,
-        Surface::Remote(client) => drop(client),
-    }
+    checkpoint("before_close_and_durable_flush")?;
+    surface.close()?;
     event(&json!({"event":"complete"}))
 }

@@ -78,7 +78,8 @@ impl WriteCommand {
     }
 }
 
-/// Application response returned only after the committed entry is durably applied locally.
+/// Application response returned after canonical RAM publication. Persistence follows
+/// asynchronously; an explicit durability barrier waits for the corresponding disk commit.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriteResponse {
     pub bookmark: Bookmark,

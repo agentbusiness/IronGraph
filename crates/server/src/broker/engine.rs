@@ -13,6 +13,10 @@ use serde::{
 };
 use uuid::Uuid;
 
+#[path = "persistence.rs"]
+pub(super) mod persistence;
+pub use persistence::BrokerPersistenceSelection;
+
 use crate::storage::ConnectionId;
 use crate::{
     Bookmark, CommitAcknowledgement, Error, ProjectId, Result,
@@ -137,7 +141,7 @@ struct BrokerPayloadSegment {
     #[serde(default)]
     shared_kafka_ingress: Option<Arc<IngressMetadata>>,
     /// Conservative protocol/accounting charge for an ingress envelope stored once here rather
-    /// than repeated inside every raw payload record. Older snapshots recompute a zero default.
+    /// than repeated inside every raw payload record.
     #[serde(default)]
     shared_ingress_bytes: u64,
 }
@@ -150,17 +154,6 @@ struct PayloadSegmentRecord {
     resolved_time_ms: i64,
     ingress: IngressMetadata,
     payload: Vec<u8>,
-    checksum: [u8; 32],
-}
-
-#[cfg(test)]
-#[derive(Serialize)]
-struct PayloadSegmentRecordRef<'a> {
-    project: ProjectId,
-    id: MessageId,
-    resolved_time_ms: i64,
-    ingress: &'a IngressMetadata,
-    payload: &'a [u8],
     checksum: [u8; 32],
 }
 
@@ -400,9 +393,6 @@ struct PendingDelivery {
 #[derive(Clone, Debug, Default)]
 struct MessageTable(CanonicalMap<u64, StoredPayloadRecord>);
 fn broker_map_id(key: u128) -> Option<u64> {
-    if key > 0 && key <= u128::from(u64::MAX) {
-        return Some(key as u64);
-    }
     (key as u64 == 0)
         .then_some((key >> 64) as u64)
         .filter(|id| *id != 0)
@@ -1036,18 +1026,15 @@ pub trait BrokerCoordinator: Send + Sync {
         let _ = connection;
         self.submit_with_timeout(command, wait, timeout_millis)
     }
-    fn snapshot(&self) -> Result<BrokerStateMachine>;
-    fn reclaim_payload_storage(&self) -> Result<u64> {
-        Ok(0)
-    }
+    fn canonical_state(&self) -> Result<BrokerStateMachine>;
     fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
         tokio::sync::watch::channel(0).1
     }
     fn projects_with_state(&self) -> Result<BTreeSet<ProjectId>> {
-        Ok(self.snapshot()?.projects_with_state())
+        Ok(self.canonical_state()?.projects_with_state())
     }
     fn topic_metadata(&self, project: ProjectId) -> Result<Vec<(String, usize)>> {
-        Ok(self.snapshot()?.topic_metadata(project))
+        Ok(self.canonical_state()?.topic_metadata(project))
     }
     fn committed_offset(
         &self,
@@ -1057,7 +1044,7 @@ pub trait BrokerCoordinator: Send + Sync {
         partition: i32,
     ) -> Result<Option<u64>> {
         Ok(self
-            .snapshot()?
+            .canonical_state()?
             .committed_offset(project, group, topic, partition))
     }
     fn group_leader(
@@ -1066,7 +1053,9 @@ pub trait BrokerCoordinator: Send + Sync {
         group: &str,
         generation: i32,
     ) -> Result<Option<String>> {
-        Ok(self.snapshot()?.group_leader(project, group, generation))
+        Ok(self
+            .canonical_state()?
+            .group_leader(project, group, generation))
     }
     fn group_assignment(
         &self,
@@ -1076,7 +1065,7 @@ pub trait BrokerCoordinator: Send + Sync {
         member: &str,
     ) -> Result<Option<Vec<u8>>> {
         Ok(self
-            .snapshot()?
+            .canonical_state()?
             .group_assignment(project, group, generation, member))
     }
     fn fetch_partition(
@@ -1137,12 +1126,8 @@ impl BrokerCoordinator for ConnectionBrokerCoordinator {
             .submit_with_timeout_from(self.connection, command, wait, timeout_millis)
     }
 
-    fn snapshot(&self) -> Result<BrokerStateMachine> {
-        self.inner.snapshot()
-    }
-
-    fn reclaim_payload_storage(&self) -> Result<u64> {
-        self.inner.reclaim_payload_storage()
+    fn canonical_state(&self) -> Result<BrokerStateMachine> {
+        self.inner.canonical_state()
     }
 
     fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -1343,8 +1328,8 @@ impl BrokerStateMachine {
                 .any(|(candidate, _)| candidate == project)
     }
 
-    /// Removes all canonical broker state owned by one dropped project. Content-addressed
-    /// payload files may remain unreferenced until storage compaction.
+    /// Removes all canonical broker state owned by one dropped project. Payload ownership
+    /// changes join the same atomic persistence batch.
     pub(crate) fn drop_project(&self, project: ProjectId) -> Result<()> {
         let mut removed_streams = BTreeSet::new();
         self.topics.retain(|(candidate, _), topic| {
@@ -1370,6 +1355,8 @@ impl BrokerStateMachine {
         self.groups
             .retain(|(candidate, _), _| *candidate != project);
         self.delivery_leases
+            .retain(|(candidate, _), _| *candidate != project);
+        self.queue_consumers
             .retain(|(candidate, _), _| *candidate != project);
         let removed_payloads = removed_streams
             .iter()
@@ -3009,6 +2996,14 @@ impl BrokerStateMachine {
             false,
             Some(read.maximum_records),
         )?;
+        let descriptors = unique_payload_descriptors(
+            &self.payload_segments,
+            pending.iter().map(|(_, stored)| stored.clone()),
+        )?;
+        let _pins = descriptors
+            .iter()
+            .map(|descriptor| segments.pin(descriptor))
+            .collect::<Result<Vec<_>>>()?;
         let loaded = load_payloads(
             &self.payload_segments,
             pending.iter().map(|(_, stored)| stored.clone()),
@@ -3544,10 +3539,8 @@ impl BrokerStateMachine {
         Ok(())
     }
 
-    /// Materializes a publish payload into its deterministic immutable segment before the
-    /// ordered append. This is derived storage, not a second WAL; an uncommitted orphan is
-    /// harmless and later content-address reuse is exact. Pre-staging prevents an oversized
-    /// segment or local disk failure from first appearing after a client mutation has committed.
+    /// Materializes a publish payload into deterministic immutable staging before ordered
+    /// publication. Uncommitted staging is harmless and content-address reuse is exact.
     #[cfg(test)]
     pub(crate) fn prestage_command_payload(
         &self,
@@ -4446,16 +4439,7 @@ impl BrokerStateMachine {
                 "broker payload segment was retired during the read",
             )
         })?;
-        let shared_ingress_bytes = if segment.shared_ingress_bytes != 0 {
-            segment.shared_ingress_bytes
-        } else {
-            // Compatibility with snapshots written before the cached charge existed.
-            segment
-                .shared_amqp_ingress
-                .as_ref()
-                .or(segment.shared_kafka_ingress.as_ref())
-                .map_or(0, |ingress| ingress_accounted_bytes(ingress))
-        };
+        let shared_ingress_bytes = segment.shared_ingress_bytes;
         payload
             .retained_bytes
             .checked_add(shared_ingress_bytes)
@@ -4490,17 +4474,7 @@ impl BrokerStateMachine {
             .map(|payload| payload.segment);
         let common_shared_ingress_bytes = common_segment
             .and_then(|segment| self.payload_segments.get(segment))
-            .map(|segment| {
-                if segment.shared_ingress_bytes != 0 {
-                    segment.shared_ingress_bytes
-                } else {
-                    segment
-                        .shared_amqp_ingress
-                        .as_ref()
-                        .or(segment.shared_kafka_ingress.as_ref())
-                        .map_or(0, |ingress| ingress_accounted_bytes(ingress))
-                }
-            })
+            .map(|segment| segment.shared_ingress_bytes)
             .unwrap_or(0);
         let retained_bytes = messages.iter().try_fold(0_u64, |total, message| {
             let payload = self
@@ -5199,7 +5173,24 @@ impl BrokerStateMachine {
             .get(&queue.stream)
             .map(|state| state.records.iter().map(|record| record.message).collect())
             .unwrap_or_else(BTreeSet::new);
+        let unsettled_owners = self
+            .streams
+            .get(&queue.stream)
+            .map(|state| {
+                state
+                    .records
+                    .iter()
+                    .filter_map(|record| match record.delivery {
+                        DeliveryState::Unacked { owner, .. } => Some(owner),
+                        _ => None,
+                    })
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
         self.streams.remove(&queue.stream);
+        for owner in unsettled_owners {
+            self.remove_delivery_lease_if_idle(project, owner);
+        }
         self.reclaim_payload_candidates(project, &removed_payloads)
     }
 
@@ -5347,10 +5338,8 @@ fn write_payload_segment_batch(
     if pending.is_empty() {
         return Err(Error::invalid_data("broker payload segment batch is empty"));
     }
-    // This is the publish delta path, not a cold rebuild: encode only this command's records and
-    // publish their derived segment without an acknowledgement-path fsync. The complete payload
-    // remains in the eventual-durability WAL and can recreate a crash-lost segment; snapshot
-    // attachment makes the segment durable before compacting that WAL suffix.
+    // Encode only this command's payload records into the canonical payload staging area. Their
+    // bytes and ownership metadata join the same atomic background record commit.
     // Records are independent. Encode the bounded command batch across the CPU pool before the
     // ordered writer frames it; this keeps filesystem publication serial and deterministic while
     // removing CBOR, payload hashing, and allocation from the single apply core. The temporary
@@ -5370,7 +5359,7 @@ fn write_payload_segment_batch(
         .into_iter()
         .map(Some)
         .collect::<Vec<_>>();
-    segments.write_replayable_immutable_streaming_indexed(
+    segments.write_immutable_streaming_indexed(
         SegmentFamily::BrokerPayload,
         Some(project),
         encoded.len(),
@@ -5397,7 +5386,7 @@ fn write_raw_amqp_payload_segment_batch(
             "raw AMQP payload segment batch is empty or heterogeneous",
         ));
     }
-    segments.write_replayable_immutable_streaming_indexed(
+    segments.write_immutable_streaming_indexed(
         SegmentFamily::BrokerPayload,
         Some(project),
         pending.len(),
@@ -5434,18 +5423,17 @@ fn write_raw_kafka_payload_segment_batch(
         .skip(1)
         .all(|record| record.payload.as_slice() == first_payload)
     {
-        let (descriptor, unique_locations) = segments
-            .write_replayable_immutable_streaming_indexed(
-                SegmentFamily::BrokerPayload,
-                Some(project),
-                1,
-                |_| {
-                    Ok(SegmentRecord {
-                        kind: BROKER_RAW_KAFKA_PAYLOAD_SEGMENT_KIND,
-                        payload: first_payload.to_vec(),
-                    })
-                },
-            )?;
+        let (descriptor, unique_locations) = segments.write_immutable_streaming_indexed(
+            SegmentFamily::BrokerPayload,
+            Some(project),
+            1,
+            |_| {
+                Ok(SegmentRecord {
+                    kind: BROKER_RAW_KAFKA_PAYLOAD_SEGMENT_KIND,
+                    payload: first_payload.to_vec(),
+                })
+            },
+        )?;
         let location = *unique_locations
             .first()
             .ok_or_else(|| Error::internal("interned Kafka payload location disappeared"))?;
@@ -5468,7 +5456,7 @@ fn write_raw_kafka_payload_segment_batch(
         });
         payload_indices.push(index);
     }
-    let (descriptor, unique_locations) = segments.write_replayable_immutable_streaming_indexed(
+    let (descriptor, unique_locations) = segments.write_immutable_streaming_indexed(
         SegmentFamily::BrokerPayload,
         Some(project),
         unique_payloads.len(),
@@ -5538,31 +5526,28 @@ fn encode_payload_segment_record(
 }
 
 fn decode_payload_segment_record(encoded: &[u8]) -> Result<PayloadSegmentRecord> {
-    if let Some(payload) = encoded.strip_prefix(BROKER_PAYLOAD_RECORD_V2_MAGIC) {
-        let compact: CompactPayloadSegmentRecord =
-            postcard::from_bytes(payload).map_err(|error| {
-                Error::new(
-                    crate::ErrorCode::CorruptStorage,
-                    format!("broker payload segment v2 is invalid: {error}"),
-                )
-            })?;
-        Ok(PayloadSegmentRecord {
-            project: compact.project,
-            id: compact.id,
-            resolved_time_ms: compact.resolved_time_ms,
-            ingress: expand_compact_ingress(compact.ingress),
-            payload: compact.payload,
-            checksum: compact.checksum,
-        })
-    } else {
-        // Snapshot compatibility for segments published before the compact record format.
-        ciborium::de::from_reader(encoded).map_err(|error| {
+    let payload = encoded
+        .strip_prefix(BROKER_PAYLOAD_RECORD_V2_MAGIC)
+        .ok_or_else(|| {
             Error::new(
                 crate::ErrorCode::CorruptStorage,
-                format!("legacy broker payload segment is invalid: {error}"),
+                "broker payload record magic is invalid",
             )
-        })
-    }
+        })?;
+    let compact: CompactPayloadSegmentRecord = postcard::from_bytes(payload).map_err(|error| {
+        Error::new(
+            crate::ErrorCode::CorruptStorage,
+            format!("broker payload record is invalid: {error}"),
+        )
+    })?;
+    Ok(PayloadSegmentRecord {
+        project: compact.project,
+        id: compact.id,
+        resolved_time_ms: compact.resolved_time_ms,
+        ingress: expand_compact_ingress(compact.ingress),
+        payload: compact.payload,
+        checksum: compact.checksum,
+    })
 }
 
 fn load_payloads(
@@ -6331,7 +6316,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_payload_record_round_trips_and_legacy_cbor_still_loads() -> Result<()> {
+    fn compact_payload_record_round_trips_and_rejects_unknown_format() -> Result<()> {
         let project = ProjectId::random();
         let id = MessageId(41);
         let ingress = IngressMetadata::Amqp {
@@ -6361,23 +6346,7 @@ mod tests {
             } if exchange == "events" && routing_key == "created"
         ));
 
-        let mut legacy = Vec::new();
-        ciborium::ser::into_writer(
-            &PayloadSegmentRecordRef {
-                project,
-                id,
-                resolved_time_ms: 7,
-                ingress: &ingress,
-                payload: body,
-                checksum,
-            },
-            &mut legacy,
-        )
-        .map_err(|error| Error::invalid_data(error.to_string()))?;
-        let decoded_legacy = decode_payload_segment_record(&legacy)?;
-        assert_eq!(decoded_legacy.project, project);
-        assert_eq!(decoded_legacy.id, id);
-        assert_eq!(decoded_legacy.payload, body);
+        assert!(decode_payload_segment_record(b"unknown payload format").is_err());
         Ok(())
     }
 

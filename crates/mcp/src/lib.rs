@@ -539,7 +539,7 @@ fn tool_definitions() -> Vec<Value> {
         json!({
             "name": "irongraph_save_document",
             "title": "Save durable source text",
-            "description": "Persist or update complete source text as an ordinary (:Document) graph node in the named project. Use this when the user asks IronGraph to remember a note, decision, document, source excerpt or reusable context. Reusing document_id updates the same document; omitting it creates a stable UUID. The full body remains canonical graph data in the normal WAL/snapshot path. When the local embedding model is enabled, meaningful document content is embedded automatically and kept current. No placeholder vector or index declaration is required before using irongraph_search.",
+            "description": "Persist or update complete source text as an ordinary (:Document) graph node in the named project. Use this when the user asks IronGraph to remember a note, decision, document, source excerpt or reusable context. Reusing document_id updates the same document; omitting it creates a stable UUID. The full body remains canonical graph data in the normal asynchronous record-persistence path. When the local embedding model is enabled, meaningful document content is embedded automatically and kept current. No placeholder vector or index declaration is required before using irongraph_search.",
             "inputSchema": {
                 "type": "object",
                 "required": ["project", "body"],

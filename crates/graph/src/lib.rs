@@ -22,6 +22,7 @@ mod concurrent;
 pub use columns::validate_property_value_shape;
 mod index;
 pub mod knowledge;
+mod persistence;
 mod persistent;
 mod semantic;
 mod shared;
@@ -51,10 +52,12 @@ pub use algorithms::{
 };
 pub use columns::MIXED_STRING_TAG;
 pub use columns::{ByteValues, Dictionary, PackedLists, PropertyColumns, TypedColumn, Validity};
+pub use concurrent::GraphPersistenceSelection;
 pub use concurrent::{
     CanonicalCounts, ConcurrentPropertyColumn, EdgeView, GraphStore, LabelsHandle, NameCatalog,
     NodePropertyReader, NodeView,
 };
+pub use index::IndexPersistenceSelection;
 pub use index::SharedVectorBacking;
 pub use index::{
     AnnDeviceImage, DerivedIndexDeviceImage, DerivedIndexState, EmbeddingDType,
@@ -67,6 +70,7 @@ pub use index::{
     SEMANTIC_RELATIONSHIP_PROPERTY, ScalarIndexCandidate, Similarity, TextDeviceImage, TextIndex,
     VectorDeviceImage, VectorHit, VectorIndex,
 };
+pub use persistence::PersistenceOp;
 pub use persistent::PagedVec;
 pub use persistent::PersistentMap;
 pub use persistent::{stable_id_key, stable_id_row};
@@ -83,6 +87,7 @@ pub use store::{
     GraphDeviceDelta, GraphMutation, GraphSnapshot, NodeDeviceDelta, NodeInput,
 };
 pub use temporal::TemporalCanonicalColumn;
+pub use temporal::TemporalPersistenceSelection;
 pub use temporal::{
     AggregateSet, RollupBucket, RollupDeviceColumn, TemporalDeclaration, TemporalDeviceColumn,
     TemporalDeviceImage, TemporalDeviceValues, TemporalOptimizerColumnStatistics,

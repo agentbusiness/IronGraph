@@ -1,6 +1,6 @@
 {
   "name": "@irongraph/node-win32-x64-msvc",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "private": true,
   "cpu": [
     "x64"

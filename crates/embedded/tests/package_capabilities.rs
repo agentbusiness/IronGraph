@@ -134,7 +134,7 @@ fn canonical_query_covers_embedded_package_capabilities() -> Result<(), Box<dyn 
         );
     }
     database.query(Query::new("USE package_app SHOW CONSUMER LAG"))?;
-    database.snapshot()?;
+    database.flush()?;
     database.close()?;
 
     let reopened = EmbeddedDatabase::open(options())?;

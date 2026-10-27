@@ -2506,6 +2506,10 @@ pub struct IndexCatalog {
     optimizer_generation_cache: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
+#[path = "index_persistence.rs"]
+mod persistence;
+pub use persistence::IndexPersistenceSelection;
+
 impl IndexCatalog {
     /// Simulates only keys affected by this batch. Canonical rows and postings remain untouched.
     pub fn validate_graph_mutations(
@@ -2662,7 +2666,7 @@ impl IndexCatalog {
         Ok(())
     }
 
-    /// Read-only pre-WAL validation: no canonical definition or vector is changed here.
+    /// Read-only pre-application validation: no canonical definition or vector is changed here.
     pub fn validate_activate_profile(&self, profile: &EmbeddingProfile) -> Result<()> {
         profile.validate()?;
         if self
@@ -2869,7 +2873,7 @@ impl IndexCatalog {
         self.validate_vector_mutations_with_planned_columns(mutations, None, &[])
     }
 
-    /// Validates definitions introduced by this WAL batch without installing them first.
+    /// Validates definitions introduced by this mutation batch without installing them first.
     pub fn validate_vector_mutations_with_planned_columns(
         &self,
         mutations: &[ResolvedVectorMutation],

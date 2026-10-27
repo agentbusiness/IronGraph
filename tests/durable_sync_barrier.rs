@@ -5,12 +5,13 @@
 // enforceable instead of switched off globally.
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-//! Guards the one durability barrier every WAL and snapshot write depends on.
+//! Guards explicit durability barriers for identity and directory publication.
 //!
 //! On Apple platforms `fsync(2)` returns before the drive flushes its own volatile write cache, so
-//! a process can acknowledge an appended WAL entry and still lose it to sudden power loss. Only
-//! `fcntl(F_FULLFSYNC)` provides the real barrier, and `std` offers no wrapper for it, so every
-//! durability-critical flush routes through `storage::fs::sync_durable`.
+//! a process can acknowledge a write and still lose it to sudden power loss. The platform requires
+//! `fcntl(F_FULLFSYNC)`. Our explicit publication flushes use `storage::fs::sync_durable`; redb
+//! commits use `File::sync_data`, whose Apple implementation in the supported Rust toolchain
+//! issues the same full barrier.
 //!
 //! Calling `File::sync_all`/`File::sync_data` directly in these modules silently reintroduces the
 //! weaker barrier on the platform the product contract names as primary, and no functional test
@@ -21,9 +22,8 @@ use std::{fs, path::Path};
 
 /// Files that legitimately call the platform primitives.
 ///
-/// `fs.rs` implements the barrier itself. `snapshot_data.rs` exposes its own `sync_all` wrapper
-/// whose body already delegates to `sync_durable` for each chunk it owns.
-const BARRIER_IMPLEMENTORS: [&str; 2] = ["storage/src/fs.rs", "engine/snapshot_data.rs"];
+/// `fs.rs` implements the explicit publication barrier itself.
+const BARRIER_IMPLEMENTORS: [&str; 1] = ["storage/src/fs.rs"];
 
 fn collect_rust_sources(path: &Path, collected: &mut Vec<(String, String)>) {
     if path.is_dir() {
