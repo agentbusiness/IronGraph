@@ -1,6 +1,6 @@
 //! Concurrent index cells. Clones share identity; they never fork index contents.
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     borrow::Borrow,
@@ -242,6 +242,67 @@ impl<'de> Deserialize<'de> for ProfileCell {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let value = Option::<super::EmbeddingProfile>::deserialize(d)?;
         Ok(Self(Arc::new(ArcSwapOption::from(value.map(Arc::new)))))
+    }
+}
+
+/// One atomically published policy and reconciliation stamp, shared by catalogue handles.
+#[derive(Clone, Debug, Default)]
+pub(super) struct RelationshipScopeCell(Arc<ArcSwap<super::RelationshipSemanticState>>);
+impl RelationshipScopeCell {
+    pub fn get(&self) -> Arc<super::RelationshipSemanticState> {
+        self.0.load_full()
+    }
+    pub fn restore(&self, value: super::RelationshipSemanticState) {
+        self.0.store(Arc::new(value));
+    }
+    pub fn set(&self, scope: super::RelationshipSemanticScope) -> crate::Result<bool> {
+        loop {
+            let previous = self.get();
+            if previous.scope == scope {
+                return Ok(false);
+            }
+            let revision = previous.revision.checked_add(1).ok_or_else(|| {
+                crate::Error::invalid_data("relationship semantic scope revision overflow")
+            })?;
+            let next = Arc::new(super::RelationshipSemanticState {
+                scope: scope.clone(),
+                revision,
+                reconciled_revision: previous.reconciled_revision,
+            });
+            if Arc::ptr_eq(&previous, &self.0.compare_and_swap(&previous, next)) {
+                return Ok(true);
+            }
+        }
+    }
+    pub fn complete(&self, expected_revision: u64) -> bool {
+        loop {
+            let previous = self.get();
+            if previous.revision != expected_revision {
+                return false;
+            }
+            if previous.reconciled_revision == expected_revision {
+                return true;
+            }
+            let next = Arc::new(super::RelationshipSemanticState {
+                scope: previous.scope.clone(),
+                revision: previous.revision,
+                reconciled_revision: expected_revision,
+            });
+            if Arc::ptr_eq(&previous, &self.0.compare_and_swap(&previous, next)) {
+                return true;
+            }
+        }
+    }
+}
+impl Serialize for RelationshipScopeCell {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.get().serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for RelationshipScopeCell {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = super::RelationshipSemanticState::deserialize(deserializer)?;
+        Ok(Self(Arc::new(ArcSwap::from_pointee(value))))
     }
 }
 

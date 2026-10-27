@@ -176,6 +176,8 @@ pub struct ExecutionContext<'a> {
     pub bookmark: Bookmark,
     pub mutation_revision: u64,
     pub resolved_time_nanos: i64,
+    /// Explicit transaction start time; autocommit uses the resolved statement time.
+    pub transaction_time_nanos: Option<i64>,
     pub next_node_id: u64,
     pub next_edge_id: u64,
     pub predicate_versions: BTreeMap<DependencyStamp, u64>,
@@ -20197,6 +20199,7 @@ mod materialized_value_order_tests {
             bookmark: Bookmark { term: 0, index: 0 },
             mutation_revision: 1,
             resolved_time_nanos: 0,
+            transaction_time_nanos: None,
             next_node_id: 1,
             next_edge_id: 1,
             predicate_versions: BTreeMap::new(),
@@ -20871,6 +20874,103 @@ mod materialized_value_order_tests {
         INTEGER_SCAN_DIAGNOSTICS.store(false, AtomicOrdering::Relaxed);
         result?;
         eprintln!("CANONICAL_RANGE_PARTITION_DIAGNOSTICS_PASS");
+        Ok(())
+    }
+
+    #[test]
+    fn temporal_qualified_clocks_execute_every_family_and_preserve_null() -> Result<()> {
+        let graph = GraphStore::default();
+        let mut context = context(&graph);
+        context.resolved_time_nanos = 86_400_000_000_000;
+        context.transaction_time_nanos = Some(0);
+        for family in ["date", "localtime", "time", "localdatetime", "datetime"] {
+            for clock in ["transaction", "statement", "realtime"] {
+                let query = format!(
+                    "RETURN {family}.{clock}('UTC') AS current, {family}.{clock}(null) AS absent"
+                );
+                let output = QueryEngine.execute(&query, &mut context)?;
+                let columns = &output.result.batches[0].columns;
+                assert_eq!(columns[0].values.len(), 1, "{query}");
+                assert!(
+                    !matches!(columns[0].values[0], ResultValue::Scalar(ScalarValue::Null)),
+                    "{query}"
+                );
+                assert_eq!(
+                    columns[1].values,
+                    vec![ResultValue::Scalar(ScalarValue::Null)],
+                    "{query}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn temporal_qualified_clock_timezones_and_clock_boundaries_are_distinct() -> Result<()> {
+        let graph = GraphStore::default();
+        let mut context = context(&graph);
+        context.resolved_time_nanos = 86_400_000_000_000;
+        context.transaction_time_nanos = Some(0);
+        let before = chrono::Utc::now().timestamp();
+        let output = QueryEngine.execute("RETURN datetime.transaction('UTC'), datetime.statement('UTC'), date.statement('-01:00'), localdatetime.transaction('+01:00'), time.statement('America/Los_Angeles'), datetime.realtime()", &mut context)?;
+        let after = chrono::Utc::now().timestamp();
+        let columns = &output.result.batches[0].columns;
+        assert_eq!(
+            columns[0].values,
+            vec![ResultValue::Scalar(ScalarValue::ZonedDateTime {
+                seconds: 0,
+                nanos: 0,
+                timezone: Arc::from("UTC")
+            })]
+        );
+        assert_eq!(
+            columns[1].values,
+            vec![ResultValue::Scalar(ScalarValue::ZonedDateTime {
+                seconds: 86_400,
+                nanos: 0,
+                timezone: Arc::from("UTC")
+            })]
+        );
+        assert_eq!(
+            columns[2].values,
+            vec![ResultValue::Scalar(ScalarValue::Date(0))]
+        );
+        assert_eq!(
+            columns[3].values,
+            vec![ResultValue::Scalar(ScalarValue::LocalDateTime {
+                seconds: 3_600,
+                nanos: 0
+            })]
+        );
+        assert_eq!(
+            columns[4].values,
+            vec![ResultValue::Scalar(ScalarValue::ZonedTime {
+                nanos: 57_600_000_000_000,
+                offset_seconds: -28_800
+            })]
+        );
+        assert!(
+            matches!(&columns[5].values[0], ResultValue::Scalar(ScalarValue::ZonedDateTime { seconds, .. }) if *seconds >= before && *seconds <= after)
+        );
+        context.resolved_time_nanos += 86_400_000_000_000;
+        let changed = QueryEngine.execute(
+            "RETURN datetime.transaction().epochSeconds, datetime.statement().epochSeconds",
+            &mut context,
+        )?;
+        assert_eq!(
+            changed.result.batches[0].columns[0].values,
+            vec![ResultValue::Scalar(ScalarValue::Integer(0))]
+        );
+        assert_eq!(
+            changed.result.batches[0].columns[1].values,
+            vec![ResultValue::Scalar(ScalarValue::Integer(172_800))]
+        );
+        for query in [
+            "RETURN datetime.statement('invalid/timezone')",
+            "RETURN time.realtime('+27:00')",
+        ] {
+            assert!(QueryEngine.execute(query, &mut context).is_err(), "{query}");
+        }
         Ok(())
     }
 
@@ -21927,6 +22027,13 @@ fn vector_search_with_selection(
         source.property,
         crate::graph::SEMANTIC_NODE_PROPERTY | crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY
     );
+    // Restricted relationship scope must participate in candidate selection, rather than
+    // remove already-ranked hits and leave LIMIT underfilled. The backend's unfiltered ANN
+    // interface cannot express a relationship-type predicate, so use canonical retrieval.
+    let scoped_relationships = source.property == crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY
+        && context.scalar_indexes.is_some_and(|indexes| {
+            indexes.relationship_semantic_scope() != crate::graph::RelationshipSemanticScope::All
+        });
     let access = if automatic {
         let ann = source.approximate.filter(|ann| {
             !source.exact.has_multi_span_owners()
@@ -21948,7 +22055,8 @@ fn vector_search_with_selection(
         access
     };
     let requested_access = match access {
-        _ if search.method != super::SearchMethod::Default
+        _ if scoped_relationships
+            || search.method != super::SearchMethod::Default
             || matches!(search.input, SearchInput::HybridText(_))
             || source.exact.has_multi_span_owners() =>
         {
@@ -22022,6 +22130,7 @@ fn vector_search_with_selection(
         let (mut hits, candidate_budget, build_generation, evidence_bookmark) = if explicit
             || hybrid
             || source.exact.has_multi_span_owners()
+            || scoped_relationships
         {
             // A very narrow beam magnifies codec/navigation error as the corpus grows.
             // This is minimum internal candidate work, never a result or ingestion quota.
@@ -22071,7 +22180,7 @@ fn vector_search_with_selection(
                 strategy,
                 |id| {
                     allowed_entities.is_none_or(|allowed| allowed.binary_search(&id).is_ok())
-                        && semantic_owner_visible(state, source.property, id)
+                        && semantic_owner_visible(state, context, source.property, id)
                 },
                 &context.cancellation,
             )?;
@@ -22130,7 +22239,7 @@ fn vector_search_with_selection(
             (
                 source.exact.exact_search_where(&vector, limit, |id| {
                     allowed_entities.is_none_or(|allowed| allowed.binary_search(&id).is_ok())
-                        && semantic_owner_visible(state, source.property, id)
+                        && semantic_owner_visible(state, context, source.property, id)
                 })?,
                 0,
                 [0_u8; 32],
@@ -22157,7 +22266,7 @@ fn vector_search_with_selection(
         let mut visible_hits = Vec::with_capacity(hits.len());
         for hit in hits {
             check_execution(context)?;
-            if !semantic_owner_visible(state, source.property, hit.entity_id) {
+            if !semantic_owner_visible(state, context, source.property, hit.entity_id) {
                 continue;
             }
             let binding = if source.property == crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY {
@@ -22298,7 +22407,7 @@ fn hybrid_retrieval_hits(
     let mut visit = |id: u64| -> Result<()> {
         check_execution(context)?;
         if !allowed_entities.is_none_or(|allowed| allowed.binary_search(&id).is_ok())
-            || !semantic_owner_visible(state, source.property, id)
+            || !semantic_owner_visible(state, context, source.property, id)
         {
             return Ok(());
         }
@@ -22477,10 +22586,21 @@ fn sort_semantic_rows(rows: &mut [Row], search: &SearchClause, context: &Executi
     });
 }
 
-fn semantic_owner_visible(state: &ExecutionState<'_>, property: PropertyId, entity: u64) -> bool {
+fn semantic_owner_visible(
+    state: &ExecutionState<'_>,
+    context: &ExecutionContext<'_>,
+    property: PropertyId,
+    entity: u64,
+) -> bool {
     if property == crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY {
         state.graph.edge(crate::EdgeId(entity)).is_some_and(|edge| {
             state.read_layers.contains_layer(edge.layer())
+                && context.scalar_indexes.is_none_or(|indexes| {
+                    state
+                        .graph
+                        .relationship_type_name(edge.relationship_type())
+                        .is_some_and(|name| indexes.relationship_semantic_included(&name))
+                })
                 && [edge.source(), edge.target()].iter().all(|id| {
                     state
                         .graph
@@ -25725,6 +25845,21 @@ fn evaluate_function(
         "date" | "localtime" | "time" | "localdatetime" | "datetime" => {
             temporal_constructor(name, &values, context.resolved_time_nanos)
         }
+        "date.transaction"
+        | "date.statement"
+        | "date.realtime"
+        | "localtime.transaction"
+        | "localtime.statement"
+        | "localtime.realtime"
+        | "time.transaction"
+        | "time.statement"
+        | "time.realtime"
+        | "localdatetime.transaction"
+        | "localdatetime.statement"
+        | "localdatetime.realtime"
+        | "datetime.transaction"
+        | "datetime.statement"
+        | "datetime.realtime" => temporal_clock(name, &values, context),
         "date.truncate"
         | "localtime.truncate"
         | "time.truncate"
@@ -29741,6 +29876,81 @@ fn temporal_constructor_from_temporal(name: &str, value: &ResultValue) -> Result
             "temporal projection dispatch is inconsistent",
         )),
     }
+}
+
+fn temporal_clock(
+    name: &str,
+    values: &[ResultValue],
+    context: &ExecutionContext<'_>,
+) -> Result<ResultValue> {
+    if values.len() > 1 {
+        return Err(function_arity(name, "zero or one", values.len()));
+    }
+    let (family, clock) = name
+        .split_once('.')
+        .ok_or_else(|| Error::internal("invalid temporal clock dispatch"))?;
+    let instant = match clock {
+        "transaction" => context
+            .transaction_time_nanos
+            .unwrap_or(context.resolved_time_nanos),
+        "statement" => context.resolved_time_nanos,
+        "realtime" => chrono::Utc::now().timestamp_nanos_opt().ok_or_else(|| {
+            Error::new(
+                ErrorCode::TemporalRange,
+                "real-time clock is outside the temporal range",
+            )
+        })?,
+        _ => return Err(Error::internal("invalid temporal clock dispatch")),
+    };
+    let timezone = if values.is_empty() {
+        "UTC".to_owned()
+    } else {
+        string_arg(values, 0)?
+    };
+    let zone = IntervalZone::parse(&timezone)?;
+    let seconds = instant.div_euclid(1_000_000_000);
+    let nanos = u32::try_from(instant.rem_euclid(1_000_000_000))
+        .map_err(|_| Error::new(ErrorCode::TemporalRange, "clock nanoseconds are invalid"))?;
+    let offset_seconds = zone.offset_at(seconds, nanos)?;
+    let local_seconds = seconds
+        .checked_add(i64::from(offset_seconds))
+        .ok_or_else(|| {
+            Error::new(
+                ErrorCode::TemporalRange,
+                "clock timezone conversion overflow",
+            )
+        })?;
+    let local =
+        chrono::DateTime::<chrono::Utc>::from_timestamp(local_seconds, nanos).ok_or_else(|| {
+            Error::new(
+                ErrorCode::TemporalRange,
+                "clock timezone conversion is outside the temporal range",
+            )
+        })?;
+    let value = match family {
+        "date" => ScalarValue::Date(
+            local
+                .date_naive()
+                .signed_duration_since(unix_epoch_date()?)
+                .num_days(),
+        ),
+        "localtime" => ScalarValue::LocalTime(local_time_nanos(local.time())?),
+        "time" => ScalarValue::ZonedTime {
+            nanos: local_time_nanos(local.time())?,
+            offset_seconds,
+        },
+        "localdatetime" => ScalarValue::LocalDateTime {
+            seconds: local_seconds,
+            nanos,
+        },
+        "datetime" => ScalarValue::ZonedDateTime {
+            seconds,
+            nanos,
+            timezone: Arc::from(timezone),
+        },
+        _ => return Err(Error::internal("invalid temporal clock dispatch")),
+    };
+    Ok(ResultValue::Scalar(value))
 }
 
 fn temporal_constructor(

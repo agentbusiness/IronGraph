@@ -58,7 +58,7 @@ pub use crate::execution::{ProcedureDefinition, ProcedureField, ProcedureValueTy
 pub use ast::*;
 pub use binder::{
     BindCapabilities, BoundQuery, DependencyKind, DependencyStamp, bind, bind_with_parameters,
-    bind_with_procedures,
+    bind_with_procedures, builtin_function_names,
 };
 pub use executor::{
     EntityDependency, ExecutionContext, ExecutionOutput, PreparedTemporalMutation,

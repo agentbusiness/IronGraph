@@ -37,6 +37,7 @@ fn context(graph: &GraphStore) -> ExecutionContext<'_> {
         bookmark: Bookmark { term: 0, index: 0 },
         mutation_revision: 1,
         resolved_time_nanos: 0,
+        transaction_time_nanos: None,
         next_node_id: 1,
         next_edge_id: 1,
         predicate_versions: BTreeMap::new(),
@@ -70,6 +71,236 @@ fn column(output: &ExecutionOutput, at: usize) -> Vec<ResultValue> {
         .iter()
         .flat_map(|batch| batch.columns[at].values.clone())
         .collect()
+}
+
+#[test]
+fn relationship_scope_filters_before_ranking_across_search_routes() -> Result<()> {
+    use crate::graph::{IndexCatalog, IvfPqConfig, IvfPqIndex, RelationshipSemanticScope};
+    let graph = GraphStore::default();
+    add_node(&graph, 1, "source", Layer::Observed)?;
+    add_node(&graph, 2, "target", Layer::Observed)?;
+    let excluded = graph.catalog().intern_relationship_type("CALLS")?;
+    let included = graph.catalog().intern_relationship_type("EXPLAINS")?;
+    let vectors = VectorIndex::new(2, Similarity::Cosine)?;
+    for id in 1..=80 {
+        graph.insert_edge(crate::graph::EdgeInput {
+            id: crate::EdgeId(id),
+            source: NodeId(1),
+            target: NodeId(2),
+            relationship_type: if id <= 40 { excluded } else { included },
+            layer: Layer::Observed,
+            revision: 1,
+            properties: Vec::new(),
+        })?;
+        vectors.upsert(id, &[1.0, if id <= 40 { 0.0 } else { id as f32 / 80.0 }], 1)?;
+    }
+    let ann = IvfPqIndex::build(
+        &vectors,
+        IvfPqConfig {
+            coarse_centroids: 4,
+            subquantizers: 1,
+            bits_per_code: 2,
+            probes: 4,
+            candidate_budget: 16,
+            iterations: 2,
+            ..IvfPqConfig::default()
+        },
+    )?;
+    let indexes = IndexCatalog::default();
+    let mut context = context(&graph);
+    context.scalar_indexes = Some(&indexes);
+    context.vector_indexes.insert(
+        crate::graph::SEMANTIC_RELATIONSHIP_INDEX.into(),
+        VectorSearchSource {
+            property: crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY,
+            exact: &vectors,
+            approximate: Some(&ann),
+            profile_hash: [0; 32],
+        },
+    );
+    let source = "SEARCH r IN (EMBEDDING INDEX semantic_relationships FOR VECTOR $vector LIMIT 2) SCORE AS score RETURN r";
+    let all = QueryEngine.execute(source, &mut context)?;
+    assert_eq!(
+        all.vector_searches[0].access,
+        crate::execution::ResidentVectorAccess::IvfPq
+    );
+    assert_eq!(column(&all, 0).len(), 2);
+    indexes.set_relationship_semantic_scope(RelationshipSemanticScope::AllExcept(
+        BTreeSet::from(["CALLS".into()]),
+    ))?;
+    for method in ["", "USING EXACT", "USING ADAPTIVE", "USING QUANTIZED"] {
+        for prefix in ["", "MATCH ()-[r]->() "] {
+            let query = format!(
+                "{prefix}SEARCH r IN (EMBEDDING INDEX semantic_relationships FOR VECTOR $vector {method} LIMIT 2) SCORE AS score RETURN r"
+            );
+            let output = QueryEngine.execute(&query, &mut context)?;
+            let relationships = column(&output, 0);
+            assert_eq!(relationships.len(), 2, "{query}");
+            assert!(
+                relationships.iter().all(
+                    |value| matches!(value, ResultValue::Relationship(edge) if edge.id.0 > 40)
+                ),
+                "{query}: {relationships:?}"
+            );
+        }
+    }
+    indexes.set_relationship_semantic_scope(RelationshipSemanticScope::None)?;
+    assert!(column(&QueryEngine.execute(source, &mut context)?, 0).is_empty());
+    indexes.set_relationship_semantic_scope(RelationshipSemanticScope::All)?;
+    assert_eq!(
+        column(&QueryEngine.execute(source, &mut context)?, 0).len(),
+        2
+    );
+    Ok(())
+}
+
+#[test]
+fn relationship_scope_preserves_trained_prefix_search() -> Result<()> {
+    use crate::graph::{IndexCatalog, RelationshipSemanticScope};
+    struct PrefixEncoder(EmbeddingProfile);
+    impl TextEmbedding for PrefixEncoder {
+        fn profile(&self) -> &EmbeddingProfile {
+            &self.0
+        }
+        fn supports_prefix_dimensions(&self, dimensions: usize) -> bool {
+            dimensions == 128
+        }
+        fn embed(&self, _: &str) -> Result<Vec<f32>> {
+            let mut vector = vec![0.0; 128];
+            vector[0] = 1.0;
+            Ok(vector)
+        }
+    }
+    let graph = GraphStore::default();
+    add_node(&graph, 1, "source", Layer::Observed)?;
+    add_node(&graph, 2, "target", Layer::Observed)?;
+    let vectors = VectorIndex::new(128, Similarity::Cosine)?;
+    for (id, name) in [(10, "CALLS"), (11, "EXPLAINS")] {
+        graph.insert_edge(crate::graph::EdgeInput {
+            id: crate::EdgeId(id),
+            source: NodeId(1),
+            target: NodeId(2),
+            relationship_type: graph.catalog().intern_relationship_type(name)?,
+            layer: Layer::Observed,
+            revision: 1,
+            properties: Vec::new(),
+        })?;
+        let mut vector = vec![0.0; 128];
+        vector[0] = 1.0;
+        vector[1] = if id == 10 { 0.0 } else { 0.1 };
+        vectors.upsert(id, &vector, 1)?;
+    }
+    let indexes = IndexCatalog::default();
+    indexes.set_relationship_semantic_scope(RelationshipSemanticScope::AllExcept(
+        BTreeSet::from(["CALLS".into()]),
+    ))?;
+    let encoder = PrefixEncoder(EmbeddingProfile::new(
+        [1; 32],
+        [2; 32],
+        128,
+        EmbeddingDType::F16,
+        true,
+        Similarity::Cosine,
+    )?);
+    let mut context = context(&graph);
+    context.scalar_indexes = Some(&indexes);
+    context.text_embedding = Some(&encoder);
+    context.vector_indexes.insert(
+        crate::graph::SEMANTIC_RELATIONSHIP_INDEX.into(),
+        VectorSearchSource {
+            property: crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY,
+            exact: &vectors,
+            approximate: None,
+            profile_hash: encoder.profile().profile_hash,
+        },
+    );
+    for input in ["TEXT 'needle'", "HYBRID TEXT 'needle'"] {
+        let query = format!(
+            "SEARCH r IN (EMBEDDING INDEX semantic_relationships FOR {input} USING PREFIX LIMIT 1) SCORE AS score RETURN r"
+        );
+        let output = QueryEngine.execute(&query, &mut context)?;
+        assert!(
+            matches!(column(&output, 0).as_slice(), [ResultValue::Relationship(edge)] if edge.id == crate::EdgeId(11))
+        );
+    }
+    indexes.set_relationship_semantic_scope(RelationshipSemanticScope::None)?;
+    let output = QueryEngine.execute("SEARCH r IN (EMBEDDING INDEX semantic_relationships FOR TEXT 'needle' USING PREFIX LIMIT 1) SCORE AS score RETURN r", &mut context)?;
+    assert!(column(&output, 0).is_empty());
+    Ok(())
+}
+
+#[test]
+fn relationship_scope_applies_to_combined_and_hybrid_lexical_search() -> Result<()> {
+    use crate::graph::{IndexCatalog, RelationshipSemanticScope};
+    let graph = GraphStore::default();
+    add_node(&graph, 1, "source", Layer::Observed)?;
+    add_node(&graph, 2, "target", Layer::Observed)?;
+    let body = graph.catalog().intern_property("body")?;
+    let vectors = VectorIndex::new(2, Similarity::Cosine)?;
+    let nodes = VectorIndex::new(2, Similarity::Cosine)?;
+    nodes.upsert(1, &[0.0, 1.0], 1)?;
+    for (id, kind, value) in [(10, "CALLS", [1.0, 0.0]), (11, "EXPLAINS", [0.8, 0.2])] {
+        graph.insert_edge(crate::graph::EdgeInput {
+            id: crate::EdgeId(id),
+            source: NodeId(1),
+            target: NodeId(2),
+            relationship_type: graph.catalog().intern_relationship_type(kind)?,
+            layer: Layer::Observed,
+            revision: 1,
+            properties: vec![(body, ScalarValue::String("needle evidence".into()))],
+        })?;
+        vectors.upsert(id, &value, 1)?;
+    }
+    let indexes = IndexCatalog::default();
+    indexes.set_relationship_semantic_scope(RelationshipSemanticScope::AllExcept(
+        BTreeSet::from(["CALLS".into()]),
+    ))?;
+    let encoder = encoder()?;
+    let mut context = context(&graph);
+    context.scalar_indexes = Some(&indexes);
+    context.text_embedding = Some(&encoder);
+    for (name, property, exact) in [
+        (
+            crate::graph::SEMANTIC_NODE_INDEX,
+            crate::graph::SEMANTIC_NODE_PROPERTY,
+            &nodes,
+        ),
+        (
+            crate::graph::SEMANTIC_RELATIONSHIP_INDEX,
+            crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY,
+            &vectors,
+        ),
+    ] {
+        context.vector_indexes.insert(
+            name.into(),
+            VectorSearchSource {
+                property,
+                exact,
+                approximate: None,
+                profile_hash: [0; 32],
+            },
+        );
+    }
+    for index in ["semantic_relationships", "graph_semantic"] {
+        for input in ["VECTOR $vector", "HYBRID TEXT 'needle'"] {
+            let query = format!(
+                "SEARCH r IN (EMBEDDING INDEX {index} FOR {input} USING EXACT LIMIT 1) SCORE AS score RETURN r"
+            );
+            let output = QueryEngine.execute(&query, &mut context)?;
+            assert!(
+                matches!(column(&output, 0).as_slice(), [ResultValue::Relationship(edge)] if edge.id == crate::EdgeId(11)),
+                "{query}"
+            );
+        }
+    }
+    indexes.set_relationship_semantic_scope(RelationshipSemanticScope::None)?;
+    let combined = QueryEngine.execute("SEARCH r IN (EMBEDDING INDEX graph_semantic FOR VECTOR $vector USING EXACT LIMIT 10) SCORE AS score RETURN r", &mut context)?;
+    assert!(
+        matches!(column(&combined, 0).as_slice(), [ResultValue::Node(node)] if node.id == NodeId(1))
+    );
+    let relationships = QueryEngine.execute("SEARCH r IN (EMBEDDING INDEX semantic_relationships FOR HYBRID TEXT 'needle' USING EXACT LIMIT 10) SCORE AS score RETURN r", &mut context)?;
+    assert!(column(&relationships, 0).is_empty());
+    Ok(())
 }
 
 #[test]

@@ -50,7 +50,7 @@ ratings | sample_variance | population_variance | sample_stdev | sqrt_of_varianc
 --------+-----------------+---------------------+--------------+-----------------
 35592   | 12.6885         | 12.6882             | 3.5621       | 3.5621          
 
-1 row, 211 ms
+1 row
 ```
 
 ## Advanced example
@@ -85,7 +85,7 @@ accounts | total_ratings | grand_mean | within_group_variance | between_group_va
 ---------+---------------+------------+-----------------------+------------------------+-----------------------------
 741      | 23200         | 0.998      | 7.9802                | 4.9183                 | 38.1                        
 
-1 row, 203 ms
+1 row
 ```
 
 ## Where it earns its place

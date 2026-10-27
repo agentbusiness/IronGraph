@@ -519,6 +519,7 @@ fn required_query_operations(statement: &Statement) -> Result<Vec<OperationScope
             "remote credentials cannot administer the project catalog",
         )),
         Statement::CreateIndex(_)
+        | Statement::AlterAutomaticSemantic { .. }
         | Statement::CreateConstraint(_)
         | Statement::RebuildIndex { .. }
         | Statement::DropIndex { .. }
@@ -893,6 +894,11 @@ mod tests {
 
     #[test]
     fn mutating_queries_require_read_scope_when_they_read_existing_graph() -> Result<()> {
+        let scope = parse("USE project ALTER AUTOMATIC SEMANTIC SET RELATIONSHIPS NONE")?;
+        assert_eq!(
+            required_query_operations(&scope.statement)?,
+            vec![OperationScope::SCHEMA]
+        );
         let read_write = parse(
             "USE project USE LAYER OBSERVED WRITE LAYER OBSERVED \
              MATCH (n) SET n.value = 1 RETURN n",

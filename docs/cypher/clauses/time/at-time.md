@@ -84,7 +84,7 @@ accounts_in_the_graph | rated_by_2012 | mean_reputation | lowest | highest
 ----------------------+---------------+-----------------+--------+--------
 5881                  | 1631          | 1.604           | -10    | 10     
 
-1 row, 8666 ms
+1 row
 ```
 
 ## Where it earns its place

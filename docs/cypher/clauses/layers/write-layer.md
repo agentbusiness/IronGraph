@@ -50,12 +50,26 @@ No rows returned. 1 change committed.
 
 ## Advanced example
 
-A derivation staged in the workspace: the busiest raters, read from the authoritative view and written where they will not disturb it. The result reads them back from the layer they landed in.
+A derivation staged in the workspace: the busiest raters, read from the authoritative view and written
+where they will not disturb it. Use a disposable import of `trust` and create this working set first:
+
+```cypher
+USE trust
+USE LAYER OBSERVED, WORKSPACE
+WRITE LAYER WORKSPACE
+MATCH (rater:Account)-[rating:RATED]->()
+WITH rater.account_id AS account, count(rating) AS given
+ORDER BY given DESC, account
+LIMIT 5
+CREATE (:RankedCandidate {account_id: account, ratings_given: given})
+```
+
+Read back from the layer where the working set was written:
 
 ```cypher
 USE trust
 USE LAYER WORKSPACE
-MATCH (candidate:Candidate)
+MATCH (candidate:RankedCandidate)
 RETURN candidate.account_id AS account,
        candidate.ratings_given AS ratings_given
 ORDER BY ratings_given DESC, account

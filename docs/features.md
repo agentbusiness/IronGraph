@@ -83,7 +83,9 @@ application deliberately writes domain data.
 ## Vectors, text embedding, and documents
 
 Nodes and relationships contribute meaningful content to automatic semantic search when the local
-embedding model is enabled. This includes documents, emails, tables, people, calendar plans, and
+embedding model is enabled. Projects include all relationship types by default. Use
+[`ALTER AUTOMATIC SEMANTIC`](./cypher/statements/indexes/alter-automatic-semantic.md) to exclude
+structural types or all relationships while keeping automatic node search. This includes documents, emails, tables, people, calendar plans, and
 tasks represented in the graph. Relationship meaning includes the relationship type, its content,
 and identifying names from its endpoints. Operational metadata, identifiers, and source URLs are
 excluded by field-selection rules.

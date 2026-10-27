@@ -65,18 +65,19 @@ pub use index::{
     GraphIndexKind, IVF_PQ_ASSIGNMENT_TILE_BYTES, IVF_PQ_BUILD_BATCH_ROWS,
     IVF_PQ_SIZE_CLASS_VERSION, IndexCatalog, IndexDeviceImage, IndexKey, IndexStatus,
     IvfPqBuildKernel, IvfPqBuildPlan, IvfPqConfig, IvfPqIndex, OptimizerIndexStatistics,
-    PostingDeviceImage, RangeIndex, ResolvedVectorMutation, RetrievalStrategy, SEMANTIC_INDEX,
-    SEMANTIC_NODE_INDEX, SEMANTIC_NODE_PROPERTY, SEMANTIC_RELATIONSHIP_INDEX,
-    SEMANTIC_RELATIONSHIP_PROPERTY, ScalarIndexCandidate, Similarity, TextDeviceImage, TextIndex,
-    VectorDeviceImage, VectorHit, VectorIndex,
+    PostingDeviceImage, RangeIndex, RelationshipSemanticScope, ResolvedVectorMutation,
+    RetrievalStrategy, SEMANTIC_INDEX, SEMANTIC_NODE_INDEX, SEMANTIC_NODE_PROPERTY,
+    SEMANTIC_RELATIONSHIP_INDEX, SEMANTIC_RELATIONSHIP_PROPERTY, ScalarIndexCandidate, Similarity,
+    TextDeviceImage, TextIndex, VectorDeviceImage, VectorHit, VectorIndex,
 };
 pub use persistence::PersistenceOp;
 pub use persistent::PagedVec;
 pub use persistent::PersistentMap;
 pub use persistent::{stable_id_key, stable_id_row};
 pub use semantic::{
-    SemanticText, SemanticTextBatch, semantic_affected_owners, semantic_owner_text,
-    semantic_owner_text_with_mutations, semantic_text_delta, semantic_texts,
+    SemanticText, SemanticTextBatch, semantic_affected_owners, semantic_affected_owners_scoped,
+    semantic_owner_text, semantic_owner_text_with_mutations, semantic_text_delta,
+    semantic_text_delta_scoped, semantic_texts, semantic_texts_scoped,
 };
 #[allow(unused_imports)]
 pub use shared::{SharedAllocation, SharedFlat};

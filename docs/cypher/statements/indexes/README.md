@@ -6,5 +6,6 @@ Four index kinds, one statement shape. An equality index answers exact lookups, 
 | --- | --- | --- |
 | [`CREATE INDEX`](./create-index.md) | Declares an access path over a label's property or properties. | extension |
 | [`SHOW INDEXES`](./show-indexes.md) | Lists a project's indexes with their kind, state and diagnostic. | extension |
+| [`ALTER AUTOMATIC SEMANTIC`](./alter-automatic-semantic.md) | Chooses which relationship types receive automatic embeddings. | extension |
 | [`REBUILD INDEX`](./rebuild-index.md) | Rebuilds an index from the current graph. | extension |
 | [`DROP INDEX`](./drop-index.md) | Removes an index declaration and everything it maintained. | extension |

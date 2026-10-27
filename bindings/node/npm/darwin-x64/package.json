@@ -1,6 +1,6 @@
 {
   "name": "@irongraph/node-darwin-x64",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "private": true,
   "cpu": [
     "x64"

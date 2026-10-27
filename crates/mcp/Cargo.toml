@@ -1,21 +1,21 @@
 [package]
 name = "irongraph-mcp"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 rust-version = "1.94"
 publish = false
 build = "build.rs"
 
 [dependencies]
-anyhow = "1.0.100"
+anyhow = "1.0.104"
 axum = "0.8.8"
-clap = { version = "4.5.54", features = ["derive", "env"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
 irongraph-client = { path = "../client" }
 irongraph-server = { path = "../server", default-features = false }
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.150"
-tokio = { version = "1.49.0", features = ["macros", "net", "rt-multi-thread"] }
-uuid = { version = "1.24.0", features = ["v4"] }
+tokio = { version = "1.54.1", features = ["macros", "net", "rt-multi-thread"] }
+uuid = { version = "1.29.0", features = ["v4"] }
 
 [dev-dependencies]
 irongraph-cypher = { path = "../cypher" }

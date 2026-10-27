@@ -82,6 +82,7 @@ fn context<'a>(
         bookmark: BOOKMARK,
         mutation_revision: 65,
         resolved_time_nanos: 0,
+        transaction_time_nanos: None,
         next_node_id: 100,
         next_edge_id: 100,
         predicate_versions: BTreeMap::new(),

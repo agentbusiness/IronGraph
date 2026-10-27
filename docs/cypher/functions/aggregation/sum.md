@@ -48,7 +48,7 @@ net_trust | ratings | mean_rating
 ----------+---------+------------
 36020     | 35592   | 1.012      
 
-1 row, 183 ms
+1 row
 ```
 
 ## Advanced example
@@ -76,7 +76,7 @@ Result:
 account | ratings | net | positive | negative | percent_negative
 --------+---------+-----+----------+----------+-----------------
 
-0 rows, 232 ms
+0 rows
 ```
 
 ## Where it earns its place

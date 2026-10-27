@@ -99,6 +99,7 @@ pub(super) fn prepare(state: &DatabaseState, mutation: &DatabaseMutation) -> Res
             Some(
                 AdministrativeMutation::CreateEmbedding { .. }
                     | AdministrativeMutation::InitializeSemantic { .. }
+                    | AdministrativeMutation::AlterAutomaticSemantic { .. }
             )
         );
     }
@@ -117,8 +118,12 @@ pub(super) fn prepare(state: &DatabaseState, mutation: &DatabaseMutation) -> Res
                     property,
                     entity_id,
                     ..
+                }
+                | ResolvedVectorMutation::Remove {
+                    property,
+                    entity_id,
+                    ..
                 } => (*property, *entity_id),
-                ResolvedVectorMutation::Remove { .. } => continue,
             };
             if property != crate::graph::SEMANTIC_NODE_PROPERTY
                 && property != crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY
@@ -225,6 +230,7 @@ pub(super) fn decode_pending(
             entity_id,
         },
         revision,
+        relationship_scope_revision: None,
     })
 }
 

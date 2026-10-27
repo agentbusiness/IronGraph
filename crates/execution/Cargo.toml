@@ -1,6 +1,6 @@
 [package]
 name = "irongraph-execution"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 rust-version = "1.94"
 publish = false
@@ -17,11 +17,11 @@ chrono-tz = { version = "0.10.4", features = ["serde"] }
 irongraph-types = { path = "../types" }
 irongraph-graph = { path = "../graph" }
 half = { version = "2.7.1", features = ["serde"] }
-ordered-float = { version = "5.1.0", features = ["serde"] }
+ordered-float = { version = "5.5.1", features = ["serde"] }
 parking_lot = { version = "0.12.5", features = ["serde"] }
-serde = { version = "1.0.228", features = ["derive", "rc"] }
-tokio-util = { version = "0.7.18", features = ["rt"] }
-uuid = { version = "1.19.0", features = ["serde", "v4", "v7"] }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
+uuid = { version = "1.29.0", features = ["serde", "v4", "v7"] }
 
 [lints.rust]
 unsafe_code = "deny"
@@ -34,4 +34,4 @@ todo = "deny"
 unimplemented = "deny"
 
 [dev-dependencies]
-proptest = "1.9.0"
+proptest = "1.12.0"

@@ -1,6 +1,6 @@
 [package]
 name = "irongraph-gpu"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 rust-version = "1.94"
 publish = false
@@ -20,14 +20,14 @@ blake3 = { workspace = true }
 chrono = { version = "0.4.42", features = ["serde"] }
 chrono-tz = { version = "0.10.4", features = ["serde"] }
 half = { version = "2.7.1", features = ["serde"] }
-ordered-float = { version = "5.1.0", features = ["serde"] }
-serde = { version = "1.0.228", features = ["derive", "rc"] }
+ordered-float = { version = "5.5.1", features = ["serde"] }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
 parking_lot = "0.12.5"
-tokio-util = { version = "0.7.18", features = ["rt"] }
-uuid = { version = "1.19.0", features = ["serde", "v4", "v7"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
+uuid = { version = "1.29.0", features = ["serde", "v4", "v7"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
-libc = "0.2"
+libc = "0.2.191"
 block2 = { version = "0.6.2", optional = true }
 candle-core = { workspace = true, optional = true, features = ["metal"] }
 candle-metal-kernels = { version = "0.11.0", optional = true }

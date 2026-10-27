@@ -48,7 +48,7 @@ ratings | mean  | median | lowest | highest
 --------+-------+--------+--------+--------
 35592   | 1.012 | 1      | -10    | 10     
 
-1 row, 209 ms
+1 row
 ```
 
 ## Advanced example
@@ -81,7 +81,7 @@ window_start        | ratings | mean  | median | skew
 1419120000000000000 | 1081    | 1.079 | 1      | -0.999
 1450656000000000000 | 57      | 1.263 | 1      | -0.999
 
-7 rows, 271 ms
+7 rows
 ```
 
 ## Where it earns its place

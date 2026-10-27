@@ -1,5 +1,29 @@
 # Functions
 
+## [Numeric functions](./numeric/README.md)
+
+Read signatures, argument and null behavior, and runnable examples for the numeric functions.
+
+## [String functions](./string/README.md)
+
+Read signatures, argument and null behavior, and runnable examples for the string functions.
+
+## [List functions](./list/README.md)
+
+Read signatures, argument and null behavior, and runnable examples for the list functions.
+
+## [Entity functions](./entity/README.md)
+
+Read signatures, argument and null behavior, and runnable examples for the entity functions.
+
+## [Conversion functions](./conversion/README.md)
+
+Read signatures, argument and null behavior, and runnable examples for the conversion functions.
+
+## [Temporal functions](./temporal/README.md)
+
+Read signatures, argument and null behavior, and runnable examples for the temporal functions.
+
 Aggregates and scalar functions. The aggregates are documented first because they are where a graph query becomes a measurement, and because the dispersion and percentile aggregates go beyond what standard Cypher offers.
 
 ## [Aggregate functions](./aggregation/README.md)

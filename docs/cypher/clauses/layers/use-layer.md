@@ -60,6 +60,17 @@ observed_accounts
 
 Workspace data is invisible to the default view. A draft is written to `WORKSPACE`, counted there, and then counted again without naming the layer — where it does not appear at all.
 
+Prerequisite: import `trust` into a disposable example database. Write the draft first:
+
+```cypher
+USE trust
+USE LAYER WORKSPACE
+WRITE LAYER WORKSPACE
+CREATE (:Draft {note: 'candidate merge'})
+```
+
+Then read it in the workspace:
+
 ```cypher
 USE trust
 USE LAYER WORKSPACE
@@ -75,7 +86,7 @@ drafts_in_workspace | notes
 --------------------+----------------------------------------------
 1                   | [{"type":"string","value":"candidate merge"}]
 
-1 row, 54 ms
+1 row
 ```
 
 ## Where it earns its place

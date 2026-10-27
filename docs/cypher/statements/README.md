@@ -1,5 +1,15 @@
 # Statements
 
+## [Streams and Queues](./brokers/README.md)
+
+Create, inspect, retain, clear, purge and drop Kafka-compatible topics and AMQP-compatible queues,
+exchanges and bindings through Cypher. Read each destructive statement's consequence before use.
+
+## Other administration
+
+- [`IMPORT DATASET`](./import-dataset.md) loads a bundled example into its named project.
+- [`CHECK READ ONLY`](./check-read-only.md) validates a statement without executing it.
+
 Statements that change what the database holds or how it is organised, as opposed to clauses that shape a query. Administration is Cypher here: there is no second language for creating a project, declaring an index or making a property remember its past.
 
 ## [Temporal schema statements](./temporal/README.md)
@@ -20,6 +30,7 @@ A project is a named, isolated graph. Every query names one, and nothing falls t
 | --- | --- |
 | [`CREATE PROJECT`](./projects/create-project.md) | Creates a named, isolated graph. |
 | [`SHOW PROJECTS`](./projects/show-projects.md) | Lists every project with its stable identity and display name. |
+| [`ALTER PROJECT`](./projects/alter-project.md) | Renames a project while preserving its stable identity. |
 | [`DROP PROJECT`](./projects/drop-project.md) | Removes a project and, with `CASCADE`, everything inside it. |
 
 ## [Index statements](./indexes/README.md)
@@ -30,6 +41,7 @@ Four index kinds, one statement shape. An equality index answers exact lookups, 
 | --- | --- |
 | [`CREATE INDEX`](./indexes/create-index.md) | Declares an access path over a label's property or properties. |
 | [`SHOW INDEXES`](./indexes/show-indexes.md) | Lists a project's indexes with their kind, state and diagnostic. |
+| [`ALTER AUTOMATIC SEMANTIC`](./indexes/alter-automatic-semantic.md) | Includes or excludes relationship types from automatic semantic search. |
 | [`REBUILD INDEX`](./indexes/rebuild-index.md) | Rebuilds an index from the current graph. |
 | [`DROP INDEX`](./indexes/drop-index.md) | Removes an index declaration and everything it maintained. |
 
@@ -40,4 +52,5 @@ A unique constraint is schema authority, not an access path. It rejects a write 
 | Page | Summary |
 | --- | --- |
 | [`CREATE CONSTRAINT`](./constraints/create-constraint.md) | Requires a property to be unique across a label, and enforces it on write. |
+| [`SHOW CONSTRAINTS`](./constraints/show-constraints.md) | Lists uniqueness requirements and their label and property. |
 | [`DROP CONSTRAINT`](./constraints/drop-constraint.md) | Removes a uniqueness requirement and the index that enforced it. |

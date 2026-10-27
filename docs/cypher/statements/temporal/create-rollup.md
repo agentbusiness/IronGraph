@@ -17,9 +17,14 @@ The windowing accepts the same `TUMBLING` and `HOPPING` forms as the `WINDOW` cl
 
 ## How it behaves
 
-A rollup is derived state and never graph data. It creates no nodes and no relationships, and nothing in a query result names it. Removing a rollup makes queries slower and never changes an answer.
+A rollup is derived state and never graph data. It creates no nodes or relationships and is not
+named in a query result. Its purpose is to maintain aggregates without changing query answers.
+There is no separate DROP ROLLUP statement.
 
 The aggregates are named as bare identifiers after `AGGREGATE`. Declare the ones the queries actually ask for: each is maintained, so an unused aggregate is pure cost.
+
+Supported rollup aggregates are `avg`, `min`, `max`, `count` and `sum`. Other query aggregates remain
+available in ordinary projections, but cannot be named in a rollup declaration.
 
 Rollups do not appear in `SHOW INDEXES`, which lists index state only.
 
@@ -31,9 +36,31 @@ Declare a rollup when the same windowed aggregate over the same temporal propert
 
 `WINDOW` computes a windowed aggregate for one query, over any rows, whether or not a temporal property is involved. `CREATE ROLLUP` declares one ahead of time over a specific temporal property. The clause is the general tool; the rollup is the standing optimisation for a shape you already know.
 
+## Prerequisites
+
+Use a new disposable project for the declaration. Run each statement separately:
+
+```cypher
+CREATE PROJECT rollup_example
+```
+
+```cypher
+USE rollup_example
+CREATE (:Account {account_id: 1, reputation: 0.0})
+```
+
+```cypher
+USE rollup_example
+ALTER NODE PROPERTY Account.reputation SET TEMPORAL FLOAT RETENTION duration('P3650D')
+```
+
+Expected result: the account property is declared temporal and can support a rollup. The advanced
+example separately requires the imported `trust` dataset described in its header.
+
 ## Simple example
 
-A monthly rollup over the reputation series in the reference dataset. It returns no rows: like an index, its effect is on later queries.
+A 30-day rollup over the scratch project's reputation property. It returns no graph rows. Thirty
+days is a fixed width rather than a calendar month.
 
 ```cypher
 USE rollup_example
@@ -51,7 +78,9 @@ No rows returned. 0 changes committed.
 
 ## Advanced example
 
-The query a rollup is declared to serve. Its shape mirrors the declaration — the same property, the same window width, aggregates drawn from the declared set — which is what makes the two match up.
+An analogous query over the imported `trust` dataset. Its property, window width and aggregates show
+the shape a rollup can serve. A rollup declared in `rollup_example` does not apply to `trust`; declare
+one in the project whose queries should use it.
 
 ```cypher
 USE trust

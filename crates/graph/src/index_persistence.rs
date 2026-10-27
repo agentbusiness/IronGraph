@@ -202,6 +202,10 @@ impl IndexCatalog {
         });
         if catalog_changed || changed_runtime {
             output.push(put(
+                b"i/5".to_vec(),
+                self.relationship_semantic.get().as_ref(),
+            )?);
+            output.push(put(
                 b"i/0".to_vec(),
                 &(
                     self.profile.get(),
@@ -390,6 +394,15 @@ impl IndexCatalog {
             return Ok(false);
         }
         match record_key.get(2).copied() {
+            Some(b'5') if record_key == b"i/5" => {
+                let state: RelationshipSemanticState = decode(value)?;
+                if state.reconciled_revision > state.revision {
+                    return Err(corrupt(
+                        "relationship scope completion exceeds its revision",
+                    ));
+                }
+                self.relationship_semantic.restore(state);
+            }
             Some(b'0') if record_key == b"i/0" => {
                 let (profile, definitions): (
                     Option<EmbeddingProfile>,
@@ -589,6 +602,126 @@ mod tests {
         }
         catalog.finish_persistence_restore(graph)?;
         Ok(catalog)
+    }
+
+    #[test]
+    fn relationship_semantic_scope_persists_without_an_encoder_and_fences_completion() -> Result<()>
+    {
+        let graph = GraphStore::default();
+        let catalog = IndexCatalog::default();
+        assert_eq!(
+            catalog.relationship_semantic_state(),
+            (RelationshipSemanticScope::All, 0)
+        );
+        assert!(!catalog.relationship_semantic_reconciliation_pending());
+        assert!(catalog.is_empty());
+        let all_generation = catalog.optimizer_generation();
+        assert!(!catalog.set_relationship_semantic_scope(RelationshipSemanticScope::All)?);
+        assert!(catalog.set_relationship_semantic_scope(RelationshipSemanticScope::None)?);
+        assert!(!catalog.is_empty());
+        assert_ne!(catalog.optimizer_generation(), all_generation);
+        let excluded = RelationshipSemanticScope::AllExcept(BTreeSet::from([
+            "CALLS".to_owned(),
+            "Future Type".to_owned(),
+        ]));
+        assert!(catalog.set_relationship_semantic_scope(excluded.clone())?);
+        assert!(!catalog.complete_relationship_semantic_reconciliation(1));
+        assert!(catalog.relationship_semantic_reconciliation_pending());
+        let selected = catalog.prepare_persistence(&graph, &[], &[])?;
+        let mut records = BTreeMap::new();
+        apply_records(
+            &mut records,
+            catalog.persistence_changes(&graph, &selected, true)?,
+        );
+        let loaded = restore(&graph, &records)?;
+        assert_eq!(loaded.relationship_semantic_state(), (excluded, 2));
+        assert!(loaded.profile().is_none());
+        assert!(!loaded.relationship_semantic_included("CALLS"));
+        assert!(!loaded.relationship_semantic_included("Future Type"));
+        assert!(loaded.relationship_semantic_included("calls"));
+        assert!(loaded.relationship_semantic_reconciliation_pending());
+        assert!(loaded.complete_relationship_semantic_reconciliation(2));
+        assert!(loaded.complete_relationship_semantic_reconciliation(2));
+        assert!(!loaded.relationship_semantic_reconciliation_pending());
+        let selected = loaded.prepare_persistence(&graph, &[], &[])?;
+        apply_records(
+            &mut records,
+            loaded.persistence_changes(&graph, &selected, true)?,
+        );
+        let loaded = restore(&graph, &records)?;
+        assert!(!loaded.relationship_semantic_reconciliation_pending());
+        assert!(loaded.set_relationship_semantic_scope(RelationshipSemanticScope::All)?);
+        assert_eq!(loaded.relationship_semantic_revision(), 3);
+        assert!(!loaded.complete_relationship_semantic_reconciliation(2));
+        assert!(loaded.relationship_semantic_reconciliation_pending());
+        Ok(())
+    }
+
+    #[test]
+    fn relationship_scope_publication_keeps_scope_and_revision_together() -> Result<()> {
+        let catalog = IndexCatalog::default();
+        std::thread::scope(|threads| {
+            let writer = threads.spawn(|| -> Result<()> {
+                for revision in 1..=1_000 {
+                    let scope = if revision % 2 == 0 {
+                        RelationshipSemanticScope::All
+                    } else {
+                        RelationshipSemanticScope::None
+                    };
+                    assert!(catalog.set_relationship_semantic_scope(scope)?);
+                    if revision % 3 == 0 {
+                        catalog.complete_relationship_semantic_reconciliation(revision);
+                    }
+                }
+                Ok(())
+            });
+            for _ in 0..10_000 {
+                let (scope, revision) = catalog.relationship_semantic_state();
+                assert_eq!(
+                    scope,
+                    if revision % 2 == 0 {
+                        RelationshipSemanticScope::All
+                    } else {
+                        RelationshipSemanticScope::None
+                    }
+                );
+            }
+            writer
+                .join()
+                .map_err(|_| corrupt("scope publication writer failed"))?
+        })?;
+        assert_eq!(catalog.relationship_semantic_revision(), 1_000);
+        assert!(!catalog.complete_relationship_semantic_reconciliation(999));
+        assert!(catalog.complete_relationship_semantic_reconciliation(1_000));
+        Ok(())
+    }
+
+    #[test]
+    fn absent_relationship_scope_record_restores_all_and_clones_share_policy() -> Result<()> {
+        let graph = GraphStore::default();
+        let loaded = restore(&graph, &BTreeMap::new())?;
+        let shared = loaded.clone();
+        assert_eq!(
+            loaded.relationship_semantic_state(),
+            (RelationshipSemanticScope::All, 0)
+        );
+        shared.set_relationship_semantic_scope(RelationshipSemanticScope::None)?;
+        assert_eq!(
+            loaded.relationship_semantic_state(),
+            (RelationshipSemanticScope::None, 1)
+        );
+        assert!(loaded.complete_relationship_semantic_reconciliation(1));
+        assert!(!shared.relationship_semantic_reconciliation_pending());
+        assert!(
+            shared.set_relationship_semantic_scope(RelationshipSemanticScope::AllExcept(
+                BTreeSet::new()
+            ))?
+        );
+        assert_eq!(
+            loaded.relationship_semantic_state(),
+            (RelationshipSemanticScope::All, 2)
+        );
+        Ok(())
     }
 
     #[test]

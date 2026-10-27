@@ -297,6 +297,7 @@ impl Binder<'_> {
             Statement::ImportDataset { .. }
             | Statement::CreateProject { .. }
             | Statement::AlterProjectRename { .. }
+            | Statement::AlterAutomaticSemantic { .. }
             | Statement::DropProject { .. }
             | Statement::CreateIndex(_)
             | Statement::CreateConstraint(_)
@@ -3472,6 +3473,14 @@ fn is_supported_builtin_function(name: &str) -> bool {
     BUILTIN_FUNCTIONS.contains(&name) || is_temporal_clock_function(name)
 }
 
+/// Names accepted by the built-in function binder, shared with client discovery.
+pub fn builtin_function_names() -> impl Iterator<Item = &'static str> {
+    BUILTIN_FUNCTIONS
+        .iter()
+        .chain(TEMPORAL_CLOCK_FUNCTIONS)
+        .copied()
+}
+
 /// Clock-qualified temporal functions accept no argument or one timezone string. NULL and every
 /// unresolved expression remain legal because temporal functions propagate NULL and runtime
 /// values may still be valid timezone strings.
@@ -3625,6 +3634,29 @@ mod tests {
                 ..BindCapabilities::default()
             },
         )
+    }
+
+    #[test]
+    fn automatic_semantic_scope_is_schema_mutation_without_catalog_types() -> Result<()> {
+        let catalog = NameCatalog::default();
+        let source = "ALTER AUTOMATIC SEMANTIC SET RELATIONSHIPS ALL EXCEPT `not declared`";
+        let bound = bind(
+            parse(source)?,
+            &catalog,
+            BindCapabilities {
+                schema: true,
+                write: true,
+                ..BindCapabilities::default()
+            },
+        )?;
+        assert!(!bound.read_only);
+        assert_eq!(
+            bind(parse(source)?, &catalog, BindCapabilities::default())
+                .err()
+                .map(|error| error.code),
+            Some(ErrorCode::AuthorizationDenied)
+        );
+        Ok(())
     }
 
     #[test]

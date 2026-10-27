@@ -32,7 +32,7 @@ describe('DocumentsPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'New' }));
 
     await waitFor(() => expect(createDocument).toHaveBeenCalledOnce());
-    expect(screen.getByRole('toolbar', { name: 'Formatting' })).toBeVisible();
+    expect(await screen.findByRole('toolbar', { name: 'Formatting' })).toBeVisible();
     expect(screen.getByRole('button', { name: 'Bold' })).toBeVisible();
     expect(screen.queryByText(/statement to run|run create|detach delete|CREATE \(:Document/i)).not.toBeInTheDocument();
   });

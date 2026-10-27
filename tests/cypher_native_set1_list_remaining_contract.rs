@@ -155,6 +155,7 @@ fn context(graph: &GraphStore) -> ExecutionContext<'_> {
         },
         mutation_revision: graph.revision().saturating_add(1),
         resolved_time_nanos: 0,
+        transaction_time_nanos: None,
         next_node_id: graph
             .nodes()
             .map(|node| node.id().0.saturating_add(1))

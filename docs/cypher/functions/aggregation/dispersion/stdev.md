@@ -49,7 +49,7 @@ ratings | mean  | sample_stdev | population_stdev
 --------+-------+--------------+-----------------
 35592   | 1.012 | 3.562        | 3.562           
 
-1 row, 196 ms
+1 row
 ```
 
 ## Advanced example
@@ -87,7 +87,7 @@ account | ratings | mean_rating | spread | coefficient_of_variation
 2388    | 136     | 0.73        | 3.35   | 4.6                     
 2322    | 31      | 0.65        | 2.92   | 4.52                    
 
-10 rows, 207 ms
+10 rows
 ```
 
 ## Where it earns its place

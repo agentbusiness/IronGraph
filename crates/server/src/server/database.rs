@@ -739,11 +739,19 @@ pub(super) enum SecurityCommand {
 pub(super) struct MutationValidation {
     snapshot: Bookmark,
     dependencies: TransactionDependencies,
+    #[serde(default)]
+    relationship_scope_revision: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum AdministrativeMutation {
+    AlterAutomaticSemantic {
+        relationships: crate::graph::RelationshipSemanticScope,
+    },
+    CompleteRelationshipSemanticScope {
+        revision: u64,
+    },
     InitializeSemantic {
         profile: crate::graph::EmbeddingProfile,
         graph_revision: u64,
@@ -999,6 +1007,11 @@ impl Database {
                         Err(error) => return Err(error),
                     };
                     let (revision, _) = embedding_owner_dependencies(&project, job.owner);
+                    if job.relationship_scope_revision.is_some_and(|expected| {
+                        expected != project.indexes.relationship_semantic_revision()
+                    }) {
+                        return Ok(None);
+                    }
                     if revision.is_some_and(|revision| revision != job.revision) {
                         return Ok(None);
                     }
@@ -1028,15 +1041,29 @@ impl Database {
                             })
                             .is_some_and(|revision| revision >= job.revision)
                     };
-                    if project.indexes.contains(semantic_index) && !current_vector(semantic_index) {
+                    let included = embedding_relationship_included(&project, job.owner);
+                    if project.indexes.contains(semantic_index)
+                        && ((!included
+                            && project
+                                .indexes
+                                .vector_search_source(semantic_index)
+                                .is_some_and(|(vectors, _)| {
+                                    vectors.has_owner_spans(job.owner.entity_id)
+                                }))
+                            || (included && !current_vector(semantic_index)))
+                    {
                         chunks.push(SemanticTextChunk {
                             property,
-                            text: crate::graph::semantic_owner_text(
-                                &project.graph,
-                                job.owner.kind,
-                                job.owner.entity_id,
-                            )?
-                            .map(Arc::from),
+                            text: if included {
+                                crate::graph::semantic_owner_text(
+                                    &project.graph,
+                                    job.owner.kind,
+                                    job.owner.entity_id,
+                                )?
+                                .map(Arc::from)
+                            } else {
+                                None
+                            },
                         });
                     }
                     if job.owner.kind == crate::types::EntityKind::Node {
@@ -1071,6 +1098,9 @@ impl Database {
                             return false;
                         };
                         embedding_owner_dependencies(&project, job.owner).0 == revision
+                            && job.relationship_scope_revision.is_none_or(|expected| {
+                                expected == project.indexes.relationship_semantic_revision()
+                            })
                     });
                     Ok(Some(EmbeddingWork {
                         encoder,
@@ -1119,6 +1149,7 @@ impl Database {
                             validation: MutationValidation {
                                 snapshot: bookmark,
                                 dependencies,
+                                relationship_scope_revision: job.relationship_scope_revision,
                             },
                             graph: Vec::new(),
                             temporal: Vec::new(),
@@ -1414,10 +1445,9 @@ impl Database {
             if !pending.barrier().is_ready() {
                 self.acknowledge_embedding_profile(project, profile_hash, Uuid::new_v4())?;
             }
-            if self
-                .pending_embedding_profile()?
-                .is_some_and(|activation| activation.barrier().is_ready())
-            {
+            if self.pending_embedding_profile()?.is_some_and(|activation| {
+                activation.barrier().subject() == &subject && activation.barrier().is_ready()
+            }) {
                 self.activate_embedding_profile(project, profile_hash, Uuid::new_v4())?;
             }
             return Ok(true);
@@ -1439,6 +1469,7 @@ impl Database {
             .collect::<Vec<_>>()
             .into_iter();
         let initializer = self.embedding_seed_initializer();
+        let initializer_database = Arc::downgrade(&self.0);
         let records = self.0.records.clone();
         // Only a project cursor, one owner, and its revision are retained. Source text stays
         // on the canonical graph; inference backlog is current metadata in the redb file.
@@ -1501,7 +1532,18 @@ impl Database {
                     state.4 = None;
                     return Ok(None);
                 };
-                let job = persistence::decode_pending(&key, &value)?;
+                let mut job = persistence::decode_pending(&key, &value)?;
+                if job.owner.kind == crate::types::EntityKind::Relationship {
+                    let Some(inner) = initializer_database.upgrade() else {
+                        return Ok(None);
+                    };
+                    if let Ok((project, _)) =
+                        Database(inner).capture_canonical_project(job.owner.project)
+                    {
+                        job.relationship_scope_revision =
+                            Some(project.indexes.relationship_semantic_revision());
+                    }
+                }
                 state.4 = Some(key.clone());
                 state.2 = Some((key, value));
                 return Ok(Some(job));
@@ -1523,13 +1565,33 @@ impl Database {
             database.initialize_automatic_semantic(project)?;
             let (live, _) = database.capture_canonical_project(project)?;
             let node_limit = live.graph.node_slot_count();
-            let edge_limit = live.graph.edge_slot_count();
+            let edge_limit = if live.indexes.relationship_semantic_scope()
+                == crate::graph::RelationshipSemanticScope::None
+                && live
+                    .indexes
+                    .vector_search_source(crate::graph::SEMANTIC_RELATIONSHIP_INDEX)
+                    .is_none_or(|(vectors, _)| vectors.is_empty())
+            {
+                0
+            } else {
+                live.graph.edge_slot_count()
+            };
+            let scope_revision = live.indexes.relationship_semantic_revision();
             let live = Arc::downgrade(&live);
+            let seed_database = Arc::downgrade(&database.0);
+            let cancellation = cancellation.clone();
             let mut node = 0;
             let mut edge = 0;
+            let mut finished = false;
             let seed = std::iter::from_fn(move || {
+                if finished || cancellation.is_cancelled() {
+                    return None;
+                }
                 let live = live.upgrade()?;
                 loop {
+                    if cancellation.is_cancelled() {
+                        return None;
+                    }
                     let owner = if node < node_limit {
                         let dense = node;
                         node += 1;
@@ -1553,17 +1615,70 @@ impl Database {
                             entity_id: row.id().0,
                         }
                     } else {
+                        if live.indexes.relationship_semantic_reconciliation_pending()
+                            && live.indexes.relationship_semantic_revision() == scope_revision
+                            && let Some(inner) = seed_database.upgrade()
+                            && let Err(error) = Database(inner)
+                                .complete_relationship_semantic_scope(project, scope_revision)
+                        {
+                            return Some(Err(error));
+                        }
+                        finished = true;
                         return None;
                     };
+                    if !embedding_relationship_included(&live, owner)
+                        && live
+                            .indexes
+                            .vector_search_source(crate::graph::SEMANTIC_RELATIONSHIP_INDEX)
+                            .is_none_or(|(vectors, _)| !vectors.has_owner_spans(owner.entity_id))
+                    {
+                        continue;
+                    }
                     let (revision, _) = embedding_owner_dependencies(&live, owner);
                     return Some(Ok(super::embedding_jobs::EmbeddingJob {
                         owner,
                         revision: revision.unwrap_or(1).max(1),
+                        relationship_scope_revision: (owner.kind
+                            == crate::types::EntityKind::Relationship)
+                            .then(|| live.indexes.relationship_semantic_revision()),
                     }));
                 }
             });
             Ok(Some(Box::new(seed) as super::embedding_jobs::EmbeddingSeed))
         })
+    }
+
+    /// Initializes empty semantic access paths; the worker seeds owner identities incrementally.
+    fn complete_relationship_semantic_scope(
+        &self,
+        project: ProjectId,
+        revision: u64,
+    ) -> Result<()> {
+        let (_, snapshot) = self.capture_canonical_project(project)?;
+        self.commit_scoped_from(
+            DatabaseMutation::Graph {
+                project,
+                validation: MutationValidation {
+                    snapshot,
+                    dependencies: TransactionDependencies::default(),
+                    relationship_scope_revision: None,
+                },
+                graph: Vec::new(),
+                temporal: Vec::new(),
+                vectors: Vec::new(),
+                administrative: Some(AdministrativeMutation::CompleteRelationshipSemanticScope {
+                    revision,
+                }),
+            },
+            MutationKind::Graph,
+            Some(project),
+            Some(Uuid::new_v4()),
+            AdmissionClass::Control,
+            CommitAcknowledgement::Published,
+            ConnectionId::new(),
+            None,
+        )?;
+        Ok(())
     }
 
     /// Initializes empty semantic access paths; the worker seeds owner identities incrementally.
@@ -1609,6 +1724,7 @@ impl Database {
                 validation: MutationValidation {
                     snapshot: bookmark,
                     dependencies: TransactionDependencies::default(),
+                    relationship_scope_revision: None,
                 },
                 graph: Vec::new(),
                 temporal: Vec::new(),
@@ -2397,7 +2513,9 @@ impl Database {
                     text_embedding.as_deref(),
                 ) {
                     Ok(output) => output,
-                    Err(error) if error.code == ErrorCode::TransactionConflict => {
+                    Err(error)
+                        if error.code == ErrorCode::TransactionConflict && error.retryable =>
+                    {
                         self.ensure_apply_healthy()?;
                         continue;
                     }
@@ -2435,6 +2553,7 @@ impl Database {
                     validation: MutationValidation {
                         snapshot: planning_bookmark,
                         dependencies: output.dependencies.clone(),
+                        relationship_scope_revision: None,
                     },
                     graph: output.graph_mutations,
                     temporal: output
@@ -2476,7 +2595,9 @@ impl Database {
                         }
                         return Err(error);
                     }
-                    Err(error) if error.code == ErrorCode::TransactionConflict => {
+                    Err(error)
+                        if error.code == ErrorCode::TransactionConflict && error.retryable =>
+                    {
                         self.ensure_apply_healthy()?;
                         continue;
                     }
@@ -2576,9 +2697,27 @@ impl Database {
         barrier: Bookmark,
         emit: &mut dyn FnMut(QueryStreamEvent) -> Result<()>,
     ) -> Result<()> {
-        let (rows, bookmark) = {
+        let (rows, bookmark, scope, reconciling) = {
             let (project, bookmark) = self.capture_canonical_project(project)?;
-            (project.indexes.statuses().collect::<Vec<_>>(), bookmark)
+            (
+                project.indexes.statuses().collect::<Vec<_>>(),
+                bookmark,
+                match project.indexes.relationship_semantic_scope() {
+                    crate::graph::RelationshipSemanticScope::All => "all".to_owned(),
+                    crate::graph::RelationshipSemanticScope::None => "none".to_owned(),
+                    crate::graph::RelationshipSemanticScope::AllExcept(names) => format!(
+                        "all except {}",
+                        names
+                            .iter()
+                            .map(|name| format!("`{}`", name.replace('`', "``")))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                },
+                project
+                    .indexes
+                    .relationship_semantic_reconciliation_pending(),
+            )
         };
         self.wait_for_captured_all(consistency, barrier, bookmark)?;
         emit(QueryStreamEvent::Schema {
@@ -2601,6 +2740,16 @@ impl Database {
                 },
                 QueryColumn {
                     name: "diagnostic".to_owned(),
+                    value_type: "STRING".to_owned(),
+                    nullable: true,
+                },
+                QueryColumn {
+                    name: "scope".to_owned(),
+                    value_type: "STRING".to_owned(),
+                    nullable: true,
+                },
+                QueryColumn {
+                    name: "reconciliation".to_owned(),
                     value_type: "STRING".to_owned(),
                     nullable: true,
                 },
@@ -2649,6 +2798,36 @@ impl Database {
                                 .diagnostic
                                 .clone()
                                 .map_or(TypedValue::Null, TypedValue::String)
+                        })
+                        .collect(),
+                },
+                BatchColumn {
+                    name: "scope".to_owned(),
+                    value_type: "STRING".to_owned(),
+                    values: rows
+                        .iter()
+                        .map(|status| {
+                            if status.name == crate::graph::SEMANTIC_RELATIONSHIP_INDEX {
+                                TypedValue::String(format!("relationships: {scope}"))
+                            } else {
+                                TypedValue::Null
+                            }
+                        })
+                        .collect(),
+                },
+                BatchColumn {
+                    name: "reconciliation".to_owned(),
+                    value_type: "STRING".to_owned(),
+                    values: rows
+                        .iter()
+                        .map(|status| {
+                            if status.name == crate::graph::SEMANTIC_RELATIONSHIP_INDEX {
+                                TypedValue::String(
+                                    if reconciling { "pending" } else { "complete" }.to_owned(),
+                                )
+                            } else {
+                                TypedValue::Null
+                            }
                         })
                         .collect(),
                 },
@@ -3563,6 +3742,7 @@ impl Database {
         };
         let mut state = TransactionState {
             catalog: snapshot.graph.catalog().clone(),
+            started_time_nanos: unix_nanos(SystemTime::now())?,
             working: Arc::clone(&snapshot),
             bookmark: current_bookmark,
             consistency,
@@ -3670,12 +3850,33 @@ fn embedding_owner_dependencies(
     (revision, dependencies)
 }
 
+fn embedding_relationship_included(
+    project: &ProjectState,
+    owner: super::embedding_jobs::EmbeddingOwner,
+) -> bool {
+    owner.kind == crate::types::EntityKind::Node
+        || project
+            .graph
+            .edge(crate::EdgeId(owner.entity_id))
+            .is_some_and(|edge| {
+                project
+                    .graph
+                    .catalog()
+                    .relationship_type_name(edge.relationship_type())
+                    .is_some_and(|name| project.indexes.relationship_semantic_included(&name))
+            })
+}
+
 fn embedding_changed_owners(
     project: &ProjectState,
     mutations: &[GraphMutation],
 ) -> Result<(BTreeSet<crate::NodeId>, BTreeSet<crate::EdgeId>)> {
-    let (mut nodes, edges) =
-        crate::graph::semantic_affected_owners(&project.graph, &[], mutations)?;
+    let (mut nodes, edges) = crate::graph::semantic_affected_owners_scoped(
+        &project.graph,
+        &[],
+        mutations,
+        &project.indexes.relationship_semantic_scope(),
+    )?;
     let sources = project
         .indexes
         .embedding_definitions()
@@ -3729,19 +3930,28 @@ fn embedding_freshness_updates(
     }
     // A map update can change many fields on the same owner. Visit its incident relationships
     // once, rather than once per field. New owners have no canonical adjacency yet.
-    for node in changed_nodes {
+    for node in changed_nodes.into_iter().filter(|_| {
+        project.indexes.relationship_semantic_scope()
+            != crate::graph::RelationshipSemanticScope::None
+    }) {
         if project.graph.node(node).is_some() {
             for edge in project.graph.incident_edge_ids(node)? {
-                candidates.insert(EmbeddingOwner {
+                let owner = EmbeddingOwner {
                     project: project.id,
                     kind: EntityKind::Relationship,
                     entity_id: edge.0,
-                });
+                };
+                if embedding_relationship_included(project, owner) {
+                    candidates.insert(owner);
+                }
             }
         }
     }
     let mut updates = Vec::new();
     for owner in candidates {
+        if !embedding_relationship_included(project, owner) {
+            continue;
+        }
         let dirty = match owner.kind {
             EntityKind::Node => dirty_nodes.contains(&crate::NodeId(owner.entity_id)),
             EntityKind::Relationship => dirty_edges.contains(&crate::EdgeId(owner.entity_id)),
@@ -3861,6 +4071,7 @@ impl QueryExecutor for Database {
 }
 
 struct TransactionState {
+    started_time_nanos: i64,
     catalog: crate::graph::NameCatalog,
     working: Arc<ProjectState>,
     bookmark: Bookmark,
@@ -4002,7 +4213,7 @@ impl QueryTransaction for DatabaseTransaction {
             .iter()
             .flat_map(|batch| batch.temporal_mutations.iter().cloned())
             .collect::<Vec<_>>();
-        let output = execute_on_project_inner(
+        let output = execute_on_project_with_clock(
             &state.working,
             &request,
             state.bookmark,
@@ -4012,6 +4223,7 @@ impl QueryTransaction for DatabaseTransaction {
             &prior_graph,
             &prior_temporal,
             None,
+            Some(state.started_time_nanos),
         )?;
         if output.administrative.is_some() {
             return Err(Error::new(
@@ -4165,6 +4377,7 @@ impl DatabaseTransaction {
                 validation: MutationValidation {
                     snapshot: state.bookmark,
                     dependencies,
+                    relationship_scope_revision: None,
                 },
                 graph,
                 temporal,
@@ -4474,6 +4687,33 @@ fn execute_on_project_inner(
     prior_temporal_mutations: &[crate::cypher::PreparedTemporalMutation],
     stream: Option<&mut dyn FnMut(ExecutionStreamItem) -> Result<()>>,
 ) -> Result<ExecutionOutput> {
+    execute_on_project_with_clock(
+        project,
+        request,
+        bookmark,
+        mutation_revision,
+        capabilities,
+        text_embedding,
+        prior_graph_mutations,
+        prior_temporal_mutations,
+        stream,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_on_project_with_clock(
+    project: &ProjectState,
+    request: &QueryRequest,
+    bookmark: Bookmark,
+    mutation_revision: u64,
+    capabilities: BindCapabilities,
+    text_embedding: Option<&dyn TextEmbedding>,
+    prior_graph_mutations: &[GraphMutation],
+    prior_temporal_mutations: &[crate::cypher::PreparedTemporalMutation],
+    stream: Option<&mut dyn FnMut(ExecutionStreamItem) -> Result<()>>,
+    transaction_time_nanos: Option<i64>,
+) -> Result<ExecutionOutput> {
     let parameters = request
         .parameters
         .iter()
@@ -4545,6 +4785,7 @@ fn execute_on_project_inner(
         bookmark,
         mutation_revision,
         resolved_time_nanos: unix_nanos(SystemTime::now())?,
+        transaction_time_nanos,
         resolved_query_at_time_nanos: None,
         next_node_id,
         next_edge_id,
@@ -4941,6 +5182,21 @@ fn staged_embedding_profile_command(
     let mut activated = None;
     match command {
         EmbeddingProfileCommand::Begin { project, profile } => {
+            if state
+                .projects
+                .get(project)
+                .is_some_and(|project| project.indexes.profile().as_deref() == Some(profile))
+                || activation.as_ref().is_some_and(|pending| {
+                    pending.profile() == profile
+                        && pending.barrier().subject()
+                            == &(ActivationSubject::EmbeddingProfile {
+                                project: *project,
+                                profile_hash: profile.profile_hash,
+                            })
+                })
+            {
+                return Ok((activation, None));
+            }
             if activation.is_some() {
                 return Err(Error::new(
                     ErrorCode::TransactionConflict,
@@ -4966,6 +5222,14 @@ fn staged_embedding_profile_command(
             project,
             profile_hash,
         } => {
+            if state
+                .projects
+                .get(project)
+                .and_then(|project| project.indexes.profile())
+                .is_some_and(|profile| profile.profile_hash == *profile_hash)
+            {
+                return Ok((activation, None));
+            }
             let pending = activation.as_mut().ok_or_else(|| {
                 Error::new(
                     ErrorCode::TransactionConflict,
@@ -4989,6 +5253,14 @@ fn staged_embedding_profile_command(
             project,
             profile_hash,
         } => {
+            if state
+                .projects
+                .get(project)
+                .and_then(|project| project.indexes.profile())
+                .is_some_and(|profile| profile.profile_hash == *profile_hash)
+            {
+                return Ok((activation, None));
+            }
             let pending = activation.take().ok_or_else(|| {
                 Error::new(
                     ErrorCode::TransactionConflict,
@@ -5235,6 +5507,18 @@ fn validate_sequencer_mutation(
                 project_state,
                 validation.snapshot.index,
             )?;
+            if validation
+                .relationship_scope_revision
+                .is_some_and(|expected| {
+                    expected != project_state.indexes.relationship_semantic_revision()
+                })
+            {
+                return Err(Error::retryable(
+                    ErrorCode::TransactionConflict,
+                    "relationship semantic scope changed during embedding",
+                    None,
+                ));
+            }
             project_state
                 .graph
                 .validate_mutations_at_revision(graph, bookmark.index)?;
@@ -5541,6 +5825,15 @@ fn validate_administrative(
             .ok_or_else(|| Error::new(ErrorCode::QueryType, "property is not declared"))
     };
     match mutation {
+        AdministrativeMutation::AlterAutomaticSemantic { relationships: _ } => {
+            project
+                .indexes
+                .relationship_semantic_revision()
+                .checked_add(1)
+                .ok_or_else(|| Error::internal("relationship semantic scope revision exhausted"))?;
+            Ok(())
+        }
+        AdministrativeMutation::CompleteRelationshipSemanticScope { .. } => Ok(()),
         AdministrativeMutation::InitializeSemantic {
             profile,
             graph_revision,
@@ -5727,6 +6020,16 @@ fn apply_administrative(
     resolved_commit_time_nanos: i64,
 ) -> Result<()> {
     match mutation {
+        AdministrativeMutation::AlterAutomaticSemantic { relationships } => {
+            project
+                .indexes
+                .set_relationship_semantic_scope(relationships)?;
+        }
+        AdministrativeMutation::CompleteRelationshipSemanticScope { revision } => {
+            project
+                .indexes
+                .complete_relationship_semantic_reconciliation(revision);
+        }
         AdministrativeMutation::InitializeSemantic {
             profile,
             graph_revision,
@@ -5977,6 +6280,15 @@ fn administrative_mutation(
             | Statement::BindQueue { .. }
             | Statement::UnbindQueue { .. },
         ) => Ok(None),
+        Some(Statement::AlterAutomaticSemantic { relationships }) => {
+            if project.indexes.relationship_semantic_scope() == relationships {
+                Ok(None)
+            } else {
+                Ok(Some(AdministrativeMutation::AlterAutomaticSemantic {
+                    relationships,
+                }))
+            }
+        }
         Some(Statement::CreateIndex(definition)) => Ok(Some(AdministrativeMutation::CreateIndex {
             name: definition.name,
             kind: format!("{:?}", definition.kind),
@@ -6872,6 +7184,7 @@ fn statement_writes(statement: &Statement) -> bool {
         | Statement::ShowExchanges
         | Statement::ShowConsumerLag => false,
         Statement::ImportDataset { .. }
+        | Statement::AlterAutomaticSemantic { .. }
         | Statement::CreateProject { .. }
         | Statement::AlterProjectRename { .. }
         | Statement::DropProject { .. }
@@ -7403,36 +7716,9 @@ where
 }
 
 fn builtin_functions() -> Vec<String> {
-    [
-        "abs",
-        "avg",
-        "ceil",
-        "coalesce",
-        "collect",
-        "count",
-        "date",
-        "datetime",
-        "duration",
-        "floor",
-        "max",
-        "min",
-        "percentileCont",
-        "percentileDisc",
-        "round",
-        "stDev",
-        "stDevP",
-        "sum",
-        "time",
-        "toBoolean",
-        "toFloat",
-        "toInteger",
-        "toString",
-        "vector.similarity.cosine",
-        "vector.similarity.euclidean",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect()
+    crate::cypher::builtin_function_names()
+        .map(str::to_owned)
+        .collect()
 }
 
 fn temporal_type(value: &str) -> Result<crate::graph::TemporalType> {
@@ -8155,6 +8441,7 @@ mod project_lifecycle_tests {
         Arc::new(TransactionResource {
             terminal: AtomicU8::new(0),
             lifecycle: Mutex::new(TransactionLifecycle::Active(TransactionState {
+                started_time_nanos: 0,
                 catalog: snapshot.graph.catalog().clone(),
                 working: Arc::clone(&snapshot),
                 bookmark,
@@ -8460,6 +8747,7 @@ mod project_lifecycle_tests {
             validation: MutationValidation {
                 snapshot,
                 dependencies,
+                relationship_scope_revision: None,
             },
             graph: vec![GraphMutation::SetNodeProperty {
                 node: crate::NodeId(1),
@@ -8502,6 +8790,7 @@ mod project_lifecycle_tests {
                 validation: MutationValidation {
                     snapshot: bookmark,
                     dependencies: output.dependencies,
+                    relationship_scope_revision: None,
                 },
                 graph: output.graph_mutations,
                 temporal: Vec::new(),
@@ -10185,6 +10474,95 @@ mod project_lifecycle_tests {
         Ok(())
     }
 
+    #[test]
+    fn embedding_profile_replayed_readiness_preserves_newer_project_activation() -> Result<()> {
+        let a = ProjectId::random();
+        let b = ProjectId::random();
+        let profile = crate::graph::EmbeddingProfile::new(
+            [7; 32],
+            [8; 32],
+            384,
+            crate::graph::EmbeddingDType::F16,
+            true,
+            crate::graph::Similarity::Cosine,
+        )?;
+        let mut state = DatabaseState::default();
+        for (id, name) in [(a, "first"), (b, "second")] {
+            apply_mutation(
+                &mut state,
+                DatabaseMutation::CreateProject {
+                    id,
+                    display_name: name.to_owned(),
+                },
+                Bookmark { term: 1, index: 1 },
+                1,
+                None,
+            )?;
+        }
+        let begin = |project| EmbeddingProfileCommand::Begin {
+            project,
+            profile: profile.clone(),
+        };
+        let ack = |project| EmbeddingProfileCommand::Acknowledge {
+            project,
+            profile_hash: profile.profile_hash,
+        };
+        let activate = |project| EmbeddingProfileCommand::Activate {
+            project,
+            profile_hash: profile.profile_hash,
+        };
+        apply_embedding_profile_command(&mut state, &begin(a))?;
+        apply_embedding_profile_command(&mut state, &ack(a))?;
+        apply_embedding_profile_command(&mut state, &activate(a))?;
+        apply_embedding_profile_command(&mut state, &ack(a))?;
+        apply_embedding_profile_command(&mut state, &activate(a))?;
+        apply_embedding_profile_command(&mut state, &begin(a))?;
+        assert!(state.embedding_activation.is_none());
+        apply_embedding_profile_command(&mut state, &begin(b))?;
+        apply_embedding_profile_command(&mut state, &ack(a))?;
+        assert!(
+            !state
+                .embedding_activation
+                .as_ref()
+                .expect("B pending")
+                .barrier()
+                .is_ready()
+        );
+        apply_embedding_profile_command(&mut state, &ack(b))?;
+        apply_embedding_profile_command(&mut state, &begin(b))?;
+        apply_embedding_profile_command(&mut state, &activate(a))?;
+        let pending = state.embedding_activation.as_ref().expect("B preserved");
+        assert!(pending.barrier().is_ready());
+        assert_eq!(
+            pending.barrier().subject(),
+            &(ActivationSubject::EmbeddingProfile {
+                project: b,
+                profile_hash: profile.profile_hash
+            })
+        );
+        assert!(
+            validate_embedding_profile_command(
+                &state,
+                &EmbeddingProfileCommand::Activate {
+                    project: a,
+                    profile_hash: [99; 32],
+                }
+            )
+            .is_err()
+        );
+        apply_embedding_profile_command(&mut state, &activate(b))?;
+        assert!(state.embedding_activation.is_none());
+        assert_eq!(
+            state
+                .projects
+                .get(&b)
+                .and_then(|project| project.indexes.profile())
+                .as_deref(),
+            Some(&profile)
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn document_embedding_delta_batches_complete_text_without_scanning_unrelated_rows()
     -> Result<()> {
@@ -10254,6 +10632,7 @@ mod project_lifecycle_tests {
                             entity_id: 2000,
                         },
                         revision: 2000,
+                        relationship_scope_revision: None,
                     }))
             }),
             EmbeddingCallbacks {

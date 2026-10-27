@@ -55,7 +55,7 @@ user | trusted_by | trusts
 8    | 104        | 29    
 9    | 15         | 16    
 
-10 rows, 95 ms
+10 rows
 ```
 
 ## Advanced example
@@ -87,7 +87,7 @@ magnitude | accounts | lowest | highest | mean
 2         | 2191     | 100    | 968     | 225.8 
 3         | 23       | 1019   | 3079    | 1424.1
 
-4 rows, 165 ms
+4 rows
 ```
 
 ## Where it earns its place

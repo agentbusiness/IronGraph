@@ -70,8 +70,10 @@ operations report a diagnostic through `SHOW INDEXES`.
 
 ## Choose automatic or field-specific search
 
-Use `graph_semantic` to search meaningful content across all nodes and relationships without a
-declaration. Use a field-specific index when a particular property, such as `Document.body`, should
+Use `graph_semantic` to search meaningful content across nodes and included relationships without a
+declaration. Projects include all relationship types by default; use
+[`ALTER AUTOMATIC SEMANTIC`](../../statements/indexes/alter-automatic-semantic.md) to exclude
+structural types or all relationships. Use a field-specific index when a particular property, such as `Document.body`, should
 determine the ranking. A plain vector index is for vectors you supply yourself. A text index searches
 the words present in the source.
 

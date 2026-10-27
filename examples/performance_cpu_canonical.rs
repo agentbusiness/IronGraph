@@ -341,6 +341,7 @@ fn context<'a>(graph: &'a GraphStore, statistics: &'a StatisticsSnapshot) -> Exe
         bookmark: Bookmark { term: 1, index: 1 },
         mutation_revision: graph.revision() + 1,
         resolved_time_nanos: 0,
+        transaction_time_nanos: None,
         next_node_id: graph.node_slot_count() as u64 + 1,
         next_edge_id: graph.edge_slot_count() as u64 + 1,
         predicate_versions: BTreeMap::new(),

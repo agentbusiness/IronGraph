@@ -157,11 +157,360 @@ async fn duplicate_index_requests_terminate_and_guards_preserve_existing_schema(
     result
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relationship_scope_cleanup_retires_durable_pending_owner() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let encoder = Arc::new(ContentEncoder::new()?);
+    let boot = open(directory.path(), encoder.clone()).await?;
+    let database = boot.backend().as_ref().clone();
+    query_async(&database, "CREATE PROJECT cleanup").await?;
+    query_async(&database, "USE cleanup CREATE (a:Symbol {name:'contract'}), (b:Symbol {name:'guitar'}), (a)-[:CALLS {body:'original'}]->(b)").await?;
+    wait_embeddings(&database, "cleanup", &encoder).await?;
+    wait_embedding_idle(&database).await?;
+    let project = database.resolve_project_name("cleanup")?;
+    let edge = database
+        .capture_canonical_project(project)?
+        .0
+        .graph
+        .edges()
+        .next()
+        .ok_or_else(|| Error::internal("missing cleanup fixture"))?
+        .id()
+        .0;
+    let owner = super::super::embedding_jobs::EmbeddingOwner {
+        project,
+        kind: crate::types::EntityKind::Relationship,
+        entity_id: edge,
+    };
+    encoder.entered.store(false, Ordering::Release);
+    encoder.paused.store(true, Ordering::Release);
+    query_async(
+        &database,
+        "USE cleanup MATCH ()-[r:CALLS]->() SET r.body='changed'",
+    )
+    .await?;
+    wait_until(|| Ok(encoder.entered.load(Ordering::Acquire))).await?;
+    assert!(
+        database
+            .0
+            .records
+            .get(&persistence::pending_key(owner))?
+            .is_some()
+    );
+    query_async(
+        &database,
+        "USE cleanup ALTER AUTOMATIC SEMANTIC SET RELATIONSHIPS NONE",
+    )
+    .await?;
+    scope_vector_count(&database, project, 0).await?;
+    wait_until(|| {
+        Ok(database
+            .0
+            .records
+            .get(&persistence::pending_key(owner))?
+            .is_none())
+    })
+    .await?;
+    database.shutdown_embedding_jobs().await?;
+    boot.runtime().shutdown().await?;
+    Ok(())
+}
+
+async fn scope_vector_count(database: &Database, project: ProjectId, count: usize) -> Result<()> {
+    wait_until(|| {
+        let (live, _) = database.capture_canonical_project(project)?;
+        Ok(live
+            .indexes
+            .vector_search_source(crate::graph::SEMANTIC_RELATIONSHIP_INDEX)
+            .is_some_and(|(vectors, _)| vectors.len() == count)
+            && !live.indexes.relationship_semantic_reconciliation_pending())
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn permanent_uniqueness_conflict_returns_without_autocommit_retry() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let boot = open(directory.path(), Arc::new(ContentEncoder::new()?)).await?;
+    let database = boot.backend().as_ref().clone();
+    query_async(&database, "CREATE PROJECT uniqueness_termination").await?;
+    query_async(
+        &database,
+        "USE uniqueness_termination CREATE (:Book {isbn:'same'})",
+    )
+    .await?;
+    query_async(&database, "USE uniqueness_termination CREATE CONSTRAINT unique_isbn FOR (b:Book) REQUIRE b.isbn IS UNIQUE").await?;
+    let mut request: QueryRequest = serde_json::from_value(serde_json::json!({
+        "request_id": Uuid::new_v4(), "query": "USE uniqueness_termination CREATE (:Book {isbn:'same'})"
+    })).map_err(|error| Error::internal(error.to_string()))?;
+    request.deadline = Some(Instant::now() + Duration::from_secs(1));
+    let worker = database.clone();
+    let error = tokio::task::spawn_blocking(move || worker.execute(request, &mut |_| Ok(())))
+        .await
+        .map_err(|error| Error::internal(error.to_string()))?
+        .expect_err("duplicate must be rejected without retrying to the deadline");
+    assert_eq!(error.code, ErrorCode::TransactionConflict);
+    assert!(!error.retryable);
+    let rows = query_async(
+        &database,
+        "USE uniqueness_termination MATCH (n:Book) RETURN count(n)",
+    )
+    .await?;
+    assert_eq!(rows[0][0]["value"], "1");
+    database.shutdown_embedding_jobs().await?;
+    boot.runtime().shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relationship_scope_excludes_cleans_widens_and_survives_reopen() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let encoder = Arc::new(ContentEncoder::new()?);
+    let boot = open(directory.path(), encoder.clone()).await?;
+    let database = boot.backend().as_ref().clone();
+    query_async(&database, "CREATE PROJECT scoped").await?;
+    query_async(
+        &database,
+        "USE scoped ALTER AUTOMATIC SEMANTIC SET RELATIONSHIPS NONE",
+    )
+    .await?;
+    query_async(&database, "USE scoped CREATE (a:Symbol {name:'contract'}), (b:Symbol {name:'guitar'}), (a)-[:CALLS]->(b), (a)-[:DESCRIBES {body:'contract'}]->(b)").await?;
+    let project = database.resolve_project_name("scoped")?;
+    scope_vector_count(&database, project, 0).await?;
+    assert!(!encoder.inputs.lock().iter().any(|text| text.contains('→')));
+    query_async(
+        &database,
+        "USE scoped ALTER AUTOMATIC SEMANTIC SET RELATIONSHIPS ALL",
+    )
+    .await?;
+    scope_vector_count(&database, project, 2).await?;
+    query_async(
+        &database,
+        "USE scoped ALTER AUTOMATIC SEMANTIC SET RELATIONSHIPS ALL EXCEPT CALLS, `Future Type`",
+    )
+    .await?;
+    // Search exclusion is immediate, independently of background vector removal.
+    let results = query_async(&database, "USE scoped SEARCH r IN (EMBEDDING INDEX semantic_relationships FOR TEXT 'contract' USING EXACT LIMIT 10) SCORE AS score RETURN type(r)").await?;
+    assert!(results.iter().all(|row| row[0]["value"] == "DESCRIBES"));
+    scope_vector_count(&database, project, 1).await?;
+    let statuses = query_async(&database, "USE scoped SHOW INDEXES").await?;
+    assert!(statuses.iter().any(|row| {
+        row[0]["value"] == "semantic_relationships"
+            && row[4]["value"]
+                .as_str()
+                .is_some_and(|value| value.contains("CALLS"))
+            && row[5]["value"] == "complete"
+    }));
+    let revision = database
+        .capture_canonical_project(project)?
+        .0
+        .indexes
+        .relationship_semantic_revision();
+    query_async(
+        &database,
+        "USE scoped ALTER AUTOMATIC SEMANTIC SET RELATIONSHIPS ALL EXCEPT CALLS, `Future Type`",
+    )
+    .await?;
+    assert_eq!(
+        revision,
+        database
+            .capture_canonical_project(project)?
+            .0
+            .indexes
+            .relationship_semantic_revision()
+    );
+    database.shutdown_embedding_jobs().await?;
+    boot.runtime().shutdown().await?;
+    drop(database);
+    drop(boot);
+    let reopened = open(directory.path(), encoder.clone()).await?;
+    let database = reopened.backend().as_ref().clone();
+    let live = database.capture_canonical_project(project)?.0;
+    assert!(!live.indexes.relationship_semantic_included("CALLS"));
+    assert!(!live.indexes.relationship_semantic_included("Future Type"));
+    drop(live);
+    query_async(&database, "USE scoped CREATE (a:Symbol {name:'new'}), (b:Symbol {name:'next'}), (a)-[:`Future Type`]->(b)").await?;
+    query_async(
+        &database,
+        "USE scoped MATCH (n:Symbol {name:'contract'}) SET n.name='renamed'",
+    )
+    .await?;
+    scope_vector_count(&database, project, 1).await?;
+    query_async(
+        &database,
+        "USE scoped ALTER AUTOMATIC SEMANTIC SET RELATIONSHIPS ALL",
+    )
+    .await?;
+    scope_vector_count(&database, project, 3).await?;
+    query_async(
+        &database,
+        "USE scoped ALTER AUTOMATIC SEMANTIC SET RELATIONSHIPS NONE",
+    )
+    .await?;
+    scope_vector_count(&database, project, 0).await?;
+    query_async(&database, "USE scoped MATCH (n) DETACH DELETE n").await?;
+    database.shutdown_embedding_jobs().await?;
+    reopened.runtime().shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relationship_scope_cancels_inflight_vectors_and_recovers_pending_widening() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let encoder = Arc::new(ContentEncoder::new()?);
+    let boot = open(directory.path(), encoder.clone()).await?;
+    let database = boot.backend().as_ref().clone();
+    query_async(&database, "CREATE PROJECT raced").await?;
+    query_async(
+        &database,
+        "USE raced CREATE (:Symbol {name:'contract'}), (:Symbol {name:'guitar'})",
+    )
+    .await?;
+    wait_embeddings(&database, "raced", &encoder).await?;
+    wait_embedding_idle(&database).await?;
+    encoder.entered.store(false, Ordering::Release);
+    encoder.paused.store(true, Ordering::Release);
+    query_async(&database, "USE raced MATCH (a:Symbol {name:'contract'}), (b:Symbol {name:'guitar'}) CREATE (a)-[:CALLS]->(b)").await?;
+    wait_until(|| Ok(encoder.entered.load(Ordering::Acquire))).await?;
+    query_async(
+        &database,
+        "USE raced ALTER AUTOMATIC SEMANTIC SET RELATIONSHIPS NONE",
+    )
+    .await?;
+    let project = database.resolve_project_name("raced")?;
+    scope_vector_count(&database, project, 0).await?;
+    // Widen while inference is paused, then stop before catch-up can finish.
+    query_async(
+        &database,
+        "USE raced ALTER AUTOMATIC SEMANTIC SET RELATIONSHIPS ALL",
+    )
+    .await?;
+    database.shutdown_embedding_jobs().await?;
+    boot.runtime().shutdown().await?;
+    drop(database);
+    drop(boot);
+    encoder.paused.store(false, Ordering::Release);
+    let restored = open(directory.path(), encoder).await?;
+    let database = restored.backend().as_ref().clone();
+    scope_vector_count(&database, project, 1).await?;
+    database.shutdown_embedding_jobs().await?;
+    restored.runtime().shutdown().await?;
+    Ok(())
+}
+
 struct ContentEncoder {
     profile: EmbeddingProfile,
     inputs: parking_lot::Mutex<Vec<String>>,
     paused: AtomicBool,
     entered: AtomicBool,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relationship_scope_works_without_encoder_and_rejects_stale_publication() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let encoder = Arc::new(ContentEncoder::new()?);
+    let boot = open(directory.path(), encoder.clone()).await?;
+    let database = boot.backend().as_ref().clone();
+    *database.0.text_embedding.write() = None;
+    query_async(&database, "CREATE PROJECT disabled_scope").await?;
+    query_async(
+        &database,
+        "USE disabled_scope ALTER AUTOMATIC SEMANTIC SET RELATIONSHIPS NONE",
+    )
+    .await?;
+    query_async(&database, "USE disabled_scope CREATE (a:Symbol {name:'contract'}), (b:Symbol {name:'guitar'}), (a)-[:CALLS]->(b)").await?;
+    database.bind_text_embedding(encoder.clone())?;
+    let project = database.resolve_project_name("disabled_scope")?;
+    scope_vector_count(&database, project, 0).await?;
+    let (live, _) = database.capture_canonical_project(project)?;
+    let stale_scope = live.indexes.relationship_semantic_revision();
+    drop(live);
+    query_async(
+        &database,
+        "USE disabled_scope ALTER AUTOMATIC SEMANTIC SET RELATIONSHIPS ALL",
+    )
+    .await?;
+    scope_vector_count(&database, project, 1).await?;
+    let (live, snapshot) = database.capture_canonical_project(project)?;
+    let owner = live
+        .graph
+        .edges()
+        .next()
+        .ok_or_else(|| Error::internal("missing fixture edge"))?
+        .id()
+        .0;
+    drop(live);
+    // An old cleanup result must not remove the newly included relationship vector.
+    let error = database
+        .commit_scoped_from(
+            DatabaseMutation::Graph {
+                project,
+                validation: MutationValidation {
+                    snapshot,
+                    dependencies: TransactionDependencies::default(),
+                    relationship_scope_revision: Some(stale_scope),
+                },
+                graph: Vec::new(),
+                temporal: Vec::new(),
+                vectors: vec![ResolvedVectorMutation::Remove {
+                    property: crate::graph::SEMANTIC_RELATIONSHIP_PROPERTY,
+                    entity_id: owner,
+                    revision: 1,
+                }],
+                administrative: None,
+            },
+            MutationKind::Graph,
+            Some(project),
+            Some(Uuid::new_v4()),
+            AdmissionClass::Control,
+            CommitAcknowledgement::Published,
+            ConnectionId::new(),
+            None,
+        )
+        .expect_err("ordered publication must fence stale scope work");
+    assert_eq!(error.code, ErrorCode::TransactionConflict);
+    scope_vector_count(&database, project, 1).await?;
+    database.shutdown_embedding_jobs().await?;
+    boot.runtime().shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn temporal_transaction_clock_stays_fixed_across_statements() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let boot = open(directory.path(), Arc::new(ContentEncoder::new()?)).await?;
+    let database = boot.backend().as_ref().clone();
+    query_async(&database, "CREATE PROJECT clocks").await?;
+    let project = database.resolve_project_name("clocks")?;
+    let worker = database.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut tx = worker.begin(Some(project), None, CommitAcknowledgement::Published)?;
+        let mut samples = Vec::new();
+        for _ in 0..2 {
+            let request: QueryRequest = serde_json::from_value(serde_json::json!({
+                "request_id": Uuid::new_v4(), "project_id": project,
+                "query": "RETURN datetime.transaction() AS transactionClock, datetime.statement() AS statementClock"
+            })).map_err(|error| Error::internal(error.to_string()))?;
+            tx.run(request, &mut |event| {
+                if let QueryStreamEvent::Batch { columns, .. } = event {
+                    samples.push((
+                        serde_json::to_value(&columns[0].values[0]).map_err(|error| Error::internal(error.to_string()))?,
+                        serde_json::to_value(&columns[1].values[0]).map_err(|error| Error::internal(error.to_string()))?,
+                    ));
+                }
+                Ok(())
+            })?;
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].0, samples[1].0);
+        assert_ne!(samples[0].1, samples[1].1);
+        tx.rollback()?;
+        Ok(())
+    }).await.map_err(|error| Error::internal(error.to_string()))??;
+    database.shutdown_embedding_jobs().await?;
+    boot.runtime().shutdown().await?;
+    Ok(())
 }
 
 impl ContentEncoder {

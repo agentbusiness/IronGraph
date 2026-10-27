@@ -35,6 +35,32 @@ An ordinary `SET` on a temporal property records a sample at write time. `SET â€
 
 The query-level `AT TIME` that precedes a query body is a different thing entirely: it chooses a read instant and never affects writes.
 
+## Prerequisites
+
+Use a new disposable project and execute these statements separately:
+
+```cypher
+CREATE PROJECT backfill_example
+```
+
+```cypher
+USE backfill_example
+CREATE (:Sensor {sensor_id: 'north', celsius: 0.0})
+```
+
+```cypher
+USE backfill_example
+ALTER NODE PROPERTY Sensor.celsius SET TEMPORAL FLOAT RETENTION duration('P3650D')
+```
+
+```cypher
+USE backfill_example
+MATCH (sensor:Sensor {sensor_id: 'north'})
+SET sensor.celsius = 18.4 AT TIME datetime('2025-03-01T09:00:00Z')
+```
+
+Expected result: one retained sample. The retention horizon must still include the stated dates.
+
 ## Simple example
 
 Read one backdated sample at its event time.
@@ -59,7 +85,22 @@ north  | 18.4
 
 ## Advanced example
 
-A batch backfill, and an out-of-order correction landing inside it. Six readings are written from a parameter list in one statement, then a seventh is inserted between two existing samples â€” and the series reads back in event-time order as though it had always been complete.
+A batch backfill with an out-of-order correction. Add four readings to the first sample, with the
+March 3 correction appearing after later events in the input. Event time determines read order:
+
+```cypher
+USE backfill_example
+UNWIND [
+  {at: datetime('2025-03-02T09:00:00Z'), value: 19.1},
+  {at: datetime('2025-03-04T09:00:00Z'), value: 21.7},
+  {at: datetime('2025-03-05T09:00:00Z'), value: 22.3},
+  {at: datetime('2025-03-03T09:00:00Z'), value: 20.4}
+] AS observation
+MATCH (sensor:Sensor {sensor_id: 'north'})
+SET sensor.celsius = observation.value AT TIME observation.at
+```
+
+Read the series back:
 
 ```cypher
 USE backfill_example

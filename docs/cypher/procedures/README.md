@@ -1,6 +1,8 @@
 # Procedures
 
-Twelve built-in graph algorithms. Every one is an IronGraph extension: standard Cypher has no procedure catalogue, and these run inside an ordinary Cypher pipeline rather than over a separately projected graph.
+Twelve built-in graph algorithms. Their names and signatures are IronGraph extensions. Call them
+inside an ordinary Cypher pipeline over the selected project and layers; no separate graph projection
+is required.
 
 They divide by the question they answer. Traversal asks what is reachable. Routing asks how to get there and what it costs. Centrality asks which nodes matter. Community asks how the graph divides. Structure asks how tightly it is knit.
 

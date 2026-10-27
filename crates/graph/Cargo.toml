@@ -1,6 +1,6 @@
 [package]
 name = "irongraph-graph"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 rust-version = "1.94"
 publish = false
@@ -10,23 +10,23 @@ default = []
 accelerator = []
 
 [dependencies]
-arc-swap = "1.9.2"
+arc-swap = "1.9.3"
 papaya = "0.2.5"
 blake3 = { workspace = true }
-bitflags = { version = "2.10.0", features = ["serde"] }
+bitflags = { version = "2.13.2", features = ["serde"] }
 bitvec = { version = "1.0.1", features = ["serde"] }
 chrono = { version = "0.4.42", features = ["serde"] }
 chrono-tz = { version = "0.10.4", features = ["serde"] }
 ciborium = "0.2.2"
 irongraph-types = { path = "../types" }
 half = { version = "2.7.1", features = ["serde"] }
-ordered-float = { version = "5.1.0", features = ["serde"] }
+ordered-float = { version = "5.5.1", features = ["serde"] }
 postcard = { version = "1.1.3", features = ["alloc", "use-std"] }
-roaring = { version = "0.11.2", features = ["serde"] }
-serde = { version = "1.0.228", features = ["derive", "rc"] }
-tokio-util = { version = "0.7.18", features = ["rt"] }
+roaring = { version = "0.11.5", features = ["serde"] }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
 unicode-normalization = "0.1.25"
-uuid = { version = "1.19.0", features = ["serde", "v4", "v7"] }
+uuid = { version = "1.29.0", features = ["serde", "v4", "v7"] }
 
 
 [lints.rust]

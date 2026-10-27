@@ -72,7 +72,8 @@ including `README.md` and files below `docs/`, is allowed when it describes the 
   IronGraph does not install, host, or invoke generative language models.
 - Documents are ordinary Cypher-native graph records, for example `(:Document {body: ...})`. They
   persist through the normal asynchronous record-persistence path. Meaningful content from all nodes and relationships
-  participates in automatic embedding and ranked vector search when the local encoder is enabled;
+  participates in automatic embedding and ranked vector search when the local encoder is enabled,
+  subject to the project's explicit automatic semantic relationship scope;
   declared embedding indexes additionally support explicit text-field selection. Operational metadata
   is excluded from automatic encoder input. No document-specific REST protocol or second store exists.
 - Kafka-compatible topic operations and AMQP-compatible queue/exchange/binding operations remain.

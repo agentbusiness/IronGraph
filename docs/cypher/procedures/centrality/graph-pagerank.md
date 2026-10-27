@@ -57,7 +57,7 @@ user | score
 1619 | 0.001536
 725  | 0.001496
 
-10 rows, 223 ms
+10 rows
 ```
 
 ## Advanced example
@@ -94,7 +94,7 @@ user | score    | trusted_by | score_per_endorsement
 3685 | 0.000926 | 339        | 2.73                 
 918  | 0.001333 | 497        | 2.68                 
 
-10 rows, 23864 ms
+10 rows
 ```
 
 ## Where it earns its place

@@ -877,6 +877,7 @@ fn context<'a>(
         bookmark: fixture.bookmark,
         mutation_revision: fixture.graph.revision().saturating_add(1),
         resolved_time_nanos: 0,
+        transaction_time_nanos: None,
         next_node_id: 1_000,
         next_edge_id: 1_000,
         predicate_versions: BTreeMap::new(),

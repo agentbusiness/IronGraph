@@ -49,7 +49,7 @@ q1_discrete | q1_continuous | median_discrete | median_continuous | p90_discrete
 ------------+---------------+-----------------+-------------------+--------------+---------------
 1           | 1             | 1               | 1                 | 4            | 4             
 
-1 row, 219 ms
+1 row
 ```
 
 ## Advanced example
@@ -86,7 +86,7 @@ account | ratings | p10 | median | p90 | span
 2498    | 45      | -10 | -10    | 5   | 15  
 832     | 92      | -10 | 2      | 4   | 14  
 
-10 rows, 229 ms
+10 rows
 ```
 
 ## Where it earns its place

@@ -1,6 +1,13 @@
 # Clauses
 
-The pieces a query pipeline is built from. Documented here are the clauses IronGraph adds to Cypher rather than the ones it shares with it: the three that put time into a query, the two that choose which layers a query sees and writes to, and the one that ranks rows by similarity.
+Compose graph reads and writes, then add time, layer selection or similarity search where needed.
+Every reference page states syntax and behavior and gives examples.
+
+## [Core clauses](./core/README.md)
+
+Select a project with `USE`; read with `MATCH`, filter and project rows, call algorithms, and write
+ordinary nodes and relationships. The core reference also covers `FOR`, `LET`, `FILTER`, `FINISH`,
+path selectors and repetition modes. See [expressions](../expressions.md) for predicates and values.
 
 ## [Time clauses](./time/README.md)
 

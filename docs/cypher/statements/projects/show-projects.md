@@ -11,7 +11,9 @@
 
 ## What it does
 
-`SHOW PROJECTS` returns one row per project: `project_id`, the stable identity the database uses, and `display_name`, the name `USE` matches. It is the one statement that runs without naming a project, because it is about the set of them.
+`SHOW PROJECTS` returns one row per project: `project_id`, the stable identity the database uses, and
+`display_name`, the name `USE` matches. It runs without selecting a project because it describes the
+project catalogue. Project creation and renaming also name their targets directly.
 
 ## How it behaves
 
@@ -35,28 +37,7 @@ Every project on this node, in name order.
 SHOW PROJECTS
 ```
 
-Result:
-
-```
-project_id                           | display_name        
--------------------------------------+---------------------
-03f84ca7-95ca-8972-86c5-3e469d1212c3 | trust               
-082b08ee-0417-8733-bfe9-0b5ec717fd14 | citations           
-118c3527-7ece-8c52-9858-6dbf3aff394c | temporal_example    
-193c9cf8-2fac-889b-8233-86808c5fe1f4 | epinions            
-1e4a00e0-579d-8710-9df8-d0c440d4da16 | flights             
-2f51a2b8-dcc9-850f-9e35-49e8101cff68 | dblp                
-4ef9ade5-83b3-81ca-b145-0d0a29e137c0 | library             
-6270cbb3-ff41-818b-ab52-3bd4955d4d0f | overflow            
-631b2546-7cd6-84c3-bd8f-71b7d8880032 | email               
-ac3c53a6-4508-884b-a884-eb082a9b40da | rollup_example      
-b85c6f6f-17a9-8359-b52f-6016e5a180d9 | worked_example_other
-bb146a2a-751a-8ccf-b9d1-2fa67a6887f0 | worked_example      
-dcad6678-1a4b-8614-ad9a-8c648265a249 | social              
-e91bf4cf-df61-83c6-b745-8bed5fc0d196 | backfill_example    
-
-14 rows
-```
+Expected result: one row per current project, with `project_id` and `display_name`. Names and identities depend on your database.
 
 ## Advanced example
 
@@ -66,29 +47,7 @@ The identity is stable and the display name is not. This listing is taken after 
 SHOW PROJECTS
 ```
 
-Result:
-
-```
-project_id                           | display_name          
--------------------------------------+-----------------------
-03f84ca7-95ca-8972-86c5-3e469d1212c3 | trust                 
-06fd99ec-881d-83fa-aeb3-d9009224ae42 | naming_example_renamed
-082b08ee-0417-8733-bfe9-0b5ec717fd14 | citations             
-118c3527-7ece-8c52-9858-6dbf3aff394c | temporal_example      
-193c9cf8-2fac-889b-8233-86808c5fe1f4 | epinions              
-1e4a00e0-579d-8710-9df8-d0c440d4da16 | flights               
-2f51a2b8-dcc9-850f-9e35-49e8101cff68 | dblp                  
-4ef9ade5-83b3-81ca-b145-0d0a29e137c0 | library               
-6270cbb3-ff41-818b-ab52-3bd4955d4d0f | overflow              
-631b2546-7cd6-84c3-bd8f-71b7d8880032 | email                 
-ac3c53a6-4508-884b-a884-eb082a9b40da | rollup_example        
-b85c6f6f-17a9-8359-b52f-6016e5a180d9 | worked_example_other  
-bb146a2a-751a-8ccf-b9d1-2fa67a6887f0 | worked_example        
-dcad6678-1a4b-8614-ad9a-8c648265a249 | social                
-e91bf4cf-df61-83c6-b745-8bed5fc0d196 | backfill_example      
-
-15 rows
-```
+Expected result: one row per current project, with `project_id` and `display_name`. Names and identities depend on your database.
 
 ## Where it earns its place
 

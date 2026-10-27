@@ -37,6 +37,8 @@ impl PartialOrd for EmbeddingOwner {
 pub(super) struct EmbeddingJob {
     pub owner: EmbeddingOwner,
     pub revision: u64,
+    /// Scope captured when this work is selected; validated again in ordered publication.
+    pub relationship_scope_revision: Option<u64>,
 }
 
 /// Worker-only canonical input; the durable cursor retains no source text or graph snapshots.
@@ -397,6 +399,7 @@ mod tests {
     }
     fn job(project: ProjectId, id: u64, revision: u64) -> EmbeddingJob {
         EmbeddingJob {
+            relationship_scope_revision: None,
             owner: EmbeddingOwner {
                 project,
                 kind: EntityKind::Node,

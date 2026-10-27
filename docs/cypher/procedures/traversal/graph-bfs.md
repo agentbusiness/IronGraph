@@ -53,7 +53,7 @@ distance | airports
 6        | 8       
 7        | 2       
 
-8 rows, 148 ms
+8 rows
 ```
 
 ## Advanced example

@@ -60,7 +60,7 @@ person | coefficient
 2469   | 0.8715     
 1963   | 0.8687     
 
-10 rows, 544 ms
+10 rows
 ```
 
 ## Advanced example
@@ -99,7 +99,7 @@ person | connections | coefficient | unclustered_connections
 348    | 229         | 0.123       | 201                    
 698    | 68          | 0.1313      | 59                     
 
-10 rows, 3279 ms
+10 rows
 ```
 
 ## Where it earns its place

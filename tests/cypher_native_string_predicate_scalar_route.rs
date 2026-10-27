@@ -328,6 +328,7 @@ fn context<'a>(graph: &'a GraphStore, backend: &'a dyn ExecutionBackend) -> Exec
         bookmark: Bookmark { term: 0, index: 0 },
         mutation_revision: 1,
         resolved_time_nanos: 0,
+        transaction_time_nanos: None,
         next_node_id: 1,
         next_edge_id: 1,
         predicate_versions: BTreeMap::new(),

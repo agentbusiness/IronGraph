@@ -92,7 +92,7 @@ core | people | lowest_degree | mean_degree | highest_degree
 106  | 2      | 116           | 116.5       | 117           
 105  | 1      | 112           | 112         | 112           
 
-10 rows, 279 ms
+10 rows
 ```
 
 ## Where it earns its place

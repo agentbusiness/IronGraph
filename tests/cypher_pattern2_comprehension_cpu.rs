@@ -69,6 +69,7 @@ fn context(graph: &GraphStore) -> ExecutionContext<'_> {
         },
         mutation_revision: 101,
         resolved_time_nanos: 0,
+        transaction_time_nanos: None,
         next_node_id: 1_000,
         next_edge_id: 1_000,
         predicate_versions: BTreeMap::new(),

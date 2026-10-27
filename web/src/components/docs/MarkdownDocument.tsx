@@ -17,13 +17,16 @@ interface Props {
 
 function inline(text: string, docId: string, onNavigate: (id: string) => void): ReactNode[] {
   const pieces: ReactNode[] = [];
-  const pattern = /(`[^`]+`|\[[^\]]+\]\([^)]+\)|\*\*[^*]+\*\*|\*[^*]+\*)/g;
+  const pattern = /(`+)([\s\S]*?)\1(?!`)|\[[^\]]+\]\([^)]+\)|\*\*[^*]+\*\*|\*[^*]+\*/g;
   let at = 0;
   for (const match of text.matchAll(pattern)) {
     const index = match.index ?? 0;
     if (index > at) pieces.push(text.slice(at, index));
     const token = match[0];
-    if (token.startsWith('`')) pieces.push(<code key={index}>{token.slice(1, -1)}</code>);
+    if (token.startsWith('`')) {
+      const delimiter = /^`+/.exec(token)![0].length;
+      pieces.push(<code key={index}>{token.slice(delimiter, -delimiter)}</code>);
+    }
     else if (token.startsWith('**')) pieces.push(<strong key={index}>{token.slice(2, -2)}</strong>);
     else if (token.startsWith('*')) pieces.push(<em key={index}>{token.slice(1, -1)}</em>);
     else {
@@ -39,6 +42,28 @@ function inline(text: string, docId: string, onNavigate: (id: string) => void): 
   }
   if (at < text.length) pieces.push(text.slice(at));
   return pieces;
+}
+
+function markdownTableCells(line: string): string[] {
+  const cells: string[] = [];
+  let cell = '';
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index]!;
+    if (character === '\\' && line[index + 1] === '|') {
+      cell += '|';
+      index += 1;
+    } else if (character === '\\' && line[index + 1] === '\\') {
+      cell += '\\\\';
+      index += 1;
+    } else if (character === '|') {
+      cells.push(cell.trim());
+      cell = '';
+    } else {
+      cell += character;
+    }
+  }
+  cells.push(cell.trim());
+  return cells.slice(1, -1);
 }
 
 function CodeBlock({ code, language, projects, onProjectsChanged }: { code: string; language: string; projects: Project[]; onProjectsChanged: () => Promise<void> }) {
@@ -141,9 +166,9 @@ export function MarkdownDocument({ body, docId, projects, onProjectsChanged, onN
     }
     if (line.startsWith('|') && lines[index + 1]?.match(/^\|?\s*:?-+/)) {
       const rows: string[][] = [];
-      rows.push(line.split('|').slice(1, -1).map((cell) => cell.trim()));
+      rows.push(markdownTableCells(line));
       index += 2;
-      while (index < lines.length && lines[index]!.startsWith('|')) rows.push(lines[index++]!.split('|').slice(1, -1).map((cell) => cell.trim()));
+      while (index < lines.length && lines[index]!.startsWith('|')) rows.push(markdownTableCells(lines[index++]!));
       blocks.push(<div className="doc-table" key={`table-${index}`}><table className="bt"><thead><tr>{rows[0]!.map((cell, cellIndex) => <th key={cellIndex}>{inline(cell, docId, onNavigate)}</th>)}</tr></thead><tbody>{rows.slice(1).map((row, rowIndex) => <tr key={rowIndex}>{row.map((cell, cellIndex) => <td key={cellIndex}>{inline(cell, docId, onNavigate)}</td>)}</tr>)}</tbody></table></div>);
       continue;
     }

@@ -57,7 +57,7 @@ window_start        | ratings | mean  | population_variance | population_stdev
 1419120000000000000 | 1081    | 1.079 | 12.92               | 3.594           
 1450656000000000000 | 57      | 1.263 | 11.913              | 3.452           
 
-7 rows, 261 ms
+7 rows
 ```
 
 ## Advanced example
@@ -98,7 +98,7 @@ account | ratings_given | mean_given | rater_variance | network_variance | varia
 1053    | 47            | 1.68       | 1.026          | 12.688           | 0.081         
 1281    | 56            | 1.04       | 1.07           | 12.688           | 0.084         
 
-10 rows, 369 ms
+10 rows
 ```
 
 ## Where it earns its place

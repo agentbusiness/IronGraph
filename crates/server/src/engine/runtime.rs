@@ -135,6 +135,8 @@ struct PersistenceMailbox {
     publication_pause: parking_lot::Mutex<Option<Arc<PublicationPause>>>,
     #[cfg(test)]
     parked: tokio::sync::Notify,
+    #[cfg(test)]
+    published: tokio::sync::Notify,
 }
 
 #[cfg(test)]
@@ -172,6 +174,8 @@ impl PersistenceMailbox {
             publication_pause: parking_lot::Mutex::new(None),
             #[cfg(test)]
             parked: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            published: tokio::sync::Notify::new(),
         }
     }
 
@@ -222,6 +226,8 @@ impl PersistenceMailbox {
                 .get_or_insert_with(|| Instant::now() + PERSISTENCE_GROUP_INTERVAL);
         }
         drop(state);
+        #[cfg(test)]
+        self.published.notify_one();
         if notify {
             self.wake.notify_one();
         }
@@ -994,6 +1000,13 @@ mod tests {
         }
     }
 
+    struct ResumePublication(Arc<PublicationPause>);
+    impl Drop for ResumePublication {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
     #[async_trait]
     impl MutationStateBackend for TestBackend {
         async fn prepare_command(
@@ -1130,6 +1143,24 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), backend.entered.notified())
             .await
             .map_err(|_| Error::internal("persistence worker never reached the test gate"))
+    }
+
+    async fn await_record_publication(runtime: &WriteRuntime, target: u64) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                // Register before checking the mailbox so publication cannot fall between
+                // checking the target and waiting for its notification.
+                let published = runtime.persistence.published.notified();
+                tokio::pin!(published);
+                published.as_mut().enable();
+                if runtime.persistence.state.lock().published >= target {
+                    return;
+                }
+                published.await;
+            }
+        })
+        .await
+        .map_err(|_| Error::internal("writer never published its current persistence records"))
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1361,14 +1392,30 @@ mod tests {
         assert!(runtime.persistence.state.lock().deadline.is_none());
         runtime.flush_persistence().await?;
         assert!(!runtime.persistence.state.lock().force);
-        runtime.write(request()).await?;
+        let pause = Arc::new(PublicationPause::default());
+        let _resume = ResumePublication(Arc::clone(&pause));
+        *runtime.persistence.publication_pause.lock() = Some(Arc::clone(&pause));
+        // The RAM acknowledgement is deliberately independent of record coalescing. Hold
+        // that phase to prove the test must synchronize on mailbox publication, not the ACK.
+        let first = runtime.write(request()).await?;
+        let entered = tokio::time::timeout(Duration::from_secs(2), pause.entered.notified()).await;
+        let before_publication = {
+            let state = runtime.persistence.state.lock();
+            (state.published, state.deadline)
+        };
+        pause.release();
+        entered.map_err(|_| Error::internal("writer did not reach the record-publication gate"))?;
+        assert_eq!(backend.applied.load(Ordering::Acquire), 1);
+        assert_eq!(before_publication, (0, None));
+        await_record_publication(&runtime, first.response.bookmark.index).await?;
         let first_deadline = runtime
             .persistence
             .state
             .lock()
             .deadline
             .expect("dirty deadline");
-        runtime.write(request()).await?;
+        let second = runtime.write(request()).await?;
+        await_record_publication(&runtime, second.response.bookmark.index).await?;
         assert_eq!(
             runtime.persistence.state.lock().deadline,
             Some(first_deadline)

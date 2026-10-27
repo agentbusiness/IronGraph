@@ -623,6 +623,7 @@ fn context<'a>(fixture: &'a Fixture, backend: &'a dyn ExecutionBackend) -> Execu
         bookmark: BOOKMARK,
         mutation_revision: fixture.graph.revision().saturating_add(1),
         resolved_time_nanos: 0,
+        transaction_time_nanos: None,
         next_node_id: 1,
         next_edge_id: 1,
         predicate_versions: BTreeMap::new(),

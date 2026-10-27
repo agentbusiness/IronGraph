@@ -1,6 +1,6 @@
 {
   "name": "@irongraph/node-linux-x64-gnu",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "cpu": [
     "x64"
   ],

@@ -49,7 +49,7 @@ ratings | with_a_score | with_a_timestamp | rated_has_reputation
 --------+--------------+------------------+---------------------
 35592   | 35592        | 35592            | 35592               
 
-1 row, 187 ms
+1 row
 ```
 
 ## Advanced example
@@ -82,7 +82,7 @@ over 100 | 38       | 7709
 2-5      | 1846     | 5498         
 1        | 1793     | 1793         
 
-5 rows, 185 ms
+5 rows
 ```
 
 ## Where it earns its place

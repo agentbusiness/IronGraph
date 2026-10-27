@@ -83,6 +83,9 @@ pub enum Statement {
         name: String,
         new_name: String,
     },
+    AlterAutomaticSemantic {
+        relationships: crate::graph::RelationshipSemanticScope,
+    },
     DropProject {
         name: String,
         if_exists: bool,

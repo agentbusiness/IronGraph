@@ -56,7 +56,7 @@ account | ratings | last_seen
 1       | 215     | 2015-03-24T01:50:08Z
 3129    | 212     | 2013-08-23T10:02:40Z
 
-10 rows, 204 ms
+10 rows
 ```
 
 ## Advanced example
@@ -95,7 +95,7 @@ account | ratings | best | mean | spread | best_in_deviations
 2110    | 53      | 10   | 1.7  | 1.58   | 5.27              
 3828    | 99      | 10   | 1.93 | 1.55   | 5.22              
 
-10 rows, 223 ms
+10 rows
 ```
 
 ## Where it earns its place

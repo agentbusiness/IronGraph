@@ -61,7 +61,7 @@ account | strongly_distrusts | first_five
 2934    | 35                 | [{"type":"integer","value":"1991"},{"type":"integer","value":"2028"},{"type":"integer","value":"2897"},{"type":"integer","value":"3015"},{"type":"integer","value":"3022"}]
 2388    | 34                 | [{"type":"integer","value":"3"},{"type":"integer","value":"2017"},{"type":"integer","value":"2498"},{"type":"integer","value":"2690"},{"type":"integer","value":"2898"}]   
 
-10 rows, 155 ms
+10 rows
 ```
 
 ## Advanced example
@@ -102,7 +102,7 @@ account | strongly_endorsed | endorsed_back_by | reciprocity_percent | mean_rati
 540     | 6                 | 5                | 83.3                | 4                   
 1396    | 6                 | 5                | 83.3                | 6                   
 
-10 rows, 159 ms
+10 rows
 ```
 
 ## Where it earns its place

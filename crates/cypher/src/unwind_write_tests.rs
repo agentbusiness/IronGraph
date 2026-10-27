@@ -18,6 +18,7 @@ fn context<'a>(graph: &'a GraphStore, indexes: &'a IndexCatalog) -> ExecutionCon
             index: graph.revision(),
         },
         resolved_time_nanos: 0,
+        transaction_time_nanos: None,
         predicate_versions: BTreeMap::new(),
         capabilities: BindCapabilities::default(),
         max_result_rows: usize::MAX,

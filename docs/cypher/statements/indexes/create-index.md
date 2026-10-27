@@ -29,7 +29,7 @@ Index names are unique within a project; re-declaring a name is rejected rather 
 Add `IF NOT EXISTS` after the name for repeatable application setup:
 
 ```cypher
-USE catalog CREATE INDEX product_by_sku IF NOT EXISTS FOR (p:Product) ON (p.sku)
+USE flights CREATE INDEX airport_by_iata IF NOT EXISTS FOR (airport:Airport) ON (airport.iata)
 ```
 
 If that name already exists, the statement succeeds with zero updates and leaves the existing
@@ -58,40 +58,53 @@ USE flights
 SHOW INDEXES
 ```
 
-Result:
-
-```
-name                | kind     | state  | diagnostic
---------------------+----------+--------+-----------
-airline_by_id       | EQUALITY | ONLINE | null      
-airport_by_iata     | EQUALITY | ONLINE | null      
-airport_by_id       | EQUALITY | ONLINE | null      
-airport_by_latitude | RANGE    | ONLINE | null      
-
-4 rows
-```
+Expected result: the flights access paths are listed with their current state. Automatic semantic indexes may also appear when local embedding is enabled.
 
 ## Advanced example
 
-All four kinds declared on one label in a scratch project, then read back. The properties are written first so that they exist in the schema when the declarations run.
+Equality, range, text and composite equality indexes declared on one label in a scratch project,
+then read back. Properties are written first so they exist when the declarations run. A VECTOR index
+instead requires list-valued numeric vectors compatible with the project's active embedding profile.
+
+Use a new disposable project and run each setup statement separately:
+
+```cypher
+CREATE PROJECT index_example
+```
+
+```cypher
+USE index_example
+CREATE (:Book {isbn: '0262033844', title: 'Introduction to Algorithms', year: 2009}),
+       (:Book {isbn: '0201896834', title: 'The Art of Computer Programming', year: 1997}),
+       (:Book {isbn: '1449373321', title: 'Designing Data-Intensive Applications', year: 2017})
+```
+
+```cypher
+USE index_example
+CREATE INDEX book_by_isbn FOR (book:Book) ON (book.isbn)
+```
+
+```cypher
+USE index_example
+CREATE RANGE INDEX book_by_year FOR (book:Book) ON (book.year)
+```
+
+```cypher
+USE index_example
+CREATE TEXT INDEX book_title_text FOR (book:Book) ON (book.title)
+```
+
+```cypher
+USE index_example
+CREATE INDEX book_by_year_and_title FOR (book:Book) ON (book.year, book.title)
+```
 
 ```cypher
 USE index_example
 SHOW INDEXES
 ```
 
-Result:
-
-```
-name                   | kind     | state  | diagnostic
------------------------+----------+--------+-----------
-book_by_isbn           | EQUALITY | ONLINE | null      
-book_by_year           | RANGE    | ONLINE | null      
-book_by_year_and_title | EQUALITY | ONLINE | null      
-book_title_text        | TEXT     | ONLINE | null      
-
-4 rows
-```
+Expected result: `book_by_isbn`, `book_by_year`, `book_title_text` and `book_by_year_and_title` are listed. Each row also contains the current scope and reconciliation columns; those columns are null for these application indexes.
 
 ## Where it earns its place
 

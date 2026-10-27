@@ -61,7 +61,7 @@ band    | accounts | mean_sample_stdev | mean_population_stdev | gap
 11-50   | 560      | 2.3201            | 2.2524                | -2.2522
 over 50 | 106      | 2.5892            | 2.5732                | -2.573 
 
-4 rows, 205 ms
+4 rows
 ```
 
 ## Advanced example
@@ -100,7 +100,7 @@ account | ratings | mean_rating | harshest | harshest_z_score
 2198    | 85      | 1.94        | -10      | -5.47           
 96      | 37      | 1.22        | -10      | -5.42           
 
-10 rows, 224 ms
+10 rows
 ```
 
 ## Where it earns its place

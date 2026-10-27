@@ -522,6 +522,7 @@ fn context<'a>(
         },
         mutation_revision: graph.revision().saturating_add(1),
         resolved_time_nanos: 0,
+        transaction_time_nanos: None,
         next_node_id: 1_000,
         next_edge_id: 2_000,
         predicate_versions: BTreeMap::new(),

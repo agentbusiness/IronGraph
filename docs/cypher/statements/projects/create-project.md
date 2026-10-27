@@ -27,7 +27,9 @@ Create a project per graph that should not see another: one per tenant, per envi
 
 ## How it differs from its neighbours
 
-It is not a label or a namespace inside one graph. Two projects share no storage, no schema and no index, and no single query can read across them — which is stronger isolation than a label prefix and cheaper than a separate process.
+A project is an isolation boundary within one database process. Projects have separate graph data,
+schema and indexes while sharing the database's storage and runtime. A query cannot read across
+projects. Use separate projects when their graph data must be selected and administered independently.
 
 ## Simple example
 
@@ -46,6 +48,22 @@ No rows returned. 1 change committed.
 ## Advanced example
 
 Isolation demonstrated rather than asserted. The same label and the same property name exist in two projects with different contents, and a query in one sees only its own.
+
+After creating `worked_example`, execute these setup statements separately:
+
+```cypher
+CREATE PROJECT worked_example_other
+```
+
+```cypher
+USE worked_example
+CREATE (:Shared {origin: 'first project'})
+```
+
+```cypher
+USE worked_example_other
+CREATE (:Shared {origin: 'second project'}), (:Shared {origin: 'second project again'})
+```
 
 ```cypher
 USE worked_example

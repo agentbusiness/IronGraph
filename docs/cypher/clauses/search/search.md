@@ -30,6 +30,12 @@ order for the same graph state. An empty project returns no matches.
 Use `semantic_nodes` or `semantic_relationships` instead of `graph_semantic` to search one entity
 kind. Query layer selection still applies; the default includes `OBSERVED` and `KNOWLEDGE`.
 
+All relationship types participate by default. Use
+[`ALTER AUTOMATIC SEMANTIC`](../../statements/indexes/alter-automatic-semantic.md) to exclude chosen
+types or all relationships for this project. Exclusions apply before ranking and `LIMIT`, including
+vector and hybrid search. `semantic_relationships` stays defined under `NONE` and returns no matches;
+`graph_semantic` then searches nodes only. Widening schedules missing embeddings asynchronously.
+
 ## What automatic embedding includes
 
 Nodes contribute labels and meaningful properties: names, titles, subjects, descriptions, document

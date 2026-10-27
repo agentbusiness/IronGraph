@@ -56,7 +56,7 @@ component_size | components
 3              | 164       
 2              | 813       
 
-10 rows, 208 ms
+10 rows
 ```
 
 ## Advanced example
@@ -82,7 +82,7 @@ components | nodes | largest_strong_component | singletons | percent_in_largest 
 -----------+-------+--------------------------+------------+--------------------+-------------------
 42176      | 75879 | 32223                    | 41112      | 42.47              | 97.48             
 
-1 row, 218 ms
+1 row
 ```
 
 ## Where it earns its place

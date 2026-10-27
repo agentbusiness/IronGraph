@@ -5,7 +5,7 @@
 | | |
 | --- | --- |
 | Kind | Clause |
-| Signature | `WINDOW TUMBLING <width> ON <instant> AS <alias>  \|  WINDOW HOPPING <width> EVERY <step> ON <instant> AS <alias>` |
+| Signature | `WINDOW TUMBLING <width> ON <instant> [ALIGN TO <instant>] [TIME ZONE '<zone>'] [EMIT EMPTY] AS <alias>` or `WINDOW HOPPING <width> EVERY <step> ON <instant> [ALIGN TO <instant>] [TIME ZONE '<zone>'] [EMIT EMPTY] AS <alias>` |
 | Relationship to standard Cypher | IronGraph extension |
 | Reference dataset | [`trust`](../../datasets.md#trust) — Bitcoin OTC signed trust ratings |
 
@@ -61,7 +61,7 @@ window_start         | ratings | mean_rating
 2014-12-21T00:00:00Z | 1081    | 1.079      
 2015-12-21T00:00:00Z | 57      | 1.263      
 
-7 rows, 249 ms
+7 rows
 ```
 
 ## Advanced example
@@ -100,7 +100,7 @@ window_start         | ratings | mean_rating | negative
 2011-06-25T00:00:00Z | 1496    | 1.48        | 51      
 2011-07-25T00:00:00Z | 1027    | 1.64        | 21      
 
-12 rows, 481 ms
+12 rows
 ```
 
 ## Where it earns its place

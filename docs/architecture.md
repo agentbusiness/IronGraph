@@ -126,7 +126,12 @@ document-specific store or REST endpoint.
 Range, text, vector, and temporal indexes accelerate graph operations while remaining rebuildable
 from canonical graph data. When local embedding is enabled, the verified encoder loads on the
 selected device and warms during startup. Each project automatically maintains semantic indexes
-for its nodes and relationships, including existing data and later changes.
+for its nodes and included relationships, including existing data and later changes. All relationship
+types are included by default. A project's
+[`automatic semantic scope`](./cypher/statements/indexes/alter-automatic-semantic.md) can exclude
+chosen types or all relationships without changing the graph or automatic node search. Scope changes
+take effect for search when the command completes; vector cleanup and catch-up proceed asynchronously
+through the normal durability path.
 
 Semantic content includes meaningful properties and labels or relationship types. Relationship
 descriptions also include identifying names from their endpoints. Recognized operational metadata,

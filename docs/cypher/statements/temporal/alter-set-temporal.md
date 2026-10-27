@@ -23,6 +23,11 @@ The declaration is not retrospective. Values written before it are not historica
 
 The type names the scalar the samples hold and is checked on write, so a declaration is also a type constraint on the temporal series.
 
+Supported types are `BOOLEAN`, `INTEGER`, `FLOAT`, `STRING`, `DATE`, `LOCAL TIME`, `ZONED TIME`,
+`LOCAL DATETIME`, `ZONED DATETIME` and `DURATION`. `TIME` and `DATETIME` denote the zoned types.
+Retention must be a positive duration representable as elapsed time; use days, hours or smaller units
+rather than calendar months.
+
 A declared temporal property has two distinct reads that are easy to confuse.
 
 - Reading it in an ordinary query returns the **current sample**: the latest retained sample in event-time order.
@@ -37,6 +42,21 @@ Declare a property temporal when its past matters as data rather than as an audi
 ## How it differs from its neighbours
 
 A temporal property is not a relationship to a timestamped event node. The event-node modelling keeps every observation as graph data you can traverse and relate; a temporal property keeps a compact series you can read at an instant. This dataset uses both: `RATED` relationships carry the events, and `reputation` carries the derived series.
+
+## Prerequisites
+
+Create a new disposable project and write the property before declaring it. Run each block separately:
+
+```cypher
+CREATE PROJECT temporal_example
+```
+
+```cypher
+USE temporal_example
+CREATE (:Instrument {symbol: 'AAA', price: 0.0})
+```
+
+Expected result: the `Instrument.price` property is available for declaration.
 
 ## Simple example
 
@@ -57,6 +77,26 @@ No rows returned. 0 changes committed.
 ## Advanced example
 
 Read three backdated samples alongside the current sample. The current price is `96`, the latest value in event-time order.
+
+After the declaration, write the samples in separate statements:
+
+```cypher
+USE temporal_example
+MATCH (instrument:Instrument {symbol: 'AAA'})
+SET instrument.price = 101.5 AT TIME datetime('2024-01-15T00:00:00Z')
+```
+
+```cypher
+USE temporal_example
+MATCH (instrument:Instrument {symbol: 'AAA'})
+SET instrument.price = 118.25 AT TIME datetime('2024-06-01T00:00:00Z')
+```
+
+```cypher
+USE temporal_example
+MATCH (instrument:Instrument {symbol: 'AAA'})
+SET instrument.price = 96.0 AT TIME datetime('2025-02-01T00:00:00Z')
+```
 
 ```cypher
 USE temporal_example

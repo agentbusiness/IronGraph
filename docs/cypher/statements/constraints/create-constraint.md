@@ -29,6 +29,22 @@ Declare one on any property an application treats as identity: a business key, a
 
 An equality index makes a lookup fast and permits duplicates. A constraint does both — but fails at declaration time if the data does not already comply, which an index never does.
 
+## Prerequisites
+
+Use a new disposable project for the examples. Run these statements separately:
+
+```cypher
+CREATE PROJECT index_example
+```
+
+```cypher
+USE index_example
+CREATE (:Book {isbn: '0262033844', title: 'Introduction to Algorithms', year: 2009}),
+       (:Book {isbn: '1449373321', title: 'Designing Data-Intensive Applications', year: 2017})
+```
+
+Expected result: two books with distinct ISBN values. Run the simple example before the advanced one.
+
 ## Simple example
 
 A constraint over a property whose values are already distinct. Nothing is returned; `SHOW CONSTRAINTS` is how you see it.
@@ -48,6 +64,7 @@ No rows returned. 0 changes committed.
 
 The constraint refusing a duplicate. The write below names an ISBN that already exists, and is rejected rather than accepted — this example is expected to fail, and the error is the point.
 
+<!-- expect-error -->
 ```cypher
 USE index_example
 CREATE (:Book {isbn: '1449373321', title: 'A second copy', year: 2020})

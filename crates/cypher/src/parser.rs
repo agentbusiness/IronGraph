@@ -168,6 +168,27 @@ impl<'source> Parser<'source> {
         }
         if self.peek_word("ALTER") {
             self.advance();
+            if self.eat_word("AUTOMATIC") {
+                self.expect_word("SEMANTIC")?;
+                self.expect_word("SET")?;
+                self.expect_word("RELATIONSHIPS")?;
+                let relationships = if self.eat_word("NONE") {
+                    crate::graph::RelationshipSemanticScope::None
+                } else {
+                    self.expect_word("ALL")?;
+                    if self.eat_word("EXCEPT") {
+                        let mut names = std::collections::BTreeSet::new();
+                        names.insert(self.identifier()?);
+                        while self.eat_symbol(Symbol::Comma) {
+                            names.insert(self.identifier()?);
+                        }
+                        crate::graph::RelationshipSemanticScope::AllExcept(names)
+                    } else {
+                        crate::graph::RelationshipSemanticScope::All
+                    }
+                };
+                return Ok(Statement::AlterAutomaticSemantic { relationships });
+            }
             if self.eat_word("PROJECT") {
                 let name = self.identifier()?;
                 self.expect_word("RENAME")?;
@@ -207,7 +228,7 @@ impl<'source> Parser<'source> {
                 TemporalTarget::Relationship
             } else {
                 return self.error(
-                    "ALTER supports PROJECT, TOPIC, QUEUE, NODE PROPERTY, or RELATIONSHIP PROPERTY",
+                    "ALTER supports AUTOMATIC SEMANTIC, PROJECT, TOPIC, QUEUE, NODE PROPERTY, or RELATIONSHIP PROPERTY",
                 );
             };
             self.expect_word("PROPERTY")?;
@@ -2763,6 +2784,52 @@ mod tests {
         ));
         assert!(parse("CHECK READ").is_err());
         assert!(parse("CHECK READ ONLY trailing").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn parses_automatic_semantic_relationship_scope() -> Result<()> {
+        use crate::graph::RelationshipSemanticScope;
+        for (source, expected) in [
+            (
+                "ALTER AUTOMATIC SEMANTIC SET RELATIONSHIPS ALL",
+                RelationshipSemanticScope::All,
+            ),
+            (
+                "USE code ALTER AUTOMATIC SEMANTIC SET RELATIONSHIPS NONE",
+                RelationshipSemanticScope::None,
+            ),
+            (
+                "ALTER AUTOMATIC SEMANTIC SET RELATIONSHIPS ALL EXCEPT CALLS, `future type`, CALLS, `tick``type`",
+                RelationshipSemanticScope::AllExcept(std::collections::BTreeSet::from([
+                    "CALLS".to_owned(),
+                    "future type".to_owned(),
+                    "tick`type".to_owned(),
+                ])),
+            ),
+        ] {
+            assert_eq!(
+                parse(source)?.statement,
+                Statement::AlterAutomaticSemantic {
+                    relationships: expected
+                }
+            );
+        }
+        for source in [
+            "ALTER AUTOMATIC SEMANTIC SET RELATIONSHIPS",
+            "ALTER AUTOMATIC SEMANTIC SET RELATIONSHIPS ONLY CALLS",
+            "ALTER AUTOMATIC SEMANTIC SET RELATIONSHIPS NONE EXCEPT CALLS",
+            "ALTER AUTOMATIC SEMANTIC SET RELATIONSHIPS ALL EXCEPT",
+            "ALTER AUTOMATIC SEMANTIC SET RELATIONSHIPS ALL EXCEPT CALLS,",
+            "ALTER AUTOMATIC SEMANTIC SET RELATIONSHIPS ALL EXCEPT 'CALLS'",
+            "ALTER AUTOMATIC SEMANTIC SET RELATIONSHIPS ALL trailing",
+        ] {
+            assert_eq!(
+                parse_failure(source)?.code,
+                ErrorCode::QuerySyntax,
+                "{source}"
+            );
+        }
         Ok(())
     }
 

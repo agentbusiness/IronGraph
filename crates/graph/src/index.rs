@@ -22,7 +22,7 @@ use super::{GraphMutation, GraphStore, NodeView, persistent::PagedVec};
 
 #[path = "concurrent_index.rs"]
 mod concurrent_index;
-use concurrent_index::{ConcurrentMap, EntryMap, Postings, ProfileCell};
+use concurrent_index::{ConcurrentMap, EntryMap, Postings, ProfileCell, RelationshipScopeCell};
 
 /// Total-order key for indexable scalar values.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -2490,12 +2490,43 @@ struct IndexEntry {
     runtime: Option<Arc<RuntimeIndex>>,
 }
 
+/// Relationship types selected for the project's automatically maintained semantic index.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RelationshipSemanticScope {
+    #[default]
+    All,
+    None,
+    AllExcept(BTreeSet<String>),
+}
+
+impl RelationshipSemanticScope {
+    /// Tests an exact, case-sensitive catalogue name, including names not yet declared.
+    #[must_use]
+    pub fn includes(&self, relationship_type: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::None => false,
+            Self::AllExcept(excluded) => !excluded.contains(relationship_type),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct RelationshipSemanticState {
+    scope: RelationshipSemanticScope,
+    revision: u64,
+    #[serde(default)]
+    reconciled_revision: u64,
+}
+
 /// Project-scoped durable definitions plus rebuildable physical index state and canonical vectors.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct IndexCatalog {
     entries: EntryMap,
     embeddings: ConcurrentMap<String, EmbeddingIndexDefinition>,
     profile: ProfileCell,
+    #[serde(default)]
+    relationship_semantic: RelationshipScopeCell,
     /// Vectors are canonical embedding rows; ANN structures in `entries` are derived.
     vector_columns: ConcurrentMap<PropertyId, Arc<VectorIndex>>,
     /// Allocated source slots covered by the last successful automatic-index build. Deleted
@@ -2511,6 +2542,64 @@ mod persistence;
 pub use persistence::IndexPersistenceSelection;
 
 impl IndexCatalog {
+    /// Current automatic relationship policy, independent of encoder availability.
+    #[must_use]
+    pub fn relationship_semantic_scope(&self) -> RelationshipSemanticScope {
+        self.relationship_semantic.get().scope.clone()
+    }
+
+    /// Monotonic policy revision used to reject obsolete inference and cleanup.
+    #[must_use]
+    pub fn relationship_semantic_revision(&self) -> u64 {
+        self.relationship_semantic.get().revision
+    }
+
+    /// Reads policy and its revision from the same atomic publication.
+    #[must_use]
+    pub fn relationship_semantic_state(&self) -> (RelationshipSemanticScope, u64) {
+        let state = self.relationship_semantic.get();
+        (state.scope.clone(), state.revision)
+    }
+
+    /// Whether current relationship-scope reconciliation still needs a complete pass.
+    #[must_use]
+    pub fn relationship_semantic_reconciliation_pending(&self) -> bool {
+        let state = self.relationship_semantic.get();
+        state.revision != state.reconciled_revision
+    }
+
+    /// Completes only the current scope pass, never a newer policy's reconciliation.
+    pub fn complete_relationship_semantic_reconciliation(&self, expected_revision: u64) -> bool {
+        self.relationship_semantic.complete(expected_revision)
+    }
+
+    /// Publishes a changed policy once; repeating the current policy is a no-op.
+    pub fn set_relationship_semantic_scope(
+        &self,
+        scope: RelationshipSemanticScope,
+    ) -> Result<bool> {
+        let scope = match scope {
+            RelationshipSemanticScope::AllExcept(names) if names.is_empty() => {
+                RelationshipSemanticScope::All
+            }
+            scope => scope,
+        };
+        let changed = self.relationship_semantic.set(scope)?;
+        if changed {
+            self.invalidate_optimizer_generation();
+        }
+        Ok(changed)
+    }
+
+    /// Whether this exact relationship-type name participates in automatic embedding.
+    #[must_use]
+    pub fn relationship_semantic_included(&self, relationship_type: &str) -> bool {
+        self.relationship_semantic
+            .get()
+            .scope
+            .includes(relationship_type)
+    }
+
     /// Simulates only keys affected by this batch. Canonical rows and postings remain untouched.
     pub fn validate_graph_mutations(
         &self,
@@ -3080,6 +3169,7 @@ impl IndexCatalog {
             && self.embeddings.is_empty()
             && self.profile.is_none()
             && self.vector_columns.is_empty()
+            && self.relationship_semantic_revision() == 0
     }
 
     /// Exports indexes exclusively for the preserved inactive graph implementation.
@@ -3834,6 +3924,21 @@ impl IndexCatalog {
         {
             let mut hasher = blake3::Hasher::new();
             hasher.update(b"index-generation-v1\0");
+            let relationship_scope = self.relationship_semantic.get();
+            match &relationship_scope.scope {
+                RelationshipSemanticScope::All => {
+                    hasher.update(&[0]);
+                }
+                RelationshipSemanticScope::None => {
+                    hasher.update(&[1]);
+                }
+                RelationshipSemanticScope::AllExcept(names) => {
+                    hasher.update(&[2]);
+                    for name in names {
+                        hash_bytes(&mut hasher, name.as_bytes());
+                    }
+                }
+            }
             for (name, entry) in &self.entries {
                 hash_bytes(&mut hasher, name.as_bytes());
                 hasher.update(&[graph_index_kind_byte(entry.definition.kind)]);

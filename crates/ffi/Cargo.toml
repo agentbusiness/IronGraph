@@ -1,6 +1,6 @@
 [package]
 name = "irongraph-ffi"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 rust-version = "1.94"
 publish = false
@@ -16,7 +16,7 @@ cuda = ["accelerator", "irongraph-embedded/cuda"]
 [dependencies]
 irongraph-client = { path = "../client" }
 irongraph-embedded = { path = "../embedded", default-features = false }
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.150"
 
 [dev-dependencies]

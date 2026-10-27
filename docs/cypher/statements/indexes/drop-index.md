@@ -19,6 +19,11 @@ Because an index changes cost and not answers, dropping one is safe in the sense
 
 Without `IF EXISTS`, dropping an index that is not there fails with `index does not exist`. With it, the statement succeeds and does nothing.
 
+The automatic search names `semantic_nodes`, `semantic_relationships` and `graph_semantic` cannot
+be dropped, including with `IF EXISTS`. Use
+[`ALTER AUTOMATIC SEMANTIC`](./alter-automatic-semantic.md) to exclude relationship types while
+preserving automatic node search.
+
 ## When to use it
 
 Drop an index that is not being used, or one whose maintenance cost outweighs what it saves. Use `IF EXISTS` in anything that might run twice.
@@ -44,7 +49,29 @@ No rows returned. 0 changes committed.
 
 ## Advanced example
 
-Dropped and re-declared, with the same query run afterwards. The rows are identical to the ones the indexed lookup returned — the index was never part of the answer.
+Dropped, with the same lookup run afterwards. In a new disposable project, run these setup statements
+separately before reading back the book:
+
+```cypher
+CREATE PROJECT index_example
+```
+
+```cypher
+USE index_example
+CREATE (:Book {isbn: '1449373321', title: 'Designing Data-Intensive Applications', year: 2017})
+```
+
+```cypher
+USE index_example
+CREATE INDEX book_by_isbn FOR (book:Book) ON (book.isbn)
+```
+
+```cypher
+USE index_example
+DROP INDEX book_by_isbn
+```
+
+The rows are unchanged by dropping the access path:
 
 ```cypher
 USE index_example

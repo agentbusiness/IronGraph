@@ -48,7 +48,7 @@ component_size | components
 75877          | 1         
 2              | 1         
 
-2 rows, 147 ms
+2 rows
 ```
 
 ## Advanced example
@@ -73,7 +73,7 @@ components | nodes | largest_component | smallest_component | percent_in_largest
 -----------+-------+-------------------+--------------------+-------------------
 2          | 75879 | 75877             | 2                  | 100               
 
-1 row, 150 ms
+1 row
 ```
 
 ## Where it earns its place

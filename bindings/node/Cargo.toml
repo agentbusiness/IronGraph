@@ -1,6 +1,6 @@
 [package]
 name = "irongraph-node"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 rust-version = "1.94"
 publish = false
@@ -19,9 +19,9 @@ irongraph-embedded = { path = "../../crates/embedded", default-features = false 
 irongraph-types = { path = "../../crates/types" }
 napi = { version = "3.12.2", features = ["async", "napi8", "serde-json", "tokio_rt"] }
 napi-derive = "3.6.3"
-serde = "1.0.228"
+serde = "1.0.229"
 serde_json = "1.0.150"
-uuid = "1.24.0"
+uuid = "1.29.0"
 
 [build-dependencies]
 napi-build = "2.3.1"

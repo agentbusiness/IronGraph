@@ -69,7 +69,7 @@ graph  | triangles | relationships | triangles_per_1000_relationships
 -------+-----------+---------------+---------------------------------
 social | 1612010   | 88234         | 18269.71                        
 
-1 row, 193 ms
+1 row
 ```
 
 ## Where it earns its place

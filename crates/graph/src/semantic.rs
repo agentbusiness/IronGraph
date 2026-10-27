@@ -10,7 +10,7 @@ use std::{
 
 use crate::{
     DocumentItem, EdgeId, GraphMutation, GraphStore, LabelId, NodeId, PropertyId,
-    RelationshipTypeId, Result, ScalarValue,
+    RelationshipSemanticScope, RelationshipTypeId, Result, ScalarValue,
 };
 
 /// One derived description, or a tombstone removing a deleted owner's vector.
@@ -29,10 +29,26 @@ pub struct SemanticTextBatch {
 
 /// Cold build for all live canonical owners, including owners with only a label or type.
 pub fn semantic_texts(graph: &GraphStore) -> Result<SemanticTextBatch> {
+    semantic_texts_scoped(graph, &RelationshipSemanticScope::All)
+}
+
+/// Cold build restricted to the project's automatic relationship policy.
+pub fn semantic_texts_scoped(
+    graph: &GraphStore,
+    scope: &RelationshipSemanticScope,
+) -> Result<SemanticTextBatch> {
     let overlay = Overlay::new(graph, &[], &[]);
     overlay.render(
         graph.nodes().map(|node| node.id()).collect(),
-        graph.edges().map(|edge| edge.id()).collect(),
+        if matches!(scope, RelationshipSemanticScope::None) {
+            BTreeSet::new()
+        } else {
+            graph
+                .edges()
+                .filter(|edge| overlay.edge_included(edge.id(), scope))
+                .map(|edge| edge.id())
+                .collect()
+        },
     )
 }
 
@@ -68,8 +84,18 @@ pub fn semantic_text_delta(
     prior: &[GraphMutation],
     current: &[GraphMutation],
 ) -> Result<SemanticTextBatch> {
-    let (nodes, edges) = semantic_affected_owners(graph, prior, current)?;
-    Overlay::new(graph, prior, current).render(nodes, edges)
+    semantic_text_delta_scoped(graph, prior, current, &RelationshipSemanticScope::All)
+}
+
+/// Scoped descriptions preserve deletion tombstones without rendering excluded live owners.
+pub fn semantic_text_delta_scoped(
+    graph: &GraphStore,
+    prior: &[GraphMutation],
+    current: &[GraphMutation],
+    scope: &RelationshipSemanticScope,
+) -> Result<SemanticTextBatch> {
+    let (nodes, edges) = semantic_affected_owners_scoped(graph, prior, current, scope)?;
+    Overlay::new(graph, prior, current).render_scoped(nodes, edges, scope)
 }
 
 /// Bounded identity-only work selection; it never materializes owner text.
@@ -78,10 +104,22 @@ pub fn semantic_affected_owners(
     prior: &[GraphMutation],
     current: &[GraphMutation],
 ) -> Result<(BTreeSet<NodeId>, BTreeSet<EdgeId>)> {
+    semantic_affected_owners_scoped(graph, prior, current, &RelationshipSemanticScope::All)
+}
+
+/// Scoped identity selection; NONE never reads endpoint adjacency. Explicit edge deletions
+/// remain selected even after the owner or its type is absent, so stale vectors are removed.
+pub fn semantic_affected_owners_scoped(
+    graph: &GraphStore,
+    prior: &[GraphMutation],
+    current: &[GraphMutation],
+    scope: &RelationshipSemanticScope,
+) -> Result<(BTreeSet<NodeId>, BTreeSet<EdgeId>)> {
     let overlay = Overlay::new(graph, prior, current);
     let mut nodes = BTreeSet::new();
     let mut edges = BTreeSet::new();
     let mut endpoints = BTreeSet::new();
+    let mut deleted_endpoints = BTreeSet::new();
     for mutation in current {
         match mutation {
             GraphMutation::InsertNode(node) => {
@@ -103,18 +141,25 @@ pub fn semantic_affected_owners(
                 }
             }
             GraphMutation::AddNodeLabels { node, .. }
-            | GraphMutation::RemoveNodeLabels { node, .. }
-            | GraphMutation::DeleteNode { node, .. } => {
+            | GraphMutation::RemoveNodeLabels { node, .. } => {
                 nodes.insert(*node);
                 endpoints.insert(*node);
             }
+            GraphMutation::DeleteNode { node, .. } => {
+                nodes.insert(*node);
+                endpoints.insert(*node);
+                deleted_endpoints.insert(*node);
+            }
             GraphMutation::InsertEdge(edge) => {
-                edges.insert(edge.id);
+                if overlay.edge_included(edge.id, scope) {
+                    edges.insert(edge.id);
+                }
             }
             GraphMutation::SetEdgeProperty { edge, property, .. } => {
                 if overlay
                     .property_name(*property)
                     .is_some_and(|name| meaningful_field(&name))
+                    && overlay.edge_included(*edge, scope)
                 {
                     edges.insert(*edge);
                 }
@@ -125,15 +170,24 @@ pub fn semantic_affected_owners(
             _ => {}
         }
     }
+    if matches!(scope, RelationshipSemanticScope::None) {
+        return Ok((nodes, edges));
+    }
     for node in &endpoints {
         if graph.node(*node).is_some() {
-            edges.extend(graph.incident_edge_ids(*node)?);
+            edges.extend(graph.incident_edge_ids(*node)?.into_iter().filter(|edge| {
+                deleted_endpoints.contains(node) || overlay.edge_included(*edge, scope)
+            }));
         }
     }
     // Inserted relationships have no canonical adjacency until commit.
     for mutation in prior.iter().chain(current) {
         if let GraphMutation::InsertEdge(edge) = mutation {
-            if endpoints.contains(&edge.source) || endpoints.contains(&edge.target) {
+            if (endpoints.contains(&edge.source) || endpoints.contains(&edge.target))
+                && (deleted_endpoints.contains(&edge.source)
+                    || deleted_endpoints.contains(&edge.target)
+                    || overlay.edge_included(edge.id, scope))
+            {
                 edges.insert(edge.id);
             }
         }
@@ -156,6 +210,32 @@ struct NodeText {
 }
 
 impl<'a> Overlay<'a> {
+    fn edge_included(&self, id: EdgeId, scope: &RelationshipSemanticScope) -> bool {
+        match scope {
+            RelationshipSemanticScope::All => return true,
+            RelationshipSemanticScope::None => return false,
+            RelationshipSemanticScope::AllExcept(_) => {}
+        }
+        let mut kind = self.graph.edge(id).map(|edge| edge.relationship_type());
+        for mutation in self.edges.get(&id).into_iter().flatten() {
+            match mutation {
+                GraphMutation::InsertEdge(edge) => kind = Some(edge.relationship_type),
+                GraphMutation::DeleteEdge { .. } => kind = None,
+                _ => {}
+            }
+        }
+        if kind.is_none() {
+            return true;
+        }
+        kind.and_then(|kind| {
+            self.types
+                .get(&kind)
+                .map(|name| Arc::from(*name))
+                .or_else(|| self.graph.catalog().relationship_type_name(kind))
+        })
+        .is_none_or(|name| scope.includes(&name))
+    }
+
     fn new(
         graph: &'a GraphStore,
         prior: &'a [GraphMutation],
@@ -397,6 +477,15 @@ impl<'a> Overlay<'a> {
         nodes: BTreeSet<NodeId>,
         edges: BTreeSet<EdgeId>,
     ) -> Result<SemanticTextBatch> {
+        self.render_scoped(nodes, edges, &RelationshipSemanticScope::All)
+    }
+
+    fn render_scoped(
+        &self,
+        nodes: BTreeSet<NodeId>,
+        edges: BTreeSet<EdgeId>,
+        scope: &RelationshipSemanticScope,
+    ) -> Result<SemanticTextBatch> {
         Ok(SemanticTextBatch {
             nodes: nodes
                 .into_iter()
@@ -412,7 +501,11 @@ impl<'a> Overlay<'a> {
                 .map(|id| {
                     Ok(SemanticText {
                         entity_id: id.0,
-                        text: self.edge_text(id)?,
+                        text: if self.edge_included(id, scope) {
+                            self.edge_text(id)?
+                        } else {
+                            None
+                        },
                     })
                 })
                 .collect::<Result<_>>()?,
@@ -696,6 +789,166 @@ mod tests {
             revision: 1,
             properties: vec![(reason, string("Responsible for the launch"))],
         }))
+    }
+
+    #[test]
+    fn scoped_semantic_selection_filters_dirty_large_owners_without_decoding_them() -> Result<()> {
+        let mut graph = GraphStore::default();
+        let payload = format!(
+            "{}FINAL COMPLETE OWNER SENTENCE",
+            "Real document content. ".repeat(100_000)
+        );
+        insert_node(
+            &mut graph,
+            1,
+            "Document",
+            vec![("title", string("First")), ("body", string(&payload))],
+        )?;
+        insert_node(
+            &mut graph,
+            2,
+            "Document",
+            vec![("title", string("Second")), ("body", string(&payload))],
+        )?;
+        for id in 1..=512 {
+            insert_edge(&mut graph, id, 1, 2)?;
+        }
+        let scope = RelationshipSemanticScope::AllExcept(BTreeSet::from(["WORKS_ON".into()]));
+        let title = graph.catalog_mut().intern_property("title")?;
+        let rename = [GraphMutation::SetNodeProperty {
+            node: NodeId(1),
+            property: title,
+            value: string("Changed"),
+            revision: 2,
+        }];
+        for scope in [&scope, &RelationshipSemanticScope::None] {
+            let (nodes, edges) = semantic_affected_owners_scoped(&graph, &[], &rename, scope)?;
+            assert_eq!(nodes, BTreeSet::from([NodeId(1)]));
+            assert!(edges.is_empty());
+            let cold = semantic_texts_scoped(&graph, scope)?;
+            assert_eq!(cold.nodes.len(), 2);
+            assert!(
+                cold.nodes[0]
+                    .text
+                    .as_ref()
+                    .is_some_and(|text| text.contains(&payload))
+            );
+            assert!(cold.relationships.is_empty());
+        }
+        let (nodes, edges) =
+            semantic_affected_owners_scoped(&graph, &[], &rename, &RelationshipSemanticScope::All)?;
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(edges.len(), 512);
+        let reason = graph.catalog_mut().intern_property("reason")?;
+        let update = [GraphMutation::SetEdgeProperty {
+            edge: EdgeId(1),
+            property: reason,
+            value: ScalarValue::Map(DocumentMap::from_canonical(Arc::from([255_u8]))),
+            revision: 3,
+        }];
+        assert!(semantic_text_delta(&graph, &[], &update).is_err());
+        assert!(
+            semantic_text_delta_scoped(&graph, &[], &update, &scope)?
+                .relationships
+                .is_empty()
+        );
+        let deletion = [GraphMutation::DeleteEdge {
+            edge: EdgeId(1),
+            revision: 4,
+        }];
+        assert_eq!(
+            semantic_text_delta_scoped(&graph, &[], &deletion, &RelationshipSemanticScope::None)?
+                .relationships,
+            vec![SemanticText {
+                entity_id: 1,
+                text: None
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_semantic_selection_resolves_new_transaction_types_and_keeps_tombstones() -> Result<()>
+    {
+        let mut graph = GraphStore::default();
+        insert_node(&mut graph, 1, "Person", vec![("name", string("Alice"))])?;
+        insert_node(&mut graph, 2, "Person", vec![("name", string("Bob"))])?;
+        let new_kind = RelationshipTypeId(100);
+        let prior = [GraphMutation::DeclareRelationshipType {
+            name: "PRIVATE_TYPE".into(),
+            id: new_kind,
+        }];
+        let edge = GraphMutation::InsertEdge(EdgeInput {
+            id: EdgeId(10),
+            source: NodeId(1),
+            target: NodeId(2),
+            relationship_type: new_kind,
+            layer: Layer::Observed,
+            revision: 2,
+            properties: vec![],
+        });
+        let scope = RelationshipSemanticScope::AllExcept(BTreeSet::from(["PRIVATE_TYPE".into()]));
+        assert!(
+            semantic_affected_owners_scoped(&graph, &prior, std::slice::from_ref(&edge), &scope)?
+                .1
+                .is_empty()
+        );
+        assert_eq!(
+            semantic_affected_owners_scoped(
+                &graph,
+                &prior,
+                std::slice::from_ref(&edge),
+                &RelationshipSemanticScope::All
+            )?
+            .1,
+            BTreeSet::from([EdgeId(10)])
+        );
+        let deleted = [
+            edge.clone(),
+            GraphMutation::DeleteEdge {
+                edge: EdgeId(10),
+                revision: 3,
+            },
+        ];
+        assert_eq!(
+            semantic_text_delta_scoped(&graph, &prior, &deleted, &scope)?.relationships,
+            vec![SemanticText {
+                entity_id: 10,
+                text: None
+            }]
+        );
+        let replaced = [
+            GraphMutation::DeleteEdge {
+                edge: EdgeId(10),
+                revision: 3,
+            },
+            edge,
+        ];
+        assert_eq!(
+            semantic_text_delta_scoped(&graph, &prior, &replaced, &scope)?.relationships,
+            vec![SemanticText {
+                entity_id: 10,
+                text: None
+            }]
+        );
+        let deleted_unknown = [GraphMutation::DeleteEdge {
+            edge: EdgeId(999),
+            revision: 4,
+        }];
+        assert_eq!(
+            semantic_text_delta_scoped(
+                &graph,
+                &[],
+                &deleted_unknown,
+                &RelationshipSemanticScope::None
+            )?
+            .relationships,
+            vec![SemanticText {
+                entity_id: 999,
+                text: None
+            }]
+        );
+        Ok(())
     }
 
     #[test]

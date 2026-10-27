@@ -60,7 +60,7 @@ iata | name                    | city   | country
 -----+-------------------------+--------+---------------
 LHR  | London Heathrow Airport | London | United Kingdom
 
-1 row, 83 ms
+1 row
 ```
 
 ## Where it earns its place

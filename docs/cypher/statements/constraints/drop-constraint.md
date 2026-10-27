@@ -25,6 +25,26 @@ Drop one when the uniqueness rule is genuinely no longer true: a key that has be
 
 `DROP INDEX` removes an access path and cannot change what is storable. This removes a rule, and can.
 
+## Prerequisites
+
+Use a new disposable project. Execute these statements separately:
+
+```cypher
+CREATE PROJECT index_example
+```
+
+```cypher
+USE index_example
+CREATE (:Book {isbn: '1449373321', title: 'Designing Data-Intensive Applications'})
+```
+
+```cypher
+USE index_example
+CREATE CONSTRAINT book_isbn_unique FOR (book:Book) REQUIRE book.isbn IS UNIQUE
+```
+
+Expected result: one book protected by a uniqueness constraint.
+
 ## Simple example
 
 The idempotent form, on a constraint that does not exist.
@@ -43,6 +63,18 @@ No rows returned. 0 changes committed.
 ## Advanced example
 
 The write that the constraint rejected, accepted once it is gone. Both books now carry the same ISBN, which is exactly what the constraint existed to prevent.
+
+Run these statements separately before reading back the books:
+
+```cypher
+USE index_example
+DROP CONSTRAINT book_isbn_unique
+```
+
+```cypher
+USE index_example
+CREATE (:Book {isbn: '1449373321', title: 'A second copy'})
+```
 
 ```cypher
 USE index_example

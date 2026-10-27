@@ -49,7 +49,7 @@ lowest_rating | highest_rating | first_rating         | last_rating
 --------------+----------------+----------------------+---------------------
 -10           | 10             | 2010-11-08T18:45:11Z | 2016-01-25T01:12:03Z
 
-1 row, 191 ms
+1 row
 ```
 
 ## Advanced example
@@ -87,7 +87,7 @@ account | ratings | active_days | ratings_per_day
 1052    | 54      | 1669        | 0.03           
 135     | 92      | 1645        | 0.06           
 
-10 rows, 214 ms
+10 rows
 ```
 
 ## Where it earns its place

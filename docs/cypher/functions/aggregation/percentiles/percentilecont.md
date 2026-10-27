@@ -52,7 +52,7 @@ ratings | p05 | p25 | median | p75 | p95 | mean
 --------+-----+-----+--------+-----+-----+------
 35592   | -10 | 1   | 1      | 2   | 5   | 1.012
 
-1 row, 236 ms
+1 row
 ```
 
 ## Advanced example
@@ -87,7 +87,7 @@ window_start        | ratings | q1 | median | q3 | interquartile_range
 1419120000000000000 | 1081    | 1  | 1      | 2  | 1                  
 1450656000000000000 | 57      | 1  | 1      | 2  | 1                  
 
-7 rows, 282 ms
+7 rows
 ```
 
 ## Where it earns its place

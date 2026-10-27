@@ -1,6 +1,6 @@
 [package]
 name = "irongraph-sdk"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 rust-version = "1.94"
 description = "Embed a CPU graph database in Rust with asynchronous GPU text embeddings, Cypher, vector search, streaming, and queues."
@@ -17,16 +17,16 @@ keywords = ["graph", "database", "cypher", "vector", "embedded"]
 [workspace]
 
 [dependencies]
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["raw_value", "float_roundtrip"] }
-tokio = { version = "1.48.0", features = ["rt", "sync"] }
+tokio = { version = "1.54.1", features = ["rt", "sync"] }
 
 [build-dependencies]
-reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls"] }
-serde = { version = "1.0.228", features = ["derive"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.10.9"
 
 [dev-dependencies]
 tempfile = "3.27.0"
-tokio = { version = "1.48.0", features = ["rt", "sync", "time", "macros"] }
+tokio = { version = "1.54.1", features = ["rt", "sync", "time", "macros"] }

@@ -29,6 +29,7 @@ fn context(graph: &GraphStore) -> ExecutionContext<'_> {
         bookmark: Bookmark { term: 1, index: 4 },
         mutation_revision: 5,
         resolved_time_nanos: 0,
+        transaction_time_nanos: None,
         next_node_id: 10,
         next_edge_id: 10,
         predicate_versions: BTreeMap::new(),
