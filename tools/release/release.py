@@ -1535,7 +1535,11 @@ def build_matrix(stage, config):
                  "--mount", f"type=bind,source={container_stage},target=/build",
                  "--mount", f"type=bind,source={directory},target=/out",
                  "--mount", "type=volume,source=irongraph-release-models,target=/root/.irongraph/models",
-                 "--mount", "type=volume,source=irongraph-release-registry,target=/root/.cargo/registry",
+                 # Cargo's extraction locks live outside the registry mount, so
+                 # concurrent containers need separate writable registry caches.
+                 "--mount", ("type=volume,source=irongraph-release-registry,target=/root/.cargo/registry"
+                             if arch == "arm64" else
+                             "type=volume,source=irongraph-release-registry-amd64,target=/root/.cargo/registry"),
                  "--workdir", "/build/source", tag, "--source", "/build/source", "--output", "/out", "--target", target, *options])
         log = logs / (target + ".log")
         print(f"Building {target}; log: {log}", flush=True)
