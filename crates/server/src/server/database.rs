@@ -881,12 +881,24 @@ impl Database {
         let _ = maximum_write_bytes;
         let transactions = TransactionAdmissionRegistry::unrestricted();
         let (broker_changes, _) = tokio::sync::watch::channel(0);
+        let started = Instant::now();
         let records = RecordStore::open(
             directory.as_ref().join("database.redb"),
             identity.store_id.0,
         )?;
+        tracing::info!(
+            phase = "storage_open",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "startup recovery phase completed"
+        );
         let segments = SegmentStore::with_records(records.clone());
+        let started = Instant::now();
         let state = persistence::restore(&records)?;
+        tracing::info!(
+            phase = "database_restore",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "startup recovery phase completed"
+        );
         state.broker.validate_payload_segments(&segments)?;
         let reader_broker = ArcSwap::from_pointee(state.broker.clone());
         let reader_security = ArcSwap::from_pointee(state.security.clone());
@@ -4832,335 +4844,317 @@ fn apply_mutation_inner(
     } else {
         None
     };
-    let result =
-        match mutation {
-            DatabaseMutation::CreateProject { id, display_name } => {
-                validate_project_name(&display_name)?;
-                let normalized = normalize_name(&display_name);
-                if state.projects.contains_key(&id) || state.names.contains_key(&normalized) {
-                    return Err(Error::new(
-                        ErrorCode::TransactionConflict,
-                        "project already exists",
-                    ));
-                }
-                state.names.insert(normalized, id);
-                state.projects.insert(
+    let result = match mutation {
+        DatabaseMutation::CreateProject { id, display_name } => {
+            validate_project_name(&display_name)?;
+            let normalized = normalize_name(&display_name);
+            if state.projects.contains_key(&id) || state.names.contains_key(&normalized) {
+                return Err(Error::new(
+                    ErrorCode::TransactionConflict,
+                    "project already exists",
+                ));
+            }
+            state.names.insert(normalized, id);
+            state.projects.insert(
+                id,
+                Arc::new(ProjectState {
                     id,
-                    Arc::new(ProjectState {
-                        id,
-                        display_name: display_name.into(),
-                        graph: GraphStore::default(),
-                        temporal: TemporalStore::default(),
-                        predicate_versions: BTreeMap::new(),
-                        indexes: IndexCatalog::default(),
-                        next_node_id: 1.into(),
-                        next_edge_id: 1.into(),
-                        authority_revision: bookmark.index.into(),
-                        optimizer_statistics: OnceLock::new().into(),
-                    }),
-                );
-                Ok(None)
+                    display_name: display_name.into(),
+                    graph: GraphStore::default(),
+                    temporal: TemporalStore::default(),
+                    predicate_versions: BTreeMap::new(),
+                    indexes: IndexCatalog::default(),
+                    next_node_id: 1.into(),
+                    next_edge_id: 1.into(),
+                    authority_revision: bookmark.index.into(),
+                    optimizer_statistics: OnceLock::new().into(),
+                }),
+            );
+            Ok(None)
+        }
+        DatabaseMutation::RenameProject { id, display_name } => {
+            validate_project_name(&display_name)?;
+            let normalized = normalize_name(&display_name);
+            if state
+                .names
+                .get(&normalized)
+                .is_some_and(|existing| *existing != id)
+            {
+                return Err(Error::new(
+                    ErrorCode::TransactionConflict,
+                    "project name already exists",
+                ));
             }
-            DatabaseMutation::RenameProject { id, display_name } => {
-                validate_project_name(&display_name)?;
-                let normalized = normalize_name(&display_name);
-                if state
-                    .names
-                    .get(&normalized)
-                    .is_some_and(|existing| *existing != id)
-                {
-                    return Err(Error::new(
-                        ErrorCode::TransactionConflict,
-                        "project name already exists",
-                    ));
-                }
-                let project = state.projects.get_mut(&id).ok_or_else(|| {
-                    Error::new(ErrorCode::ProjectNotFound, "project does not exist")
-                })?;
-                let project = project.as_ref();
-                state
-                    .names
-                    .remove(&normalize_name(&project.display_name.get()));
-                project.display_name.set(display_name);
-                state.names.insert(normalized, id);
-                Ok(None)
+            let project = state
+                .projects
+                .get_mut(&id)
+                .ok_or_else(|| Error::new(ErrorCode::ProjectNotFound, "project does not exist"))?;
+            let project = project.as_ref();
+            state
+                .names
+                .remove(&normalize_name(&project.display_name.get()));
+            project.display_name.set(display_name);
+            state.names.insert(normalized, id);
+            Ok(None)
+        }
+        DatabaseMutation::DropProject { id, cascade } => {
+            if !cascade && project_has_data(state, id)? {
+                return Err(Error::new(
+                    ErrorCode::CorruptStorage,
+                    "committed non-cascade project drop targets non-empty data",
+                ));
             }
-            DatabaseMutation::DropProject { id, cascade } => {
-                if !cascade && project_has_data(state, id)? {
-                    return Err(Error::new(
-                        ErrorCode::CorruptStorage,
-                        "committed non-cascade project drop targets non-empty data",
-                    ));
-                }
-                let project = state.projects.remove(&id).ok_or_else(|| {
-                    Error::new(ErrorCode::ProjectNotFound, "project does not exist")
-                })?;
-                state
-                    .names
-                    .remove(&normalize_name(&project.display_name.get()));
-                state.broker.drop_project(id)?;
-                Ok(None)
-            }
-            DatabaseMutation::Graph {
-                project,
-                validation: _,
-                graph,
-                temporal,
-                vectors,
-                administrative,
-            } => {
-                let project_state = state.projects.get_mut(&project).ok_or_else(|| {
-                    Error::new(ErrorCode::ProjectFenced, "project does not exist")
-                })?;
-                let project_state = project_state.as_ref();
-                let changes_graph =
-                    !graph.is_empty() || !temporal.is_empty() || administrative.is_some();
+            let project = state
+                .projects
+                .remove(&id)
+                .ok_or_else(|| Error::new(ErrorCode::ProjectNotFound, "project does not exist"))?;
+            state
+                .names
+                .remove(&normalize_name(&project.display_name.get()));
+            state.broker.drop_project(id)?;
+            Ok(None)
+        }
+        DatabaseMutation::Graph {
+            project,
+            validation: _,
+            graph,
+            temporal,
+            vectors,
+            administrative,
+        } => {
+            let project_state = state
+                .projects
+                .get_mut(&project)
+                .ok_or_else(|| Error::new(ErrorCode::ProjectFenced, "project does not exist"))?;
+            let project_state = project_state.as_ref();
+            let changes_graph =
+                !graph.is_empty() || !temporal.is_empty() || administrative.is_some();
+            project_state
+                .indexes
+                .bind_catalog_graph(&project_state.graph);
+            let freshness = embedding_freshness_updates(project_state, &graph)?;
+            // Select against the predecessor once, then encode final current records once.
+            // Canonical changes and index publication still occur in their original order.
+            let graph_selection = persistence
+                .as_ref()
+                .map(|_| project_state.graph.prepare_persistence(&graph))
+                .transpose()?;
+            let mut index_selection = persistence
+                .as_ref()
+                .map(|_| {
+                    project_state.indexes.prepare_persistence(
+                        &project_state.graph,
+                        &graph,
+                        &vectors,
+                    )
+                })
+                .transpose()?;
+            for source in &graph {
+                let mutation = retag_graph_mutation(source.clone(), bookmark.index);
+                update_next_ids(project_state, &mutation);
                 project_state
                     .indexes
-                    .bind_catalog_graph(&project_state.graph);
-                let freshness = embedding_freshness_updates(project_state, &graph)?;
-                for source in &graph {
-                    let mutation = retag_graph_mutation(source.clone(), bookmark.index);
-                    let selected = persistence
-                        .as_ref()
-                        .map(|_| -> Result<_> {
-                            Ok((
-                                project_state
-                                    .graph
-                                    .prepare_persistence(std::slice::from_ref(&mutation))?,
-                                project_state.indexes.prepare_persistence(
-                                    &project_state.graph,
-                                    std::slice::from_ref(&mutation),
-                                    &[],
-                                )?,
-                            ))
-                        })
-                        .transpose()?;
-                    update_next_ids(project_state, &mutation);
+                    .before_graph_apply(&project_state.graph, &mutation)?;
+                project_state.graph.apply(mutation.clone())?;
+                project_state
+                    .indexes
+                    .after_graph_apply(&project_state.graph, &mutation)?;
+            }
+            if let (Some(records), Some(selected)) = (persistence.as_deref_mut(), graph_selection) {
+                persistence::append_project_operations(
+                    records,
+                    project,
+                    project_state.graph.persistence_changes(&selected)?,
+                );
+            }
+            let freshness_owners = freshness
+                .iter()
+                .map(|(owner, _, _)| owner.entity_id)
+                .collect::<Vec<_>>();
+            for (owner, index, previous_vector_revision) in freshness {
+                if let (Some(index), Some(revision)) = (
+                    project_state.indexes.vector_search_source(&index),
+                    embedding_owner_dependencies(project_state, owner).0,
+                ) {
+                    index.0.advance_row_revision(
+                        owner.entity_id,
+                        previous_vector_revision,
+                        revision,
+                    );
+                }
+            }
+            let temporal_targets = temporal
+                .iter()
+                .map(|change| (change.entity_kind, change.target, change.sample.property))
+                .collect::<Vec<_>>();
+            let temporal_selection = persistence
+                .as_ref()
+                .map(|_| {
                     project_state
-                        .indexes
-                        .before_graph_apply(&project_state.graph, &mutation)?;
-                    project_state.graph.apply(mutation.clone())?;
-                    project_state
-                        .indexes
-                        .after_graph_apply(&project_state.graph, &mutation)?;
-                    if let (Some(records), Some((graph_selection, index_selection))) =
-                        (persistence.as_deref_mut(), selected)
+                        .temporal
+                        .prepare_persistence(&temporal_targets, commit_time_nanos)
+                })
+                .transpose()?;
+            let declaration_selection = persistence
+                .as_ref()
+                .map(|_| {
+                    if let Some(AdministrativeMutation::DeclareTemporal {
+                        entity_kind,
+                        label_or_type,
+                        property,
+                        scalar_type,
+                        retention_nanos,
+                    }) = &administrative
                     {
-                        persistence::append_project_operations(
-                            records,
-                            project,
-                            project_state.graph.persistence_changes(&graph_selection)?,
-                        );
-                        persistence::append_project_operations(
-                            records,
-                            project,
-                            project_state.indexes.persistence_changes(
-                                &project_state.graph,
-                                &index_selection,
-                                false,
-                            )?,
-                        );
-                    }
-                }
-                let freshness_owners = freshness
-                    .iter()
-                    .map(|(owner, _, _)| owner.entity_id)
-                    .collect::<Vec<_>>();
-                for (owner, index, previous_vector_revision) in freshness {
-                    if let (Some(index), Some(revision)) = (
-                        project_state.indexes.vector_search_source(&index),
-                        embedding_owner_dependencies(project_state, owner).0,
-                    ) {
-                        index.0.advance_row_revision(
-                            owner.entity_id,
-                            previous_vector_revision,
-                            revision,
-                        );
-                    }
-                }
-                let temporal_targets = temporal
-                    .iter()
-                    .map(|change| (change.entity_kind, change.target, change.sample.property))
-                    .collect::<Vec<_>>();
-                let temporal_selection = persistence
-                    .as_ref()
-                    .map(|_| {
+                        let catalog = project_state.graph.catalog();
+                        let target = match entity_kind {
+                            crate::types::EntityKind::Node => {
+                                catalog.label(label_or_type).map(|id| id.0)
+                            }
+                            crate::types::EntityKind::Relationship => {
+                                catalog.relationship_type(label_or_type).map(|id| id.0)
+                            }
+                        }
+                        .ok_or_else(|| Error::invalid_data("temporal target is missing"))?;
+                        let property = catalog
+                            .property(property)
+                            .ok_or_else(|| Error::invalid_data("temporal property is missing"))?;
                         project_state
                             .temporal
-                            .prepare_persistence(&temporal_targets, commit_time_nanos)
-                    })
-                    .transpose()?;
-                let declaration_selection = persistence
-                    .as_ref()
-                    .map(|_| {
-                        if let Some(AdministrativeMutation::DeclareTemporal {
-                            entity_kind,
-                            label_or_type,
-                            property,
-                            scalar_type,
-                            retention_nanos,
-                        }) = &administrative
-                        {
-                            let catalog = project_state.graph.catalog();
-                            let target = match entity_kind {
-                                crate::types::EntityKind::Node => {
-                                    catalog.label(label_or_type).map(|id| id.0)
-                                }
-                                crate::types::EntityKind::Relationship => {
-                                    catalog.relationship_type(label_or_type).map(|id| id.0)
-                                }
-                            }
-                            .ok_or_else(|| Error::invalid_data("temporal target is missing"))?;
-                            let property = catalog.property(property).ok_or_else(|| {
-                                Error::invalid_data("temporal property is missing")
-                            })?;
-                            project_state
-                                .temporal
-                                .prepare_declaration_persistence(
-                                    &crate::graph::TemporalDeclaration {
-                                        entity_kind: *entity_kind,
-                                        target,
-                                        property,
-                                        value_type: temporal_type(scalar_type)?,
-                                        retention_nanos: *retention_nanos,
-                                    },
-                                    commit_time_nanos,
-                                )
-                                .map(Some)
-                        } else {
-                            Ok(None)
-                        }
-                    })
-                    .transpose()?
-                    .flatten();
-                let index_selection = persistence
-                    .as_ref()
-                    .map(|_| -> Result<_> {
-                        let mut selected = project_state.indexes.prepare_persistence(
-                            &project_state.graph,
-                            &graph,
-                            &vectors,
-                        )?;
-                        for owner in &freshness_owners {
-                            project_state
-                                .indexes
-                                .include_persistence_owner(&mut selected, *owner);
-                        }
-                        Ok(selected)
-                    })
-                    .transpose()?;
-                let catalog_changed = administrative.is_some();
-                for mut mutation in temporal {
-                    mutation.sample.sequence_index = bookmark.index;
-                    if mutation.uses_commit_time {
-                        mutation.sample.event_time_nanos = commit_time_nanos;
+                            .prepare_declaration_persistence(
+                                &crate::graph::TemporalDeclaration {
+                                    entity_kind: *entity_kind,
+                                    target,
+                                    property,
+                                    value_type: temporal_type(scalar_type)?,
+                                    retention_nanos: *retention_nanos,
+                                },
+                                commit_time_nanos,
+                            )
+                            .map(Some)
+                    } else {
+                        Ok(None)
                     }
-                    project_state.temporal.append(
-                        mutation.entity_kind,
-                        mutation.target,
-                        mutation.sample,
-                        commit_time_nanos,
-                    )?;
+                })
+                .transpose()?
+                .flatten();
+            if let Some(selected) = &mut index_selection {
+                for owner in &freshness_owners {
+                    project_state
+                        .indexes
+                        .include_persistence_owner(selected, *owner);
                 }
-                if let Some(administrative) = administrative {
-                    apply_administrative(
-                        project_state,
-                        retag_administrative_mutation(administrative, bookmark.index),
-                        commit_time_nanos,
-                    )?;
-                }
-                for mutation in vectors {
-                    project_state.indexes.apply_vector_mutation_from_graph(
-                        &project_state.graph,
-                        &retag_vector_mutation(mutation, bookmark.index),
-                    )?;
-                }
-                if let Some(records) = persistence.as_deref_mut() {
-                    if let Some(selection) = index_selection {
-                        persistence::append_project_operations(
-                            records,
-                            project,
-                            project_state.indexes.persistence_changes(
-                                &project_state.graph,
-                                &selection,
-                                catalog_changed,
-                            )?,
-                        );
-                    }
-                    if let Some(selection) = temporal_selection {
-                        persistence::append_project_operations(
-                            records,
-                            project,
-                            project_state
-                                .temporal
-                                .persistence_changes(&selection, catalog_changed)?,
-                        );
-                    }
-                    if let Some(selection) = declaration_selection {
-                        persistence::append_project_operations(
-                            records,
-                            project,
-                            project_state
-                                .temporal
-                                .persistence_changes(&selection, catalog_changed)?,
-                        );
-                    }
-                }
-                if changes_graph {
-                    project_state.authority_revision.set(bookmark.index);
-                    refresh_optimizer_statistics(project_state);
-                }
-                Ok(None)
             }
-            DatabaseMutation::Broker { command } => {
-                let project = broker_project(&command);
-                if !state.projects.contains_key(&project) {
-                    return Err(Error::new(
-                        ErrorCode::ProjectFenced,
-                        "broker mutation references a missing project",
-                    ));
+            let catalog_changed = administrative.is_some();
+            for mut mutation in temporal {
+                mutation.sample.sequence_index = bookmark.index;
+                if mutation.uses_commit_time {
+                    mutation.sample.event_time_nanos = commit_time_nanos;
                 }
-                let segments = segments.ok_or_else(|| {
-                    Error::internal("broker mutation requires the canonical payload segment store")
-                })?;
-                state.broker.apply(command, segments).map(Some)
-            }
-            DatabaseMutation::EmbeddingProfile { command } => {
-                apply_embedding_profile_command(state, &command)?;
-                if let Some(records) = persistence.as_deref_mut() {
-                    let id = match command {
-                        EmbeddingProfileCommand::Begin { project, .. }
-                        | EmbeddingProfileCommand::Acknowledge { project, .. }
-                        | EmbeddingProfileCommand::Activate { project, .. }
-                        | EmbeddingProfileCommand::Abort { project, .. } => project,
-                    };
-                    if let Some(project) = state.projects.get(&id) {
-                        let selected =
-                            project
-                                .indexes
-                                .prepare_persistence(&project.graph, &[], &[])?;
-                        persistence::append_project_operations(
-                            records,
-                            id,
-                            project
-                                .indexes
-                                .persistence_changes(&project.graph, &selected, true)?,
-                        );
-                    }
-                }
-                Ok(None)
-            }
-            DatabaseMutation::Security { command } => {
-                apply_security_command(
-                    &state.security,
-                    &command,
-                    bookmark,
-                    commit_time_nanos / 1_000_000,
+                project_state.temporal.append(
+                    mutation.entity_kind,
+                    mutation.target,
+                    mutation.sample,
+                    commit_time_nanos,
                 )?;
-                Ok(None)
             }
-        };
+            if let Some(administrative) = administrative {
+                apply_administrative(
+                    project_state,
+                    retag_administrative_mutation(administrative, bookmark.index),
+                    commit_time_nanos,
+                )?;
+            }
+            for mutation in vectors {
+                project_state.indexes.apply_vector_mutation_from_graph(
+                    &project_state.graph,
+                    &retag_vector_mutation(mutation, bookmark.index),
+                )?;
+            }
+            if let Some(records) = persistence.as_deref_mut() {
+                if let Some(selection) = index_selection {
+                    persistence::append_project_operations(
+                        records,
+                        project,
+                        project_state.indexes.persistence_changes(
+                            &project_state.graph,
+                            &selection,
+                            catalog_changed,
+                        )?,
+                    );
+                }
+                if let Some(selection) = temporal_selection {
+                    persistence::append_project_operations(
+                        records,
+                        project,
+                        project_state
+                            .temporal
+                            .persistence_changes(&selection, catalog_changed)?,
+                    );
+                }
+                if let Some(selection) = declaration_selection {
+                    persistence::append_project_operations(
+                        records,
+                        project,
+                        project_state
+                            .temporal
+                            .persistence_changes(&selection, catalog_changed)?,
+                    );
+                }
+            }
+            if changes_graph {
+                project_state.authority_revision.set(bookmark.index);
+                refresh_optimizer_statistics(project_state);
+            }
+            Ok(None)
+        }
+        DatabaseMutation::Broker { command } => {
+            let project = broker_project(&command);
+            if !state.projects.contains_key(&project) {
+                return Err(Error::new(
+                    ErrorCode::ProjectFenced,
+                    "broker mutation references a missing project",
+                ));
+            }
+            let segments = segments.ok_or_else(|| {
+                Error::internal("broker mutation requires the canonical payload segment store")
+            })?;
+            state.broker.apply(command, segments).map(Some)
+        }
+        DatabaseMutation::EmbeddingProfile { command } => {
+            apply_embedding_profile_command(state, &command)?;
+            if let Some(records) = persistence.as_deref_mut() {
+                let id = match command {
+                    EmbeddingProfileCommand::Begin { project, .. }
+                    | EmbeddingProfileCommand::Acknowledge { project, .. }
+                    | EmbeddingProfileCommand::Activate { project, .. }
+                    | EmbeddingProfileCommand::Abort { project, .. } => project,
+                };
+                if let Some(project) = state.projects.get(&id) {
+                    let selected = project
+                        .indexes
+                        .prepare_persistence(&project.graph, &[], &[])?;
+                    persistence::append_project_operations(
+                        records,
+                        id,
+                        project
+                            .indexes
+                            .persistence_changes(&project.graph, &selected, true)?,
+                    );
+                }
+            }
+            Ok(None)
+        }
+        DatabaseMutation::Security { command } => {
+            apply_security_command(
+                &state.security,
+                &command,
+                bookmark,
+                commit_time_nanos / 1_000_000,
+            )?;
+            Ok(None)
+        }
+    };
     if result.is_ok() {
         if let (Some(records), Some(capture)) = (persistence, broker_capture.as_ref()) {
             records.extend(state.broker.persistence_changes(capture)?);

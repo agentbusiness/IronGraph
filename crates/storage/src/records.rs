@@ -1,4 +1,4 @@
-use std::{ops::Bound, path::Path, sync::Arc};
+use std::{borrow::Cow, ops::Bound, path::Path, sync::Arc};
 
 use irongraph_types::{Bookmark, Error, ErrorCode, Result};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
@@ -59,7 +59,7 @@ impl RecordReader {
         records
             .get(key)
             .map_err(storage_error)?
-            .map(|value| read_record(&chunks, key, value.value()))
+            .map(|value| read_record(&chunks, key, value.value()).map(Cow::into_owned))
             .transpose()
     }
 
@@ -305,7 +305,7 @@ impl RecordStore {
             let matches = records
                 .get(key)
                 .map_err(storage_error)?
-                .map(|value| read_record(&chunks, key, value.value()))
+                .map(|value| read_record(&chunks, key, value.value()).map(Cow::into_owned))
                 .transpose()?
                 .is_some_and(|value| value == expected);
             if !matches {
@@ -350,7 +350,7 @@ impl RecordStore {
         }
         Ok(Some((
             key.value().to_vec(),
-            read_record(&chunks, key.value(), value.value())?,
+            read_record(&chunks, key.value(), value.value())?.into_owned(),
         )))
     }
 }
@@ -375,11 +375,11 @@ fn delete_record(
     Ok(())
 }
 
-fn read_record(
+fn read_record<'a>(
     chunks: &impl ReadableTable<(&'static [u8], u64), &'static [u8]>,
     key: &[u8],
-    encoded: &[u8],
-) -> Result<Vec<u8>> {
+    encoded: &'a [u8],
+) -> Result<Cow<'a, [u8]>> {
     let (length, count, checksum) = decode_header(encoded)?;
     let length =
         usize::try_from(length).map_err(|_| corrupt("record length exceeds process range"))?;
@@ -391,11 +391,7 @@ fn read_record(
     if count != expected_count {
         return Err(corrupt("record chunk count disagrees with length"));
     }
-    let mut value = Vec::new();
-    value
-        .try_reserve_exact(length)
-        .map_err(|_| Error::internal("record allocation failed"))?;
-    if count == 0 {
+    let value = if count == 0 {
         if encoded.len()
             != HEADER_BYTES
                 .checked_add(length)
@@ -403,11 +399,15 @@ fn read_record(
         {
             return Err(corrupt("inline record length mismatch"));
         }
-        value.extend_from_slice(&encoded[HEADER_BYTES..]);
+        Cow::Borrowed(&encoded[HEADER_BYTES..])
     } else {
         if encoded.len() != HEADER_BYTES {
             return Err(corrupt("chunked record header length mismatch"));
         }
+        let mut value = Vec::new();
+        value
+            .try_reserve_exact(length)
+            .map_err(|_| Error::internal("record allocation failed"))?;
         for index in 0..count {
             let chunk = chunks
                 .get((key, index))
@@ -419,7 +419,8 @@ fn read_record(
             }
             value.extend_from_slice(chunk.value());
         }
-    }
+        Cow::Owned(value)
+    };
     if blake3::hash(&value).as_bytes() != checksum {
         return Err(corrupt("record checksum mismatch"));
     }
@@ -515,6 +516,39 @@ mod tests {
             key: key.to_vec(),
             value: value.to_vec(),
         }
+    }
+
+    #[test]
+    fn inline_reads_borrow_checked_bytes_and_chunked_reads_own_their_assembly() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store = RecordStore::open(directory.path().join("database.redb"), Uuid::new_v4())?;
+        let small = vec![0x5a; CHUNK_BYTES];
+        let large = vec![0x7b; CHUNK_BYTES + 1];
+        store.commit(&[batch(
+            1,
+            vec![put(b"inline", &small), put(b"chunked", &large)],
+        )])?;
+        let transaction = store.database.begin_read().map_err(storage_error)?;
+        let records = transaction.open_table(RECORDS).map_err(storage_error)?;
+        let chunks = transaction.open_table(CHUNKS).map_err(storage_error)?;
+        let inline = records
+            .get(b"inline".as_slice())
+            .map_err(storage_error)?
+            .ok_or_else(|| corrupt("missing inline fixture"))?;
+        let decoded = read_record(&chunks, b"inline", inline.value())?;
+        assert!(matches!(decoded, Cow::Borrowed(_)));
+        assert_eq!(decoded.as_ref(), small);
+        let mut damaged = inline.value().to_vec();
+        damaged[HEADER_BYTES] ^= 1;
+        assert!(read_record(&chunks, b"inline", &damaged).is_err());
+        let chunked = records
+            .get(b"chunked".as_slice())
+            .map_err(storage_error)?
+            .ok_or_else(|| corrupt("missing chunked fixture"))?;
+        let decoded = read_record(&chunks, b"chunked", chunked.value())?;
+        assert!(matches!(decoded, Cow::Owned(_)));
+        assert_eq!(decoded.as_ref(), large);
+        Ok(())
     }
 
     #[test]

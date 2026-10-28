@@ -10,6 +10,65 @@ fn test_guard() -> std::sync::MutexGuard<'static, ()> {
 }
 
 #[test]
+fn batched_merge_duplicate_keys_and_property_updates_survive_reopen()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _guard = test_guard();
+    let directory = tempfile::tempdir()?;
+    let options =
+        || EmbeddedOptions::new(directory.path()).with_embedding_policy(EmbeddingPolicy::Disabled);
+    let database = EmbeddedDatabase::open(options())?;
+    database.query(Query::new("CREATE PROJECT batch"))?;
+    database.query(Query::new(
+        "USE batch CREATE (:Code:Sym:Function {sid:'existing', rank:0})",
+    ))?;
+    database.query(Query::new(
+        "USE batch CREATE INDEX code_sid FOR (n:Code) ON (n.sid)",
+    ))?;
+    let body = "complete source text ".repeat(4096);
+    let rows = serde_json::json!([
+        {"sid":"new", "p":{"sid":"new","rank":1,"body":body}},
+        {"sid":"existing", "p":{"rank":2,"body":body}},
+        {"sid":"new", "p":{"rank":3,"body":body}}
+    ]);
+    database.query(
+        Query::new(
+            "USE batch UNWIND $rows AS r MERGE (n:Code:Sym:Function {sid:r.sid}) SET n += r.p",
+        )
+        .with_parameter("rows", rows),
+    )?;
+    database.query(Query::new(
+        "USE batch MATCH (n:Code {sid:'existing'}) SET n.sid='renamed', n.rank=4",
+    ))?;
+    database.query(Query::new("USE batch UNWIND ['renamed','new','renamed'] AS sid MERGE (n:Code:Sym:Function {sid:sid}) SET n.checked=true"))?;
+    let statement =
+        "USE batch MATCH (n:Code) RETURN n.sid, n.rank, n.body, n.checked ORDER BY n.sid";
+    let before = database.query(Query::new(statement))?;
+    assert_eq!(before.rows.len(), 2);
+    for row in &before.rows {
+        assert!(matches!(&row[2], TypedValue::String(text) if text == &body));
+        assert!(matches!(&row[3], TypedValue::Boolean(true)));
+    }
+    assert!(matches!(&before.rows[0][0], TypedValue::String(sid) if sid == "new"));
+    assert!(matches!(&before.rows[0][1], TypedValue::Integer(rank) if rank == "3"));
+    assert!(matches!(&before.rows[1][0], TypedValue::String(sid) if sid == "renamed"));
+    assert!(matches!(&before.rows[1][1], TypedValue::Integer(rank) if rank == "4"));
+    database.flush()?;
+    database.close()?;
+    let database = EmbeddedDatabase::open(options())?;
+    let after = database.query(Query::new(statement))?;
+    assert_eq!(
+        serde_json::to_value(&before.rows)?,
+        serde_json::to_value(&after.rows)?
+    );
+    let old = database.query(Query::new(
+        "USE batch MATCH (n:Code {sid:'existing'}) RETURN n",
+    ))?;
+    assert!(old.rows.is_empty());
+    database.close()?;
+    Ok(())
+}
+
+#[test]
 fn bundled_fraud_dataset_makes_the_features_path_query_runnable()
 -> Result<(), Box<dyn std::error::Error>> {
     let _guard = test_guard();

@@ -86,23 +86,38 @@ pub async fn run(config: Config) -> Result<()> {
 
 fn initialize_embedding(
     progress: Arc<StartupProgress>,
-    database: Database,
     device: crate::embeddings::EmbeddingDevice,
     storage: crate::embeddings::EmbeddingStorage,
-) -> Result<()> {
+) -> Result<Arc<crate::embeddings::LocalEmbeddingModel>> {
+    let started = std::time::Instant::now();
     let artifacts = irongraph_embedding::ensure_default_embedding_model_with_storage(
         &storage,
         &progress.install,
     )?;
+    tracing::info!(
+        phase = "embedding_artifacts",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        "startup embedding phase completed"
+    );
     *progress.phase.lock() = "loading";
+    let started = std::time::Instant::now();
     let embedding = Arc::new(crate::embeddings::LocalEmbeddingModel::load_with_storage(
         artifacts, device, &storage,
     )?);
+    tracing::info!(
+        phase = "embedding_load",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        "startup embedding phase completed"
+    );
     *progress.phase.lock() = "warming";
+    let started = std::time::Instant::now();
     embedding.warm_up()?;
-    database.bind_text_embedding(embedding)?;
-    *progress.phase.lock() = "ready";
-    Ok(())
+    tracing::info!(
+        phase = "embedding_warmup",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        "startup embedding phase completed"
+    );
+    Ok(embedding)
 }
 
 async fn run_with_startup(
@@ -110,10 +125,9 @@ async fn run_with_startup(
     shutdown: CancellationToken,
     initialize: impl FnOnce(
         Arc<StartupProgress>,
-        Database,
         crate::embeddings::EmbeddingDevice,
         crate::embeddings::EmbeddingStorage,
-    ) -> Result<()>
+    ) -> Result<Arc<crate::embeddings::LocalEmbeddingModel>>
     + Send
     + 'static,
 ) -> Result<()> {
@@ -129,6 +143,23 @@ async fn run_with_startup(
     .map_err(|error| {
         Error::internal(format!("identity initialization worker failed: {error}"))
     })??;
+
+    // Model preparation and record recovery are independent. Only binding needs a recovered store.
+    let startup = Arc::new(StartupProgress::default());
+    struct CancelPreparation(irongraph_embedding::ModelInstallProgress);
+    impl Drop for CancelPreparation {
+        fn drop(&mut self) {
+            self.0.cancel();
+        }
+    }
+    // Listener/configuration failures must also release an in-progress artifact download.
+    let _cancel_preparation = CancelPreparation(startup.install.clone());
+    let progress = Arc::clone(&startup);
+    let embedding_device = config.embedding_device();
+    let embedding_storage = config.embedding_storage();
+    let mut initializer = tokio::task::spawn_blocking(move || {
+        initialize(progress, embedding_device, embedding_storage)
+    });
 
     let bootstrap_options = SingleNodeBootstrapConfig {
         execution_class: ExecutionClass::Cpu,
@@ -148,7 +179,15 @@ async fn run_with_startup(
             )?))
         },
     )
-    .await?;
+    .await;
+    let boot = match boot {
+        Ok(boot) => boot,
+        Err(error) => {
+            startup.install.cancel();
+            let _ = initializer.await;
+            return Err(error);
+        }
+    };
     boot.backend()
         .bind_runtime(Arc::downgrade(boot.runtime()))?;
     let database = boot.backend().as_ref().clone();
@@ -158,7 +197,6 @@ async fn run_with_startup(
         database.ensure_project(project, CommitAcknowledgement::Published)?;
     }
 
-    let startup = Arc::new(StartupProgress::default());
     let state = AppState {
         database: database.clone(),
         startup: Arc::clone(&startup),
@@ -241,20 +279,9 @@ async fn run_with_startup(
             .await
             .map_err(Error::from)
     }));
-    let embedding_device = config.embedding_device();
-    let embedding_storage = config.embedding_storage();
     let embedding_database = database.clone();
     let embedding_shutdown = shutdown.clone();
     components.spawn(async move {
-        let progress = Arc::clone(&startup);
-        let mut initializer = tokio::task::spawn_blocking(move || {
-            initialize(
-                progress,
-                embedding_database,
-                embedding_device,
-                embedding_storage,
-            )
-        });
         let initialized = tokio::select! {
             result = &mut initializer => result,
             () = embedding_shutdown.cancelled() => {
@@ -263,7 +290,13 @@ async fn run_with_startup(
             }
         };
         let failure = match initialized {
-            Ok(Ok(())) => None,
+            Ok(Ok(embedding)) => match embedding_database.bind_text_embedding(embedding) {
+                Ok(()) => {
+                    *startup.phase.lock() = "ready";
+                    None
+                }
+                Err(error) => Some(error.to_string()),
+            },
             Ok(Err(error)) => Some(error.to_string()),
             Err(error) => Some(format!("embedding startup worker failed: {error}")),
         };
@@ -934,7 +967,7 @@ mod tests {
         let server = tokio::spawn(run_with_startup(
             config,
             shutdown.clone(),
-            move |_progress, _database, _device, _storage| {
+            move |_progress, _device, _storage| {
                 while !release.is_cancelled() {
                     std::thread::sleep(Duration::from_millis(5));
                 }

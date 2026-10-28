@@ -29,7 +29,8 @@ for nodes in map(int, args.sizes.split(",")):
     rows = [row for row in report["measurements"] if row.get("nodes") == nodes and not row.get("operation", "").startswith("flights_")]
     assert {row["operation"] for row in rows} == expected
     stages = {row["stage"] for row in report["physical_footprint_samples"] if row["nodes"] == nodes}
-    assert {"empty_graph_encoder_ready", "before_close_and_durable_snapshot"} <= stages
+    close_stage = "before_close_and_durable_flush" if language == "internal" else "before_close_and_durable_snapshot"
+    assert {"empty_graph_encoder_ready", close_stage} <= stages
     lifecycle = [row for row in report["lifecycle_memory"] if row["nodes"] == nodes]
     assert len(lifecycle) == 1 and lifecycle[0]["samples"]
     for row in rows:

@@ -148,7 +148,7 @@ for (const nodes of config.sizes) {
       if (!line.startsWith('{')) continue
       const event = JSON.parse(line)
       if (event.event === 'checkpoint') {
-        if (event.stage === 'before_close_and_durable_snapshot') closeMemoryStart = report.memory_samples.length
+        if (event.stage === 'before_close_and_durable_snapshot' || event.stage === 'before_close_and_durable_flush') closeMemoryStart = report.memory_samples.length
         await samplingJob
         await sample()
         if (event.stage.endsWith(':before')) stages.set(event.stage.slice(0, -7), report.memory_samples.length - roles.size)

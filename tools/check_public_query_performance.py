@@ -46,7 +46,11 @@ for nodes in map(int, args.sizes.split(",")):
         assert control["status"] == "ok" and control["samples"] == 500 and control["warmups"] == 20
         assert control["periodic_memory_sampling"] is (control["iteration"] % 2 == 0)
         assert math.isfinite(control["p50"]) and control["p95"] >= control["p50"] > 0
-        assert control["server_reported_elapsed_us_p50"] >= 0
+        server_elapsed = control["server_reported_elapsed_us_p50"]
+        if server_elapsed is None:
+            assert report["config"]["transport"] == "bolt", "HTTP/embedded server timing is missing"
+        else:
+            assert math.isfinite(server_elapsed) and server_elapsed >= 0
         assert "complete decoded" in control["timing_boundary"]
     rows = [row for row in report["measurements"] if row["nodes"] == nodes and not row["operation"].startswith("flights_") and row["operation"] != "memory_sampler_control"]
     assert {row["operation"] for row in rows} == expected, (nodes, "Missing or additional workload")

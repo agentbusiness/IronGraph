@@ -339,57 +339,93 @@ impl EmbeddedCore {
         let data_dir = absolute_path(options.data_dir)?;
         let max_write_bytes = usize::MAX;
         let request_timeout = Duration::ZERO;
-        let boot = open_standalone(
-            &data_dir,
-            SingleNodeBootstrapConfig {
-                execution_class: ExecutionClass::Cpu,
-                startup_timeout: Duration::ZERO,
-            },
-            move |directory, identity| {
-                Ok(std::sync::Arc::new(Database::open_backend(
-                    directory,
-                    max_write_bytes,
-                    request_timeout,
-                    identity,
-                )?))
-            },
-        )
-        .await?;
+        let progress = ModelInstallProgress::default();
+        let preparation_progress = progress.clone();
+        let recovery = async {
+            let recovered = open_standalone(
+                &data_dir,
+                SingleNodeBootstrapConfig {
+                    execution_class: ExecutionClass::Cpu,
+                    startup_timeout: Duration::ZERO,
+                },
+                move |directory, identity| {
+                    Ok(std::sync::Arc::new(Database::open_backend(
+                        directory,
+                        max_write_bytes,
+                        request_timeout,
+                        identity,
+                    )?))
+                },
+            )
+            .await;
+            if recovered.is_err() {
+                progress.cancel();
+            }
+            recovered
+        };
+        let preparation = async {
+            let embedding = if options.embedding_policy == EmbeddingPolicy::Automatic {
+                let embedding_device = options.embedding_device;
+                let storage = EmbeddingStorage {
+                    model_dir: options.model_dir.clone(),
+                    cache_dir: options.embedding_cache_dir.clone(),
+                };
+                Some(
+                    tokio::task::spawn_blocking(move || {
+                        let started = std::time::Instant::now();
+                        let artifacts = ensure_default_embedding_model_with_storage(
+                            &storage,
+                            &preparation_progress,
+                        )?;
+                        tracing::info!(
+                            phase = "embedding_artifacts",
+                            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                            "startup embedding phase completed"
+                        );
+                        let started = std::time::Instant::now();
+                        let embedding =
+                            std::sync::Arc::new(LocalEmbeddingModel::load_with_storage(
+                                artifacts,
+                                embedding_device,
+                                &storage,
+                            )?);
+                        tracing::info!(
+                            phase = "embedding_load",
+                            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                            "startup embedding phase completed"
+                        );
+                        let started = std::time::Instant::now();
+                        embedding.warm_up()?;
+                        tracing::info!(
+                            phase = "embedding_warmup",
+                            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                            "startup embedding phase completed"
+                        );
+                        Ok::<_, irongraph_types::Error>(embedding)
+                    })
+                    .await
+                    .map_err(|error| {
+                        irongraph_types::Error::internal(format!(
+                            "embedded embedding startup task failed: {error}"
+                        ))
+                    })??,
+                )
+            } else {
+                None
+            };
+            Ok::<_, irongraph_types::Error>(embedding)
+        };
+        // Neither preparation reads graph data; both finish before the encoder is bound or the
+        // embedded handle is returned. Join also settles recovery when encoder preparation fails.
+        let (recovered, prepared) = tokio::join!(recovery, preparation);
+        let boot = recovered?;
+        let embedding = prepared?;
         boot.backend()
             .bind_runtime(std::sync::Arc::downgrade(boot.runtime()))?;
         let database = boot.backend().as_ref().clone();
-        let embedding = if options.embedding_policy == EmbeddingPolicy::Automatic {
-            let embedding_device = options.embedding_device;
-            let storage = EmbeddingStorage {
-                model_dir: options.model_dir.clone(),
-                cache_dir: options.embedding_cache_dir.clone(),
-            };
-            let embedding_database = database.clone();
-            Some(
-                tokio::task::spawn_blocking(move || {
-                    let artifacts = ensure_default_embedding_model_with_storage(
-                        &storage,
-                        &ModelInstallProgress::default(),
-                    )?;
-                    let embedding = std::sync::Arc::new(LocalEmbeddingModel::load_with_storage(
-                        artifacts,
-                        embedding_device,
-                        &storage,
-                    )?);
-                    embedding.warm_up()?;
-                    embedding_database.bind_text_embedding(embedding.clone())?;
-                    Ok::<_, irongraph_types::Error>(embedding)
-                })
-                .await
-                .map_err(|error| {
-                    irongraph_types::Error::internal(format!(
-                        "embedded embedding startup task failed: {error}"
-                    ))
-                })??,
-            )
-        } else {
-            None
-        };
+        if let Some(embedding) = &embedding {
+            database.bind_text_embedding(embedding.clone())?;
+        }
 
         Ok(Self {
             boot,

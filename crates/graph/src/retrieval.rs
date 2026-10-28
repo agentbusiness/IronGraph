@@ -285,6 +285,7 @@ impl VectorIndex {
                 if position == 0 {
                     if let Some(gate) = self.store.retrieval.first_span_gate.get() {
                         gate.wait();
+                        gate.wait();
                     }
                 }
                 #[cfg(not(test))]
@@ -359,6 +360,7 @@ impl VectorIndex {
                     #[cfg(test)]
                     if position == 0 {
                         if let Some(gate) = self.store.retrieval.first_code_gate.get() {
+                            gate.wait();
                             gate.wait();
                         }
                     }
@@ -952,6 +954,7 @@ mod tests {
             });
             gate.wait();
             token.cancel();
+            gate.wait();
             worker
                 .join()
                 .map_err(|_| Error::internal("scoring worker panicked"))?
@@ -988,6 +991,7 @@ mod tests {
             });
             gate.wait();
             token.cancel();
+            gate.wait();
             worker
                 .join()
                 .map_err(|_| Error::internal("code worker panicked"))?

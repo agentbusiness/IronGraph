@@ -17952,13 +17952,19 @@ fn host_index_candidates(
     let Some(mut candidates) = base_candidates else {
         return Ok(None);
     };
-    // The base index only covers committed rows. Union any node the overlay modified this statement
-    // (inserts/updates/relabels) so they are not missed; the caller re-checks each candidate with
-    // node_matches, so stale or non-matching entries — including overlay-deleted base rows — are
-    // filtered. During a pure edge-load `self.nodes` is empty, so this union is O(0).
+    // Committed indexes omit statement-local changes. Select matching touched IDs through a
+    // lazily maintained equality posting rather than rescan every earlier MERGE row. The caller
+    // still checks every label/property/layer and filters deleted or stale committed candidates.
     if state.graph.has_overlay_node_modifications() {
         let existing: BTreeSet<u32> = candidates.iter().copied().collect();
-        for dense in state.graph.overlay_modified_node_denses() {
+        let (property, value) = values
+            .first_key_value()
+            .ok_or_else(|| Error::internal("indexed lookup has no equality values"))?;
+        let changed = state
+            .graph
+            .overlay_equality_candidates(*property, value)?
+            .unwrap_or_else(|| state.graph.overlay_modified_node_denses().collect());
+        for dense in changed {
             if !existing.contains(&dense) {
                 candidates.push(dense);
             }

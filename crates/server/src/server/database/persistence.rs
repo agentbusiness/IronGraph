@@ -387,7 +387,12 @@ pub(super) fn restore(records: &RecordStore) -> Result<DatabaseState> {
     })?;
     for project in state.projects.values() {
         let prefix = project_prefix(project.id);
+        let started = Instant::now();
+        let mut record_count = 0_u64;
+        let mut record_bytes = 0_u64;
         records.scan_prefix(&prefix, |key, bytes| {
+            record_count = record_count.saturating_add(1);
+            record_bytes = record_bytes.saturating_add(bytes.len() as u64);
             let suffix = &key[prefix.len()..];
             if project.graph.restore_persistence_record(suffix, bytes)?
                 || project.indexes.restore_persistence_record(suffix, bytes)?
@@ -400,9 +405,21 @@ pub(super) fn restore(records: &RecordStore) -> Result<DatabaseState> {
                 "unknown project persistence record",
             ))
         })?;
+        tracing::info!(phase = "project_records", project = %project.id,
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            records = record_count, bytes = record_bytes, "startup recovery phase completed");
+        let started = Instant::now();
         project.graph.finish_persistence_restore()?;
+        tracing::info!(phase = "graph_validation", project = %project.id,
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0, "startup recovery phase completed");
+        let started = Instant::now();
         project.indexes.finish_persistence_restore(&project.graph)?;
+        tracing::info!(phase = "index_validation", project = %project.id,
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0, "startup recovery phase completed");
+        let started = Instant::now();
         project.temporal.finish_persistence_restore()?;
+        tracing::info!(phase = "temporal_validation", project = %project.id,
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0, "startup recovery phase completed");
     }
     records.scan_prefix(REQUESTS, |key, bytes| {
         let id = Uuid::from_slice(&key[REQUESTS.len()..])

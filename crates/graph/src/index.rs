@@ -4370,11 +4370,15 @@ impl IndexCatalog {
     /// Removes old postings before a canonical graph mutation changes or deletes a row.
     pub fn before_graph_apply(&self, graph: &GraphStore, mutation: &GraphMutation) -> Result<()> {
         match mutation {
-            GraphMutation::SetNodeProperty { node, .. }
-            | GraphMutation::AddNodeLabels { node, .. }
+            GraphMutation::SetNodeProperty { node, property, .. } => {
+                if let Some(view) = graph.node(*node) {
+                    self.remove_node(view, false, Some(*property))?;
+                }
+            }
+            GraphMutation::AddNodeLabels { node, .. }
             | GraphMutation::RemoveNodeLabels { node, .. } => {
                 if let Some(view) = graph.node(*node) {
-                    self.remove_node(view, false)?;
+                    self.remove_node(view, false, None)?;
                 }
             }
             GraphMutation::DeleteNode {
@@ -4383,7 +4387,7 @@ impl IndexCatalog {
                 revision,
             } => {
                 if let Some(view) = graph.node(*node) {
-                    self.remove_node(view, true)?;
+                    self.remove_node(view, true, None)?;
                 }
                 if let Some(column) = self.vector_columns.get(&crate::SEMANTIC_NODE_PROPERTY) {
                     column.remove(node.0, *revision);
@@ -4417,14 +4421,18 @@ impl IndexCatalog {
         match mutation {
             GraphMutation::InsertNode(input) => {
                 if let Some(view) = graph.node(input.id) {
-                    self.insert_node(view)?;
+                    self.insert_node(view, None)?;
                 }
             }
-            GraphMutation::SetNodeProperty { node, .. }
-            | GraphMutation::AddNodeLabels { node, .. }
+            GraphMutation::SetNodeProperty { node, property, .. } => {
+                if let Some(view) = graph.node(*node) {
+                    self.insert_node(view, Some(*property))?;
+                }
+            }
+            GraphMutation::AddNodeLabels { node, .. }
             | GraphMutation::RemoveNodeLabels { node, .. } => {
                 if let Some(view) = graph.node(*node) {
-                    self.insert_node(view)?;
+                    self.insert_node(view, None)?;
                 }
             }
             _ => {}
@@ -4607,10 +4615,16 @@ impl IndexCatalog {
         }
     }
 
-    fn remove_node(&self, node: NodeView<'_>, remove_vectors: bool) -> Result<()> {
+    fn remove_node(
+        &self,
+        node: NodeView<'_>,
+        remove_vectors: bool,
+        property: Option<PropertyId>,
+    ) -> Result<()> {
         for entry in self.entries.values() {
             if entry.state != DerivedIndexState::Online
                 || !node.labels().contains(&entry.definition.label)
+                || property.is_some_and(|property| !entry.definition.properties.contains(&property))
             {
                 continue;
             }
@@ -4647,10 +4661,11 @@ impl IndexCatalog {
         Ok(())
     }
 
-    fn insert_node(&self, node: NodeView<'_>) -> Result<()> {
+    fn insert_node(&self, node: NodeView<'_>, property: Option<PropertyId>) -> Result<()> {
         for entry in self.entries.values() {
             if entry.state != DerivedIndexState::Online
                 || !node.labels().contains(&entry.definition.label)
+                || property.is_some_and(|property| !entry.definition.properties.contains(&property))
             {
                 continue;
             }
@@ -5070,6 +5085,53 @@ fn total_f32(left: f32, right: f32) -> Ordering {
 mod concurrent_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    #[test]
+    fn property_publication_keeps_unrelated_index_postings_in_place() -> Result<()> {
+        let (graph, label, body, unrelated) = fixture()?;
+        let catalog = IndexCatalog::default();
+        catalog.create(
+            &graph,
+            GraphIndexDefinition {
+                name: "body".into(),
+                kind: GraphIndexKind::Equality,
+                label,
+                properties: vec![body],
+                unique: false,
+            },
+        )?;
+        let values = BTreeMap::from([(body, ScalarValue::String("complete document".into()))]);
+        let before = catalog.equality_candidates(label, &values)?;
+        let mutation = GraphMutation::SetNodeProperty {
+            node: crate::NodeId(1),
+            property: unrelated,
+            value: ScalarValue::Bytes(vec![0x5a; 256 * 1024].into()),
+            revision: 2,
+        };
+        catalog.before_graph_apply(&graph, &mutation)?;
+        assert_eq!(catalog.equality_candidates(label, &values)?, before);
+        graph.apply(mutation.clone())?;
+        catalog.after_graph_apply(&graph, &mutation)?;
+        assert_eq!(catalog.equality_candidates(label, &values)?, before);
+        let mutation = GraphMutation::SetNodeProperty {
+            node: crate::NodeId(1),
+            property: body,
+            value: ScalarValue::String("changed document".into()),
+            revision: 3,
+        };
+        catalog.before_graph_apply(&graph, &mutation)?;
+        assert_eq!(
+            catalog
+                .equality_candidates(label, &values)?
+                .map(|rows| rows.len()),
+            Some(3)
+        );
+        graph.apply(mutation.clone())?;
+        catalog.after_graph_apply(&graph, &mutation)?;
+        let changed = BTreeMap::from([(body, ScalarValue::String("changed document".into()))]);
+        assert_eq!(catalog.equality_candidates(label, &changed)?, Some(vec![0]));
+        Ok(())
+    }
 
     fn profile() -> Result<EmbeddingProfile> {
         EmbeddingProfile::new(

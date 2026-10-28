@@ -3,13 +3,13 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Deref,
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 
 use crate::{
     EdgeId, Error, ErrorCode, Layer, NodeId, Result, ScalarValue,
     graph::{
-        EdgeInput, EdgeView, GraphMutation, GraphStore, LayerMask, NodeInput, NodeView,
+        EdgeInput, EdgeView, GraphMutation, GraphStore, IndexKey, LayerMask, NodeInput, NodeView,
         TemporalSample, TemporalStore,
     },
     types::{EntityKind, LabelId, PropertyId, RelationshipTypeId},
@@ -554,6 +554,29 @@ fn merged_properties(
     base
 }
 
+#[derive(Default)]
+struct OverlayEquality {
+    keys: BTreeMap<u32, IndexKey>,
+    postings: BTreeMap<IndexKey, BTreeSet<u32>>,
+}
+
+impl OverlayEquality {
+    fn replace(&mut self, dense: u32, key: Option<IndexKey>) {
+        if let Some(previous) = self.keys.remove(&dense) {
+            if let Some(rows) = self.postings.get_mut(&previous) {
+                rows.remove(&dense);
+                if rows.is_empty() {
+                    self.postings.remove(&previous);
+                }
+            }
+        }
+        if let Some(key) = key {
+            self.postings.entry(key.clone()).or_default().insert(dense);
+            self.keys.insert(dense, key);
+        }
+    }
+}
+
 /// One statement borrows canonical columns and stores only fields it changes.
 pub struct GraphReadView<'a> {
     base: &'a GraphStore,
@@ -566,6 +589,8 @@ pub struct GraphReadView<'a> {
     inserted_incoming: BTreeMap<NodeId, BTreeSet<u32>>,
     node_property_types: BTreeMap<PropertyId, ScalarKind>,
     edge_property_types: BTreeMap<PropertyId, ScalarKind>,
+    // Lazy equality postings contain only keys and IDs of touched nodes, never graph payloads.
+    overlay_equality: RwLock<BTreeMap<PropertyId, OverlayEquality>>,
     // O(1) counts of overlay-*inserted* (dense >= base slot count) nodes/edges. Maintained on
     // insert so the hot bulk-CREATE path never rescans the whole overlay to allocate the next dense
     // id — that scan made a single UNWIND ... CREATE of N rows O(N^2).
@@ -595,6 +620,7 @@ impl<'a> GraphReadView<'a> {
             inserted_incoming: BTreeMap::new(),
             node_property_types: BTreeMap::new(),
             edge_property_types: BTreeMap::new(),
+            overlay_equality: RwLock::new(BTreeMap::new()),
             inserted_node_total: 0,
             inserted_edge_total: 0,
             revision: base.revision(),
@@ -745,6 +771,71 @@ impl<'a> GraphReadView<'a> {
     /// edges have been written, in which case the base node index is still exact.
     pub fn has_overlay_node_modifications(&self) -> bool {
         !self.nodes.is_empty()
+    }
+
+    /// Cold-build a lookup once; subsequent mutations maintain only their own posting.
+    pub fn overlay_equality_candidates(
+        &self,
+        property: PropertyId,
+        value: &ScalarValue,
+    ) -> Result<Option<Vec<u32>>> {
+        // Other scalar families retain the general matcher, including cross-type numeric equality.
+        if !matches!(value, ScalarValue::String(_)) {
+            return Ok(None);
+        }
+        let Ok(key) = IndexKey::try_from(value) else {
+            return Ok(None);
+        };
+        let mut indexes = self
+            .overlay_equality
+            .write()
+            .map_err(|_| Error::internal("statement equality lookup poisoned"))?;
+        let index = indexes.entry(property).or_insert_with(|| {
+            let mut index = OverlayEquality::default();
+            for dense in self.nodes.keys().copied() {
+                let key = self
+                    .node_dense(dense)
+                    .and_then(|node| node.property(property))
+                    .and_then(|value| IndexKey::try_from(&value).ok());
+                index.replace(dense, key);
+            }
+            index
+        });
+        Ok(Some(
+            index
+                .postings
+                .get(&key)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect(),
+        ))
+    }
+
+    fn refresh_overlay_equality(&mut self, node: NodeId) -> Result<()> {
+        let Some(dense) = self.node_ids.get(&node).copied() else {
+            return Ok(());
+        };
+        let properties: Vec<_> = self
+            .overlay_equality
+            .get_mut()
+            .map_err(|_| Error::internal("statement equality lookup poisoned"))?
+            .keys()
+            .copied()
+            .collect();
+        for property in properties {
+            let key = self
+                .node_dense(dense)
+                .and_then(|node| node.property(property))
+                .and_then(|value| IndexKey::try_from(&value).ok());
+            self.overlay_equality
+                .get_mut()
+                .map_err(|_| Error::internal("statement equality lookup poisoned"))?
+                .get_mut(&property)
+                .ok_or_else(|| Error::internal("statement equality lookup disappeared"))?
+                .replace(dense, key);
+        }
+        Ok(())
     }
 
     /// Includes deleted slots and transaction-local inserts, without materializing candidate ids.
@@ -980,6 +1071,14 @@ impl<'a> GraphReadView<'a> {
     }
 
     pub fn apply(&mut self, mutation: &GraphMutation) -> Result<()> {
+        let node = match mutation {
+            GraphMutation::InsertNode(input) => Some(input.id),
+            GraphMutation::SetNodeProperty { node, .. }
+            | GraphMutation::AddNodeLabels { node, .. }
+            | GraphMutation::RemoveNodeLabels { node, .. }
+            | GraphMutation::DeleteNode { node, .. } => Some(*node),
+            _ => None,
+        };
         match mutation {
             GraphMutation::DeclareLabel { name, id } => self.catalog.declare_label(name, *id),
             GraphMutation::DeclareProperty { name, id } => self.catalog.declare_property(name, *id),
@@ -1016,7 +1115,19 @@ impl<'a> GraphReadView<'a> {
                 revision,
             } => self.delete_node(*node, *detach, *revision),
             GraphMutation::DeleteEdge { edge, revision } => self.delete_edge(*edge, *revision),
+        }?;
+        let refresh = match mutation {
+            GraphMutation::SetNodeProperty { property, .. } => self
+                .overlay_equality
+                .get_mut()
+                .map_err(|_| Error::internal("statement equality lookup poisoned"))?
+                .contains_key(property),
+            _ => true,
+        };
+        if let Some(node) = node.filter(|_| refresh) {
+            self.refresh_overlay_equality(node)?;
         }
+        Ok(())
     }
 
     fn insert_node(&mut self, input: &NodeInput) -> Result<()> {
@@ -1328,9 +1439,10 @@ impl<'a> GraphReadView<'a> {
     fn ensure_forward_revision(&self, revision: u64) -> Result<()> {
         if revision < self.revision {
             if revision < self.base.revision() {
-                return Err(Error::new(
+                return Err(Error::retryable(
                     ErrorCode::TransactionConflict,
                     "canonical graph advanced while preparing statement mutations",
+                    None,
                 ));
             }
             return Err(Error::invalid_data(
@@ -1578,6 +1690,137 @@ mod tests {
     use super::*;
     use crate::graph::{TemporalDeclaration, TemporalType};
 
+    #[test]
+    fn overlay_equality_tracks_changed_keys_labels_null_and_deletion() -> Result<()> {
+        let (graph, label, property, _) = graph_fixture()?;
+        let mut view = GraphReadView::new(&graph);
+        assert!(
+            view.overlay_equality_candidates(property, &ScalarValue::Integer(10))?
+                .is_none()
+        );
+        let key = |s: &str| ScalarValue::String(s.into());
+        assert_eq!(
+            view.overlay_equality_candidates(property, &key("one"))?,
+            Some(vec![])
+        );
+        view.apply(&GraphMutation::SetNodeProperty {
+            node: NodeId(1),
+            property,
+            value: key("one"),
+            revision: 2,
+        })?;
+        assert_eq!(
+            view.overlay_equality_candidates(property, &key("one"))?,
+            Some(vec![0])
+        );
+        view.apply(&GraphMutation::SetNodeProperty {
+            node: NodeId(1),
+            property,
+            value: key("two"),
+            revision: 2,
+        })?;
+        assert_eq!(
+            view.overlay_equality_candidates(property, &key("one"))?,
+            Some(vec![])
+        );
+        assert_eq!(
+            view.overlay_equality_candidates(property, &key("two"))?,
+            Some(vec![0])
+        );
+        view.apply(&GraphMutation::RemoveNodeLabels {
+            node: NodeId(1),
+            labels: vec![label],
+            revision: 2,
+        })?;
+        assert_eq!(
+            view.overlay_equality_candidates(property, &key("two"))?,
+            Some(vec![0])
+        );
+        view.apply(&GraphMutation::SetNodeProperty {
+            node: NodeId(1),
+            property,
+            value: ScalarValue::Null,
+            revision: 2,
+        })?;
+        assert_eq!(
+            view.overlay_equality_candidates(property, &key("two"))?,
+            Some(vec![])
+        );
+        view.apply(&GraphMutation::InsertNode(NodeInput {
+            id: NodeId(3),
+            layer: Layer::Observed,
+            revision: 2,
+            labels: vec![label],
+            properties: vec![(property, key("three"))],
+        }))?;
+        assert_eq!(
+            view.overlay_equality_candidates(property, &key("three"))?,
+            Some(vec![2])
+        );
+        view.apply(&GraphMutation::DeleteNode {
+            node: NodeId(3),
+            detach: true,
+            revision: 2,
+        })?;
+        assert_eq!(
+            view.overlay_equality_candidates(property, &key("three"))?,
+            Some(vec![])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_equality_large_dirty_rows_return_only_matching_ids() -> Result<()> {
+        let (graph, label, property, _) = graph_fixture()?;
+        let body = graph.catalog().intern_property("body")?;
+        let payload = ScalarValue::String("complete document ".repeat(4096).into());
+        let mut view = GraphReadView::new(&graph);
+        for id in 3..=2050 {
+            view.apply(&GraphMutation::InsertNode(NodeInput {
+                id: NodeId(id),
+                layer: Layer::Observed,
+                revision: 2,
+                labels: vec![label],
+                properties: vec![
+                    (property, ScalarValue::String(format!("key:{id}").into())),
+                    (body, payload.clone()),
+                ],
+            }))?;
+        }
+        let wanted = ScalarValue::String("key:1000".into());
+        assert_eq!(
+            view.overlay_equality_candidates(property, &wanted)?,
+            Some(vec![999])
+        );
+        for id in 2051..=4098 {
+            view.apply(&GraphMutation::InsertNode(NodeInput {
+                id: NodeId(id),
+                layer: Layer::Observed,
+                revision: 2,
+                labels: vec![label],
+                properties: vec![
+                    (property, ScalarValue::String(format!("key:{id}").into())),
+                    (body, payload.clone()),
+                ],
+            }))?;
+        }
+        assert_eq!(
+            view.overlay_equality_candidates(property, &wanted)?,
+            Some(vec![999])
+        );
+        let cache = view
+            .overlay_equality
+            .read()
+            .map_err(|_| Error::internal("lookup poisoned"))?;
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache[&property].keys.len(), 4096);
+        assert!(
+            view.node(NodeId(4098))
+                .is_some_and(|node| node.property(body) == Some(payload))
+        );
+        Ok(())
+    }
+
     fn graph_fixture() -> Result<(GraphStore, LabelId, PropertyId, RelationshipTypeId)> {
         let graph = GraphStore::default();
         let label = graph.catalog_mut().intern_label("Item")?;
@@ -1623,6 +1866,7 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::TransactionConflict);
+        assert!(error.retryable);
         assert_eq!(
             graph.node(NodeId(2)).unwrap().property(property),
             Some(ScalarValue::Integer(20))
