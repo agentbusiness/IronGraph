@@ -955,4 +955,29 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    #[ignore = "qualification: downloads only the pinned model configuration over HTTPS"]
+    fn pinned_model_configuration_https_transport()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use sha2::{Digest as _, Sha256};
+
+        let mut output = tempfile::tempfile()?;
+        download_from(
+            &format!("{MODEL_BASE}{DEFAULT_EMBEDDING_CONFIG_FILE}?download=true"),
+            0,
+            &mut output,
+            &ProgressSink::default(),
+        )?;
+        output.rewind()?;
+        let mut bytes = Vec::new();
+        output.read_to_end(&mut bytes)?;
+        assert!(serde_json::from_slice::<serde_json::Value>(&bytes)?.is_object());
+        println!(
+            "PINNED_MODEL_CONFIG_SHA256={:x} BYTES={}",
+            Sha256::digest(&bytes),
+            bytes.len()
+        );
+        Ok(())
+    }
 }

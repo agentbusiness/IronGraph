@@ -1,6 +1,11 @@
 use super::*;
 use crate::graph::{EmbeddingDType, EmbeddingProfile, Similarity};
 
+thread_local! {
+    // Qualification control only; absent from application and SDK builds.
+    pub(super) static LEXICAL_REUSE_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
 struct Encoder(EmbeddingProfile);
 impl TextEmbedding for Encoder {
     fn profile(&self) -> &EmbeddingProfile {
@@ -71,6 +76,142 @@ fn column(output: &ExecutionOutput, at: usize) -> Vec<ResultValue> {
         .iter()
         .flat_map(|batch| batch.columns[at].values.clone())
         .collect()
+}
+
+#[test]
+fn retrieval_lexical_warm_counts_follow_same_revision_mutations_and_overlays() -> Result<()> {
+    let graph = GraphStore::default();
+    add_node(&graph, 1, &"unrelated ".repeat(512), Layer::Observed)?;
+    add_node(&graph, 2, &"needle needle ".repeat(512), Layer::Observed)?;
+    let encoder = encoder()?;
+    let indexes = IndexCatalog::default();
+    indexes.initialize_semantic(encoder.profile().clone())?;
+    let (vectors, _) = indexes
+        .vector_search_source(crate::graph::SEMANTIC_NODE_INDEX)
+        .ok_or_else(|| Error::internal("lexical fixture index absent"))?;
+    for id in [1, 2] {
+        vectors.upsert(id, &[1.0, 0.0], 1)?;
+    }
+    let mut context = context(&graph);
+    context.text_embedding = Some(&encoder);
+    context.scalar_indexes = Some(&indexes);
+    context.vector_indexes.insert(
+        crate::graph::SEMANTIC_NODE_INDEX.into(),
+        VectorSearchSource {
+            property: crate::graph::SEMANTIC_NODE_PROPERTY,
+            exact: &vectors,
+            approximate: None,
+            profile_hash: encoder.profile().profile_hash,
+        },
+    );
+    let query = "SEARCH n IN (EMBEDDING INDEX semantic_nodes FOR HYBRID TEXT 'needle' USING EXACT LIMIT 2) SCORE AS score RETURN n";
+    for _ in 0..2 {
+        let output = QueryEngine.execute(query, &mut context)?;
+        assert!(matches!(&column(&output,0)[0],ResultValue::Node(node) if node.id==NodeId(2)));
+    }
+    let body = graph.catalog().intern_property("body")?;
+    // Both mutations share one publication revision. Warming in between cannot preserve counts
+    // for the first intermediate value after the second mutation.
+    for (id, text) in [(1, "needle needle needle"), (2, "unrelated")] {
+        let mutation = GraphMutation::SetNodeProperty {
+            node: NodeId(id),
+            property: body,
+            value: ScalarValue::String(format!("{text} ").repeat(512).into()),
+            revision: 2,
+        };
+        indexes.before_graph_apply(&graph, &mutation)?;
+        graph.apply(mutation.clone())?;
+        indexes.after_graph_apply(&graph, &mutation)?;
+        QueryEngine.execute(query, &mut context)?;
+    }
+    let change = GraphMutation::SetNodeProperty {
+        node: NodeId(1),
+        property: body,
+        value: ScalarValue::String("unrelated ".repeat(512).into()),
+        revision: 2,
+    };
+    indexes.before_graph_apply(&graph, &change)?;
+    graph.apply(change.clone())?;
+    indexes.after_graph_apply(&graph, &change)?;
+    let change = GraphMutation::SetNodeProperty {
+        node: NodeId(2),
+        property: body,
+        value: ScalarValue::String("needle ".repeat(512).into()),
+        revision: 2,
+    };
+    indexes.before_graph_apply(&graph, &change)?;
+    graph.apply(change.clone())?;
+    indexes.after_graph_apply(&graph, &change)?;
+    let output = QueryEngine.execute(query, &mut context)?;
+    assert!(matches!(&column(&output,0)[0],ResultValue::Node(node) if node.id==NodeId(2)));
+    assert!(vectors.lexical_resident_bytes() > 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "release hybrid cached/uncached complete-query cost control"]
+fn retrieval_lexical_cost_scorecard() -> Result<()> {
+    let graph = GraphStore::default();
+    let text = "common filler words and background details ".repeat(128);
+    for id in 1..=1000 {
+        add_node(&graph, id, &format!("{text} needle-{id}"), Layer::Observed)?;
+    }
+    let encoder = encoder()?;
+    let indexes = IndexCatalog::default();
+    indexes.initialize_semantic(encoder.profile().clone())?;
+    let (vectors, _) = indexes
+        .vector_search_source(crate::graph::SEMANTIC_NODE_INDEX)
+        .ok_or_else(|| Error::internal("lexical fixture index absent"))?;
+    for id in 1..=1000 {
+        vectors.upsert(id, &[1.0, 0.0], 1)?;
+    }
+    let mut context = context(&graph);
+    context.text_embedding = Some(&encoder);
+    context.scalar_indexes = Some(&indexes);
+    context.vector_indexes.insert(
+        crate::graph::SEMANTIC_NODE_INDEX.into(),
+        VectorSearchSource {
+            property: crate::graph::SEMANTIC_NODE_PROPERTY,
+            exact: &vectors,
+            approximate: None,
+            profile_hash: encoder.profile().profile_hash,
+        },
+    );
+    let query = "SEARCH n IN (EMBEDDING INDEX semantic_nodes FOR HYBRID TEXT 'needle 1' USING EXACT LIMIT 10) SCORE AS score RETURN id(n), score";
+    let expected = QueryEngine.execute(query, &mut context)?;
+    let mut cached = Vec::new();
+    let mut uncached = Vec::new();
+    for round in 0..12 {
+        for control in if round % 2 == 0 {
+            [false, true]
+        } else {
+            [true, false]
+        } {
+            let previous = LEXICAL_REUSE_ENABLED.replace(!control);
+            let started = std::time::Instant::now();
+            let output = QueryEngine.execute(query, &mut context);
+            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            LEXICAL_REUSE_ENABLED.set(previous);
+            let output = output?;
+            assert_eq!(column(&output, 0), column(&expected, 0));
+            assert_eq!(column(&output, 1), column(&expected, 1));
+            if control {
+                uncached.push(elapsed)
+            } else {
+                cached.push(elapsed)
+            }
+        }
+    }
+    cached.sort_by(f64::total_cmp);
+    uncached.sort_by(f64::total_cmp);
+    println!(
+        "{{\"event\":\"hybrid_cost_control\",\"owners\":1000,\"cached_p50_ms\":{},\"uncached_p50_ms\":{},\"lexical_bytes\":{},\"boundary\":\"same complete internal query and fixture, count reuse disabled only in qualification build; synthetic encoder; not historical production speedup\"}}",
+        cached[6],
+        uncached[6],
+        vectors.lexical_resident_bytes()
+    );
+    println!("LEXICAL_COST_SCORECARD_OK");
+    Ok(())
 }
 
 #[test]

@@ -7,6 +7,9 @@
 
 use super::*;
 #[cfg(test)]
+#[path = "retrieval_qualification.rs"]
+mod qualification;
+#[cfg(test)]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 
@@ -484,6 +487,7 @@ impl VectorIndex {
     /// Source graph properties referenced by this index are counted only by the canonical graph.
     pub fn resident_bytes(&self) -> usize {
         size_of::<Self>()
+            + self.lexical_resident_bytes()
             + self.row_count() * size_of::<VectorSlot>()
             + self.store.payload_bytes.load(AtomicOrdering::Relaxed)
             + self

@@ -225,7 +225,7 @@ functionality outside the current product boundary.
   an expected result; a claim without current command output is not complete.
 - Verify Rust with formatting, workspace checks for default and no-default features, tests, and
   Clippy. Verify the web application with its test suite, production build, and an actual rendered
-  browser pass. Browser verification uses ego-browser, never Puppeteer.
+  browser pass. Browser verification uses the default browser, never Puppeteer.
 - Before completion, prove there is exactly one authoritative repository-guidance Markdown file,
   exactly one browser data endpoint, only the declared web surfaces and execution backends, and no
   out-of-scope terminology or untracked generated material.

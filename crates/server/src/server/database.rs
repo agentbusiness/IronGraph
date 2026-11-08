@@ -1002,8 +1002,10 @@ impl Database {
         let publish_database = Arc::downgrade(&self.0);
         let published_owner = Arc::new(Mutex::new(None));
         let completed_owner = Arc::clone(&published_owner);
+        let failed_owner = Arc::new(Mutex::new(None));
+        let cursor_failure = Arc::clone(&failed_owner);
         let queue = DurableEmbeddingWorker::start(
-            self.committed_embedding_owners(completed_owner),
+            self.committed_embedding_owners(completed_owner, cursor_failure),
             EmbeddingCallbacks {
                 load: Arc::new(move |job, cancellation| {
                     if cancellation.is_cancelled() {
@@ -1184,9 +1186,10 @@ impl Database {
                         Err(error) => Err(error),
                     }
                 }),
-                failed: Arc::new(
-                    |job, error| tracing::error!(project = %job.owner.project, owner = job.owner.entity_id, code = ?error.code, message = %error.message, "asynchronous embedding failed"),
-                ),
+                failed: Arc::new(move |job, error| {
+                    *failed_owner.lock() = Some((job.owner, job.revision));
+                    tracing::error!(project = %job.owner.project, owner = job.owner.entity_id, code = ?error.code, message = %error.message, "asynchronous embedding failed");
+                }),
             },
         )?;
         self.0
@@ -1470,6 +1473,7 @@ impl Database {
     fn committed_embedding_owners(
         &self,
         published_owner: Arc<Mutex<Option<(super::embedding_jobs::EmbeddingOwner, u64)>>>,
+        failed_owner: Arc<Mutex<Option<(super::embedding_jobs::EmbeddingOwner, u64)>>>,
     ) -> Arc<super::embedding_jobs::NextCommittedOwner> {
         use super::embedding_jobs::EmbeddingSeed;
         let projects = self
@@ -1485,15 +1489,26 @@ impl Database {
         let records = self.0.records.clone();
         // Only a project cursor, one owner, and its revision are retained. Source text stays
         // on the canonical graph; inference backlog is current metadata in the redb file.
+        let startup_projects = projects.clone();
         let state = Mutex::new((
             projects,
             None::<EmbeddingSeed>,
             None::<(Vec<u8>, Vec<u8>)>,
             false,
             None::<Vec<u8>>,
+            false,           // a failed owner in the current cold seed
+            None::<Vec<u8>>, // last seed marker visited in this pass
+            false,           // retry the startup cold-recovery pass after an owner failure
         ));
         Arc::new(move |cancellation| {
             let mut state = state.lock();
+            let failed = failed_owner.lock().take();
+            if failed.is_some() && state.1.is_some() {
+                state.5 = true;
+                if state.2.is_none() {
+                    state.7 = true;
+                }
+            }
             loop {
                 if cancellation.is_cancelled() {
                     return Ok(None);
@@ -1503,8 +1518,19 @@ impl Database {
                         return job.map(Some);
                     }
                     state.1 = None;
+                    // A startup pass has no active durable seed marker. Its retry is tracked
+                    // separately; do not carry its failure into another project's marker.
+                    if state.2.is_none() {
+                        state.5 = false;
+                    }
                 }
                 if let Some((key, value)) = state.2.take() {
+                    let retry = if key.starts_with(persistence::EMBEDDING_PENDING) {
+                        let job = persistence::decode_pending(&key, &value)?;
+                        failed == Some((job.owner, job.revision))
+                    } else {
+                        state.5
+                    };
                     let completed_with_vectors = if key.starts_with(persistence::EMBEDDING_PENDING)
                     {
                         let job = persistence::decode_pending(&key, &value)?;
@@ -1512,9 +1538,10 @@ impl Database {
                     } else {
                         false
                     };
-                    if !completed_with_vectors {
+                    if !completed_with_vectors && !retry {
                         records.remove_if_value(&key, &value)?;
                     }
+                    state.5 = false;
                 }
                 if !state.3 {
                     if let Some(project) = state.0.next() {
@@ -1527,7 +1554,7 @@ impl Database {
                     }
                     state.3 = true;
                 }
-                if let Some((key, value)) = records.next_after(b"s/", None)? {
+                if let Some((key, value)) = records.next_after(b"s/", state.6.as_deref())? {
                     let id = Uuid::from_slice(&key[2..])
                         .map_err(|e| Error::invalid_data(e.to_string()))?;
                     match initializer(ProjectId(id), cancellation) {
@@ -1535,6 +1562,7 @@ impl Database {
                         Err(error) if error.code == ErrorCode::ProjectNotFound => {}
                         Err(error) => return Err(error),
                     }
+                    state.6 = Some(key.clone());
                     state.2 = Some((key, value));
                     continue;
                 }
@@ -1542,6 +1570,12 @@ impl Database {
                     records.next_after(persistence::EMBEDDING_PENDING, state.4.as_deref())?
                 else {
                     state.4 = None;
+                    state.6 = None;
+                    if state.7 {
+                        state.0 = startup_projects.clone();
+                        state.3 = false;
+                        state.7 = false;
+                    }
                     return Ok(None);
                 };
                 let mut job = persistence::decode_pending(&key, &value)?;

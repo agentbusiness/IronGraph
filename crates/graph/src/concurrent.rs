@@ -3988,6 +3988,106 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "release stalled-reader retention and external physical-footprint qualification"]
+    fn stalled_reader_scorecard() -> Result<()> {
+        for readers in [1_usize, 8, 32] {
+            for mib in [1_usize, 4] {
+                let (graph, label, property, _) = fixture()?;
+                for id in 3..=readers as u64 {
+                    graph.insert_node(NodeInput {
+                        id: NodeId(id),
+                        layer: Layer::Observed,
+                        revision: 1,
+                        labels: vec![label],
+                        properties: vec![(property, ScalarValue::Integer(0))],
+                    })?;
+                }
+                let metadata = graph.0.node_properties.bytes.load(Ordering::Acquire);
+                for id in 1..=readers as u64 {
+                    graph.set_node_property(
+                        NodeId(id),
+                        property,
+                        ScalarValue::String("a".repeat(mib * 1024 * 1024).into()),
+                        2,
+                    )?;
+                }
+                let column = graph
+                    .node_property_column(property)
+                    .ok_or_else(|| missing("property column"))?;
+                let ready = Barrier::new(readers + 1);
+                let release = Barrier::new(readers + 1);
+                let held = AtomicUsize::new(0);
+                let peak = std::thread::scope(|scope| -> Result<usize> {
+                    let mut handles = Vec::new();
+                    for row in 0..readers {
+                        let (ready, release, held) = (&ready, &release, &held);
+                        let column = &column;
+                        handles.push(scope.spawn(move || -> Result<()> {
+                            let borrowed = column
+                                .cells
+                                .get(row)
+                                .and_then(|cell| cell.payload.load_full())
+                                .ok_or_else(|| missing("reader allocation"))?;
+                            held.fetch_add(borrowed.bytes, Ordering::AcqRel);
+                            ready.wait();
+                            release.wait();
+                            drop(borrowed);
+                            Ok(())
+                        }));
+                    }
+                    ready.wait();
+                    let result = (|| -> Result<usize> {
+                        for revision in 3..=18 {
+                            for id in 1..=readers as u64 {
+                                graph.set_node_property(
+                                    NodeId(id),
+                                    property,
+                                    ScalarValue::String("b".repeat(mib * 1024 * 1024).into()),
+                                    revision,
+                                )?;
+                            }
+                            let retained = graph.0.node_properties.bytes.load(Ordering::Acquire);
+                            if retained
+                                > metadata
+                                    + held.load(Ordering::Acquire) * 2
+                                    + readers * size_of::<ValueAllocation>()
+                            {
+                                return Err(Error::internal(format!(
+                                    "unborrowed history retained: {retained}"
+                                )));
+                            }
+                        }
+                        let peak = graph.resident_bytes();
+                        let unix_ms = chrono::Utc::now().timestamp_millis();
+                        println!(
+                            "{{\"event\":\"stalled_reader_held\",\"unix_ms\":{unix_ms},\"pid\":{},\"readers\":{readers},\"mib_per_value\":{mib},\"logical_bytes\":{peak}}}",
+                            std::process::id()
+                        );
+                        std::thread::sleep(Duration::from_millis(40));
+                        Ok(peak)
+                    })();
+                    release.wait();
+                    for handle in handles {
+                        handle.join().map_err(|_| missing("reader panicked"))??;
+                    }
+                    result
+                })?;
+                let settled = graph.resident_bytes();
+                assert_eq!(peak - settled, held.load(Ordering::Acquire));
+                let unix_ms = chrono::Utc::now().timestamp_millis();
+                println!(
+                    "{{\"event\":\"stalled_reader_released\",\"unix_ms\":{unix_ms},\"pid\":{},\"readers\":{readers},\"mib_per_value\":{mib},\"logical_bytes\":{settled},\"reclaimed_bytes\":{}}}",
+                    std::process::id(),
+                    peak - settled
+                );
+                std::thread::sleep(Duration::from_millis(40));
+            }
+        }
+        println!("STALLED_READER_SCORECARD_OK");
+        Ok(())
+    }
+
+    #[test]
     fn replaced_large_payload_reclaims_every_unborrowed_intermediate() -> Result<()> {
         let (graph, _, property, _) = fixture()?;
         let metadata_bytes = graph.0.node_properties.bytes.load(Ordering::Acquire);

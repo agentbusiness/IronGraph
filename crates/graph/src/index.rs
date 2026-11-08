@@ -256,6 +256,9 @@ pub struct VectorIndex {
 #[path = "retrieval.rs"]
 mod retrieval;
 pub use retrieval::RetrievalStrategy;
+#[path = "lexical.rs"]
+mod lexical;
+pub use lexical::LexicalDocument;
 
 #[derive(Default)]
 struct VectorStore {
@@ -269,6 +272,8 @@ struct VectorStore {
     retrieval: retrieval::RetrievalIndex,
     payload_bytes: std::sync::atomic::AtomicUsize,
     multi_span_owners: std::sync::atomic::AtomicUsize,
+    lexical_active: std::sync::atomic::AtomicBool,
+    lexical_building: std::sync::atomic::AtomicUsize,
 }
 #[derive(Default)]
 struct VectorSlot {
@@ -283,6 +288,11 @@ struct VectorPayload {
     #[serde(with = "atomic_vector_revision")]
     revision: std::sync::atomic::AtomicU64,
     coordinates: VectorCoordinates,
+    /// Rebuildable token counts only; never persisted text or another graph representation.
+    #[serde(skip)]
+    lexical: arc_swap::ArcSwapOption<LexicalDocument>,
+    #[serde(skip)]
+    lexical_epoch: std::sync::atomic::AtomicU64,
 }
 impl VectorPayload {
     fn is_multi_span(&self) -> bool {
@@ -748,6 +758,8 @@ impl VectorIndex {
                 + 1,
             revision: std::sync::atomic::AtomicU64::new(revision),
             coordinates,
+            lexical: arc_swap::ArcSwapOption::empty(),
+            lexical_epoch: std::sync::atomic::AtomicU64::new(0),
         });
         let stamp = payload.stamp;
         let payload_bytes = payload.resident_bytes();
@@ -4369,6 +4381,7 @@ impl IndexCatalog {
 
     /// Removes old postings before a canonical graph mutation changes or deletes a row.
     pub fn before_graph_apply(&self, graph: &GraphStore, mutation: &GraphMutation) -> Result<()> {
+        self.invalidate_lexical_mutation(graph, mutation)?;
         match mutation {
             GraphMutation::SetNodeProperty { node, property, .. } => {
                 if let Some(view) = graph.node(*node) {
@@ -4418,6 +4431,7 @@ impl IndexCatalog {
 
     /// Adds current postings after a canonical graph mutation creates or updates a row.
     pub fn after_graph_apply(&self, graph: &GraphStore, mutation: &GraphMutation) -> Result<()> {
+        self.invalidate_lexical_mutation(graph, mutation)?;
         match mutation {
             GraphMutation::InsertNode(input) => {
                 if let Some(view) = graph.node(input.id) {

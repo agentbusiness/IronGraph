@@ -398,11 +398,140 @@ async fn relationship_scope_cancels_inflight_vectors_and_recovers_pending_wideni
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn embedding_fair_poison_owner_keeps_durable_retry_across_reopen() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let encoder = Arc::new(ContentEncoder::new()?);
+    encoder.fail_poison.store(true, Ordering::Release);
+    let boot = open(directory.path(), encoder.clone()).await?;
+    let database = boot.backend();
+    query_async(database, "CREATE PROJECT fairness").await?;
+    query_async(
+        database,
+        "USE fairness CREATE (:Document {body:'poison-owner contract'})",
+    )
+    .await?;
+    query_async(database, "USE fairness UNWIND range(1,1000) AS id CREATE (:Document {id:id,body:'healthy contract'})").await?;
+    let project = database.resolve_project_name("fairness")?;
+    let (live, _) = database.capture_canonical_project(project)?;
+    let count = || {
+        live.indexes
+            .vector_search_source(crate::graph::SEMANTIC_NODE_INDEX)
+            .map_or(0, |(vectors, _)| vectors.len())
+    };
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while count() != 1000 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .map_err(|_| Error::internal("poison owner starved healthy durable work"))?;
+    database.shutdown_embedding_jobs().await?;
+    boot.runtime().flush_persistence().await?;
+    let body = live.graph.catalog().intern_property("body")?;
+    let poison = live
+        .graph
+        .nodes()
+        .find(|node| {
+            node.property(body) == Some(ScalarValue::String("poison-owner contract".into()))
+        })
+        .ok_or_else(|| Error::internal("poison fixture absent"))?
+        .id();
+    let key = persistence::pending_key(super::super::embedding_jobs::EmbeddingOwner {
+        project,
+        kind: crate::types::EntityKind::Node,
+        entity_id: poison.0,
+    });
+    assert!(
+        database.0.records.get(&key)?.is_some(),
+        "failure must not acknowledge/remove pending work"
+    );
+    drop(live);
+    boot.runtime().shutdown().await?;
+    drop(boot);
+    let boot = open(directory.path(), encoder.clone()).await?;
+    assert!(boot.backend().0.records.get(&key)?.is_some());
+    encoder.fail_poison.store(false, Ordering::Release);
+    let (live, _) = boot.backend().capture_canonical_project(project)?;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while live
+            .indexes
+            .vector_search_source(crate::graph::SEMANTIC_NODE_INDEX)
+            .map_or(0, |(vectors, _)| vectors.len())
+            != 1001
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .map_err(|_| Error::internal("recovered failed owner was not retried"))?;
+    boot.backend().shutdown_embedding_jobs().await?;
+    boot.runtime().flush_persistence().await?;
+    assert!(boot.backend().0.records.get(&key)?.is_none());
+    boot.runtime().shutdown().await?;
+    Ok(())
+}
+
 struct ContentEncoder {
     profile: EmbeddingProfile,
     inputs: parking_lot::Mutex<Vec<String>>,
     paused: AtomicBool,
     entered: AtomicBool,
+    fail_poison: AtomicBool,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn embedding_fair_failed_cold_seed_does_not_starve_other_projects() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let encoder = Arc::new(ContentEncoder::new()?);
+    encoder.fail_poison.store(true, Ordering::Release);
+    let boot = open(directory.path(), encoder.clone()).await?;
+    let database = boot.backend();
+    *database.0.text_embedding.write() = None;
+    for name in ["cold_a", "cold_b"] {
+        query_async(database, &format!("CREATE PROJECT {name}")).await?;
+        query_async(database,&format!("USE {name} UNWIND range(1,10) AS id CREATE (:Document {{id:id,body:'healthy contract'}})")).await?;
+    }
+    query_async(
+        database,
+        "USE cold_a CREATE (:Document {body:'poison-owner contract'})",
+    )
+    .await?;
+    database.bind_text_embedding(encoder.clone())?;
+    for name in ["cold_a", "cold_b"] {
+        let project = database.resolve_project_name(name)?;
+        database.initialize_automatic_semantic(project)?;
+        let (live, _) = database.capture_canonical_project(project)?;
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while live
+                .indexes
+                .vector_search_source(crate::graph::SEMANTIC_NODE_INDEX)
+                .map_or(0, |(vectors, _)| vectors.len())
+                != 10
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .map_err(|_| Error::internal("failed cold seed starved another owner/project"))?;
+    }
+    encoder.fail_poison.store(false, Ordering::Release);
+    let (live, _) = database.capture_canonical_project(database.resolve_project_name("cold_a")?)?;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while live
+            .indexes
+            .vector_search_source(crate::graph::SEMANTIC_NODE_INDEX)
+            .map_or(0, |(vectors, _)| vectors.len())
+            != 11
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .map_err(|_| Error::internal("failed cold seed was discarded instead of retried"))?;
+    database.shutdown_embedding_jobs().await?;
+    boot.runtime().shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -527,6 +656,7 @@ impl ContentEncoder {
             inputs: parking_lot::Mutex::new(Vec::new()),
             paused: AtomicBool::new(false),
             entered: AtomicBool::new(false),
+            fail_poison: AtomicBool::new(false),
         })
     }
 }
@@ -537,6 +667,12 @@ impl TextEmbedding for ContentEncoder {
     }
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let lower = text.to_lowercase();
+        if self.fail_poison.load(Ordering::Acquire) && lower.contains("poison-owner") {
+            return Err(Error::new(
+                ErrorCode::EmbeddingUnavailable,
+                "injected owner failure",
+            ));
+        }
         let mut vector = vec![
             0.1,
             f32::from(lower.contains("contract")),

@@ -177,3 +177,160 @@ fn tls_configuration_error(error: impl std::fmt::Display) -> Error {
 }
 
 // These exercise the shared remote-service mTLS loader.
+#[cfg(test)]
+mod tests {
+    use std::io::{Read as _, Write as _};
+
+    use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+    use rustls::{ClientConfig, ClientConnection, ServerConnection, pki_types::ServerName};
+
+    use super::*;
+
+    type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+    fn certificate_authority() -> TestResult<CertifiedIssuer<'static, KeyPair>> {
+        let mut params = CertificateParams::new(Vec::<String>::new())?;
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        Ok(CertifiedIssuer::self_signed(params, KeyPair::generate()?)?)
+    }
+
+    fn client_config(
+        trusted: &CertifiedIssuer<'_, KeyPair>,
+        identity: Option<&CertifiedIssuer<'_, KeyPair>>,
+        alpn: &[u8],
+    ) -> TestResult<Arc<ClientConfig>> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(trusted.der().clone())?;
+        let builder = ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_root_certificates(roots);
+        let mut client = if let Some(issuer) = identity {
+            let key = KeyPair::generate()?;
+            let cert =
+                CertificateParams::new(vec!["client".to_owned()])?.signed_by(&key, issuer)?;
+            builder.with_client_auth_cert(
+                vec![cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            )?
+        } else {
+            builder.with_no_client_auth()
+        };
+        client.alpn_protocols = if alpn.is_empty() {
+            Vec::new()
+        } else {
+            vec![alpn.to_vec()]
+        };
+        Ok(Arc::new(client))
+    }
+
+    fn server_config(
+        issuer: &CertifiedIssuer<'_, KeyPair>,
+        alpn: &[u8],
+    ) -> TestResult<Arc<ServerConfig>> {
+        let directory = tempfile::tempdir()?;
+        let key = KeyPair::generate()?;
+        let cert = CertificateParams::new(vec!["localhost".to_owned()])?.signed_by(&key, issuer)?;
+        let certificate_path = directory.path().join("server.pem");
+        let key_path = directory.path().join("key.pem");
+        let trust_path = directory.path().join("ca.pem");
+        std::fs::write(&certificate_path, cert.pem())?;
+        std::fs::write(&key_path, key.serialize_pem())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::write(&trust_path, issuer.pem())?;
+        Ok(load_remote_service_tls(
+            &certificate_path,
+            &key_path,
+            &trust_path,
+            if alpn.is_empty() {
+                Vec::new()
+            } else {
+                vec![alpn.to_vec()]
+            },
+        )?)
+    }
+
+    fn transfer(client: &mut ClientConnection, server: &mut ServerConnection) -> TestResult {
+        for _ in 0..16 {
+            let mut to_server = Vec::new();
+            client.write_tls(&mut to_server)?;
+            let mut input = to_server.as_slice();
+            while !input.is_empty() {
+                server.read_tls(&mut input)?;
+                server.process_new_packets()?;
+            }
+            let mut to_client = Vec::new();
+            server.write_tls(&mut to_client)?;
+            let mut input = to_client.as_slice();
+            while !input.is_empty() {
+                client.read_tls(&mut input)?;
+                client.process_new_packets()?;
+            }
+            if !client.is_handshaking()
+                && !server.is_handshaking()
+                && !client.wants_write()
+                && !server.wants_write()
+            {
+                return Ok(());
+            }
+        }
+        Err("TLS fixture did not finish exchanging records".into())
+    }
+
+    #[test]
+    fn mtls_preserves_payloads_and_alpn_for_every_remote_protocol() -> TestResult {
+        let issuer = certificate_authority()?;
+        let payload = "query rows: null, -41, 3.14159, 東京, café\n".repeat(512);
+        // HTTP negotiates ALPN; Bolt, Kafka and AMQP use no ALPN.
+        for alpn in [b"h2".as_slice(), b"http/1.1", b""] {
+            let mut server = ServerConnection::new(server_config(&issuer, alpn)?)?;
+            let mut client = ClientConnection::new(
+                client_config(&issuer, Some(&issuer), alpn)?,
+                ServerName::try_from("localhost")?,
+            )?;
+            transfer(&mut client, &mut server)?;
+            assert_eq!(
+                server.protocol_version(),
+                Some(rustls::ProtocolVersion::TLSv1_3)
+            );
+            let expected_alpn = (!alpn.is_empty()).then_some(alpn);
+            assert_eq!(client.alpn_protocol(), expected_alpn);
+            assert_eq!(server.alpn_protocol(), expected_alpn);
+            client.writer().write_all(payload.as_bytes())?;
+            transfer(&mut client, &mut server)?;
+            let mut received = vec![0; payload.len()];
+            server.reader().read_exact(&mut received)?;
+            assert_eq!(received, payload.as_bytes());
+            server.writer().write_all(&received)?;
+            transfer(&mut client, &mut server)?;
+            client.reader().read_exact(&mut received)?;
+            assert_eq!(received, payload.as_bytes());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mtls_rejects_missing_untrusted_clients_and_untrusted_or_misnamed_servers() -> TestResult {
+        let trusted = certificate_authority()?;
+        let untrusted = certificate_authority()?;
+        for (roots, identity, hostname) in [
+            (&trusted, None, "localhost"),
+            (&trusted, Some(&untrusted), "localhost"),
+            (&untrusted, Some(&trusted), "localhost"),
+            (&trusted, Some(&trusted), "different.invalid"),
+        ] {
+            let mut server = ServerConnection::new(server_config(&trusted, b"http/1.1")?)?;
+            let mut client = ClientConnection::new(
+                client_config(roots, identity, b"http/1.1")?,
+                ServerName::try_from(hostname)?,
+            )?;
+            assert!(transfer(&mut client, &mut server).is_err(), "{hostname}");
+        }
+        Ok(())
+    }
+}

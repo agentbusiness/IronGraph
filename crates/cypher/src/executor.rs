@@ -22419,45 +22419,87 @@ fn hybrid_retrieval_hits(
         }
         // A declared field index must not gain lexical matches from unrelated properties.
         // The borrowed statement view includes prior and current uncommitted changes.
-        let text = if let Some(definition) = &declared {
-            state
-                .graph
-                .node(NodeId(id))
-                .filter(|node| node.labels().contains(&definition.label))
-                .and_then(|node| node.property(definition.source_property))
-                .and_then(|value| match value {
-                    ScalarValue::String(text) => Some(text.to_string()),
-                    _ => None,
-                })
-        } else {
-            crate::graph::semantic_owner_text_with_mutations(
-                context.graph,
-                context.prior_graph_mutations,
-                &state.mutations,
-                kind,
-                id,
-            )?
+        let load_text = || {
+            if let Some(definition) = &declared {
+                Ok(state
+                    .graph
+                    .node(NodeId(id))
+                    .filter(|node| node.labels().contains(&definition.label))
+                    .and_then(|node| node.property(definition.source_property))
+                    .and_then(|value| match value {
+                        ScalarValue::String(text) => Some(text.to_string()),
+                        _ => None,
+                    }))
+            } else {
+                crate::graph::semantic_owner_text_with_mutations(
+                    context.graph,
+                    context.prior_graph_mutations,
+                    &state.mutations,
+                    kind,
+                    id,
+                )
+            }
         };
-        let Some(text) = text else {
+        let reuse = context.prior_graph_mutations.is_empty() && state.mutations.is_empty();
+        #[cfg(test)]
+        let reuse = reuse && retrieval_tests::LEXICAL_REUSE_ENABLED.get();
+        let statistics = if reuse {
+            let (revision, source_revision, target_revision) = match kind {
+                crate::types::EntityKind::Node => (
+                    context
+                        .graph
+                        .node(NodeId(id))
+                        .map_or(0, |node| node.revision()),
+                    0,
+                    0,
+                ),
+                crate::types::EntityKind::Relationship => context
+                    .graph
+                    .edge(crate::EdgeId(id))
+                    .map_or((0, 0, 0), |edge| {
+                        (
+                            edge.revision(),
+                            context
+                                .graph
+                                .node(edge.source())
+                                .map_or(0, |node| node.revision()),
+                            context
+                                .graph
+                                .node(edge.target())
+                                .map_or(0, |node| node.revision()),
+                        )
+                    }),
+            };
+            source.exact.lexical_document(
+                id,
+                [
+                    source.property.0,
+                    revision,
+                    source_revision,
+                    target_revision,
+                    declared.as_ref().map_or(0, |definition| definition.label.0),
+                ],
+                &terms,
+                load_text,
+                &context.cancellation,
+            )?
+        } else {
+            // Overlay counts are statement-local, never installed on canonical allocations.
+            load_text()?
+                .map(|text| {
+                    crate::graph::LexicalDocument::for_query(&text, &terms, &context.cancellation)
+                })
+                .transpose()?
+                .map(std::sync::Arc::new)
+        };
+        let Some(statistics) = statistics else {
             return Ok(());
         };
-        let mut frequencies = vec![0_usize; terms.len()];
-        let mut length = 0_usize;
-        for (token_index, token) in text
-            .split(|character: char| !character.is_alphanumeric())
-            .enumerate()
-        {
-            if token_index & 1023 == 0 {
-                check_execution(context)?;
-            }
-            if token.is_empty() {
-                continue;
-            }
-            length = length.saturating_add(1);
-            if let Ok(at) = terms.binary_search(&token.to_lowercase()) {
-                frequencies[at] = frequencies[at].saturating_add(1);
-            }
-        }
+        let length = statistics.length();
+        let frequencies: Vec<_> = terms
+            .iter()
+            .map(|term| statistics.frequency(term))
+            .collect();
         total_length = total_length.saturating_add(length);
         documents = documents.saturating_add(1);
         if frequencies.iter().any(|frequency| *frequency > 0) {

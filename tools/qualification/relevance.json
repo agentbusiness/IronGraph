@@ -1,0 +1,1427 @@
+{
+  "provenance": "Synthetic authored fixture, Apache-2.0 with repository; frozen before measurements. Last six topics held out as groups. Not customer demand or a public benchmark.",
+  "documents": [
+    {
+      "id": 0,
+      "body": "Guitar workshop 1. guitar lessons teach chords, rhythm and finger picking. Registration reference E1000. ギターのレッスン。"
+    },
+    {
+      "id": 1,
+      "body": "Guitar workshop 2. guitar lessons teach chords, rhythm and finger picking. Registration reference E1001. ギターのレッスン。"
+    },
+    {
+      "id": 2,
+      "body": "Guitar workshop 3. guitar lessons teach chords, rhythm and finger picking. Registration reference E1002. ギターのレッスン。"
+    },
+    {
+      "id": 3,
+      "body": "Guitar workshop 4. guitar lessons teach chords, rhythm and finger picking. Registration reference E1003. ギターのレッスン。"
+    },
+    {
+      "id": 4,
+      "body": "Guitar workshop 5. guitar lessons teach chords, rhythm and finger picking. Registration reference E1004. ギターのレッスン。"
+    },
+    {
+      "id": 5,
+      "body": "Astronomy workshop 1. astronomy classes explain planets, stars and telescopes. Registration reference E1005. 天文学と星。"
+    },
+    {
+      "id": 6,
+      "body": "Astronomy workshop 2. astronomy classes explain planets, stars and telescopes. Registration reference E1006. 天文学と星。"
+    },
+    {
+      "id": 7,
+      "body": "Astronomy workshop 3. astronomy classes explain planets, stars and telescopes. Registration reference E1007. 天文学と星。"
+    },
+    {
+      "id": 8,
+      "body": "Astronomy workshop 4. astronomy classes explain planets, stars and telescopes. Registration reference E1008. 天文学と星。"
+    },
+    {
+      "id": 9,
+      "body": "Astronomy workshop 5. astronomy classes explain planets, stars and telescopes. Registration reference E1009. 天文学と星。"
+    },
+    {
+      "id": 10,
+      "body": "Gardening workshop 1. gardening lessons cover soil, seedlings and vegetable cultivation. Registration reference E1010. 野菜と園芸。"
+    },
+    {
+      "id": 11,
+      "body": "Gardening workshop 2. gardening lessons cover soil, seedlings and vegetable cultivation. Registration reference E1011. 野菜と園芸。"
+    },
+    {
+      "id": 12,
+      "body": "Gardening workshop 3. gardening lessons cover soil, seedlings and vegetable cultivation. Registration reference E1012. 野菜と園芸。"
+    },
+    {
+      "id": 13,
+      "body": "Gardening workshop 4. gardening lessons cover soil, seedlings and vegetable cultivation. Registration reference E1013. 野菜と園芸。"
+    },
+    {
+      "id": 14,
+      "body": "Gardening workshop 5. gardening lessons cover soil, seedlings and vegetable cultivation. Registration reference E1014. 野菜と園芸。"
+    },
+    {
+      "id": 15,
+      "body": "Aviation workshop 1. aviation training covers airplane navigation and flight safety. Registration reference E1015. 飛行機の操縦。"
+    },
+    {
+      "id": 16,
+      "body": "Aviation workshop 2. aviation training covers airplane navigation and flight safety. Registration reference E1016. 飛行機の操縦。"
+    },
+    {
+      "id": 17,
+      "body": "Aviation workshop 3. aviation training covers airplane navigation and flight safety. Registration reference E1017. 飛行機の操縦。"
+    },
+    {
+      "id": 18,
+      "body": "Aviation workshop 4. aviation training covers airplane navigation and flight safety. Registration reference E1018. 飛行機の操縦。"
+    },
+    {
+      "id": 19,
+      "body": "Aviation workshop 5. aviation training covers airplane navigation and flight safety. Registration reference E1019. 飛行機の操縦。"
+    },
+    {
+      "id": 20,
+      "body": "Photography workshop 1. photography courses explain camera lenses, exposure and portraits. Registration reference E1020. カメラと写真。"
+    },
+    {
+      "id": 21,
+      "body": "Photography workshop 2. photography courses explain camera lenses, exposure and portraits. Registration reference E1021. カメラと写真。"
+    },
+    {
+      "id": 22,
+      "body": "Photography workshop 3. photography courses explain camera lenses, exposure and portraits. Registration reference E1022. カメラと写真。"
+    },
+    {
+      "id": 23,
+      "body": "Photography workshop 4. photography courses explain camera lenses, exposure and portraits. Registration reference E1023. カメラと写真。"
+    },
+    {
+      "id": 24,
+      "body": "Photography workshop 5. photography courses explain camera lenses, exposure and portraits. Registration reference E1024. カメラと写真。"
+    },
+    {
+      "id": 25,
+      "body": "Cooking workshop 1. cooking classes teach sauces, baking and food preparation. Registration reference E1025. 料理と食事。"
+    },
+    {
+      "id": 26,
+      "body": "Cooking workshop 2. cooking classes teach sauces, baking and food preparation. Registration reference E1026. 料理と食事。"
+    },
+    {
+      "id": 27,
+      "body": "Cooking workshop 3. cooking classes teach sauces, baking and food preparation. Registration reference E1027. 料理と食事。"
+    },
+    {
+      "id": 28,
+      "body": "Cooking workshop 4. cooking classes teach sauces, baking and food preparation. Registration reference E1028. 料理と食事。"
+    },
+    {
+      "id": 29,
+      "body": "Cooking workshop 5. cooking classes teach sauces, baking and food preparation. Registration reference E1029. 料理と食事。"
+    },
+    {
+      "id": 30,
+      "body": "Swimming workshop 1. swimming lessons teach floating, breathing and water safety. Registration reference E1030. 水泳の練習。"
+    },
+    {
+      "id": 31,
+      "body": "Swimming workshop 2. swimming lessons teach floating, breathing and water safety. Registration reference E1031. 水泳の練習。"
+    },
+    {
+      "id": 32,
+      "body": "Swimming workshop 3. swimming lessons teach floating, breathing and water safety. Registration reference E1032. 水泳の練習。"
+    },
+    {
+      "id": 33,
+      "body": "Swimming workshop 4. swimming lessons teach floating, breathing and water safety. Registration reference E1033. 水泳の練習。"
+    },
+    {
+      "id": 34,
+      "body": "Swimming workshop 5. swimming lessons teach floating, breathing and water safety. Registration reference E1034. 水泳の練習。"
+    },
+    {
+      "id": 35,
+      "body": "Carpentry workshop 1. carpentry training covers wood joints, saws and furniture construction. Registration reference E1035. 木工と家具。"
+    },
+    {
+      "id": 36,
+      "body": "Carpentry workshop 2. carpentry training covers wood joints, saws and furniture construction. Registration reference E1036. 木工と家具。"
+    },
+    {
+      "id": 37,
+      "body": "Carpentry workshop 3. carpentry training covers wood joints, saws and furniture construction. Registration reference E1037. 木工と家具。"
+    },
+    {
+      "id": 38,
+      "body": "Carpentry workshop 4. carpentry training covers wood joints, saws and furniture construction. Registration reference E1038. 木工と家具。"
+    },
+    {
+      "id": 39,
+      "body": "Carpentry workshop 5. carpentry training covers wood joints, saws and furniture construction. Registration reference E1039. 木工と家具。"
+    },
+    {
+      "id": 40,
+      "body": "Robotics workshop 1. robotics workshops teach motors, sensors and programmable machines. Registration reference E1040. ロボットの制作。"
+    },
+    {
+      "id": 41,
+      "body": "Robotics workshop 2. robotics workshops teach motors, sensors and programmable machines. Registration reference E1041. ロボットの制作。"
+    },
+    {
+      "id": 42,
+      "body": "Robotics workshop 3. robotics workshops teach motors, sensors and programmable machines. Registration reference E1042. ロボットの制作。"
+    },
+    {
+      "id": 43,
+      "body": "Robotics workshop 4. robotics workshops teach motors, sensors and programmable machines. Registration reference E1043. ロボットの制作。"
+    },
+    {
+      "id": 44,
+      "body": "Robotics workshop 5. robotics workshops teach motors, sensors and programmable machines. Registration reference E1044. ロボットの制作。"
+    },
+    {
+      "id": 45,
+      "body": "Pottery workshop 1. pottery classes teach shaping clay, glazing and kiln firing. Registration reference E1045. 陶芸と粘土。"
+    },
+    {
+      "id": 46,
+      "body": "Pottery workshop 2. pottery classes teach shaping clay, glazing and kiln firing. Registration reference E1046. 陶芸と粘土。"
+    },
+    {
+      "id": 47,
+      "body": "Pottery workshop 3. pottery classes teach shaping clay, glazing and kiln firing. Registration reference E1047. 陶芸と粘土。"
+    },
+    {
+      "id": 48,
+      "body": "Pottery workshop 4. pottery classes teach shaping clay, glazing and kiln firing. Registration reference E1048. 陶芸と粘土。"
+    },
+    {
+      "id": 49,
+      "body": "Pottery workshop 5. pottery classes teach shaping clay, glazing and kiln firing. Registration reference E1049. 陶芸と粘土。"
+    },
+    {
+      "id": 50,
+      "body": "Cycling workshop 1. cycling training covers bicycle maintenance, gears and road safety. Registration reference E1050. 自転車の修理。"
+    },
+    {
+      "id": 51,
+      "body": "Cycling workshop 2. cycling training covers bicycle maintenance, gears and road safety. Registration reference E1051. 自転車の修理。"
+    },
+    {
+      "id": 52,
+      "body": "Cycling workshop 3. cycling training covers bicycle maintenance, gears and road safety. Registration reference E1052. 自転車の修理。"
+    },
+    {
+      "id": 53,
+      "body": "Cycling workshop 4. cycling training covers bicycle maintenance, gears and road safety. Registration reference E1053. 自転車の修理。"
+    },
+    {
+      "id": 54,
+      "body": "Cycling workshop 5. cycling training covers bicycle maintenance, gears and road safety. Registration reference E1054. 自転車の修理。"
+    },
+    {
+      "id": 55,
+      "body": "Sailing workshop 1. sailing lessons teach wind, rigging and boat navigation. Registration reference E1055. 帆船の航海。"
+    },
+    {
+      "id": 56,
+      "body": "Sailing workshop 2. sailing lessons teach wind, rigging and boat navigation. Registration reference E1056. 帆船の航海。"
+    },
+    {
+      "id": 57,
+      "body": "Sailing workshop 3. sailing lessons teach wind, rigging and boat navigation. Registration reference E1057. 帆船の航海。"
+    },
+    {
+      "id": 58,
+      "body": "Sailing workshop 4. sailing lessons teach wind, rigging and boat navigation. Registration reference E1058. 帆船の航海。"
+    },
+    {
+      "id": 59,
+      "body": "Sailing workshop 5. sailing lessons teach wind, rigging and boat navigation. Registration reference E1059. 帆船の航海。"
+    },
+    {
+      "id": 60,
+      "body": "FirstAid workshop 1. first aid courses teach emergency care, bandages and resuscitation. Registration reference E1060. 救急手当。"
+    },
+    {
+      "id": 61,
+      "body": "FirstAid workshop 2. first aid courses teach emergency care, bandages and resuscitation. Registration reference E1061. 救急手当。"
+    },
+    {
+      "id": 62,
+      "body": "FirstAid workshop 3. first aid courses teach emergency care, bandages and resuscitation. Registration reference E1062. 救急手当。"
+    },
+    {
+      "id": 63,
+      "body": "FirstAid workshop 4. first aid courses teach emergency care, bandages and resuscitation. Registration reference E1063. 救急手当。"
+    },
+    {
+      "id": 64,
+      "body": "FirstAid workshop 5. first aid courses teach emergency care, bandages and resuscitation. Registration reference E1064. 救急手当。"
+    },
+    {
+      "id": 65,
+      "body": "Geology workshop 1. geology courses explain minerals, rocks and plate tectonics. Registration reference E1065. 地質学と岩石。"
+    },
+    {
+      "id": 66,
+      "body": "Geology workshop 2. geology courses explain minerals, rocks and plate tectonics. Registration reference E1066. 地質学と岩石。"
+    },
+    {
+      "id": 67,
+      "body": "Geology workshop 3. geology courses explain minerals, rocks and plate tectonics. Registration reference E1067. 地質学と岩石。"
+    },
+    {
+      "id": 68,
+      "body": "Geology workshop 4. geology courses explain minerals, rocks and plate tectonics. Registration reference E1068. 地質学と岩石。"
+    },
+    {
+      "id": 69,
+      "body": "Geology workshop 5. geology courses explain minerals, rocks and plate tectonics. Registration reference E1069. 地質学と岩石。"
+    },
+    {
+      "id": 70,
+      "body": "Beekeeping workshop 1. beekeeping workshops cover hives, honey and pollination. Registration reference E1070. 養蜂と蜂蜜。"
+    },
+    {
+      "id": 71,
+      "body": "Beekeeping workshop 2. beekeeping workshops cover hives, honey and pollination. Registration reference E1071. 養蜂と蜂蜜。"
+    },
+    {
+      "id": 72,
+      "body": "Beekeeping workshop 3. beekeeping workshops cover hives, honey and pollination. Registration reference E1072. 養蜂と蜂蜜。"
+    },
+    {
+      "id": 73,
+      "body": "Beekeeping workshop 4. beekeeping workshops cover hives, honey and pollination. Registration reference E1073. 養蜂と蜂蜜。"
+    },
+    {
+      "id": 74,
+      "body": "Beekeeping workshop 5. beekeeping workshops cover hives, honey and pollination. Registration reference E1074. 養蜂と蜂蜜。"
+    },
+    {
+      "id": 75,
+      "body": "Sewing workshop 1. sewing classes cover fabric patterns, stitching and garment repair. Registration reference E1075. 裁縫と衣服。"
+    },
+    {
+      "id": 76,
+      "body": "Sewing workshop 2. sewing classes cover fabric patterns, stitching and garment repair. Registration reference E1076. 裁縫と衣服。"
+    },
+    {
+      "id": 77,
+      "body": "Sewing workshop 3. sewing classes cover fabric patterns, stitching and garment repair. Registration reference E1077. 裁縫と衣服。"
+    },
+    {
+      "id": 78,
+      "body": "Sewing workshop 4. sewing classes cover fabric patterns, stitching and garment repair. Registration reference E1078. 裁縫と衣服。"
+    },
+    {
+      "id": 79,
+      "body": "Sewing workshop 5. sewing classes cover fabric patterns, stitching and garment repair. Registration reference E1079. 裁縫と衣服。"
+    },
+    {
+      "id": 80,
+      "body": "Chess workshop 1. chess lessons teach openings, tactics and checkmate. Registration reference E1080. チェスの戦術。"
+    },
+    {
+      "id": 81,
+      "body": "Chess workshop 2. chess lessons teach openings, tactics and checkmate. Registration reference E1081. チェスの戦術。"
+    },
+    {
+      "id": 82,
+      "body": "Chess workshop 3. chess lessons teach openings, tactics and checkmate. Registration reference E1082. チェスの戦術。"
+    },
+    {
+      "id": 83,
+      "body": "Chess workshop 4. chess lessons teach openings, tactics and checkmate. Registration reference E1083. チェスの戦術。"
+    },
+    {
+      "id": 84,
+      "body": "Chess workshop 5. chess lessons teach openings, tactics and checkmate. Registration reference E1084. チェスの戦術。"
+    },
+    {
+      "id": 85,
+      "body": "Diving workshop 1. diving courses explain scuba equipment, pressure and underwater safety. Registration reference E1085. スキューバダイビング。"
+    },
+    {
+      "id": 86,
+      "body": "Diving workshop 2. diving courses explain scuba equipment, pressure and underwater safety. Registration reference E1086. スキューバダイビング。"
+    },
+    {
+      "id": 87,
+      "body": "Diving workshop 3. diving courses explain scuba equipment, pressure and underwater safety. Registration reference E1087. スキューバダイビング。"
+    },
+    {
+      "id": 88,
+      "body": "Diving workshop 4. diving courses explain scuba equipment, pressure and underwater safety. Registration reference E1088. スキューバダイビング。"
+    },
+    {
+      "id": 89,
+      "body": "Diving workshop 5. diving courses explain scuba equipment, pressure and underwater safety. Registration reference E1089. スキューバダイビング。"
+    },
+    {
+      "id": 90,
+      "body": "Electronics workshop 1. electronics workshops teach circuits, soldering and voltage measurement. Registration reference E1090. 電子回路と電圧。"
+    },
+    {
+      "id": 91,
+      "body": "Electronics workshop 2. electronics workshops teach circuits, soldering and voltage measurement. Registration reference E1091. 電子回路と電圧。"
+    },
+    {
+      "id": 92,
+      "body": "Electronics workshop 3. electronics workshops teach circuits, soldering and voltage measurement. Registration reference E1092. 電子回路と電圧。"
+    },
+    {
+      "id": 93,
+      "body": "Electronics workshop 4. electronics workshops teach circuits, soldering and voltage measurement. Registration reference E1093. 電子回路と電圧。"
+    },
+    {
+      "id": 94,
+      "body": "Electronics workshop 5. electronics workshops teach circuits, soldering and voltage measurement. Registration reference E1094. 電子回路と電圧。"
+    },
+    {
+      "id": 95,
+      "body": "Languages workshop 1. language classes teach vocabulary, grammar and conversation. Registration reference E1095. 外国語の会話。"
+    },
+    {
+      "id": 96,
+      "body": "Languages workshop 2. language classes teach vocabulary, grammar and conversation. Registration reference E1096. 外国語の会話。"
+    },
+    {
+      "id": 97,
+      "body": "Languages workshop 3. language classes teach vocabulary, grammar and conversation. Registration reference E1097. 外国語の会話。"
+    },
+    {
+      "id": 98,
+      "body": "Languages workshop 4. language classes teach vocabulary, grammar and conversation. Registration reference E1098. 外国語の会話。"
+    },
+    {
+      "id": 99,
+      "body": "Languages workshop 5. language classes teach vocabulary, grammar and conversation. Registration reference E1099. 外国語の会話。"
+    }
+  ],
+  "questions": [
+    {
+      "text": "How can I learn to play string music?",
+      "relevant": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Guitar training workshop",
+      "relevant": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "ギターのレッスン",
+      "relevant": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Registration reference E1003",
+      "relevant": [
+        3
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "guitar lessons teach chords, rhythm and finger picking information",
+      "relevant": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Where can I study the night sky?",
+      "relevant": [
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Astronomy training workshop",
+      "relevant": [
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "天文学と星",
+      "relevant": [
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Registration reference E1008",
+      "relevant": [
+        8
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "astronomy classes explain planets, stars and telescopes information",
+      "relevant": [
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "How do I grow vegetables in healthy soil?",
+      "relevant": [
+        10,
+        11,
+        12,
+        13,
+        14
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Gardening training workshop",
+      "relevant": [
+        10,
+        11,
+        12,
+        13,
+        14
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "野菜と園芸",
+      "relevant": [
+        10,
+        11,
+        12,
+        13,
+        14
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Registration reference E1013",
+      "relevant": [
+        13
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "gardening lessons cover soil, seedlings and vegetable cultivation information",
+      "relevant": [
+        10,
+        11,
+        12,
+        13,
+        14
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Where can I learn to pilot an aircraft safely?",
+      "relevant": [
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Aviation training workshop",
+      "relevant": [
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "飛行機の操縦",
+      "relevant": [
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Registration reference E1018",
+      "relevant": [
+        18
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "aviation training covers airplane navigation and flight safety information",
+      "relevant": [
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "How do I take better pictures with a camera?",
+      "relevant": [
+        20,
+        21,
+        22,
+        23,
+        24
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Photography training workshop",
+      "relevant": [
+        20,
+        21,
+        22,
+        23,
+        24
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "カメラと写真",
+      "relevant": [
+        20,
+        21,
+        22,
+        23,
+        24
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Registration reference E1023",
+      "relevant": [
+        23
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "photography courses explain camera lenses, exposure and portraits information",
+      "relevant": [
+        20,
+        21,
+        22,
+        23,
+        24
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Where can I learn to prepare meals?",
+      "relevant": [
+        25,
+        26,
+        27,
+        28,
+        29
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Cooking training workshop",
+      "relevant": [
+        25,
+        26,
+        27,
+        28,
+        29
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "料理と食事",
+      "relevant": [
+        25,
+        26,
+        27,
+        28,
+        29
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Registration reference E1028",
+      "relevant": [
+        28
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "cooking classes teach sauces, baking and food preparation information",
+      "relevant": [
+        25,
+        26,
+        27,
+        28,
+        29
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "How can I move safely through water?",
+      "relevant": [
+        30,
+        31,
+        32,
+        33,
+        34
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Swimming training workshop",
+      "relevant": [
+        30,
+        31,
+        32,
+        33,
+        34
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "水泳の練習",
+      "relevant": [
+        30,
+        31,
+        32,
+        33,
+        34
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Registration reference E1033",
+      "relevant": [
+        33
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "swimming lessons teach floating, breathing and water safety information",
+      "relevant": [
+        30,
+        31,
+        32,
+        33,
+        34
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "How do I build a wooden table?",
+      "relevant": [
+        35,
+        36,
+        37,
+        38,
+        39
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Carpentry training workshop",
+      "relevant": [
+        35,
+        36,
+        37,
+        38,
+        39
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "木工と家具",
+      "relevant": [
+        35,
+        36,
+        37,
+        38,
+        39
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Registration reference E1038",
+      "relevant": [
+        38
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "carpentry training covers wood joints, saws and furniture construction information",
+      "relevant": [
+        35,
+        36,
+        37,
+        38,
+        39
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Where can I learn to build a robot?",
+      "relevant": [
+        40,
+        41,
+        42,
+        43,
+        44
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Robotics training workshop",
+      "relevant": [
+        40,
+        41,
+        42,
+        43,
+        44
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "ロボットの制作",
+      "relevant": [
+        40,
+        41,
+        42,
+        43,
+        44
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Registration reference E1043",
+      "relevant": [
+        43
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "robotics workshops teach motors, sensors and programmable machines information",
+      "relevant": [
+        40,
+        41,
+        42,
+        43,
+        44
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "How can I make ceramic bowls?",
+      "relevant": [
+        45,
+        46,
+        47,
+        48,
+        49
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Pottery training workshop",
+      "relevant": [
+        45,
+        46,
+        47,
+        48,
+        49
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "陶芸と粘土",
+      "relevant": [
+        45,
+        46,
+        47,
+        48,
+        49
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Registration reference E1048",
+      "relevant": [
+        48
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "pottery classes teach shaping clay, glazing and kiln firing information",
+      "relevant": [
+        45,
+        46,
+        47,
+        48,
+        49
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "How do I repair and ride a bicycle?",
+      "relevant": [
+        50,
+        51,
+        52,
+        53,
+        54
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Cycling training workshop",
+      "relevant": [
+        50,
+        51,
+        52,
+        53,
+        54
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "自転車の修理",
+      "relevant": [
+        50,
+        51,
+        52,
+        53,
+        54
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Registration reference E1053",
+      "relevant": [
+        53
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "cycling training covers bicycle maintenance, gears and road safety information",
+      "relevant": [
+        50,
+        51,
+        52,
+        53,
+        54
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "How can I navigate a sailboat?",
+      "relevant": [
+        55,
+        56,
+        57,
+        58,
+        59
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Sailing training workshop",
+      "relevant": [
+        55,
+        56,
+        57,
+        58,
+        59
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "帆船の航海",
+      "relevant": [
+        55,
+        56,
+        57,
+        58,
+        59
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Registration reference E1058",
+      "relevant": [
+        58
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "sailing lessons teach wind, rigging and boat navigation information",
+      "relevant": [
+        55,
+        56,
+        57,
+        58,
+        59
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "How should I help someone injured before medics arrive?",
+      "relevant": [
+        60,
+        61,
+        62,
+        63,
+        64
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "FirstAid training workshop",
+      "relevant": [
+        60,
+        61,
+        62,
+        63,
+        64
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "救急手当",
+      "relevant": [
+        60,
+        61,
+        62,
+        63,
+        64
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Registration reference E1063",
+      "relevant": [
+        63
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "first aid courses teach emergency care, bandages and resuscitation information",
+      "relevant": [
+        60,
+        61,
+        62,
+        63,
+        64
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Where can I study how rocks and mountains form?",
+      "relevant": [
+        65,
+        66,
+        67,
+        68,
+        69
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Geology training workshop",
+      "relevant": [
+        65,
+        66,
+        67,
+        68,
+        69
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "地質学と岩石",
+      "relevant": [
+        65,
+        66,
+        67,
+        68,
+        69
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "Registration reference E1068",
+      "relevant": [
+        68
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "geology courses explain minerals, rocks and plate tectonics information",
+      "relevant": [
+        65,
+        66,
+        67,
+        68,
+        69
+      ],
+      "split": "tuning"
+    },
+    {
+      "text": "How do I care for honey bees?",
+      "relevant": [
+        70,
+        71,
+        72,
+        73,
+        74
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "Beekeeping training workshop",
+      "relevant": [
+        70,
+        71,
+        72,
+        73,
+        74
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "養蜂と蜂蜜",
+      "relevant": [
+        70,
+        71,
+        72,
+        73,
+        74
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "Registration reference E1073",
+      "relevant": [
+        73
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "beekeeping workshops cover hives, honey and pollination information",
+      "relevant": [
+        70,
+        71,
+        72,
+        73,
+        74
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "How can I mend and make clothing?",
+      "relevant": [
+        75,
+        76,
+        77,
+        78,
+        79
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "Sewing training workshop",
+      "relevant": [
+        75,
+        76,
+        77,
+        78,
+        79
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "裁縫と衣服",
+      "relevant": [
+        75,
+        76,
+        77,
+        78,
+        79
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "Registration reference E1078",
+      "relevant": [
+        78
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "sewing classes cover fabric patterns, stitching and garment repair information",
+      "relevant": [
+        75,
+        76,
+        77,
+        78,
+        79
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "How can I improve at the game with kings and queens?",
+      "relevant": [
+        80,
+        81,
+        82,
+        83,
+        84
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "Chess training workshop",
+      "relevant": [
+        80,
+        81,
+        82,
+        83,
+        84
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "チェスの戦術",
+      "relevant": [
+        80,
+        81,
+        82,
+        83,
+        84
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "Registration reference E1083",
+      "relevant": [
+        83
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "chess lessons teach openings, tactics and checkmate information",
+      "relevant": [
+        80,
+        81,
+        82,
+        83,
+        84
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "How do I explore underwater using breathing equipment?",
+      "relevant": [
+        85,
+        86,
+        87,
+        88,
+        89
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "Diving training workshop",
+      "relevant": [
+        85,
+        86,
+        87,
+        88,
+        89
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "スキューバダイビング",
+      "relevant": [
+        85,
+        86,
+        87,
+        88,
+        89
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "Registration reference E1088",
+      "relevant": [
+        88
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "diving courses explain scuba equipment, pressure and underwater safety information",
+      "relevant": [
+        85,
+        86,
+        87,
+        88,
+        89
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "How do I assemble and test electrical circuits?",
+      "relevant": [
+        90,
+        91,
+        92,
+        93,
+        94
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "Electronics training workshop",
+      "relevant": [
+        90,
+        91,
+        92,
+        93,
+        94
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "電子回路と電圧",
+      "relevant": [
+        90,
+        91,
+        92,
+        93,
+        94
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "Registration reference E1093",
+      "relevant": [
+        93
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "electronics workshops teach circuits, soldering and voltage measurement information",
+      "relevant": [
+        90,
+        91,
+        92,
+        93,
+        94
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "Where can I practice speaking a foreign language?",
+      "relevant": [
+        95,
+        96,
+        97,
+        98,
+        99
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "Languages training workshop",
+      "relevant": [
+        95,
+        96,
+        97,
+        98,
+        99
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "外国語の会話",
+      "relevant": [
+        95,
+        96,
+        97,
+        98,
+        99
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "Registration reference E1098",
+      "relevant": [
+        98
+      ],
+      "split": "heldout"
+    },
+    {
+      "text": "language classes teach vocabulary, grammar and conversation information",
+      "relevant": [
+        95,
+        96,
+        97,
+        98,
+        99
+      ],
+      "split": "heldout"
+    }
+  ]
+}

@@ -105,6 +105,8 @@ impl DurableEmbeddingWorker {
         let wake_pending = Arc::new(AtomicBool::new(false));
         let worker_wake_pending = Arc::clone(&wake_pending);
         let worker = runtime.spawn(async move {
+            let mut pass_failed = false;
+            let mut retry_delay_ms = 10_u64;
             while !cancel.is_cancelled() {
                 // Register before reading durable work so a commit racing the empty check
                 // cannot be lost between that check and the idle wait.
@@ -118,10 +120,23 @@ impl DurableEmbeddingWorker {
                 match next {
                     Ok(Ok(Some(job))) => {
                         if !process_job(job, Arc::clone(&callbacks), 16, cancel.clone()).await {
-                            break;
+                            if cancel.is_cancelled() { break; }
+                            pass_failed = true;
                         }
                     }
                     Ok(Ok(None)) => {
+                        // Failed work remains in the durable cursor. Retry only after visiting
+                        // the rest of this pass, retaining no owner queue or source-text copy.
+                        if pass_failed {
+                            tokio::select! {
+                                _ = cancel.cancelled() => break,
+                                _ = tokio::time::sleep(std::time::Duration::from_millis(retry_delay_ms)) => {},
+                            }
+                            retry_delay_ms = retry_delay_ms.saturating_mul(2).min(1000);
+                            pass_failed = false;
+                            continue;
+                        }
+                        retry_delay_ms = 10;
                         // A durable insertion may sort before the current cursor while
                         // inference runs. Finish this pass, then revisit its beginning.
                         if worker_wake_pending.swap(false, Ordering::AcqRel) {
@@ -185,53 +200,43 @@ async fn process_job(
     batch_size: usize,
     cancellation: CancellationToken,
 ) -> bool {
-    let mut delay_ms = 10_u64;
-    loop {
-        if cancellation.is_cancelled() {
-            return true;
+    if cancellation.is_cancelled() {
+        return true;
+    }
+    let cb = Arc::clone(&callbacks);
+    let cancel = cancellation.clone();
+    let execution = tokio::task::spawn_blocking(move || {
+        let result = (|| {
+            let Some(work) = (cb.load)(job, &cancel)? else {
+                return Ok(false);
+            };
+            let obsolete = || {
+                cancel.is_cancelled() || work.is_current.as_ref().is_some_and(|current| !current())
+            };
+            let vectors = encode(&work, job, batch_size, &obsolete)?;
+            if obsolete() {
+                return Err(cancelled());
+            }
+            (cb.publish)(job, vectors, &cancel)
+        })();
+        if let Err(error) = &result
+            && error.code != ErrorCode::Cancelled
+            && !cancel.is_cancelled()
+        {
+            (cb.failed)(job, error);
         }
-        let cb = Arc::clone(&callbacks);
-        let cancel = cancellation.clone();
-        let execution = tokio::task::spawn_blocking(move || {
-            let result = (|| {
-                let Some(work) = (cb.load)(job, &cancel)? else {
-                    return Ok(false);
-                };
-                let obsolete = || {
-                    cancel.is_cancelled()
-                        || work.is_current.as_ref().is_some_and(|current| !current())
-                };
-                let vectors = encode(&work, job, batch_size, &obsolete)?;
-                if obsolete() {
-                    return Err(cancelled());
-                }
-                (cb.publish)(job, vectors, &cancel)
-            })();
-            if let Err(error) = &result
-                && error.code != ErrorCode::Cancelled
-                && !cancel.is_cancelled()
-            {
-                (cb.failed)(job, error);
-            }
-            result
-        })
-        .await;
-        match execution {
-            Err(error) => {
-                tracing::error!(%error, "embedding CPU worker terminated unexpectedly");
-                cancellation.cancel();
-                return false;
-            }
-            Ok(Ok(_)) => return true,
-            Ok(Err(error)) if error.code == ErrorCode::Cancelled => return true,
-            Ok(Err(_)) => {
-                tokio::select! {
-                    _ = cancellation.cancelled() => return true,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {},
-                }
-                delay_ms = delay_ms.saturating_mul(2).min(1000);
-            }
+        result
+    })
+    .await;
+    match execution {
+        Err(error) => {
+            tracing::error!(%error, "embedding CPU worker terminated unexpectedly");
+            cancellation.cancel();
+            false
         }
+        Ok(Ok(_)) => true,
+        Ok(Err(error)) if error.code == ErrorCode::Cancelled => true,
+        Ok(Err(_)) => false,
     }
 }
 
@@ -756,15 +761,10 @@ mod tests {
                 failure_count.fetch_add(1, Ordering::Relaxed);
             }),
         });
-        assert!(
-            process_job(
-                job(ProjectId::random(), 7, 11),
-                callbacks,
-                1,
-                CancellationToken::new(),
-            )
-            .await
-        );
+        let pending = job(ProjectId::random(), 7, 11);
+        // A failed attempt yields to the cursor; retry reloads the complete owner later.
+        assert!(!process_job(pending, callbacks.clone(), 1, CancellationToken::new()).await);
+        assert!(process_job(pending, callbacks, 1, CancellationToken::new()).await);
         assert_eq!(loads.load(Ordering::Relaxed), 2);
         assert_eq!(published.load(Ordering::Relaxed), 2);
         assert_eq!(failures.load(Ordering::Relaxed), 1);

@@ -64,11 +64,12 @@ pub use index::{
     EmbeddingIndexDefinition, EmbeddingProfile, EqualityIndex, GraphIndexDefinition,
     GraphIndexKind, IVF_PQ_ASSIGNMENT_TILE_BYTES, IVF_PQ_BUILD_BATCH_ROWS,
     IVF_PQ_SIZE_CLASS_VERSION, IndexCatalog, IndexDeviceImage, IndexKey, IndexStatus,
-    IvfPqBuildKernel, IvfPqBuildPlan, IvfPqConfig, IvfPqIndex, OptimizerIndexStatistics,
-    PostingDeviceImage, RangeIndex, RelationshipSemanticScope, ResolvedVectorMutation,
-    RetrievalStrategy, SEMANTIC_INDEX, SEMANTIC_NODE_INDEX, SEMANTIC_NODE_PROPERTY,
-    SEMANTIC_RELATIONSHIP_INDEX, SEMANTIC_RELATIONSHIP_PROPERTY, ScalarIndexCandidate, Similarity,
-    TextDeviceImage, TextIndex, VectorDeviceImage, VectorHit, VectorIndex,
+    IvfPqBuildKernel, IvfPqBuildPlan, IvfPqConfig, IvfPqIndex, LexicalDocument,
+    OptimizerIndexStatistics, PostingDeviceImage, RangeIndex, RelationshipSemanticScope,
+    ResolvedVectorMutation, RetrievalStrategy, SEMANTIC_INDEX, SEMANTIC_NODE_INDEX,
+    SEMANTIC_NODE_PROPERTY, SEMANTIC_RELATIONSHIP_INDEX, SEMANTIC_RELATIONSHIP_PROPERTY,
+    ScalarIndexCandidate, Similarity, TextDeviceImage, TextIndex, VectorDeviceImage, VectorHit,
+    VectorIndex,
 };
 pub use persistence::PersistenceOp;
 pub use persistent::PagedVec;
